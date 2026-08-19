@@ -26,6 +26,7 @@ default = []
 ffi = []  # Enable FFI module for non-Android builds
 
 [dependencies]
+arc-swap = "*"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
@@ -98,7 +99,6 @@ android_logger = "*"
 jni = "0.22"
 ndk-sys = "*"
 
-[profile.release]
-opt-level = 3
-lto = "fat"
-strip = true
+# NOTE(shoes-engine): upstream's [profile.release] moved to the workspace root
+# Cargo.toml. Cargo ignores profiles declared by non-root workspace members, so
+# leaving it here would only produce a warning. The settings are unchanged.

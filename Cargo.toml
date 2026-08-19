@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    # Upstream shoes, imported verbatim via `git subtree` (prefix: shoes/).
+    # Never restructure this directory -- it must stay mergeable with upstream.
+    "shoes",
+    # Our additions live outside it.
+    "crates/shoes-api",
+    "crates/shoes-engine",
+    "crates/shoes-controller",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+shoes = { path = "shoes" }
+shoes-api = { path = "crates/shoes-api" }
+shoes-engine = { path = "crates/shoes-engine" }
+
+# Versions use "*" to match upstream shoes/Cargo.toml's convention; Cargo.lock
+# at the workspace root is the single source of truth for resolved versions.
+arc-swap = "*"
+async-trait = "*"
+dashmap = "*"
+http = "*"
+http-body-util = "*"
+hyper = { version = "*", features = ["server", "http1"] }
+hyper-util = { version = "*", features = ["tokio", "server"] }
+log = { version = "*", features = ["std"] }
+serde = { version = "*", features = ["derive", "std"] }
+serde_json = "*"
+serde_yaml = "*"
+tokio = { version = "*", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "*", features = ["time"] }
+
+# Profiles must live at the workspace root; a member's [profile] is ignored.
+# These mirror shoes/Cargo.toml so release builds keep upstream's characteristics.
+[profile.release]
+opt-level = 3
+lto = "fat"
+strip = true
