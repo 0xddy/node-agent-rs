@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# Local runtime artifacts
+/run/
+*.log
