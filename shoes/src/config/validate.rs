@@ -1703,6 +1703,13 @@ mod tests {
             tokio::fs::write(&path, content).await.unwrap();
         }
 
+        // A Windows temp path is backslash-separated, and inside a double-quoted YAML
+        // scalar `\U` (as in `\Users`) is an invalid escape, so the template below
+        // fails to parse before it can test anything. Escaping the separators keeps
+        // the template's quoting style as written and is a no-op wherever paths
+        // already use `/`.
+        let cert_dir = cert_dir.display().to_string().replace('\\', "\\\\");
+
         let config_yaml = format!(
             r#"
 - address: "0.0.0.0:443"
@@ -1750,17 +1757,17 @@ mod tests {
             protocol:
               type: http
 "#,
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display(),
-            cert_dir.display()
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir,
+            cert_dir
         );
 
         let configs: Vec<Config> = serde_yaml::from_str(&config_yaml).unwrap();
