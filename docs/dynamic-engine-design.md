@@ -53,7 +53,7 @@ gRPC, or a database. If a change would need one of those, it belongs in
                     ▼                           ▼
    crates/shoes-api                  shoes/src/dynamic/  ── the extension points
      InboundSpec, UserSpec,            UserRegistry, UserContext, ConnContext,
-     InboundInfo, UserInfo             TrafficMeterStream, HandlerSlot,
+     InboundInfo, UserInfo             TrafficMeterStream, HandlerSlot, SelectorSlot,
      (vocabulary only)                 ServerHandle, StaticUserRegistry, credential
                                                   │
                                                   ▼
@@ -106,7 +106,8 @@ Authentication cannot be wrapped from the outside, because every protocol carrie
 credential differently *and at a different point in its handshake*: VLESS puts a raw
 uuid at byte offset 1, Trojan sends a hex digest terminated by CRLF, VMess hides an
 AEAD-sealed auth id findable only by trial decryption, Hysteria2 sends a password in an
-HTTP/3 header, TUIC sends a uuid beside a token keyed with a password.
+HTTP/3 header, TUIC sends a uuid beside a token keyed with a password, AnyTLS opens
+with a bare hash, NaiveProxy waits for an HTTP/2 request header.
 
 So the thing that gets abstracted is the **credential lookup itself**, injected into
 the existing handlers rather than layered on top of them:
@@ -119,6 +120,9 @@ pub trait UserRegistry: Send + Sync + Debug {
     fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> { None }
     fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> { None }
     fn find_tuic_uuid(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> { None }
+    fn find_password_sha256(&self, hash: &[u8; 32]) -> Option<Arc<UserContext>> { None }
+    fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool { false }
+    fn find_naive_basic(&self, encoded: &[u8]) -> Option<Arc<UserContext>> { None }
     fn user_count(&self) -> usize;
 }
 ```
@@ -127,17 +131,22 @@ Every method **defaults to denying**. An implementation answers only for the cre
 shapes its inbound actually uses, and a registry that implements nothing rejects
 everyone — which is the correct behaviour for an inbound with no users yet.
 
-### Three credential shapes
+### Four credential shapes
 
 The return types are not uniform, and the differences are the design:
 
 | shape | protocols | returns | why |
 |---|---|---|---|
-| **indexable** | VLESS, Trojan, Hysteria2, AnyTLS\* | `Arc<UserContext>` | the client names itself; a hit is the whole answer |
+| **indexable** | VLESS, Trojan, Hysteria2, AnyTLS, NaiveProxy | `Arc<UserContext>` | the client names itself; a hit is the whole answer |
 | **derived** | Shadowsocks 2022, VMess | identity + key material | naming the user is not enough — the rest of the handshake derives from their key |
 | **paired** | TUIC | identity + password, **unauthenticated** | half the credential is public; only the caller can check the other half |
+| **incomplete** | AnyTLS | `bool` | asked *before* the credential has fully arrived, so it can only be a plausibility test |
 
-\* not yet converted — see the plan.
+Three protocols index a *derivation* of one cleartext password, and each is its own
+key: Trojan sends 56 hex characters of SHA-224, Hysteria2 sends the cleartext, AnyTLS
+sends 32 raw bytes of SHA-256. One `password` on a user feeds all three, which is why
+`CredentialKinds` does not treat them as a conflict — but they are never one index,
+because sharing one would accept a secret in a form its owner never sends.
 
 VMess is the one that cannot be indexed at all: its auth id carries no identifier, so
 recognising a user is linear in the user count. Every implementation of the protocol
@@ -149,6 +158,21 @@ wire in cleartext, and the 32-byte token beside it is keyed with the user's pass
 seen. So `find_tuic_uuid` hands back a password rather than a verdict, deliberately
 does **not** call `note_auth`, and says so in its own documentation. The handler counts
 the authentication once the token matches.
+
+AnyTLS breaks a different one. It peeks at the first 8 bytes of a connection and, on a
+miss, diverts it to a fallback destination without waiting for the remaining 24 —
+which is what stops a prober from hanging the handler. So
+`has_password_sha256_prefix` has to answer *before the credential is complete*, and it
+is therefore a plausibility test rather than a lookup: `true` means "keep reading",
+never "this user exists". In particular it **ignores whether the user is enabled**.
+Answering `false` for a suspended user would send their connections to the fallback
+while a live user's went to the handler, which is an observable difference an
+attacker could use to enumerate suspensions.
+
+NaiveProxy's credential is the only one that contains the user's **id**: it is HTTP
+Basic, base64 of `username:password`, and `UserSpec` has no username field of its own.
+So on such an inbound the id is part of the credential, and renaming a user rotates
+it — stated here because it is the one place where an id is not merely a label.
 
 ### Invariants
 
@@ -269,12 +293,10 @@ connection*. Where it does not, the context is passed as
 | protocol | shape | why |
 |---|---|---|
 | VLESS, VMess, Trojan, Shadowsocks 2022 | A | authenticate inline, then spawn |
-| AnyTLS\* | A | authenticates in `setup_server_stream`, *before* its own spawn |
+| AnyTLS | A | authenticates in `setup_server_stream`, *before* its own spawn |
 | Hysteria2 | B | authenticates once, then fans out into three loops, each its own task |
 | TUIC | B | same, four loops |
-| NaiveProxy\* | B | auth happens *inside* a hyper `serve_connection` task |
-
-\* not yet converted.
+| NaiveProxy | B | hyper owns the task from `serve_connection` on, and the credential is not read until a request arrives |
 
 The failure mode when this is got wrong is silent: TCP still adds up perfectly and the
 user's counters simply sit at zero. Every suite therefore has a section that moves
@@ -367,9 +389,14 @@ the abort would cut exactly the connections the drain exists to protect.
 - **The listen set and the transport.** Changing either is a different set of
   listeners, which is not something to do silently; `check_reload` refuses both with a
   message naming what it is serving.
-- **Hysteria2 and TUIC, entirely** — they register no `HandlerSlot` because they never
-  build a `TcpServerHandler`. This is the one acknowledged gap, and it is increment 1
-  of the plan.
+- **Protocol settings on Hysteria2 and TUIC.** They never build a `TcpServerHandler`,
+  so they register a [`SelectorSlot`](#5-reload-rcu-without-a-grace-period) instead,
+  which reaches their rules and nothing else. `udp_enabled`, `zero_rtt_handshake` and
+  the credential were read once before the accept loop started, so the handle records
+  them and `check_reload` refuses a change by name rather than ignoring it — silently
+  ignoring a `udp_enabled: false` would leave UDP running after an operator turned it
+  off. In dynamic mode the credential is excluded from that comparison, because the
+  engine regenerates its placeholder on every call and it carries no intent.
 
 ---
 
@@ -502,17 +529,19 @@ What a future `git subtree` merge of upstream has to survive, measured against
 
 | area | size |
 |---|---|
-| `shoes/src/dynamic/` (entirely new) | ~2,200 lines |
-| the rest of `shoes/` | 24 files, +1,945 / −440 |
-| `crates/` | ~8,600 lines, of which ~5,100 are tests |
+| `shoes/src/dynamic/` (entirely new) | ~2,900 lines |
+| the rest of `shoes/` | 28 files, +2,156 / −733 |
+| `crates/` | ~10,200 lines, of which ~6,200 are tests |
 
 Inside `shoes/`, outside the new module, the changes are of four kinds:
 
 1. **Visibility widenings** — `pub mod tcp;`, `pub mod socket_util;`, exporting
    `DnsRegistry`; plus `[profile.release]` moved to the workspace root, because Cargo
    ignores profiles in a non-root member.
-2. **Registry injection at six authentication sites** — VLESS, Trojan, VMess,
-   Shadowsocks 2022, Hysteria2, TUIC. Behaviour-preserving by construction, per §3.
+2. **Registry injection at eight authentication sites** — VLESS, Trojan, VMess,
+   Shadowsocks 2022, Hysteria2, TUIC, AnyTLS, NaiveProxy. Behaviour-preserving by
+   construction, per §3. One deletion: NaiveProxy's `UserLookup` is gone, because the
+   registry answers everything it answered.
 3. **Metering and reload threading** — `Option<Arc<dyn UserRegistry>>` and a `metered`
    flag through the handler factory and the accept loops; `HandlerSlot` / `ServerHandle`
    in place of a bare handler.
@@ -521,6 +550,10 @@ Inside `shoes/`, outside the new module, the changes are of four kinds:
 > **Known stale:** the "Invasiveness" table in `crates/shoes-engine/src/lib.rs` still
 > describes the phase-2a footprint — "two authentication sites (VLESS, Trojan)". The
 > numbers above supersede it.
+
+Every protocol shoes can tell users apart on is now registry-backed. Snell is the only
+one left out, and it is not a gap: it has no multi-user identity mechanism at all, so
+there is nothing for a registry to answer.
 
 ---
 
