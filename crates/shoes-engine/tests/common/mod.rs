@@ -46,6 +46,8 @@ use shoes_engine::{Engine, InboundSpec, UserInfo, UserSpec};
 
 /// The client half of the Hysteria2 suite, which shoes cannot supply.
 pub mod hysteria2;
+/// Likewise for TUIC.
+pub mod tuic;
 
 /// Ceiling on every individual read in the harness.
 ///
@@ -391,6 +393,41 @@ pub fn hysteria2_inbound_with_password(
     config
 }
 
+/// A TUIC v5 inbound over QUIC for **dynamic** mode, using the bundled self-signed
+/// cert.
+///
+/// Neither `uuid` nor `password`, and for the same reason `hysteria2_inbound` omits
+/// its password: with a registry injected, both are dead config, and the engine
+/// refuses a payload that declares one. Shoes' schema requires both fields, so the
+/// engine fills in throwaways -- see `PLACEHOLDER_FIELDS` in `shoes-engine`'s
+/// `protocol` module, which is why that table maps a protocol to a *list*.
+///
+/// `alpn_protocols: ["h3"]` is not a TUIC requirement the way it is for Hysteria2 --
+/// TUIC does not speak HTTP/3 -- but a server that names an ALPN and a client that
+/// offers a different one fail the handshake, so the two halves have to agree and
+/// this is the value the test client offers.
+pub fn tuic_inbound(address: SocketAddr) -> Value {
+    json!({
+        "address": address.to_string(),
+        "transport": "quic",
+        "quic_settings": {
+            "cert": test_cert(),
+            "key": test_key(),
+            "alpn_protocols": ["h3"],
+        },
+        "protocol": {"type": "tuic"},
+    })
+}
+
+/// As [`tuic_inbound`], but declaring the credential a classic-mode inbound
+/// authenticates against.
+pub fn tuic_inbound_with_credential(address: SocketAddr, uuid: &str, password: &str) -> Value {
+    let mut config = tuic_inbound(address);
+    config["protocol"]["uuid"] = json!(uuid);
+    config["protocol"]["password"] = json!(password);
+    config
+}
+
 /// A deterministic base64 PSK of `len` bytes, derived from `seed`.
 ///
 /// Deterministic so a test can hand the same key to a client leg and to `add_user`
@@ -479,6 +516,27 @@ pub fn disabled_password_user(id: &str, password: &str) -> UserSpec {
     UserSpec {
         enabled: false,
         ..password_user(id, password)
+    }
+}
+
+/// A user whose credential is a uuid *and* a password, as TUIC wants.
+///
+/// The only helper here that fills in both. Neither half stands alone: a TUIC user
+/// missing either one is refused when they are added, rather than accepted and left
+/// unable to connect.
+pub fn tuic_user(id: &str, uuid: &str, password: &str) -> UserSpec {
+    UserSpec {
+        id: Some(id.to_string()),
+        uuid: Some(uuid.to_string()),
+        password: Some(password.to_string()),
+        enabled: true,
+    }
+}
+
+pub fn disabled_tuic_user(id: &str, uuid: &str, password: &str) -> UserSpec {
+    UserSpec {
+        enabled: false,
+        ..tuic_user(id, uuid, password)
     }
 }
 

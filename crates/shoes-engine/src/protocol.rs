@@ -95,14 +95,18 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
         // `create_tcp_server_handler`.
         ServerProxyConfig::Hysteria2 { .. } => kinds.merge(CredentialKinds::PLAIN_PASSWORD),
 
+        // TUIC needs a uuid and a password together: the uuid arrives in cleartext and
+        // names the user, the password keys the 32 byte token beside it. Like
+        // Hysteria2 it authenticates in its own QUIC accept loop rather than through a
+        // `TcpServerHandler`, so it takes the registry as a parameter.
+        ServerProxyConfig::TuicV5 { .. } => kinds.merge(CredentialKinds::TUIC),
+
         // Authenticates, but not through the registry yet. Snell has no multi-user
-        // identity mechanism at all, AnyTLS and NaiveProxy already have their own
-        // multi-user tables, and TUIC needs a uuid and a password together, which is
-        // a credential shape nothing here can express yet.
+        // identity mechanism at all, and AnyTLS and NaiveProxy already have their own
+        // multi-user tables.
         ServerProxyConfig::Snell { .. }
         | ServerProxyConfig::Anytls { .. }
-        | ServerProxyConfig::Naiveproxy { .. }
-        | ServerProxyConfig::TuicV5 { .. } => {}
+        | ServerProxyConfig::Naiveproxy { .. } => {}
 
         // Either no credentials at all, or plain proxy credentials that identify a
         // client but not a billable user.
@@ -138,12 +142,19 @@ pub(crate) fn display_name(protocol: &ServerProxyConfig) -> String {
     }
 }
 
-/// The leaf credential field each registry-backed protocol declares in its config.
-const PLACEHOLDER_FIELDS: &[(&str, &str)] = &[
-    ("vless", "user_id"),
-    ("vmess", "user_id"),
-    ("trojan", "password"),
-    ("hysteria2", "password"),
+/// The leaf credential fields each registry-backed protocol declares in its config.
+///
+/// A list per protocol rather than a single field, because TUIC declares two. Both
+/// spellings of its tag appear: `rename_all = "lowercase"` makes the variant
+/// `tuicv5`, and shoes accepts `tuic` as an alias, so listing only one would leave
+/// configs written the other way demanding a credential the registry has taken over.
+const PLACEHOLDER_FIELDS: &[(&str, &[&str])] = &[
+    ("vless", &["user_id"]),
+    ("vmess", &["user_id"]),
+    ("trojan", &["password"]),
+    ("hysteria2", &["password"]),
+    ("tuicv5", &["uuid", "password"]),
+    ("tuic", &["uuid", "password"]),
 ];
 /// Fills in the credential fields shoes' schema requires but a registry supersedes.
 ///
@@ -264,21 +275,29 @@ fn fill_protocol_object(map: &mut Map<String, Value>) -> EngineResult<()> {
         _ => return Ok(()),
     };
 
-    let Some((_, field)) = PLACEHOLDER_FIELDS.iter().find(|(name, _)| *name == kind) else {
+    let Some((_, fields)) = PLACEHOLDER_FIELDS.iter().find(|(name, _)| *name == kind) else {
         return Ok(());
     };
 
-    if map.contains_key(*field) {
-        return Err(EngineError::InvalidConfig(format!(
-            "remove `{field}` from the {kind} protocol: this inbound has a `users` list, \
-             which is its only authority, so a credential in the config would be ignored"
-        )));
+    for field in *fields {
+        if map.contains_key(*field) {
+            return Err(EngineError::InvalidConfig(format!(
+                "remove `{field}` from the {kind} protocol: this inbound has a `users` \
+                 list, which is its only authority, so a credential in the config would \
+                 be ignored"
+            )));
+        }
     }
 
-    map.insert(
-        (*field).to_string(),
-        Value::String(credential::random_uuid()),
-    );
+    // Every field gets a uuid, password fields included. The value is dead either way
+    // -- nothing reads it once a registry is injected -- and an unguessable throwaway
+    // is a better failure mode than a fixed one, should a path ever be found that does.
+    for field in *fields {
+        map.insert(
+            (*field).to_string(),
+            Value::String(credential::random_uuid()),
+        );
+    }
     Ok(())
 }
 
@@ -398,6 +417,25 @@ mod tests {
         let kinds = credential_kinds(&parse(r#"{"type":"hysteria2","password":"p"}"#));
         assert_eq!(kinds, CredentialKinds::PLAIN_PASSWORD);
         assert!(!kinds.trojan_password, "the password is not hashed");
+    }
+
+    #[test]
+    fn classifies_tuic_as_a_uuid_and_a_password_together() {
+        // The one kind that needs two fields. `uuid` is set as well as `tuic` because
+        // the uuid really is the index key the lookup hits; `tuic` is what says the
+        // password beside it is required rather than optional.
+        for json in [
+            r#"{"type":"tuic","uuid":"b85798ef-e9dc-46a4-9a87-8da4499d36d0","password":"p"}"#,
+            r#"{"type":"tuicv5","uuid":"b85798ef-e9dc-46a4-9a87-8da4499d36d0","password":"p"}"#,
+        ] {
+            let kinds = credential_kinds(&parse(json));
+            assert_eq!(kinds, CredentialKinds::TUIC, "for {json}");
+            assert!(kinds.uuid);
+            assert!(kinds.tuic);
+            // Not a plain-password inbound: the password never authenticates alone.
+            assert!(!kinds.plain_password);
+            assert!(kinds.conflict().is_none());
+        }
     }
 
     #[test]
@@ -625,6 +663,39 @@ mod tests {
             serde_json::from_str(&inbound(r#"{"type":"hysteria2","password":"p"}"#)).unwrap();
         let err = install_placeholder_credentials(&mut declared).unwrap_err();
         assert!(err.to_string().contains("password"));
+    }
+
+    #[test]
+    fn fills_in_both_halves_of_a_tuic_credential() {
+        // The case `PLACEHOLDER_FIELDS` became a list for. Filling only one of the two
+        // would leave shoes' deserializer reporting the other as missing.
+        for tag in ["tuic", "tuicv5"] {
+            let mut config: Value =
+                serde_json::from_str(&inbound(&format!(r#"{{"type":"{tag}"}}"#))).unwrap();
+            install_placeholder_credentials(&mut config).unwrap();
+            let uuid = config["protocol"]["uuid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tag} should get a placeholder uuid"));
+            let password = config["protocol"]["password"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tag} should get a placeholder password"));
+            assert!(!uuid.is_empty() && !password.is_empty());
+            assert_ne!(uuid, password, "two throwaways, not one value twice");
+
+            // Either half being declared is an error, and nothing is filled in on the
+            // way to reporting it.
+            for declared in [
+                format!(r#"{{"type":"{tag}","uuid":"b85798ef-e9dc-46a4-9a87-8da4499d36d0"}}"#),
+                format!(r#"{{"type":"{tag}","password":"p"}}"#),
+            ] {
+                let mut config: Value = serde_json::from_str(&inbound(&declared)).unwrap();
+                let err = install_placeholder_credentials(&mut config).unwrap_err();
+                assert!(
+                    matches!(err, EngineError::InvalidConfig(_)),
+                    "for {declared}"
+                );
+            }
+        }
     }
 
     #[test]

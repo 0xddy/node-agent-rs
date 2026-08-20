@@ -17,6 +17,21 @@ pub struct ShadowsocksIdentity {
     pub psk: Box<[u8]>,
 }
 
+/// Who a TUIC uuid names, and the password its token is keyed with.
+///
+/// TUIC's `AUTHENTICATE` command puts the uuid on the wire in cleartext, next to a
+/// 32-byte token that only the user's password and the QUIC connection's own exported
+/// keying material can produce. So, as with Shadowsocks 2022, naming the user is not
+/// the end of it: the lookup hands back the password the server needs to derive the
+/// token it expects to see.
+pub struct TuicIdentity {
+    /// The user the uuid named -- **not yet authenticated**. See
+    /// [`UserRegistry::find_tuic_uuid`].
+    pub user: Arc<UserContext>,
+    /// That user's password, which the expected token is derived from.
+    pub password: Arc<str>,
+}
+
 /// Who a VMess auth id belongs to, and what the rest of the handshake needs.
 ///
 /// A VMess server cannot proceed on "yes, that is a valid user" alone -- the next
@@ -61,6 +76,16 @@ pub struct VmessIdentity {
 /// Handlers treat `None` as "unknown credential" and may divert the connection to
 /// a probe-resistant fallback; distinguishing the two cases at the protocol level
 /// would hand an observer a way to confirm that a credential is valid.
+///
+/// # Counting the authentication
+///
+/// A lookup that returns `Some` has already called
+/// [`note_auth`](UserContext::note_auth), so that a handler cannot forget to. That
+/// works because for every credential here the key *is* the proof: a password or a
+/// hash is compared against the stored value, and a VMess auth id carries a checksum
+/// only the uuid holder can produce.
+///
+/// [`find_tuic_uuid`](Self::find_tuic_uuid) is the one exception, and it says so.
 pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// Look up the 16-byte uuid that VLESS sends in cleartext at offset 1 of its
     /// request header, and that VMess seals into its auth id.
@@ -115,6 +140,26 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// implementations should index on the hash rather than walk their users.
     fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
         let _ = hash;
+        None
+    }
+
+    /// Find whose TUIC uuid this is, together with the password its token is keyed
+    /// with.
+    ///
+    /// Kept apart from [`find_uuid`](Self::find_uuid) because a TUIC credential is two
+    /// values at once and half of it will not do: a VLESS user registered with the same
+    /// uuid has no password to derive a token from, so authenticating them here would
+    /// let a cleartext uuid stand in for the whole handshake.
+    ///
+    /// **This is the one lookup here that does not authenticate.** The uuid arrives in
+    /// cleartext, so a hit proves nothing until the token beside it has been checked,
+    /// and only the caller can check it -- deriving the expected token needs the QUIC
+    /// connection's exported keying material, which the registry has never seen. So
+    /// implementations must *not* call [`note_auth`](UserContext::note_auth); the
+    /// handler calls it once the token matches. They must still treat a disabled user
+    /// as absent.
+    fn find_tuic_uuid(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> {
+        let _ = uuid;
         None
     }
 

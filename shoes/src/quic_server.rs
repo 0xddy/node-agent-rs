@@ -28,7 +28,6 @@ use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
-use crate::uuid_util::parse_uuid;
 
 /// How long a cancelled QUIC endpoint waits for its live connections before it
 /// drops the socket.
@@ -99,7 +98,8 @@ async fn start_quic_server(
                 // was accepted.
                 let server_handler = handler_slot.load();
                 tokio::spawn(async move {
-                    if let Err(e) = process_connection(resolver, server_handler, conn, metered).await
+                    if let Err(e) =
+                        process_connection(resolver, server_handler, conn, metered).await
                     {
                         error!("Connection ended with error: {e}");
                     }
@@ -158,8 +158,7 @@ async fn process_connection(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_streams(cloned_resolver, cloned_handler, stream, metered).await
+            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream, metered).await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -484,14 +483,21 @@ pub async fn start_quic_servers(
             password,
             zero_rtt_handshake,
         } => {
-            let uuid: Arc<[u8]> = parse_uuid(&uuid)?.into();
-            let password: Arc<str> = password.into();
+            // TUIC's credential is two values at once: the uuid names the user in
+            // cleartext and the password keys the token beside it. An injected registry
+            // answers for both; without one, the config's own pair becomes a one-user
+            // registry, which is the same comparison this used to do inline.
+            let tuic_users = match users.as_ref() {
+                Some(users) => users.clone(),
+                None => StaticUserRegistry::single_tuic(&uuid, &password)?,
+            };
+
             for bind_address in bind_addresses.into_iter() {
                 let tuic_handles = crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config.clone(),
-                    uuid.clone(),
-                    password.clone(),
+                    tuic_users.clone(),
+                    metered,
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     num_endpoints,

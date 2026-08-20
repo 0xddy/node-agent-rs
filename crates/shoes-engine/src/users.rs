@@ -38,7 +38,9 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use shoes::dynamic::credential::VmessAuthKey;
-use shoes::dynamic::{ShadowsocksIdentity, UserContext, UserRegistry, VmessIdentity, credential};
+use shoes::dynamic::{
+    ShadowsocksIdentity, TuicIdentity, UserContext, UserRegistry, VmessIdentity, credential,
+};
 use shoes_api::{UserInfo, UserSpec};
 use subtle::ConstantTimeEq;
 
@@ -79,6 +81,11 @@ pub struct CredentialKinds {
     /// Shadowsocks 2022: a raw PSK, given base64 encoded, recognised on the wire by
     /// the identity header a client seals with it.
     pub shadowsocks_psk: ShadowsocksPsk,
+    /// TUIC: a uuid *and* a password, together. The odd one out here -- every other
+    /// kind is one field, and a user who supplies it can connect. A TUIC user needs
+    /// both: the uuid names them in cleartext and the password keys the 32 byte token
+    /// beside it, so half a credential authenticates nobody.
+    pub tuic: bool,
 }
 
 impl CredentialKinds {
@@ -87,6 +94,7 @@ impl CredentialKinds {
         trojan_password: false,
         plain_password: false,
         shadowsocks_psk: ShadowsocksPsk::None,
+        tuic: false,
     };
 
     pub const UUID: Self = Self {
@@ -101,6 +109,14 @@ impl CredentialKinds {
 
     pub const PLAIN_PASSWORD: Self = Self {
         plain_password: true,
+        ..Self::NONE
+    };
+
+    /// A TUIC user's uuid is a real uuid credential -- it is what `find_tuic_uuid`
+    /// indexes on -- so the pair sets `uuid` as well as `tuic`.
+    pub const TUIC: Self = Self {
+        uuid: true,
+        tuic: true,
         ..Self::NONE
     };
 
@@ -121,6 +137,7 @@ impl CredentialKinds {
         self.uuid |= other.uuid;
         self.trojan_password |= other.trojan_password;
         self.plain_password |= other.plain_password;
+        self.tuic |= other.tuic;
         self.shadowsocks_psk = match (self.shadowsocks_psk, other.shadowsocks_psk) {
             (ShadowsocksPsk::None, only) | (only, ShadowsocksPsk::None) => only,
             (ShadowsocksPsk::Len(a), ShadowsocksPsk::Len(b)) if a == b => ShadowsocksPsk::Len(a),
@@ -132,6 +149,7 @@ impl CredentialKinds {
     fn takes_password(&self) -> bool {
         self.trojan_password
             || self.plain_password
+            || self.tuic
             || matches!(self.shadowsocks_psk, ShadowsocksPsk::Len(_))
     }
 
@@ -170,6 +188,10 @@ impl CredentialKinds {
 
     /// The credential fields a caller may set, for use in error messages.
     fn accepted_fields(&self) -> String {
+        // TUIC wants both at once, which "or" would misstate.
+        if self.tuic {
+            return "`uuid` and `password`".to_string();
+        }
         let mut fields = Vec::new();
         if self.uuid {
             fields.push("`uuid`");
@@ -203,6 +225,11 @@ struct Credentials {
     /// the cleartext, so there is nothing to derive.
     password: Option<Box<str>>,
     shadowsocks: Option<ShadowsocksCredential>,
+    /// The password half of a TUIC credential. Not an index key and not a credential
+    /// on its own -- the uuid is what is looked up, and this is what the token beside
+    /// it is keyed with. Two TUIC users may share a password without conflict; it is
+    /// their uuids that must differ.
+    tuic_password: Option<Arc<str>>,
 }
 
 /// One user: their shared accounting record plus the credentials that reach it.
@@ -214,6 +241,7 @@ struct Entry {
     trojan_hash: Option<Box<[u8]>>,
     password: Option<Box<str>>,
     shadowsocks: Option<ShadowsocksCredential>,
+    tuic_password: Option<Arc<str>>,
     /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
     /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
     /// schedule *per user* on every handshake.
@@ -349,6 +377,9 @@ impl MemoryUserRegistry {
             trojan_hash: credentials.trojan_hash,
             password: credentials.password,
             shadowsocks: credentials.shadowsocks,
+            // Nothing to retire below, unlike the fields above it: this is carried on
+            // the entry rather than indexed, so rotating it replaces the whole record.
+            tuic_password: credentials.tuic_password,
             // Built whenever the user has a uuid, whether or not this inbound speaks
             // VMess. One registry serves a whole inbound, and a TLS inbound can carry
             // VLESS on one SNI and VMess on another, so "is VMess in use here" is not
@@ -474,6 +505,16 @@ impl MemoryUserRegistry {
                 self.kinds.accepted_fields()
             )));
         }
+        // The one form that needs two fields at once. Refused here rather than left to
+        // the lookup, where a user missing half would simply never match and look to
+        // the operator like a client problem.
+        if self.kinds.tuic && (spec.uuid.is_none() || spec.password.is_none()) {
+            return Err(EngineError::InvalidUser(
+                "a tuic user needs both `uuid` and `password`: the uuid names them \
+                 on the wire and the password keys the token beside it"
+                    .to_string(),
+            ));
+        }
 
         let uuid = match spec.uuid.as_deref() {
             Some(uuid) => Some(
@@ -520,6 +561,10 @@ impl MemoryUserRegistry {
                 false => None,
             },
             shadowsocks,
+            tuic_password: match self.kinds.tuic {
+                true => spec.password.as_deref().map(Arc::from),
+                false => None,
+            },
         })
     }
 
@@ -656,6 +701,29 @@ impl UserRegistry for MemoryUserRegistry {
         })
     }
 
+    /// The uuid half of a TUIC credential, plus the password its token is keyed with.
+    ///
+    /// Not `accept`, and no `note_auth`: the token that proves the client holds that
+    /// password has not been checked yet and cannot be checked from here, so there is
+    /// nothing yet to count. The handler counts it once the token matches. See the
+    /// trait method's docs.
+    ///
+    /// A user registered without a TUIC password -- which this inbound's
+    /// `parse_credentials` refuses, but a registry built for another protocol would
+    /// hold -- is absent here rather than authenticated on their uuid alone.
+    fn find_tuic_uuid(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> {
+        let entry = self.by_uuid.get(uuid)?;
+        let password = entry.tuic_password.clone()?;
+        let expected = entry.uuid.as_ref()?;
+        if expected.ct_eq(&uuid[..]).unwrap_u8() == 0 || !entry.context.is_enabled() {
+            return None;
+        }
+        Some(TuicIdentity {
+            user: entry.context.clone(),
+            password,
+        })
+    }
+
     fn user_count(&self) -> usize {
         self.users.len()
     }
@@ -704,6 +772,15 @@ mod tests {
 
     /// A 2022 PSK spec. The key is `len` bytes derived from `id`, so distinct users
     /// get distinct keys without any of them being a real secret.
+    fn tuic_spec(id: &str, uuid: &str, password: &str) -> UserSpec {
+        UserSpec {
+            id: Some(id.to_string()),
+            uuid: Some(uuid.to_string()),
+            password: Some(password.to_string()),
+            enabled: true,
+        }
+    }
+
     fn ss_spec(id: &str, len: usize) -> UserSpec {
         UserSpec {
             id: Some(id.to_string()),
@@ -1170,6 +1247,131 @@ mod tests {
                 .find_shadowsocks_psk_hash(&ss_name("bob", 16))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn finds_a_tuic_user_without_counting_an_authentication() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::TUIC);
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "hunter2"))
+            .unwrap();
+
+        let found = registry.find_tuic_uuid(&uuid_bytes(UUID_A)).unwrap();
+        assert_eq!(&**found.user.id(), "alice");
+        assert_eq!(&*found.password, "hunter2");
+        // The whole point of this lookup being different: the token has not been
+        // checked yet, so nothing may be billed. The handler counts it once it has.
+        assert_eq!(found.user.total_conns(), 0);
+
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID_B)).is_none());
+    }
+
+    #[test]
+    fn a_tuic_user_needs_both_halves() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::TUIC);
+
+        let uuid_only = registry.upsert(uuid_spec("alice", UUID_A)).unwrap_err();
+        assert!(uuid_only.to_string().contains("both `uuid` and `password`"));
+        let password_only = registry
+            .upsert(trojan_spec("alice", "hunter2"))
+            .unwrap_err();
+        assert!(
+            password_only
+                .to_string()
+                .contains("both `uuid` and `password`")
+        );
+        assert_eq!(registry.user_count(), 0);
+
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "hunter2"))
+            .unwrap();
+        assert_eq!(registry.user_count(), 1);
+    }
+
+    #[test]
+    fn half_a_tuic_credential_authenticates_nothing() {
+        // A TUIC user's password is not indexed as a password credential, and a plain
+        // uuid user has no password for a token to be keyed with. Neither half stands
+        // alone, whichever direction it is asked from.
+        let tuic = MemoryUserRegistry::new(CredentialKinds::TUIC);
+        tuic.upsert(tuic_spec("alice", UUID_A, "hunter2")).unwrap();
+        assert!(tuic.find_password("hunter2").is_none());
+        assert!(
+            tuic.find_trojan_hash(&credential::trojan_password_hash("hunter2"))
+                .is_none()
+        );
+
+        let vless = MemoryUserRegistry::new(CredentialKinds::UUID);
+        vless.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        assert!(vless.find_tuic_uuid(&uuid_bytes(UUID_A)).is_none());
+    }
+
+    #[test]
+    fn a_disabled_tuic_user_looks_absent() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::TUIC);
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "hunter2"))
+            .unwrap();
+        let user = registry.find_tuic_uuid(&uuid_bytes(UUID_A)).unwrap().user;
+
+        user.set_enabled(false);
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID_A)).is_none());
+        user.set_enabled(true);
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID_A)).is_some());
+    }
+
+    #[test]
+    fn rotating_a_tuic_password_retires_the_old_one() {
+        // The password is carried on the entry rather than indexed, so what retires it
+        // is the entry being replaced whole. Worth its own check: the uuid, which *is*
+        // indexed, stays the same across this rotation and would hide a stale password.
+        let registry = MemoryUserRegistry::new(CredentialKinds::TUIC);
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "hunter2"))
+            .unwrap();
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "hunter3"))
+            .unwrap();
+
+        let found = registry.find_tuic_uuid(&uuid_bytes(UUID_A)).unwrap();
+        assert_eq!(&*found.password, "hunter3");
+        assert_eq!(registry.user_count(), 1);
+    }
+
+    #[test]
+    fn two_tuic_users_may_share_a_password() {
+        // Only the uuid is an index key, so a shared password collides with nothing.
+        // Refusing it would be a rule with no mechanism behind it.
+        let registry = MemoryUserRegistry::new(CredentialKinds::TUIC);
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "hunter2"))
+            .unwrap();
+        registry
+            .upsert(tuic_spec("bob", UUID_B, "hunter2"))
+            .unwrap();
+
+        assert_eq!(
+            &**registry
+                .find_tuic_uuid(&uuid_bytes(UUID_A))
+                .unwrap()
+                .user
+                .id(),
+            "alice"
+        );
+        assert_eq!(
+            &**registry
+                .find_tuic_uuid(&uuid_bytes(UUID_B))
+                .unwrap()
+                .user
+                .id(),
+            "bob"
+        );
+
+        // The uuid still is one, though.
+        let err = registry
+            .upsert(tuic_spec("mallory", UUID_A, "hunter4"))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::DuplicateCredential { .. }));
     }
 
     #[test]

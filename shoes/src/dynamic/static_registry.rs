@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 use subtle::ConstantTimeEq;
 
 use super::credential::VmessAuthKey;
-use super::registry::{UserRegistry, VmessIdentity};
+use super::registry::{TuicIdentity, UserRegistry, VmessIdentity};
 use super::user::UserContext;
 use crate::trojan_handler::create_password_hash;
 use crate::uuid_util::parse_uuid;
@@ -33,6 +33,10 @@ struct Entry {
     /// so that a user has exactly one record: re-registering a uuid replaces it
     /// whole, with no second table left pointing at the superseded context.
     vmess: Option<VmessAuthKey>,
+    /// Present only for TUIC entries, where the uuid alone is not the credential: the
+    /// token beside it is keyed with this password. Not indexed on, and not a
+    /// credential in its own right -- a TUIC user cannot authenticate by password.
+    tuic_password: Option<Arc<str>>,
 }
 
 impl Entry {
@@ -41,12 +45,20 @@ impl Entry {
             context: UserContext::new(id),
             credential: credential.into(),
             vmess: None,
+            tuic_password: None,
         }
     }
 
     fn uuid(id: &str, uuid: [u8; 16]) -> Self {
         Self {
             vmess: Some(VmessAuthKey::new(&uuid)),
+            ..Self::new(id, uuid)
+        }
+    }
+
+    fn tuic(id: &str, uuid: [u8; 16], password: &str) -> Self {
+        Self {
+            tuic_password: Some(password.into()),
             ..Self::new(id, uuid)
         }
     }
@@ -76,6 +88,23 @@ impl Entry {
             user: self.context.clone(),
             instruction_key: *key.instruction_key(),
             timestamp,
+        })
+    }
+
+    /// This entry's user and TUIC password, if the uuid is theirs.
+    ///
+    /// Deliberately does not call `note_auth`, unlike every other method here: the
+    /// token that proves the client holds the password has not been checked yet, and
+    /// cannot be checked from in here. See
+    /// [`UserRegistry::find_tuic_uuid`](super::registry::UserRegistry::find_tuic_uuid).
+    fn verify_tuic(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> {
+        let password = self.tuic_password.clone()?;
+        if self.credential.ct_eq(&uuid[..]).unwrap_u8() == 0 || !self.context.is_enabled() {
+            return None;
+        }
+        Some(TuicIdentity {
+            user: self.context.clone(),
+            password,
         })
     }
 }
@@ -128,6 +157,21 @@ impl StaticUserRegistry {
         self
     }
 
+    /// Register a TUIC credential: a uuid and the password its token is keyed with.
+    ///
+    /// The uuid is the reported id, for the same reason as [`add_uuid`](Self::add_uuid)
+    /// -- TUIC sends it in cleartext and operators already refer to the user by it.
+    /// The password never serves as an id and is not registered as a credential of its
+    /// own, so this user cannot authenticate anywhere but TUIC.
+    pub fn add_tuic(&mut self, uuid_str: &str, password: &str) -> std::io::Result<&mut Self> {
+        let bytes = parse_uuid(uuid_str)?;
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&bytes);
+        self.by_uuid
+            .insert(uuid, Entry::tuic(uuid_str, uuid, password));
+        Ok(self)
+    }
+
     /// Registry for a config that declares exactly one uuid.
     pub fn single_uuid(uuid_str: &str) -> std::io::Result<Arc<dyn UserRegistry>> {
         let mut registry = Self::new();
@@ -152,6 +196,13 @@ impl StaticUserRegistry {
         registry.add_password(CONFIG_USER_ID, password);
         Arc::new(registry)
     }
+
+    /// Registry for a config that declares exactly one TUIC uuid and password.
+    pub fn single_tuic(uuid_str: &str, password: &str) -> std::io::Result<Arc<dyn UserRegistry>> {
+        let mut registry = Self::new();
+        registry.add_tuic(uuid_str, password)?;
+        Ok(Arc::new(registry))
+    }
 }
 
 impl UserRegistry for StaticUserRegistry {
@@ -164,9 +215,7 @@ impl UserRegistry for StaticUserRegistry {
     }
 
     fn find_password(&self, password: &str) -> Option<Arc<UserContext>> {
-        self.by_password
-            .get(password)?
-            .verify(password.as_bytes())
+        self.by_password.get(password)?.verify(password.as_bytes())
     }
 
     fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
@@ -174,6 +223,10 @@ impl UserRegistry for StaticUserRegistry {
         // config-built registry holds one, so the loop is a formality here; it is the
         // dynamic registry that pays the linear cost.
         self.by_uuid.values().find_map(|e| e.verify_vmess(auth_id))
+    }
+
+    fn find_tuic_uuid(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> {
+        self.by_uuid.get(uuid)?.verify_tuic(uuid)
     }
 
     fn user_count(&self) -> usize {
@@ -304,9 +357,14 @@ mod tests {
         let registry = StaticUserRegistry::new();
         assert_eq!(registry.user_count(), 0);
         assert!(registry.find_uuid(&uuid_bytes(UUID)).is_none());
-        assert!(registry.find_trojan_hash(&create_password_hash("x")).is_none());
+        assert!(
+            registry
+                .find_trojan_hash(&create_password_hash("x"))
+                .is_none()
+        );
         assert!(registry.find_password("x").is_none());
         assert!(registry.find_vmess_auth_id(&[0u8; 16]).is_none());
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID)).is_none());
     }
 
     #[test]
@@ -371,5 +429,51 @@ mod tests {
                 .find_vmess_auth_id(&seal_auth_id(UUID, 1, [0; 4]))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn finds_a_tuic_uuid_without_counting_an_authentication() {
+        let registry = StaticUserRegistry::single_tuic(UUID, "hunter2").unwrap();
+
+        let found = registry
+            .find_tuic_uuid(&uuid_bytes(UUID))
+            .expect("the config's uuid should be found");
+        assert_eq!(&**found.user.id(), UUID);
+        assert_eq!(&*found.password, "hunter2");
+        // The whole point: the token has not been checked yet, so nothing may be
+        // billed. The handler counts it once it has.
+        assert_eq!(found.user.total_conns(), 0);
+
+        assert!(
+            registry
+                .find_tuic_uuid(&uuid_bytes("11111111-1111-4111-8111-111111111111"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_disabled_tuic_user_looks_absent() {
+        let registry = StaticUserRegistry::single_tuic(UUID, "hunter2").unwrap();
+        let user = registry.find_tuic_uuid(&uuid_bytes(UUID)).unwrap().user;
+        user.set_enabled(false);
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID)).is_none());
+        user.set_enabled(true);
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID)).is_some());
+    }
+
+    #[test]
+    fn half_a_tuic_credential_authenticates_nothing() {
+        // A TUIC user's password is not a password credential, and a plain uuid user
+        // has no password for a token to be keyed with. Neither half stands alone.
+        let tuic = StaticUserRegistry::single_tuic(UUID, "hunter2").unwrap();
+        assert!(tuic.find_password("hunter2").is_none());
+
+        let vless = StaticUserRegistry::single_uuid(UUID).unwrap();
+        assert!(vless.find_tuic_uuid(&uuid_bytes(UUID)).is_none());
+    }
+
+    #[test]
+    fn rejects_an_invalid_tuic_uuid_at_build_time() {
+        assert!(StaticUserRegistry::single_tuic("not-a-uuid", "hunter2").is_err());
     }
 }

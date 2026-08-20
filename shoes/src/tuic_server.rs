@@ -8,7 +8,7 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error};
 use lru::LruCache;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -18,6 +18,7 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::dynamic::{ConnContext, TrafficMeterStream, UserContext, UserRegistry};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
@@ -32,7 +33,9 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 
 // hostname case: type (1) + hostname length (1) + hostname bytes (255) + port (2)
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
-const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
+// version (1) + command (1) + assoc id (2) + packet id (2) + fragment total (1)
+// + fragment id (1) + payload size (2) + address
+const MAX_HEADER_LEN: usize = 1 + 1 + 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -51,11 +54,60 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 
+/// The accounting record for one authenticated QUIC connection, or `None` when the
+/// inbound is not metered.
+///
+/// Same shape and same reason as hysteria2's: TUIC authenticates once, up front,
+/// before any stream or datagram exists, and then fans the connection out into four
+/// loops that each run in a task of their own. So one context is bound to its user
+/// immediately and travels as an explicit parameter, rather than through
+/// [`scope_connection`](crate::dynamic::scope_connection), which a `tokio::spawn`
+/// would not carry.
+type Meter = Option<Arc<ConnContext>>;
+
+/// One client-facing QUIC stream, metered if the inbound is.
+///
+/// TUIC uses three stream shapes and needs a different half of each: a bidirectional
+/// stream carries a proxied TCP connection, a client-opened uni stream carries
+/// inbound UDP packets, and a server-opened uni stream carries outbound ones. Boxing
+/// gives the metered and unmetered cases one type, so the loops below stay concrete.
+///
+/// Wrapping the stream is what meters the UDP-over-uni-stream mode; the datagram
+/// mode has no stream to wrap and is counted explicitly through
+/// [`ConnContext::count_datagram_tx`] and its receiving counterpart.
+type ClientStream = Box<dyn AsyncStream>;
+type ClientRecvStream = Box<dyn AsyncRead + Unpin + Send>;
+type ClientSendStream = Box<dyn AsyncWrite + Unpin + Send>;
+
+fn meter_stream(send: quinn::SendStream, recv: quinn::RecvStream, meter: &Meter) -> ClientStream {
+    match meter {
+        Some(meter) => Box::new(TrafficMeterStream::new(
+            QuicStream::from(send, recv),
+            meter.clone(),
+        )),
+        None => Box::new(QuicStream::from(send, recv)),
+    }
+}
+
+fn meter_recv(recv: quinn::RecvStream, meter: &Meter) -> ClientRecvStream {
+    match meter {
+        Some(meter) => Box::new(TrafficMeterStream::new(recv, meter.clone())),
+        None => Box::new(recv),
+    }
+}
+
+fn meter_send(send: quinn::SendStream, meter: &Meter) -> ClientSendStream {
+    match meter {
+        Some(meter) => Box::new(TrafficMeterStream::new(send, meter.clone())),
+        None => Box::new(send),
+    }
+}
+
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    uuid: Arc<[u8]>,
-    password: Arc<str>,
+    users: Arc<dyn UserRegistry>,
+    metered: bool,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<()> {
@@ -79,8 +131,8 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
-        Ok(Ok(())) => {}
+    let user = match timeout(AUTH_TIMEOUT, auth_connection(&connection, users.as_ref())).await {
+        Ok(Ok(user)) => user,
         Ok(Err(e)) => {
             connection.close(0u32.into(), b"auth failed");
             return Err(e);
@@ -93,7 +145,17 @@ async fn process_connection(
                 "authentication timeout",
             ));
         }
-    }
+    };
+
+    // The AUTHENTICATE stream itself goes uncounted. It is read before anyone knows
+    // whose connection this is, so there is no user to bill it to at the time, and it
+    // is 50 bytes once per connection -- the same argument that already applies to the
+    // QUIC handshake that carried it.
+    let meter: Meter = metered.then(|| {
+        let context = ConnContext::new();
+        context.bind(user);
+        context
+    });
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
@@ -108,31 +170,44 @@ async fn process_connection(
     // Clone what we need for each loop before creating async blocks
     let heartbeat_connection = connection.clone();
     let heartbeat_cancel_token = cancel_token.clone();
+    let heartbeat_meter = meter.clone();
 
     let bi_connection = connection.clone();
     let bi_client_proxy_selector = client_proxy_selector.clone();
     let bi_resolver = resolver.clone();
+    let bi_meter = meter.clone();
 
     let uni_connection = connection.clone();
     let uni_client_proxy_selector = client_proxy_selector.clone();
     let uni_resolver = resolver.clone();
     let uni_udp_session_map = udp_session_map.clone();
     let uni_cancel_token = cancel_token.clone();
+    let uni_meter = meter.clone();
 
     let datagram_connection = connection.clone();
     let datagram_cancel_token = cancel_token.clone();
 
     // Use try_join! to run all loops concurrently within the same task, like Quinn's perf example.
     // This reduces task count and avoids spawning separate tasks for the main loops.
-    let heartbeat_loop = run_heartbeat_loop(heartbeat_connection, heartbeat_cancel_token);
+    let heartbeat_loop = run_heartbeat_loop(
+        heartbeat_connection,
+        heartbeat_meter,
+        heartbeat_cancel_token,
+    );
 
-    let bi_loop = run_bidirectional_loop(bi_connection, bi_client_proxy_selector, bi_resolver);
+    let bi_loop = run_bidirectional_loop(
+        bi_connection,
+        bi_client_proxy_selector,
+        bi_resolver,
+        bi_meter,
+    );
 
     let uni_loop = run_unidirectional_loop(
         uni_connection,
         uni_client_proxy_selector,
         uni_resolver,
         uni_udp_session_map,
+        uni_meter,
         uni_cancel_token,
     );
 
@@ -141,6 +216,7 @@ async fn process_connection(
         client_proxy_selector,
         resolver,
         udp_session_map,
+        meter,
         datagram_cancel_token,
     );
 
@@ -166,6 +242,7 @@ async fn process_connection(
 /// Returns an error if heartbeat fails, which will cause the connection to close.
 async fn run_heartbeat_loop(
     connection: quinn::Connection,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -180,25 +257,36 @@ async fn run_heartbeat_loop(
             _ = interval.tick() => {
                 // Send heartbeat datagram: [version, command_heartbeat]
                 let heartbeat = bytes::Bytes::from_static(&[5, COMMAND_TYPE_HEARTBEAT]);
+                let heartbeat_len = heartbeat.len();
                 if let Err(e) = connection.send_datagram(heartbeat) {
                     // Per sing-box reference, heartbeat failure should close the connection
                     return Err(std::io::Error::other(format!("heartbeat failed: {e}")));
+                }
+                // Counted, small as it is, because the client's own heartbeats are
+                // counted on the way in -- `run_datagram_loop` bills a datagram before
+                // it looks at what kind it is. One rule for both directions is easier
+                // to state, and to test, than an exemption for keepalives.
+                if let Some(meter) = &meter {
+                    meter.count_datagram_tx(heartbeat_len);
                 }
             }
         }
     }
 }
 
+/// Read the client's `AUTHENTICATE` command and hand back whose connection this is.
+///
+/// TUIC's credential is two values at once. The uuid arrives in cleartext and only
+/// names the user; the 32 bytes beside it are the proof, and they are worth nothing
+/// on their own either -- they are keyed with that user's password *and* with this
+/// QUIC connection's exported keying material, so the same password produces a
+/// different token on every connection. That is why the registry hands back a
+/// password instead of a verdict: the expected token can only be derived here, once
+/// the uuid has said which password to derive it from.
 async fn auth_connection(
     connection: &quinn::Connection,
-    uuid: &[u8],
-    password: &str,
-) -> std::io::Result<()> {
-    let mut expected_token_bytes = [0u8; 32];
-    connection
-        .export_keying_material(&mut expected_token_bytes, uuid, password.as_bytes())
-        .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
-
+    users: &dyn UserRegistry,
+) -> std::io::Result<Arc<UserContext>> {
     // Loop until we receive an AUTH command.
     // Other commands (like DISSOCIATE) may arrive on uni streams before AUTH.
     // We discard non-AUTH streams and wait for the next one.
@@ -220,14 +308,43 @@ async fn auth_connection(
             continue;
         }
 
-        let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
-        if specified_uuid != uuid {
+        let mut specified_uuid = [0u8; 16];
+        specified_uuid.copy_from_slice(stream_reader.read_slice(&mut recv_stream, 16).await?);
+
+        // Looked up now, acted on after the token is read. An unknown uuid and a
+        // suspended user give the same answer, and neither gives it early: closing on
+        // the uuid alone, before the client has finished sending, would tell an
+        // observer which uuids this inbound knows.
+        let identity = users.find_tuic_uuid(&specified_uuid);
+
+        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
+
+        // The value is not echoed back into the error. With more than one user it is
+        // somebody's live credential, or a guess at one, and neither belongs in a log.
+        let Some(identity) = identity else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("incorrect uuid: {specified_uuid:?}"),
+                "unrecognized uuid",
             ));
-        }
-        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
+        };
+
+        let mut expected_token_bytes = [0u8; 32];
+        connection
+            .export_keying_material(
+                &mut expected_token_bytes,
+                &specified_uuid,
+                identity.password.as_bytes(),
+            )
+            .map_err(|e| {
+                std::io::Error::other(format!("Failed to export keying material: {e:?}"))
+            })?;
+
+        // A plain comparison rather than a constant-time one, as upstream had it, and
+        // it is sound here for a reason worth writing down: the expected token is
+        // derived from this connection's keying material, so it is a fresh value every
+        // time. There is no stored secret for a timing probe to walk a byte at a time,
+        // because an attacker would have to re-derive its target for each attempt --
+        // which is precisely the thing it cannot do.
         if token_bytes != expected_token_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -235,7 +352,10 @@ async fn auth_connection(
             ));
         }
 
-        return Ok(());
+        // The lookup deliberately left this to us: only now is the client shown to
+        // hold the password the token was keyed with. See `UserRegistry::find_tuic_uuid`.
+        identity.user.note_auth();
+        return Ok(identity.user);
     }
 }
 
@@ -243,6 +363,7 @@ async fn run_bidirectional_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    meter: Meter,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -263,9 +384,19 @@ async fn run_bidirectional_loop(
         let conn = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
+        // Every stream on this connection shares the one context, so a user's counters
+        // cover all of them at once and the live-connection count follows the QUIC
+        // connection rather than the streams multiplexed over it.
+        let meter = meter.clone();
         tokio::spawn(async move {
-            match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
-                .await
+            match process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                meter,
+                send_stream,
+                recv_stream,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -284,8 +415,11 @@ async fn run_bidirectional_loop(
     Ok(())
 }
 
-async fn read_address(
-    recv: &mut quinn::RecvStream,
+/// Generic over the stream because every caller reads through a different one: the
+/// TCP path through a whole [`ClientStream`], the uni-stream UDP path through a
+/// [`ClientRecvStream`], and either of those may be a meter wrapping the real thing.
+async fn read_address<T: AsyncReadExt + Unpin>(
+    recv: &mut T,
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<Option<NetLocation>> {
     let address_type = stream_reader.read_u8(recv).await?;
@@ -385,18 +519,24 @@ fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    meter: Meter,
     send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
+    // Wrapped before the request header is read rather than after, so the version
+    // byte, the command and the address are billed along with the payload that
+    // follows. They are bytes the client put on the wire.
+    let mut server_stream: ClientStream = meter_stream(send, recv, &meter);
+
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
-    let tuic_version = stream_reader.read_u8(&mut recv).await?;
+    let tuic_version = stream_reader.read_u8(&mut server_stream).await?;
     if tuic_version != 5 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid tuic version: {tuic_version}"),
         ));
     }
-    let command_type = stream_reader.read_u8(&mut recv).await?;
+    let command_type = stream_reader.read_u8(&mut server_stream).await?;
     if command_type != COMMAND_TYPE_CONNECT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -404,11 +544,10 @@ async fn process_tcp_stream(
         ));
     }
 
-    let remote_location = read_address(&mut recv, &mut stream_reader)
+    let remote_location = read_address(&mut server_stream, &mut stream_reader)
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
         setup_client_tcp_stream(
@@ -492,7 +631,7 @@ impl UdpSession {
     #[allow(clippy::too_many_arguments)]
     fn start_with_send_stream(
         assoc_id: u16,
-        send_stream: quinn::SendStream,
+        send_stream: ClientSendStream,
         client_socket: Arc<UdpSocket>,
         initial_location: NetLocation,
         initial_socket_addr: SocketAddr,
@@ -512,6 +651,8 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
+        // No meter parameter here: the stream this loop writes to is already wrapped,
+        // so its bytes are counted where they cross.
         tokio::spawn(async move {
             if let Err(e) = run_udp_remote_to_local_stream_loop(
                 assoc_id,
@@ -538,6 +679,7 @@ impl UdpSession {
         initial_socket_addr: SocketAddr,
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
+        meter: Meter,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -558,6 +700,7 @@ impl UdpSession {
                 connection,
                 client_socket,
                 override_local_write_location,
+                meter,
                 session_cancel_token,
             )
             .await
@@ -622,7 +765,7 @@ impl UdpSession {
 
 async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
-    mut send_stream: quinn::SendStream,
+    mut send_stream: ClientSendStream,
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
@@ -672,30 +815,35 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let address_bytes_len = address_bytes.len();
 
-        // assoc_id(2) + packet_id(2) + fragment total(1) + fragment id(1) + payload size (2) + address bytes
-        let header_len = 2 + 2 + 1 + 1 + 2 + address_bytes_len;
+        // version(1) + command(1) + assoc_id(2) + packet_id(2) + fragment total(1)
+        // + fragment id(1) + payload size (2) + address bytes
+        //
+        // The two leading bytes were missing here, and here only: the datagram path
+        // above writes them, and `process_uni_stream` reads them off every uni stream
+        // a client sends. A TUIC client in `quic` UDP relay mode parses this stream
+        // the same way, so without them it read the assoc id as a version and dropped
+        // the packet -- which is why that mode never worked.
+        let header_len = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes_len;
 
         let start_offset = MAX_HEADER_LEN - header_len;
         let end_offset = MAX_HEADER_LEN + payload_len;
 
-        buf[start_offset] = (assoc_id >> 8) as u8;
-        buf[start_offset + 1] = assoc_id as u8;
-        buf[start_offset + 2] = (packet_id >> 8) as u8;
-        buf[start_offset + 3] = packet_id as u8;
-        buf[start_offset + 4] = 1;
-        buf[start_offset + 5] = 0;
-        buf[start_offset + 6] = (payload_len >> 8) as u8;
-        buf[start_offset + 7] = payload_len as u8;
-        buf[start_offset + 8..start_offset + 8 + address_bytes_len].copy_from_slice(&address_bytes);
+        buf[start_offset] = 5;
+        buf[start_offset + 1] = COMMAND_TYPE_PACKET;
+        buf[start_offset + 2] = (assoc_id >> 8) as u8;
+        buf[start_offset + 3] = assoc_id as u8;
+        buf[start_offset + 4] = (packet_id >> 8) as u8;
+        buf[start_offset + 5] = packet_id as u8;
+        buf[start_offset + 6] = 1;
+        buf[start_offset + 7] = 0;
+        buf[start_offset + 8] = (payload_len >> 8) as u8;
+        buf[start_offset + 9] = payload_len as u8;
+        buf[start_offset + 10..start_offset + 10 + address_bytes_len]
+            .copy_from_slice(&address_bytes);
 
-        let mut i = start_offset;
-        while i < end_offset {
-            let count = send_stream
-                .write(&buf[i..end_offset])
-                .await
-                .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
-            i += count;
-        }
+        write_all(&mut send_stream, &buf[start_offset..end_offset])
+            .await
+            .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
     }
 }
 
@@ -704,6 +852,7 @@ async fn run_udp_remote_to_local_datagram_loop(
     connection: quinn::Connection,
     client_socket: Arc<UdpSocket>,
     override_local_write_location: Option<NetLocation>,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     use bytes::BufMut;
@@ -775,9 +924,17 @@ async fn run_udp_remote_to_local_datagram_loop(
             datagram.extend_from_slice(&address_bytes);
             datagram.extend_from_slice(&buf[..payload_len]);
 
+            // Counted after the send, and by datagram length rather than payload
+            // length, so the session and address headers the client is charged for
+            // receiving are the ones actually put on the wire.
+            let datagram = datagram.freeze();
+            let datagram_len = datagram.len();
             connection
-                .send_datagram(datagram.freeze())
+                .send_datagram(datagram)
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
+            if let Some(meter) = &meter {
+                meter.count_datagram_tx(datagram_len);
+            }
         } else {
             // Calculate header sizes for first fragment and subsequent fragments.
             let first_overhead = header_overhead; // full address included in the first fragment
@@ -811,11 +968,16 @@ async fn run_udp_remote_to_local_datagram_loop(
                     datagram.put_u8(0xff);
                 }
                 datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
-                connection.send_datagram(datagram.freeze()).map_err(|e| {
+                let datagram = datagram.freeze();
+                let datagram_len = datagram.len();
+                connection.send_datagram(datagram).map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to send datagram fragment {fragment_id}: {e}"
                     ))
                 })?;
+                if let Some(meter) = &meter {
+                    meter.count_datagram_tx(datagram_len);
+                }
                 offset += fragment_payload_len;
             }
         }
@@ -826,6 +988,7 @@ async fn run_unidirectional_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
@@ -875,6 +1038,7 @@ async fn run_unidirectional_loop(
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
+        let meter = meter.clone();
         tokio::spawn(async move {
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
@@ -884,6 +1048,7 @@ async fn run_unidirectional_loop(
                 resolver,
                 recv_stream,
                 udp_session_map,
+                meter,
                 cancel_token,
             )
             .await
@@ -907,10 +1072,17 @@ async fn process_uni_stream(
     connection: &quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    mut recv_stream: quinn::RecvStream,
+    recv_stream: quinn::RecvStream,
     udp_session_map: UdpSessionMap,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
+    // Wrapped before the first byte is read, so a packet command is billed whole --
+    // headers, address and payload -- and a malformed one is billed too. The datagram
+    // loop counts before validating for the same reason: bytes the client sent are
+    // bytes it sent, whatever it made of them.
+    let mut recv_stream: ClientRecvStream = meter_recv(recv_stream, &meter);
+
     let mut stream_reader = StreamReader::new_with_buffer_size(MAX_HEADER_LEN + 65535);
 
     let tuic_version = stream_reader.read_u8(&mut recv_stream).await?;
@@ -972,6 +1144,7 @@ async fn process_uni_stream(
         remote_location,
         payload_fragment,
         true,
+        &meter,
         &cancel_token,
     )
     .await
@@ -993,6 +1166,7 @@ async fn process_udp_packet(
     remote_location: Option<NetLocation>,
     payload_fragment: &[u8],
     is_uni_stream: bool,
+    meter: &Meter,
     cancel_token: &CancellationToken,
 ) -> std::io::Result<()> {
     if frag_total == 0 {
@@ -1078,7 +1252,7 @@ async fn process_udp_packet(
 
                     UdpSession::start_with_send_stream(
                         assoc_id,
-                        send_stream,
+                        meter_send(send_stream, meter),
                         Arc::new(client_socket),
                         remote_location,
                         resolved_address,
@@ -1095,6 +1269,7 @@ async fn process_udp_packet(
                         resolved_address,
                         override_local_write_location,
                         override_remote_write_address,
+                        meter.clone(),
                         cancel_token,
                     )
                 };
@@ -1255,6 +1430,7 @@ async fn run_datagram_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     udp_session_map: UdpSessionMap,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     // Use LRU cache for fragment reassembly to prevent unbounded memory growth.
@@ -1282,6 +1458,14 @@ async fn run_datagram_loop(
             .read_datagram()
             .await
             .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
+
+        // Counted before any of the validation below, because every rejection past
+        // this point discards a datagram the client has already sent and this proxy
+        // has already received. Billing only the well-formed ones would let a client
+        // move bytes for free by malforming them.
+        if let Some(meter) = &meter {
+            meter.count_datagram_rx(data.len());
+        }
 
         // Per official TUIC reference (handle_stream.rs:172-180), protocol errors close the connection
         if data.len() < 2 {
@@ -1383,6 +1567,7 @@ async fn run_datagram_loop(
             remote_location,
             payload_fragment,
             false,
+            &meter,
             &cancel_token,
         )
         .await
@@ -1396,8 +1581,8 @@ async fn run_datagram_loop(
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    uuid: Arc<[u8]>,
-    password: Arc<str>,
+    users: Arc<dyn UserRegistry>,
+    metered: bool,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
@@ -1409,8 +1594,7 @@ pub async fn start_tuic_server(
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
-        let uuid = uuid.clone();
-        let password = password.clone();
+        let users = users.clone();
         let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
@@ -1468,14 +1652,13 @@ pub async fn start_tuic_server(
                 };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
-                let cloned_uuid = uuid.clone();
-                let cloned_password = password.clone();
+                let cloned_users = users.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
-                        cloned_uuid,
-                        cloned_password,
+                        cloned_users,
+                        metered,
                         conn,
                         zero_rtt_handshake,
                     )
