@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::json;
-use shoes_api::InboundSpec;
+use shoes_engine::InboundSpec;
 use tokio::io::AsyncWriteExt;
 
 const ALICE: &str = "11111111-1111-4111-8111-111111111111";

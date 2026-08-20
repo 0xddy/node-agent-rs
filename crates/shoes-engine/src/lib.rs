@@ -21,7 +21,7 @@
 //! |---|---|
 //! | `shoes` | the proxy engine, plus the hooks below |
 //! | `shoes-engine` | **the integration point**: programmatic control of inbounds and users |
-//! | `shoes-api` | the argument and report types those methods use |
+//! | `shoes-api` | the argument and report types those methods use, re-exported here |
 //!
 //! There is deliberately no crate above this one. An embedder links `shoes-engine`
 //! as a library and drives [`Engine`] directly from its own service layer -- gRPC,
@@ -79,10 +79,17 @@ use shoes::dns::{DnsRegistry, build_dns_registry};
 use shoes::dynamic::{ServerHandle, UserRegistry};
 use shoes::resolver::Resolver;
 use shoes::tcp::tcp_server::start_servers_with_users;
-use shoes_api::{EngineStatus, InboundInfo, InboundSpec, UserInfo, UserSpec};
 
 pub use error::{EngineError, EngineResult};
 pub use inbound::InboundSlot;
+/// The vocabulary of [`Engine`]'s own method signatures, re-exported so that an
+/// embedder needs exactly one dependency to write against it.
+///
+/// These live in a separate crate only because conversion code -- a gRPC service, an
+/// FFI shim -- may want to name them without linking the proxy engine. Whether that
+/// crate stays separate is an implementation detail nobody depending on
+/// `shoes-engine` has to care about.
+pub use shoes_api::{EngineStatus, InboundInfo, InboundSpec, UserInfo, UserSpec};
 pub use users::{CredentialKinds, MemoryUserRegistry};
 
 use inbound::BindTargets;

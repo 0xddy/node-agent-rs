@@ -9,7 +9,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use shoes_api::UserSpec;
+use shoes_engine::UserSpec;
 use tokio::io::AsyncWriteExt;
 
 const ALICE: &str = "11111111-1111-4111-8111-111111111111";

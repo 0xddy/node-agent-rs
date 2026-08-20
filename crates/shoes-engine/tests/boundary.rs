@@ -8,7 +8,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use shoes_api::InboundSpec;
+use shoes_engine::InboundSpec;
 
 const ALICE: &str = "11111111-1111-4111-8111-111111111111";
 const BOB: &str = "22222222-2222-4222-8222-222222222222";

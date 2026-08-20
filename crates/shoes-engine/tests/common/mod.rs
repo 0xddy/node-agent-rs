@@ -39,8 +39,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use shoes_api::{InboundSpec, UserInfo, UserSpec};
-use shoes_engine::Engine;
+// Named through `shoes_engine` rather than `shoes_api` on purpose: these tests stand
+// in for an embedder, and an embedder should not need a second dependency to write
+// down the types the engine's own methods take.
+use shoes_engine::{Engine, InboundSpec, UserInfo, UserSpec};
 
 /// Ceiling on every individual read in the harness.
 ///
@@ -327,7 +329,7 @@ pub async fn start_leg(engine: &Engine, tag: &str, chain: Value) -> SocketAddr {
 }
 
 /// The engine's current view of one inbound.
-pub fn info(engine: &Engine, tag: &str) -> shoes_api::InboundInfo {
+pub fn info(engine: &Engine, tag: &str) -> shoes_engine::InboundInfo {
     engine
         .get_inbound(tag)
         .unwrap_or_else(|| panic!("inbound {tag} should be registered"))
