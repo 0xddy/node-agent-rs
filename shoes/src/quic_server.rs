@@ -442,6 +442,10 @@ pub async fn start_quic_servers(
     let cancel = CancellationToken::new();
     let mut handle = ServerHandle::new(transport, cancel.clone());
 
+    // Kept for the two arms below, which record what their accept loops bake in so
+    // that a later reload can refuse to change it. The `match` consumes `protocol`.
+    let started_protocol = protocol.clone();
+
     match protocol {
         ServerProxyConfig::Hysteria2 {
             password,
@@ -457,21 +461,26 @@ pub async fn start_quic_servers(
             };
 
             for bind_address in bind_addresses.into_iter() {
+                // A rule slot rather than a handler slot: hysteria2 authenticates in
+                // its own accept loop rather than through a `TcpServerHandler`, so
+                // the rules are the only thing above the socket a reload can reach.
+                let selector_slot = handle.push_selector(
+                    client_proxy_selector.clone(),
+                    &started_protocol,
+                    users.is_some(),
+                );
                 let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
                     quic_server_config.clone(),
                     hysteria2_users.clone(),
                     metered,
-                    client_proxy_selector.clone(),
+                    selector_slot,
                     resolver.clone(),
                     num_endpoints,
                     udp_enabled,
                     cancel.clone(),
                 )
                 .await?;
-                // No handler slot is recorded: hysteria2 authenticates inside its
-                // own accept loop rather than through a `TcpServerHandler`, so
-                // there is nothing here for a reload to swap.
                 for listener in hysteria2_handles {
                     handle.push_listener(listener);
                 }
@@ -493,19 +502,24 @@ pub async fn start_quic_servers(
             };
 
             for bind_address in bind_addresses.into_iter() {
+                // As above: rules only.
+                let selector_slot = handle.push_selector(
+                    client_proxy_selector.clone(),
+                    &started_protocol,
+                    users.is_some(),
+                );
                 let tuic_handles = crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config.clone(),
                     tuic_users.clone(),
                     metered,
-                    client_proxy_selector.clone(),
+                    selector_slot,
                     resolver.clone(),
                     num_endpoints,
                     zero_rtt_handshake,
                     cancel.clone(),
                 )
                 .await?;
-                // As above: nothing to swap.
                 for listener in tuic_handles {
                     handle.push_listener(listener);
                 }

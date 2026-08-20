@@ -419,6 +419,16 @@ pub fn tuic_inbound(address: SocketAddr) -> Value {
     })
 }
 
+/// As [`tuic_inbound`], but routing by `rules` instead of the default.
+///
+/// The reload suite's way of making a rules swap visible on a QUIC-native inbound:
+/// an `override_address` rule names which generation a connection is running under.
+pub fn tuic_inbound_with_rules(address: SocketAddr, rules: Value) -> Value {
+    let mut config = tuic_inbound(address);
+    config["rules"] = rules;
+    config
+}
+
 /// As [`tuic_inbound`], but declaring the credential a classic-mode inbound
 /// authenticates against.
 pub fn tuic_inbound_with_credential(address: SocketAddr, uuid: &str, password: &str) -> Value {

@@ -22,14 +22,31 @@ mergeable. Protocols are converted one at a time to authenticate through
 | **NaiveProxy** | **no** — own `UserLookup` | **no** — auth is past a `tokio::spawn` | increment 3 |
 | Snell | n/a | n/a | out of scope: no multi-user identity mechanism exists |
 
-Rules hot-reload works for every `TcpServerHandler`-based inbound. It does **not**
-work for Hysteria2 or TUIC, which is increment 1.
+Rules hot-reload works for every inbound, including Hysteria2 and TUIC — see
+increment 1, which has landed.
 
-Three increments remain, in this order. Each is one commit.
+Two increments remain, in this order. Each is one commit.
 
 ---
 
-## 1. Rules hot-reload for the QUIC-native inbounds
+## 1. Rules hot-reload for the QUIC-native inbounds — **landed**
+
+Built as designed below. `SelectorSlot` sits beside `HandlerSlot` in
+`shoes/src/dynamic/reload.rs`; the two QUIC-native arms of `start_quic_servers`
+record one per bind address and their accept loops `load()` once per accepted
+connection. The settings comparison went the way the decision section proposes,
+with one refinement found on contact with the code: a dynamic inbound's config
+credential is a placeholder the engine regenerates on every `update_inbound`, so it
+carries no operator intent and is excluded from the comparison — `FixedProtocol`
+records whether a registry was injected so it knows to skip it. Without a registry
+the credential is real and is compared.
+
+Covered by four unit tests in `reload.rs` and
+`a_quic_native_inbound_swaps_its_rules_in_place` in
+`crates/shoes-engine/tests/reload.rs`.
+
+<details>
+<summary>The original plan, kept as the design record</summary>
 
 ### The gap
 
@@ -122,6 +139,8 @@ case that reloads successfully.
 
 **Risk: moderate.** This touches the reload core every other inbound depends on. The
 mitigation is that `SelectorSlot` is additive: nothing existing changes shape.
+
+</details>
 
 ---
 

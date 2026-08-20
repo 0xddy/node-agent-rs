@@ -39,6 +39,10 @@
 //! every new connection is given and whose `shutdown` stops the accept loops while
 //! leaving established sessions to finish. See the [`reload`] module docs for why
 //! that is enough to make the swap safe.
+//!
+//! Hysteria2 and TUIC have no handler to swap -- they authenticate inside their own
+//! QUIC accept loops -- so they take a [`SelectorSlot`] instead, which reaches their
+//! routing rules by the same mechanism and nothing else.
 
 pub mod credential;
 mod meter;
@@ -51,7 +55,7 @@ pub use meter::{
     ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
 };
 pub use registry::{ShadowsocksIdentity, TuicIdentity, UserRegistry, VmessIdentity};
-pub use reload::{HandlerSlot, ServerHandle};
+pub use reload::{HandlerSlot, SelectorSlot, ServerHandle};
 pub use static_registry::StaticUserRegistry;
 pub use user::{UserContext, UserStats};
 

@@ -47,7 +47,8 @@ use log::debug;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{BindLocation, ConfigSelection, ServerConfig, Transport};
+use crate::client_proxy_selector::ClientProxySelector;
+use crate::config::{BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, Transport};
 use crate::dynamic::UserRegistry;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
@@ -117,6 +118,192 @@ impl std::fmt::Debug for HandlerSlot {
     }
 }
 
+/// The routing rules an accept loop hands to each connection it accepts,
+/// replaceable while the listener stays up.
+///
+/// [`HandlerSlot`] for protocols that never build a [`TcpServerHandler`]. Hysteria2
+/// and TUIC authenticate inside their own QUIC accept loops, so there is no handler
+/// to swap and nothing above the socket to hang rules off -- but the rules
+/// themselves are still an `Arc` read once per connection, which is the only
+/// property the swap needs.
+///
+/// The safety argument is [`HandlerSlot`]'s, unchanged: the accept loop `load`s once
+/// per accepted connection and hands that `Arc` to every loop the connection fans
+/// out into, so the connection is pinned to the generation it started on and a
+/// [`store`](Self::store) can only change what the *next* `load` returns.
+///
+/// `ClientProxySelector` is sized, so unlike `dyn TcpServerHandler` it needs no cell
+/// to go behind the `ArcSwap`.
+pub struct SelectorSlot {
+    current: ArcSwap<ClientProxySelector>,
+    generation: AtomicU64,
+}
+
+impl SelectorSlot {
+    pub fn new(selector: Arc<ClientProxySelector>) -> Arc<Self> {
+        Arc::new(Self {
+            current: ArcSwap::from(selector),
+            generation: AtomicU64::new(0),
+        })
+    }
+
+    /// The rules for a connection being accepted now.
+    #[inline]
+    pub fn load(&self) -> Arc<ClientProxySelector> {
+        self.current.load_full()
+    }
+
+    /// Install `selector` for connections accepted from here on, and return the
+    /// generation it was given.
+    pub fn store(&self, selector: Arc<ClientProxySelector>) -> u64 {
+        self.current.store(selector);
+        self.generation.fetch_add(1, Ordering::Release) + 1
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for SelectorSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectorSlot")
+            .field("generation", &self.generation())
+            .finish()
+    }
+}
+
+/// What a QUIC-native inbound baked into its accept loop at start, and therefore
+/// cannot change without being replaced.
+///
+/// Hysteria2 and TUIC read their settings once, before the loop starts, and pass
+/// them by value into every connection it spawns. A [`SelectorSlot`] reaches the
+/// rules and nothing else, so a reload that also changed `udp_enabled` would leave
+/// UDP running after an operator turned it off -- fail-open, and invisible until
+/// somebody noticed. Recording the settings here is what lets `check_reload` say so
+/// instead.
+///
+/// A credential is recorded as `None` when a registry was injected: in dynamic mode
+/// the config's credential is a placeholder the control plane regenerates on every
+/// call, so it carries no intent to compare against. Without a registry it is the
+/// real credential and changing it needs a new listener, so it is compared.
+#[derive(Debug, Clone)]
+struct FixedProtocol {
+    settings: QuicNativeSettings,
+    /// Recorded so that a reload extracts the incoming config the same way this one
+    /// was extracted, rather than guessing from the values it finds.
+    has_registry: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuicNativeSettings {
+    Hysteria2 {
+        password: Option<String>,
+        udp_enabled: bool,
+    },
+    Tuic {
+        uuid: Option<String>,
+        password: Option<String>,
+        zero_rtt_handshake: bool,
+    },
+}
+
+impl FixedProtocol {
+    /// The settings of a QUIC-native protocol, or `None` for anything that reloads
+    /// through a [`HandlerSlot`] and has nothing fixed.
+    fn extract(protocol: &ServerProxyConfig, has_registry: bool) -> Option<Self> {
+        QuicNativeSettings::extract(protocol, has_registry).map(|settings| Self {
+            settings,
+            has_registry,
+        })
+    }
+
+    /// Whether `protocol` describes the same fixed listener, or which field says it
+    /// does not.
+    fn check(&self, protocol: &ServerProxyConfig) -> Result<(), &'static str> {
+        match QuicNativeSettings::extract(protocol, self.has_registry) {
+            Some(incoming) => match self.settings.first_difference(&incoming) {
+                Some(field) => Err(field),
+                None => Ok(()),
+            },
+            None => Err("type"),
+        }
+    }
+}
+
+impl QuicNativeSettings {
+    fn extract(protocol: &ServerProxyConfig, has_registry: bool) -> Option<Self> {
+        let hide = |value: &String| (!has_registry).then(|| value.clone());
+        match protocol {
+            ServerProxyConfig::Hysteria2 {
+                password,
+                udp_enabled,
+            } => Some(Self::Hysteria2 {
+                password: hide(password),
+                udp_enabled: *udp_enabled,
+            }),
+            ServerProxyConfig::TuicV5 {
+                uuid,
+                password,
+                zero_rtt_handshake,
+            } => Some(Self::Tuic {
+                uuid: hide(uuid),
+                password: hide(password),
+                zero_rtt_handshake: *zero_rtt_handshake,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Names the first field that cannot be changed in place, for the error message.
+    fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        match (self, other) {
+            (
+                Self::Hysteria2 {
+                    password,
+                    udp_enabled,
+                },
+                Self::Hysteria2 {
+                    password: new_password,
+                    udp_enabled: new_udp,
+                },
+            ) => {
+                if password != new_password {
+                    Some("password")
+                } else if udp_enabled != new_udp {
+                    Some("udp_enabled")
+                } else {
+                    None
+                }
+            }
+            (
+                Self::Tuic {
+                    uuid,
+                    password,
+                    zero_rtt_handshake,
+                },
+                Self::Tuic {
+                    uuid: new_uuid,
+                    password: new_password,
+                    zero_rtt_handshake: new_zero_rtt,
+                },
+            ) => {
+                if uuid != new_uuid {
+                    Some("uuid")
+                } else if password != new_password {
+                    Some("password")
+                } else if zero_rtt_handshake != new_zero_rtt {
+                    Some("zero_rtt_handshake")
+                } else {
+                    None
+                }
+            }
+            // A different variant entirely, which `check_reload` reports on its own.
+            _ => Some("type"),
+        }
+    }
+}
+
 /// Which listener a [`HandlerSlot`] belongs to.
 ///
 /// Handlers are shared per bind IP rather than per port: a protocol's state does
@@ -144,8 +331,15 @@ pub struct ServerHandle {
     binds: Vec<SocketAddr>,
     /// Empty for a protocol that authenticates inside its own accept loop
     /// (hysteria2, TUIC): those never go through a `TcpServerHandler`, so there is
-    /// nothing here to swap.
+    /// nothing here to swap. Those inbounds record a [`SelectorSlot`] instead.
     slots: Vec<(HandlerKey, Arc<HandlerSlot>)>,
+    /// The rule slots of a QUIC-native inbound, one per bind address. Empty for
+    /// everything that reloads through `slots`, whose rules travel inside the
+    /// handler.
+    selectors: Vec<Arc<SelectorSlot>>,
+    /// What such an inbound cannot change in place. `None` until a selector slot is
+    /// recorded, and for every handler-based inbound.
+    fixed: Option<FixedProtocol>,
     cancel: CancellationToken,
     listeners: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -156,6 +350,8 @@ impl ServerHandle {
             transport,
             binds: Vec::new(),
             slots: Vec::new(),
+            selectors: Vec::new(),
+            fixed: None,
             cancel,
             listeners: Mutex::new(Vec::new()),
         }
@@ -198,6 +394,27 @@ impl ServerHandle {
         slot
     }
 
+    /// Record a rule slot for a QUIC-native listener, along with the protocol
+    /// settings that listener baked in.
+    ///
+    /// Unlike [`slot_for_ip`](Self::slot_for_ip) each bind address gets its own
+    /// slot, because these listeners take the selector directly rather than sharing
+    /// a handler; `reload` stores the same rebuilt selector into all of them, so
+    /// they stay in step regardless.
+    pub(crate) fn push_selector(
+        &mut self,
+        selector: Arc<ClientProxySelector>,
+        protocol: &ServerProxyConfig,
+        has_registry: bool,
+    ) -> Arc<SelectorSlot> {
+        let slot = SelectorSlot::new(selector);
+        self.selectors.push(Arc::clone(&slot));
+        if self.fixed.is_none() {
+            self.fixed = FixedProtocol::extract(protocol, has_registry);
+        }
+        slot
+    }
+
     pub fn listener_count(&self) -> usize {
         self.listeners.lock().unwrap().len()
     }
@@ -206,13 +423,12 @@ impl ServerHandle {
         &self.binds
     }
 
-    /// The highest generation any of this inbound's slots has reached.
+    /// The highest generation any of this inbound's slots has reached, of either
+    /// kind. An inbound only ever has one kind.
     pub fn generation(&self) -> u64 {
-        self.slots
-            .iter()
-            .map(|(_, slot)| slot.generation())
-            .max()
-            .unwrap_or(0)
+        let handlers = self.slots.iter().map(|(_, slot)| slot.generation());
+        let selectors = self.selectors.iter().map(|slot| slot.generation());
+        handlers.chain(selectors).max().unwrap_or(0)
     }
 
     /// Returns the first listener task that has already exited, if any.
@@ -243,11 +459,28 @@ impl ServerHandle {
             ));
         }
 
-        if self.slots.is_empty() {
+        if self.slots.is_empty() && self.selectors.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "this protocol authenticates inside its own accept loop, so its \
-                 settings are fixed until the listener is replaced",
+                "this listener has nothing to swap in place, so its settings are \
+                 fixed until it is replaced",
+            ));
+        }
+
+        // A selector slot reaches the rules and nothing else. Everything else in a
+        // QUIC-native inbound's protocol object was read once, before its accept
+        // loop started, so accepting a change to it here would report success for a
+        // setting that never took effect.
+        if let Some(fixed) = &self.fixed
+            && let Err(field) = fixed.check(&config.protocol)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot change `{field}` in place: this listener reads it once, \
+                     before it starts accepting. Only `rules` can be reloaded here; \
+                     replace the inbound to change anything else"
+                ),
             ));
         }
 
@@ -318,10 +551,16 @@ impl ServerHandle {
         for (slot, handler) in rebuilt {
             generation = generation.max(slot.store(handler));
         }
+        // The same selector into every slot: they are per bind address only because
+        // each QUIC-native listener holds its own, not because they can differ.
+        for slot in &self.selectors {
+            generation = generation.max(slot.store(Arc::clone(&selector)));
+        }
 
         debug!(
-            "reloaded {} handler slot(s) on {:?} to generation {generation}",
+            "reloaded {} handler slot(s) and {} rule slot(s) on {:?} to generation {generation}",
             self.slots.len(),
+            self.selectors.len(),
             self.binds
         );
 
@@ -573,7 +812,8 @@ mod tests {
 
     #[test]
     fn a_handle_without_slots_refuses_to_reload() {
-        // hysteria2 and TUIC: nothing to swap, so say so instead of pretending.
+        // A listener that recorded neither kind of slot has nothing above the socket
+        // to reach, so say so instead of pretending.
         let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
         handle.push_address("127.0.0.1:1080".parse().unwrap());
         let config: ServerConfig =
@@ -582,6 +822,109 @@ mod tests {
             .reload(config, &resolver(), None)
             .expect_err("no slots to swap");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// A hysteria2 inbound as the QUIC start path records it: one rule slot per bind
+    /// address, and the settings its accept loop baked in.
+    fn hysteria2_handle(has_registry: bool) -> (ServerHandle, Arc<SelectorSlot>) {
+        let config = hysteria2_config(true);
+        let selector = Arc::new(create_tcp_client_proxy_selector(
+            config
+                .rules
+                .clone()
+                .map(ConfigSelection::unwrap_config)
+                .into_vec(),
+            resolver(),
+        ));
+
+        let mut handle = ServerHandle::new(Transport::Quic, CancellationToken::new());
+        let slot = handle.push_selector(selector, &config.protocol, has_registry);
+        handle.push_address("127.0.0.1:18443".parse().unwrap());
+        (handle, slot)
+    }
+
+    fn hysteria2_config(udp_enabled: bool) -> ServerConfig {
+        serde_yaml::from_str(&format!(
+            "address: 127.0.0.1:18443\n\
+             transport: quic\n\
+             quic_settings:\n  cert: c\n  key: k\n\
+             protocol:\n  type: hysteria2\n  password: p\n  udp_enabled: {udp_enabled}\n\
+             rules:\n  - masks: 0.0.0.0/0\n    action: allow\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_rule_slot_reloads_where_a_handler_slot_would_have_nothing_to_swap() {
+        // The gap this closes: hysteria2 and TUIC used to refuse outright.
+        let (handle, slot) = hysteria2_handle(true);
+        assert_eq!(slot.generation(), 0);
+
+        let generation = handle
+            .reload(hysteria2_config(true), &resolver(), None)
+            .expect("rules should swap on a selector-only listener");
+
+        assert_eq!(generation, 1);
+        assert_eq!(slot.generation(), 1, "the running listener sees the swap");
+        assert_eq!(handle.generation(), 1);
+    }
+
+    #[test]
+    fn a_rule_slot_refuses_a_changed_protocol_setting() {
+        // `udp_enabled` is read once, before the accept loop starts. Accepting the
+        // change would report success for a setting that never took effect -- and
+        // leave UDP running after an operator turned it off.
+        let (handle, slot) = hysteria2_handle(true);
+        let err = handle
+            .reload(hysteria2_config(false), &resolver(), None)
+            .expect_err("udp_enabled cannot change in place");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("udp_enabled"), "{err}");
+        assert!(
+            err.to_string().contains("rules"),
+            "say what *can* change: {err}"
+        );
+        assert_eq!(slot.generation(), 0, "a rejected reload swaps nothing");
+    }
+
+    #[test]
+    fn a_rule_slot_ignores_the_credential_only_when_a_registry_supersedes_it() {
+        let changed = |handle: &ServerHandle| {
+            let mut config = hysteria2_config(true);
+            if let ServerProxyConfig::Hysteria2 { password, .. } = &mut config.protocol {
+                *password = "rotated".to_string();
+            }
+            handle.reload(config, &resolver(), None)
+        };
+
+        // In dynamic mode the config password is a placeholder the control plane
+        // regenerates on every call, so comparing it would refuse every reload.
+        let (dynamic, _) = hysteria2_handle(true);
+        assert!(changed(&dynamic).is_ok());
+
+        // Without a registry it is the real credential, and the accept loop already
+        // turned it into a one-user registry it will not rebuild.
+        let (classic, _) = hysteria2_handle(false);
+        let err = changed(&classic).expect_err("the config credential cannot change in place");
+        assert!(err.to_string().contains("password"), "{err}");
+    }
+
+    #[test]
+    fn a_rule_slot_refuses_a_different_protocol_entirely() {
+        let (handle, _) = hysteria2_handle(true);
+        let config: ServerConfig = serde_yaml::from_str(
+            "address: 127.0.0.1:18443\n\
+             transport: quic\n\
+             quic_settings:\n  cert: c\n  key: k\n\
+             protocol:\n  type: socks\n\
+             rules:\n  - masks: 0.0.0.0/0\n    action: allow\n",
+        )
+        .unwrap();
+        let err = handle
+            .reload(config, &resolver(), None)
+            .expect_err("a hysteria2 listener cannot become a socks one");
+        assert!(err.to_string().contains("`type`"), "{err}");
     }
 
     #[test]

@@ -102,11 +102,12 @@ impl InboundSlot {
         info
     }
 
-    /// How many times this inbound's handlers have been swapped since it started.
+    /// How many times this inbound's handlers or rules have been swapped since it
+    /// started.
     ///
-    /// Stays at 0 for a protocol that authenticates inside its own accept loop
-    /// (hysteria2, TUIC): it has no handler to swap, and [`Self::reload`] says so
-    /// rather than pretending.
+    /// One number for both, because an inbound only ever has one kind of slot: a
+    /// handler slot for everything that goes through a `TcpServerHandler`, a rule
+    /// slot for hysteria2 and TUIC, which do not.
     pub fn revision(&self) -> u64 {
         self.handles
             .iter()

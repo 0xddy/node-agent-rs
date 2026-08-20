@@ -369,9 +369,11 @@ impl Engine {
     ///   user at a time; folding them into a config update would make a partly
     ///   applied update possible, and would leave "the list omits Bob" ambiguous
     ///   between revoking Bob and not mentioning him.
-    /// - **hysteria2 and TUIC.** They authenticate inside their own accept loop
-    ///   rather than through a handler, so there is nothing to swap. Said plainly
-    ///   rather than accepted as a no-op.
+    /// - **Protocol settings on hysteria2 and TUIC.** These authenticate inside
+    ///   their own QUIC accept loops rather than through a handler, and that loop
+    ///   reads its settings once before it starts. Their *rules* do reload, through
+    ///   a `SelectorSlot`; anything else in their protocol object is refused by
+    ///   name rather than accepted as a no-op.
     ///
     /// The inbound's user registry is carried over untouched, so online users, their
     /// credentials and their counters all survive the swap.

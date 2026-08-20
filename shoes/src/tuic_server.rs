@@ -18,7 +18,7 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
-use crate::dynamic::{ConnContext, TrafficMeterStream, UserContext, UserRegistry};
+use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
@@ -1583,7 +1583,9 @@ pub async fn start_tuic_server(
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     users: Arc<dyn UserRegistry>,
     metered: bool,
-    client_proxy_selector: Arc<ClientProxySelector>,
+    // Read once per accepted connection, so a rules reload reaches the next
+    // connection and never one already running. See `SelectorSlot`.
+    selector: Arc<SelectorSlot>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     zero_rtt_handshake: bool,
@@ -1593,7 +1595,7 @@ pub async fn start_tuic_server(
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
-        let client_proxy_selector = client_proxy_selector.clone();
+        let selector = selector.clone();
         let users = users.clone();
         let shutdown = shutdown.clone();
 
@@ -1650,7 +1652,10 @@ pub async fn start_tuic_server(
                         None => break,
                     },
                 };
-                let cloned_selector = client_proxy_selector.clone();
+                // Loaded here rather than inside the spawned task: a connection
+                // must be pinned to the rules it was *accepted* under, not to
+                // whichever generation happened to be current when its task ran.
+                let cloned_selector = selector.load();
                 let cloned_resolver = resolver.clone();
                 let cloned_users = users.clone();
                 tokio::spawn(async move {

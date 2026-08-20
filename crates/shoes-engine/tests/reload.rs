@@ -18,12 +18,15 @@ mod common;
 
 use std::time::Duration;
 
+use common::tuic as tu;
 use common::*;
 use serde_json::json;
 use shoes_engine::InboundSpec;
 use tokio::io::AsyncWriteExt;
 
 const ALICE: &str = "11111111-1111-4111-8111-111111111111";
+const BOB: &str = "22222222-2222-4222-8222-222222222222";
+const ALICE_PASSWORD: &str = "alice-password";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn config_swaps_are_forward_looking() {
@@ -339,6 +342,164 @@ async fn config_swaps_are_forward_looking() {
         "the replacement inbound's registry starts fresh",
         engine.list_users("vless").map(|u| u.len()).unwrap_or(0),
         1,
+    );
+
+    checks.finish();
+}
+
+/// The same property, on an inbound that has no handler to swap.
+///
+/// Hysteria2 and TUIC authenticate inside their own QUIC accept loops, so they never
+/// build a `TcpServerHandler` and the `HandlerSlot` the test above exercises does not
+/// exist for them. Until `SelectorSlot`, `update_inbound` refused them outright and
+/// the only way to change their rules was to remove and re-add the inbound -- which
+/// drops every established connection, i.e. exactly the thing this suite exists to
+/// prevent.
+///
+/// What a rule slot reaches is *only* the rules, so section 4 is as important as the
+/// swap itself: a setting the accept loop read once, before it started, has to be
+/// refused rather than silently ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quic_native_inbound_swaps_its_rules_in_place() {
+    let mut checks = Checks::new("rcu reload on a quic-native inbound");
+
+    let engine = engine().await;
+    let sink_a = Sink::start("A").await;
+    let sink_b = Sink::start("B").await;
+    // Never listened on. Every rule below overrides the destination, so a connection
+    // that reached anything at all proves which generation it was routed by.
+    let nowhere = free_addr();
+
+    let tuic = free_addr();
+    engine
+        .add_inbound(dynamic(
+            "tuic",
+            tuic_inbound_with_rules(tuic, redirect_to(sink_a.address)),
+        ))
+        .await
+        .expect("a tuic inbound with rules should start");
+    engine
+        .add_user("tuic", tuic_user("alice", ALICE, ALICE_PASSWORD))
+        .expect("alice should be accepted");
+
+    let first = info(&engine, "tuic");
+
+    // -- 1. the inbound routes by its starting rules --------------------------
+    checks.section("1. the starting generation");
+    checks.eq(
+        "alice reaches A, though she asked for nowhere",
+        tu::reach(tuic, ALICE, ALICE_PASSWORD, nowhere).await.ok(),
+        Some("A".to_string()),
+    );
+    checks.eq("no swap has happened yet", first.revision, 0);
+
+    // -- 2. hold a connection open across the swap ----------------------------
+    checks.section("2. swap the rules under a live connection");
+    let held_client = tu::TuicClient::connect(tuic, ALICE, ALICE_PASSWORD)
+        .await
+        .expect("alice should authenticate");
+    let mut held = held_client
+        .open_tcp(nowhere)
+        .await
+        .expect("alice should open a proxied stream");
+    held.write_all(b"wh").await.expect("send half a request");
+    // Let the first half reach sink A, so the connection is established end to end
+    // rather than merely accepted at the QUIC layer.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let before = quiet(&engine, "tuic", "alice").await;
+    let redirected = engine
+        .update_inbound(classic(
+            "tuic",
+            tuic_inbound_with_rules(tuic, redirect_to(sink_b.address)),
+        ))
+        .await
+        .expect("a rules-only swap should be accepted on a quic-native inbound");
+
+    // -- 3. the decisive pair -------------------------------------------------
+    checks.section("3. new rules for new connections only");
+    checks.eq(
+        "a new connection is redirected to B",
+        tu::reach(tuic, ALICE, ALICE_PASSWORD, nowhere).await.ok(),
+        Some("B".to_string()),
+    );
+
+    held.write_all(b"o\n")
+        .await
+        .expect("finish the held request");
+    checks.eq(
+        "the connection held across the swap still answers A",
+        held.read_line().await.ok(),
+        Some("A".to_string()),
+    );
+    drop(held);
+    drop(held_client);
+
+    checks.detail(
+        "the revision advanced",
+        redirected.revision > first.revision,
+        format!("{} -> {}", first.revision, redirected.revision),
+    );
+    checks.eq(
+        "the listener count is unchanged -- nothing rebound",
+        redirected.listeners,
+        first.listeners,
+    );
+    checks.eq(
+        "and the bind set is unchanged",
+        redirected.bind.clone(),
+        first.bind.clone(),
+    );
+
+    // -- 4. what a rule slot cannot reach -------------------------------------
+    //
+    // `zero_rtt_handshake` is read once, before the accept loop starts. Accepting it
+    // here would report success for a setting that never took effect.
+    checks.section("4. settings the accept loop baked in are refused");
+    let mut with_zero_rtt = tuic_inbound_with_rules(tuic, redirect_to(sink_b.address));
+    with_zero_rtt["protocol"]["zero_rtt_handshake"] = json!(true);
+    checks.refused(
+        "changing zero_rtt_handshake in place is refused",
+        engine.update_inbound(classic("tuic", with_zero_rtt)).await,
+        "zero_rtt_handshake",
+    );
+    checks.eq(
+        "the inbound kept serving the rules it had",
+        tu::reach(tuic, ALICE, ALICE_PASSWORD, nowhere).await.ok(),
+        Some("B".to_string()),
+    );
+    checks.eq(
+        "and stayed on the revision it had",
+        info(&engine, "tuic").revision,
+        redirected.revision,
+    );
+
+    // -- 5. users and counters came through -----------------------------------
+    checks.section("5. the registry survived the swap");
+    let after = quiet(&engine, "tuic", "alice").await;
+    checks.detail(
+        "alice's counters carried across the swap",
+        after.tx >= before.tx && after.rx >= before.rx,
+        format!(
+            "tx {} -> {}, rx {} -> {}",
+            before.tx, after.tx, before.rx, after.rx
+        ),
+    );
+    checks.eq(
+        "and she is still the only user",
+        engine.list_users("tuic").map(|u| u.len()).unwrap_or(0),
+        1,
+    );
+    checks.that(
+        "a user added after the swap authenticates too",
+        engine
+            .add_user("tuic", tuic_user("bob", BOB, "bob-password"))
+            .is_ok(),
+    );
+    checks.eq(
+        "bob reaches B like everyone else",
+        tu::reach(tuic, BOB, "bob-password", nowhere).await.ok(),
+        Some("B".to_string()),
     );
 
     checks.finish();
