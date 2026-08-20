@@ -141,6 +141,17 @@ impl StaticUserRegistry {
         registry.add_trojan_password(password);
         Arc::new(registry)
     }
+
+    /// Registry for a config that declares exactly one cleartext password, as
+    /// Hysteria2 does.
+    ///
+    /// Named like the Trojan one and for the same reason: the password is the whole
+    /// credential, so there is nothing else that could serve as an id.
+    pub fn single_password(password: &str) -> Arc<dyn UserRegistry> {
+        let mut registry = Self::new();
+        registry.add_password(CONFIG_USER_ID, password);
+        Arc::new(registry)
+    }
 }
 
 impl UserRegistry for StaticUserRegistry {
@@ -253,6 +264,39 @@ mod tests {
         // A short read must not panic or match.
         assert!(registry.find_trojan_hash(b"").is_none());
         assert!(registry.find_trojan_hash(&hash[..55]).is_none());
+    }
+
+    #[test]
+    fn finds_a_cleartext_password_and_counts_the_hit() {
+        let registry = StaticUserRegistry::single_password("hunter2");
+        let found = registry
+            .find_password("hunter2")
+            .expect("the config's own password should authenticate");
+        assert_eq!(&**found.id(), CONFIG_USER_ID);
+        assert_eq!(found.total_conns(), 1);
+
+        assert!(registry.find_password("hunter3").is_none());
+        // A prefix must not match: the comparison is over the whole value.
+        assert!(registry.find_password("hunter").is_none());
+        assert!(registry.find_password("").is_none());
+        // Trojan hashes its password; this one is compared as sent, so the hash of
+        // the same password is a different credential and must not match either.
+        assert!(
+            registry
+                .find_trojan_hash(&create_password_hash("hunter2"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_disabled_password_user_looks_absent() {
+        let registry = StaticUserRegistry::single_password("hunter2");
+        let user = registry.find_password("hunter2").unwrap();
+        user.set_enabled(false);
+        assert!(registry.find_password("hunter2").is_none());
+        assert_eq!(user.total_conns(), 1, "a denial is not a connection");
+        user.set_enabled(true);
+        assert!(registry.find_password("hunter2").is_some());
     }
 
     #[test]

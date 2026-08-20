@@ -88,14 +88,20 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
             }
         }
 
+        // Hysteria2 sends its password in cleartext in an HTTP/3 header, so a registry
+        // lookup is the whole of authentication. It authenticates in its own QUIC
+        // accept loop rather than through a `TcpServerHandler`, which is why it takes
+        // the registry as a parameter instead of getting one from
+        // `create_tcp_server_handler`.
+        ServerProxyConfig::Hysteria2 { .. } => kinds.merge(CredentialKinds::PLAIN_PASSWORD),
+
         // Authenticates, but not through the registry yet. Snell has no multi-user
         // identity mechanism at all, AnyTLS and NaiveProxy already have their own
-        // multi-user tables, and Hysteria2 and TUIC authenticate inside their QUIC
-        // accept loops rather than through a `TcpServerHandler`.
+        // multi-user tables, and TUIC needs a uuid and a password together, which is
+        // a credential shape nothing here can express yet.
         ServerProxyConfig::Snell { .. }
         | ServerProxyConfig::Anytls { .. }
         | ServerProxyConfig::Naiveproxy { .. }
-        | ServerProxyConfig::Hysteria2 { .. }
         | ServerProxyConfig::TuicV5 { .. } => {}
 
         // Either no credentials at all, or plain proxy credentials that identify a
@@ -137,6 +143,7 @@ const PLACEHOLDER_FIELDS: &[(&str, &str)] = &[
     ("vless", "user_id"),
     ("vmess", "user_id"),
     ("trojan", "password"),
+    ("hysteria2", "password"),
 ];
 /// Fills in the credential fields shoes' schema requires but a registry supersedes.
 ///
@@ -374,7 +381,7 @@ mod tests {
         for json in [
             r#"{"type":"http"}"#,
             r#"{"type":"socks"}"#,
-            r#"{"type":"hysteria2","password":"p"}"#,
+            r#"{"type":"snell","cipher":"aes-256-gcm","password":"p"}"#,
             r#"{"type":"forward","targets":"127.0.0.1:80"}"#,
         ] {
             assert!(
@@ -382,6 +389,15 @@ mod tests {
                 "expected no registry credentials for {json}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_hysteria2_as_a_cleartext_password() {
+        // Its password arrives in an HTTP/3 header as sent, so unlike trojan there is
+        // nothing to hash before the lookup -- a distinct kind, not a shared one.
+        let kinds = credential_kinds(&parse(r#"{"type":"hysteria2","password":"p"}"#));
+        assert_eq!(kinds, CredentialKinds::PLAIN_PASSWORD);
+        assert!(!kinds.trojan_password, "the password is not hashed");
     }
 
     #[test]
@@ -585,10 +601,30 @@ mod tests {
 
     #[test]
     fn leaves_other_protocols_alone() {
-        let original = inbound(r#"{"type":"hysteria2","password":"p"}"#);
+        // Snell has no multi-user identity mechanism, so its password is a real
+        // credential and this pass must not touch it.
+        let original = inbound(r#"{"type":"snell","cipher":"aes-256-gcm","password":"p"}"#);
         let mut config: Value = serde_json::from_str(&original).unwrap();
         install_placeholder_credentials(&mut config).unwrap();
         assert_eq!(config, serde_json::from_str::<Value>(&original).unwrap());
+    }
+
+    #[test]
+    fn fills_in_a_hysteria2_password() {
+        // Its `password` is non-optional in shoes' schema but dead in dynamic mode, so
+        // it gets a throwaway like vless' `user_id` does -- and a declared one is an
+        // error rather than a value that quietly stops being consulted.
+        let mut config: Value = serde_json::from_str(&inbound(r#"{"type":"hysteria2"}"#)).unwrap();
+        install_placeholder_credentials(&mut config).unwrap();
+        let filled = config["protocol"]["password"]
+            .as_str()
+            .expect("hysteria2 should get a placeholder password");
+        assert!(!filled.is_empty());
+
+        let mut declared: Value =
+            serde_json::from_str(&inbound(r#"{"type":"hysteria2","password":"p"}"#)).unwrap();
+        let err = install_placeholder_credentials(&mut declared).unwrap_err();
+        assert!(err.to_string().contains("password"));
     }
 
     #[test]

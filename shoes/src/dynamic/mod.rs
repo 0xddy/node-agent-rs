@@ -54,3 +54,20 @@ pub use registry::{ShadowsocksIdentity, UserRegistry, VmessIdentity};
 pub use reload::{HandlerSlot, ServerHandle};
 pub use static_registry::StaticUserRegistry;
 pub use user::{UserContext, UserStats};
+
+/// Records the runtime's thread count, which QUIC needs before any config is parsed.
+///
+/// `main` calls this once at startup (`main.rs:305`) and everything downstream
+/// assumes it happened: a QUIC server with `num_endpoints: 0` resolves the default
+/// from it (`config/validate.rs:657`) and a QUIC client sizes its endpoint pool the
+/// same way (`tcp/socket_connector_impl.rs:158`). Both `unwrap` the `OnceLock`, so an
+/// embedder that never sets it gets a panic the first time somebody configures QUIC.
+///
+/// A library has no `main` to do this in, hence the shim. It lives here rather than
+/// as a `pub mod thread_util` because publishing an upstream module wholesale is a
+/// wider change than the one call an embedder needs, and repeat calls after the first
+/// are ignored -- so bootstrapping twice, or bootstrapping inside a process that is
+/// also running the CLI, is not an error.
+pub fn set_num_threads(num_threads: usize) {
+    crate::thread_util::set_num_threads(num_threads);
+}

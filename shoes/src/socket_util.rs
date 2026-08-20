@@ -41,6 +41,17 @@ pub fn new_socket2_udp_socket(
     new_socket2_udp_socket_with_buffer_size(is_ipv6, bind_interface, bind_address, reuse_port, None)
 }
 
+/// Whether this platform can put more than one socket on a single UDP port.
+///
+/// QUIC servers use `SO_REUSEPORT` to run an endpoint per thread on one port, and
+/// asking for it where it does not exist is a panic below rather than an error.
+/// Windows' `SO_REUSEADDR` is not a substitute: the binds would succeed and then
+/// every datagram would go to just one of the sockets, so the only safe number of
+/// endpoints on such a platform is one.
+pub const fn supports_reuse_port() -> bool {
+    cfg!(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))
+}
+
 pub fn new_socket2_udp_socket_with_buffer_size(
     is_ipv6: bool,
     bind_interface: Option<String>,

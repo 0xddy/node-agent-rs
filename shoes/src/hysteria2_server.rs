@@ -33,16 +33,31 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
+use crate::dynamic::{ConnContext, TrafficMeterStream, UserContext, UserRegistry};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
+/// The accounting record for one authenticated QUIC connection, or `None` when the
+/// inbound is not metered.
+///
+/// Hysteria2 multiplexes every proxied stream and datagram over a single QUIC
+/// connection, and it authenticates once, up front, before any of them exist. So
+/// unlike the TCP path there is no anonymous phase to hand over: one context is
+/// bound to its user immediately and then shared by every loop below.
+///
+/// It travels as an explicit parameter rather than through
+/// [`scope_connection`](crate::dynamic::scope_connection), because each of those
+/// loops runs in a task of its own and a task local would not survive the spawn.
+type Meter = Option<Arc<ConnContext>>;
+
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    password: Arc<str>,
+    users: Arc<dyn UserRegistry>,
+    metered: bool,
     conn: quinn::Incoming,
     udp_enabled: bool,
 ) -> std::io::Result<()> {
@@ -66,13 +81,13 @@ async fn process_connection(
             .map_err(|e| std::io::Error::other(format!("H3 connection setup failed: {e}")))?;
 
     // Per sing-box reference, authentication timeout is 3 seconds
-    match timeout(
+    let user = match timeout(
         AUTH_TIMEOUT,
-        auth_connection(&mut h3_conn, &password, udp_enabled),
+        auth_connection(&mut h3_conn, users.as_ref(), udp_enabled),
     )
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(user)) => user,
         Ok(Err(e)) => {
             connection.close(CLOSE_ERR_CODE_OK.into(), b"auth failed");
             return Err(e);
@@ -85,12 +100,23 @@ async fn process_connection(
                 "authentication timeout",
             ));
         }
-    }
+    };
+
+    // The auth exchange itself goes uncounted: it rides h3's own streams, whose
+    // framing and QPACK encoding quinn and h3 own between them. It is a few hundred
+    // bytes once per connection, and the same argument already applies to the QUIC
+    // handshake that carried it.
+    let meter: Meter = metered.then(|| {
+        let context = ConnContext::new();
+        context.bind(user);
+        context
+    });
 
     let udp_connection = connection.clone();
     let udp_client_proxy_selector = client_proxy_selector.clone();
     let udp_resolver = resolver.clone();
     let udp_cancel_token = cancel_token.clone();
+    let udp_meter = meter.clone();
 
     let uni_connection = connection.clone();
 
@@ -102,6 +128,7 @@ async fn process_connection(
                 udp_connection,
                 udp_client_proxy_selector,
                 udp_resolver,
+                udp_meter,
                 udp_cancel_token,
             )
             .await
@@ -130,7 +157,7 @@ async fn process_connection(
     };
 
     let tcp_connection = connection.clone();
-    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver);
+    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver, meter);
 
     let result = tokio::try_join!(udp_loop, uni_loop, tcp_loop);
 
@@ -148,7 +175,17 @@ async fn process_connection(
     }
 }
 
-fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::Result<()> {
+/// Check that this really is a hysteria2 auth request, and hand back whose it is.
+///
+/// The password arrives in cleartext in a header, so a registry lookup is the whole
+/// of authentication here -- there is nothing derived and nothing to recompute. That
+/// is also why the rejection message no longer echoes the value: with more than one
+/// user it is somebody's live credential, or a guess at one, and neither belongs in
+/// a log line.
+fn validate_auth_request<T>(
+    req: http::Request<T>,
+    users: &dyn UserRegistry,
+) -> std::io::Result<Arc<UserContext>> {
     if req.uri() != "https://hysteria/auth" {
         return Err(std::io::Error::other(format!(
             "unexpected uri: {}",
@@ -172,13 +209,10 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
     let auth_str = auth_value
         .to_str()
         .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
-    if auth_str != password {
-        return Err(std::io::Error::other(format!(
-            "incorrect auth password: {auth_str}"
-        )));
-    }
 
-    Ok(())
+    users
+        .find_password(auth_str)
+        .ok_or_else(|| std::io::Error::other("unrecognized auth password"))
 }
 
 fn generate_ascii_string() -> String {
@@ -192,9 +226,9 @@ fn generate_ascii_string() -> String {
 
 async fn auth_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
-    password: &str,
+    users: &dyn UserRegistry,
     udp_enabled: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<Arc<UserContext>> {
     loop {
         match h3_conn
             .accept()
@@ -205,8 +239,8 @@ async fn auth_connection(
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
                     std::io::Error::other(format!("Failed to resolve request: {err}"))
                 })?;
-                match validate_auth_request(req, password) {
-                    Ok(()) => {
+                match validate_auth_request(req, users) {
+                    Ok(user) => {
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::from_u16(233).unwrap())
                             .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
@@ -223,7 +257,7 @@ async fn auth_connection(
                             std::io::Error::other(format!("failed to finish auth stream: {e}"))
                         })?;
 
-                        return Ok(());
+                        return Ok(user);
                     }
                     Err(e) => {
                         error!("Received non-hysteria2 auth http3 request: {e}");
@@ -282,6 +316,7 @@ impl UdpSession {
         initial_socket_addr: SocketAddr,
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
+        meter: Meter,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -303,6 +338,7 @@ impl UdpSession {
                 connection,
                 client_socket,
                 override_local_write_location,
+                meter,
                 session_cancel_token,
             )
             .await
@@ -320,6 +356,7 @@ async fn run_udp_remote_to_local_loop(
     connection: quinn::Connection,
     socket: Arc<UdpSocket>,
     override_local_write_address: Option<NetLocation>,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
@@ -400,9 +437,17 @@ async fn run_udp_remote_to_local_loop(
             datagram.extend_from_slice(&address_bytes);
             datagram.extend_from_slice(&buf[..payload_len]);
 
+            // Counted after the send, and by datagram length rather than payload
+            // length, so the session and address headers the client is charged for
+            // receiving are the ones actually put on the wire.
+            let datagram = datagram.freeze();
+            let datagram_len = datagram.len();
             connection
-                .send_datagram(datagram.freeze())
+                .send_datagram(datagram)
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
+            if let Some(meter) = &meter {
+                meter.count_datagram_tx(datagram_len);
+            }
         } else {
             let available_payload = max_datagram_size - header_overhead;
             let fragment_count = payload_len.div_ceil(available_payload) as u8;
@@ -417,11 +462,16 @@ async fn run_udp_remote_to_local_loop(
                 datagram.extend_from_slice(&address_bytes);
                 datagram.extend_from_slice(&buf[start..end]);
 
-                connection.send_datagram(datagram.freeze()).map_err(|e| {
+                let datagram = datagram.freeze();
+                let datagram_len = datagram.len();
+                connection.send_datagram(datagram).map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to send datagram fragment {fragment_id}: {e}"
                     ))
                 })?;
+                if let Some(meter) = &meter {
+                    meter.count_datagram_tx(datagram_len);
+                }
             }
         }
     }
@@ -431,6 +481,7 @@ async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let mut resolver_cache = ResolverCache::new(resolver.clone());
@@ -461,6 +512,14 @@ async fn run_udp_local_to_remote_loop(
             .read_datagram()
             .await
             .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
+
+        // Counted before any of the validation below, because every one of those
+        // `continue`s discards a datagram the client has already sent and this proxy
+        // has already received. Billing only the well-formed ones would let a client
+        // move bytes for free by malforming them.
+        if let Some(meter) = &meter {
+            meter.count_datagram_rx(data.len());
+        }
 
         // Per official hysteria reference (server.go:332-353), parse errors are ignored
         // and we continue waiting for the next message. Only connection errors are fatal.
@@ -588,12 +647,18 @@ async fn run_udp_local_to_remote_loop(
                         (None, None)
                     };
 
-                // even if the remote location is ipv4, a future location could be ipv6.
                 // TODO: the configured client socket is for the current remote_location, but
                 // the remote_location could be changed later on with a different client_socket
                 // configuration.
-                // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                //
+                // The family follows the first destination, as `SocketConnector` does
+                // for every other protocol (`tcp/socket_connector_impl.rs:328`). An
+                // AF_INET6 socket is not a dual-stack shortcut here: sending to a plain
+                // `SocketAddr::V4` from one is a WSAEFAULT/EINVAL, and reaching an IPv4
+                // peer through its `::ffff:` form would put a mapped address in the
+                // source field this loop writes back to the client.
+                let client_socket =
+                    crate::socket_util::new_udp_socket(resolved_address.is_ipv6(), None)?;
 
                 let session = UdpSession::start(
                     session_id,
@@ -603,6 +668,7 @@ async fn run_udp_local_to_remote_loop(
                     resolved_address,
                     override_local_write_location,
                     override_remote_write_address,
+                    meter.clone(),
                     &cancel_token,
                 );
                 entry.insert(session)
@@ -734,6 +800,7 @@ async fn run_tcp_loop(
     connection: quinn::Connection,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    meter: Meter,
 ) -> std::io::Result<()> {
     loop {
         let (send_stream, recv_stream) = match connection.accept_bi().await {
@@ -753,9 +820,19 @@ async fn run_tcp_loop(
 
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
+        // Every stream on this connection shares the one context, so a user's
+        // counters cover all of them at once and the live-connection count follows
+        // the QUIC connection rather than the streams multiplexed over it.
+        let meter = meter.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream).await
+            if let Err(e) = process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                meter,
+                send_stream,
+                recv_stream,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -769,14 +846,13 @@ async fn run_tcp_loop(
 const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
 
 async fn handle_tcp_header(
-    send: &mut quinn::SendStream,
-    recv: &mut quinn::RecvStream,
+    stream: &mut Box<dyn AsyncStream>,
 ) -> std::io::Result<(NetLocation, StreamReader)> {
     let mut stream_reader = StreamReader::new_with_buffer_size(8192);
 
     // Read the TCP request frame type as a QUIC varint per protocol spec.
     // The value 0x401 can be encoded in multiple valid ways (e.g., [0x44, 0x01] as 2-byte form).
-    let tcp_request_id = read_varint(recv, &mut stream_reader).await?;
+    let tcp_request_id = read_varint(stream, &mut stream_reader).await?;
     if tcp_request_id != FRAME_TYPE_TCP_REQUEST {
         return Err(std::io::Error::other(format!(
             "invalid tcp request id: expected {:#x}, got {:#x}",
@@ -785,20 +861,24 @@ async fn handle_tcp_header(
     }
 
     // max lengths from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/internal/protocol/proxy.go#L19
-    let address_len = read_varint(recv, &mut stream_reader).await?;
+    let address_len = read_varint(stream, &mut stream_reader).await?;
     if address_len > 2048 {
         return Err(std::io::Error::other("invalid address length"));
     }
-    let address_bytes = stream_reader.read_slice(recv, address_len as usize).await?;
+    let address_bytes = stream_reader
+        .read_slice(stream, address_len as usize)
+        .await?;
     let address = std::str::from_utf8(address_bytes)
         .map_err(|e| std::io::Error::other(format!("invalid address encoding: {e}")))?;
     let remote_location = NetLocation::from_str(address, None)?;
 
-    let padding_len = read_varint(recv, &mut stream_reader).await?;
+    let padding_len = read_varint(stream, &mut stream_reader).await?;
     if padding_len > 4096 {
         return Err(std::io::Error::other("invalid padding length"));
     }
-    stream_reader.read_slice(recv, padding_len as usize).await?;
+    stream_reader
+        .read_slice(stream, padding_len as usize)
+        .await?;
 
     let response_bytes = {
         // [uint8] Status (0x00 = OK, 0x01 = Error)
@@ -825,7 +905,7 @@ async fn handle_tcp_header(
     let len = response_bytes.len();
     let mut i = 0;
     while i < len {
-        let count = send
+        let count = stream
             .write(&response_bytes[i..len])
             .await
             .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
@@ -838,18 +918,27 @@ async fn handle_tcp_header(
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    meter: Meter,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 ) -> std::io::Result<()> {
-    let (remote_location, stream_reader) = match handle_tcp_header(&mut send, &mut recv).await {
+    // Metered before the request header is read, rather than after, so the address,
+    // the padding, and the status response this proxy writes back are all billed --
+    // they are bytes the client put on the wire and had put back to it. Reading the
+    // header through the wrapper is also what makes `handle_tcp_header` take one
+    // stream instead of quinn's send and recv halves.
+    let mut server_stream: Box<dyn AsyncStream> = match meter {
+        Some(meter) => Box::new(TrafficMeterStream::new(QuicStream::from(send, recv), meter)),
+        None => Box::new(QuicStream::from(send, recv)),
+    };
+
+    let (remote_location, stream_reader) = match handle_tcp_header(&mut server_stream).await {
         Ok(res) => res,
         Err(e) => {
-            let _ = send.shutdown().await;
+            let _ = server_stream.shutdown().await;
             return Err(e);
         }
     };
-
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
@@ -941,10 +1030,10 @@ fn encode_varint(value: u64) -> std::io::Result<Box<[u8]>> {
 }
 
 async fn read_varint(
-    recv: &mut quinn::RecvStream,
+    stream: &mut Box<dyn AsyncStream>,
     stream_reader: &mut StreamReader,
 ) -> std::io::Result<u64> {
-    let first_byte = stream_reader.read_u8(recv).await?;
+    let first_byte = stream_reader.read_u8(stream).await?;
 
     let length = first_byte >> 6;
     let mut value: u64 = (first_byte & 0b00111111) as u64;
@@ -961,7 +1050,7 @@ async fn read_varint(
     };
 
     if num_bytes > 1 {
-        let remaining_bytes = stream_reader.read_slice(recv, num_bytes - 1).await?;
+        let remaining_bytes = stream_reader.read_slice(stream, num_bytes - 1).await?;
         for byte in remaining_bytes {
             value <<= 8; // Shift left by 8 bits for each subsequent byte
             value |= *byte as u64; // Add the next byte
@@ -975,7 +1064,8 @@ async fn read_varint(
 pub async fn start_hysteria2_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    hysteria2_password: Arc<str>,
+    users: Arc<dyn UserRegistry>,
+    metered: bool,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
@@ -987,7 +1077,7 @@ pub async fn start_hysteria2_server(
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
-        let hysteria2_password = hysteria2_password.clone();
+        let users = users.clone();
         let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
@@ -1016,11 +1106,14 @@ pub async fn start_hysteria2_server(
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+            //
+            // SO_REUSEPORT only when there is a second endpoint to share the port with:
+            // platforms without it panic rather than fail.
             let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
                 bind_address.is_ipv6(),
                 None,
                 Some(bind_address),
-                true,
+                num_endpoints > 1,
                 Some(8_625_000),
             )
             .unwrap();
@@ -1044,12 +1137,13 @@ pub async fn start_hysteria2_server(
                 };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
-                let cloned_password = hysteria2_password.clone();
+                let cloned_users = users.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
-                        cloned_password,
+                        cloned_users,
+                        metered,
                         conn,
                         udp_enabled,
                     )

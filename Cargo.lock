@@ -2158,8 +2158,14 @@ name = "shoes-engine"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bytes",
  "dashmap",
+ "h3",
+ "h3-quinn",
+ "http",
  "log",
+ "quinn",
+ "rustls",
  "serde_json",
  "serde_yaml",
  "shoes",

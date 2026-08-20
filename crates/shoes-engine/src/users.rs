@@ -74,6 +74,8 @@ pub struct CredentialKinds {
     pub uuid: bool,
     /// Trojan: SHA-224 of a password, hex encoded, terminated by CRLF.
     pub trojan_password: bool,
+    /// Hysteria2: the password itself, sent in cleartext in an HTTP/3 header.
+    pub plain_password: bool,
     /// Shadowsocks 2022: a raw PSK, given base64 encoded, recognised on the wire by
     /// the identity header a client seals with it.
     pub shadowsocks_psk: ShadowsocksPsk,
@@ -83,6 +85,7 @@ impl CredentialKinds {
     pub const NONE: Self = Self {
         uuid: false,
         trojan_password: false,
+        plain_password: false,
         shadowsocks_psk: ShadowsocksPsk::None,
     };
 
@@ -93,6 +96,11 @@ impl CredentialKinds {
 
     pub const TROJAN_PASSWORD: Self = Self {
         trojan_password: true,
+        ..Self::NONE
+    };
+
+    pub const PLAIN_PASSWORD: Self = Self {
+        plain_password: true,
         ..Self::NONE
     };
 
@@ -112,6 +120,7 @@ impl CredentialKinds {
     pub fn merge(&mut self, other: Self) {
         self.uuid |= other.uuid;
         self.trojan_password |= other.trojan_password;
+        self.plain_password |= other.plain_password;
         self.shadowsocks_psk = match (self.shadowsocks_psk, other.shadowsocks_psk) {
             (ShadowsocksPsk::None, only) | (only, ShadowsocksPsk::None) => only,
             (ShadowsocksPsk::Len(a), ShadowsocksPsk::Len(b)) if a == b => ShadowsocksPsk::Len(a),
@@ -121,7 +130,9 @@ impl CredentialKinds {
 
     /// Whether a user's `password` means anything to this inbound.
     fn takes_password(&self) -> bool {
-        self.trojan_password || matches!(self.shadowsocks_psk, ShadowsocksPsk::Len(_))
+        self.trojan_password
+            || self.plain_password
+            || matches!(self.shadowsocks_psk, ShadowsocksPsk::Len(_))
     }
 
     /// Why this combination of credential forms cannot share one user table.
@@ -133,6 +144,11 @@ impl CredentialKinds {
     /// inbound. Saying so when the inbound is added is better than accepting users who
     /// can only reach half of it.
     ///
+    /// Trojan and Hysteria2 together are *not* a conflict, even though one hashes the
+    /// password and the other compares it as sent: both start from the same cleartext
+    /// value, so one `password` field serves both and the two indexes are simply two
+    /// derivations of it.
+    ///
     /// Checked by the engine before building a registry; [`MemoryUserRegistry::new`]
     /// takes the kinds as given.
     pub fn conflict(&self) -> Option<String> {
@@ -142,10 +158,10 @@ impl CredentialKinds {
                  `password` cannot serve them all; give each cipher its own inbound"
                     .to_string(),
             ),
-            ShadowsocksPsk::Len(_) if self.trojan_password => Some(
-                "it mixes trojan and shadowsocks targets, whose `password` fields mean \
-                 different things -- a cleartext password and a base64 PSK; give each its \
-                 own inbound"
+            ShadowsocksPsk::Len(_) if self.trojan_password || self.plain_password => Some(
+                "it mixes shadowsocks with a protocol that wants a cleartext password, \
+                 so its `password` field would mean two different things -- a password \
+                 and a base64 PSK; give each its own inbound"
                     .to_string(),
             ),
             _ => None,
@@ -183,6 +199,9 @@ struct ShadowsocksCredential {
 struct Credentials {
     uuid: Option<[u8; 16]>,
     trojan_hash: Option<Box<[u8]>>,
+    /// The password as the client will send it. Its own index key: Hysteria2 compares
+    /// the cleartext, so there is nothing to derive.
+    password: Option<Box<str>>,
     shadowsocks: Option<ShadowsocksCredential>,
 }
 
@@ -193,6 +212,7 @@ struct Entry {
     /// that found this entry is not constant time and proves nothing on its own.
     uuid: Option<[u8; 16]>,
     trojan_hash: Option<Box<[u8]>>,
+    password: Option<Box<str>>,
     shadowsocks: Option<ShadowsocksCredential>,
     /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
     /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
@@ -247,6 +267,8 @@ pub struct MemoryUserRegistry {
     by_uuid: DashMap<[u8; 16], Arc<Entry>>,
     /// wire hash -> user. The index `find_trojan_hash` hits.
     by_trojan_hash: DashMap<Box<[u8]>, Arc<Entry>>,
+    /// cleartext password -> user. The index `find_password` hits.
+    by_password: DashMap<Box<str>, Arc<Entry>>,
     /// named psk -> user. The index `find_shadowsocks_psk_hash` hits.
     by_psk_hash: DashMap<[u8; 16], Arc<Entry>>,
     /// Every uuid-bearing user, as an immutable snapshot for VMess to walk. Not an
@@ -271,6 +293,7 @@ impl MemoryUserRegistry {
             users: DashMap::new(),
             by_uuid: DashMap::new(),
             by_trojan_hash: DashMap::new(),
+            by_password: DashMap::new(),
             by_psk_hash: DashMap::new(),
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
         })
@@ -324,6 +347,7 @@ impl MemoryUserRegistry {
             context,
             uuid: credentials.uuid,
             trojan_hash: credentials.trojan_hash,
+            password: credentials.password,
             shadowsocks: credentials.shadowsocks,
             // Built whenever the user has a uuid, whether or not this inbound speaks
             // VMess. One registry serves a whole inbound, and a TLS inbound can carry
@@ -345,6 +369,11 @@ impl MemoryUserRegistry {
             {
                 self.by_trojan_hash.remove(hash);
             }
+            if previous.password != entry.password
+                && let Some(password) = &previous.password
+            {
+                self.by_password.remove(password);
+            }
             if let Some(old) = &previous.shadowsocks
                 && entry.shadowsocks.as_ref().map(|new| new.hash) != Some(old.hash)
             {
@@ -357,6 +386,9 @@ impl MemoryUserRegistry {
         }
         if let Some(hash) = &entry.trojan_hash {
             self.by_trojan_hash.insert(hash.clone(), entry.clone());
+        }
+        if let Some(password) = &entry.password {
+            self.by_password.insert(password.clone(), entry.clone());
         }
         if let Some(shadowsocks) = &entry.shadowsocks {
             self.by_psk_hash.insert(shadowsocks.hash, entry.clone());
@@ -388,6 +420,9 @@ impl MemoryUserRegistry {
         }
         if let Some(hash) = &entry.trojan_hash {
             self.by_trojan_hash.remove(hash);
+        }
+        if let Some(password) = &entry.password {
+            self.by_password.remove(password);
         }
         if let Some(shadowsocks) = &entry.shadowsocks {
             self.by_psk_hash.remove(&shadowsocks.hash);
@@ -477,6 +512,13 @@ impl MemoryUserRegistry {
                     .map(credential::trojan_password_hash),
                 false => None,
             },
+            // Kept as sent, and deliberately not deduplicated against `trojan_hash`:
+            // an inbound that speaks both wants the same value indexed twice, once
+            // hashed and once not.
+            password: match self.kinds.plain_password {
+                true => spec.password.as_deref().map(Box::from),
+                false => None,
+            },
             shadowsocks,
         })
     }
@@ -505,6 +547,15 @@ impl MemoryUserRegistry {
                 owner: owner.to_string(),
             });
         }
+        if let Some(password) = &credentials.password
+            && let Some(owner) = self.credential_owner_password(password)
+            && &*owner != id
+        {
+            return Err(EngineError::DuplicateCredential {
+                id: id.to_string(),
+                owner: owner.to_string(),
+            });
+        }
         if let Some(shadowsocks) = &credentials.shadowsocks
             && let Some(owner) = self.credential_owner_psk(&shadowsocks.hash)
             && &*owner != id
@@ -524,6 +575,12 @@ impl MemoryUserRegistry {
     fn credential_owner_trojan(&self, hash: &[u8]) -> Option<Arc<str>> {
         self.by_trojan_hash
             .get(hash)
+            .map(|e| e.context.id().clone())
+    }
+
+    fn credential_owner_password(&self, password: &str) -> Option<Arc<str>> {
+        self.by_password
+            .get(password)
             .map(|e| e.context.id().clone())
     }
 
@@ -566,6 +623,17 @@ impl UserRegistry for MemoryUserRegistry {
         let entry = self.by_trojan_hash.get(hash)?;
         let expected = entry.trojan_hash.as_deref()?;
         entry.accept(expected, hash)
+    }
+
+    /// The whole of Hysteria2 authentication: the client sends its password in
+    /// cleartext, so a hit on the index is the credential.
+    ///
+    /// The map lookup found this entry by hash, which is not constant time and proves
+    /// nothing; `accept` re-checks the bytes, same as every other lookup here.
+    fn find_password(&self, password: &str) -> Option<Arc<UserContext>> {
+        let entry = self.by_password.get(password)?;
+        let expected = entry.password.as_deref()?;
+        entry.accept(expected.as_bytes(), password.as_bytes())
     }
 
     fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
@@ -853,6 +921,108 @@ mod tests {
         assert!(matches!(err, EngineError::UnknownUser { .. }));
     }
 
+    // -- Hysteria2: the password compared as sent -----------------------------------
+
+    #[test]
+    fn finds_a_user_by_their_cleartext_password() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::PLAIN_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        registry.upsert(trojan_spec("bob", "hunter3")).unwrap();
+
+        assert_eq!(&**registry.find_password("hunter2").unwrap().id(), "alice");
+        assert_eq!(&**registry.find_password("hunter3").unwrap().id(), "bob");
+        assert_eq!(registry.get("alice").unwrap().total_conns, 1);
+
+        // A prefix is not a match: the comparison covers the whole value.
+        assert!(registry.find_password("hunter").is_none());
+        assert!(registry.find_password("hunter22").is_none());
+        assert!(registry.find_password("").is_none());
+    }
+
+    #[test]
+    fn a_plain_password_is_not_a_trojan_hash_or_the_reverse() {
+        // The two derive from the same field, so an inbound that speaks only one of
+        // them must not answer the other's lookup.
+        let plain = MemoryUserRegistry::new(CredentialKinds::PLAIN_PASSWORD);
+        plain.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        assert!(
+            plain
+                .find_trojan_hash(&credential::trojan_password_hash("hunter2"))
+                .is_none()
+        );
+
+        let trojan = MemoryUserRegistry::new(CredentialKinds::TROJAN_PASSWORD);
+        trojan.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        assert!(trojan.find_password("hunter2").is_none());
+    }
+
+    #[test]
+    fn one_password_serves_trojan_and_hysteria2_together() {
+        // Not a conflict, unlike shadowsocks: both start from the same cleartext, so
+        // the user's one `password` reaches the same record either way.
+        let mut kinds = CredentialKinds::TROJAN_PASSWORD;
+        kinds.merge(CredentialKinds::PLAIN_PASSWORD);
+        assert!(kinds.conflict().is_none());
+        let registry = MemoryUserRegistry::new(kinds);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+
+        let by_plain = registry.find_password("hunter2").unwrap();
+        let by_hash = registry
+            .find_trojan_hash(&credential::trojan_password_hash("hunter2"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&by_plain, &by_hash));
+    }
+
+    #[test]
+    fn rotating_a_password_retires_the_old_one() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::PLAIN_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        let before = registry.find_password("hunter2").unwrap();
+        before.add_rx(128);
+
+        registry.upsert(trojan_spec("alice", "hunter3")).unwrap();
+        assert_eq!(registry.user_count(), 1);
+        assert!(registry.find_password("hunter2").is_none());
+        let after = registry.find_password("hunter3").unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(after.rx(), 128);
+
+        registry.remove("in", "alice").unwrap();
+        assert!(registry.find_password("hunter3").is_none());
+    }
+
+    #[test]
+    fn a_disabled_password_user_looks_absent() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::PLAIN_PASSWORD);
+        let mut spec = trojan_spec("alice", "hunter2");
+        spec.enabled = false;
+        registry.upsert(spec).unwrap();
+        assert!(registry.find_password("hunter2").is_none());
+        assert_eq!(registry.get("alice").unwrap().total_conns, 0);
+
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        assert!(registry.find_password("hunter2").is_some());
+    }
+
+    #[test]
+    fn rejects_a_password_owned_by_another_user() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::PLAIN_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        let err = registry.upsert(trojan_spec("bob", "hunter2")).unwrap_err();
+        assert!(matches!(err, EngineError::DuplicateCredential { .. }));
+        assert_eq!(registry.user_count(), 1);
+        assert_eq!(&**registry.find_password("hunter2").unwrap().id(), "alice");
+    }
+
+    #[test]
+    fn a_uuid_registry_answers_no_password_lookup() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        assert!(registry.find_password("hunter2").is_none());
+        assert!(registry.find_password("").is_none());
+        assert!(registry.upsert(trojan_spec("bob", "hunter2")).is_err());
+    }
+
     // -- Shadowsocks 2022: found by the name in an identity header ------------------
 
     #[test]
@@ -1010,6 +1180,11 @@ mod tests {
         let mut trojan_and_ss = CredentialKinds::TROJAN_PASSWORD;
         trojan_and_ss.merge(CredentialKinds::shadowsocks_psk(16));
         assert!(trojan_and_ss.conflict().is_some());
+
+        // A cleartext password is no more compatible with a PSK than a hashed one.
+        let mut plain_and_ss = CredentialKinds::PLAIN_PASSWORD;
+        plain_and_ss.merge(CredentialKinds::shadowsocks_psk(32));
+        assert!(plain_and_ss.conflict().is_some());
 
         // Same for two shadowsocks ciphers with different key lengths.
         let mut two_lengths = CredentialKinds::shadowsocks_psk(16);

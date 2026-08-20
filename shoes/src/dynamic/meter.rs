@@ -133,6 +133,30 @@ impl ConnContext {
         true
     }
 
+    /// Count a datagram sent to the client, for a protocol whose datagrams never
+    /// pass through a [`TrafficMeterStream`].
+    ///
+    /// Hysteria2 and TUIC carry UDP over QUIC datagrams rather than over the stream
+    /// the connection was accepted on, so there is nothing there to wrap: quinn owns
+    /// the datagram, and the loop that builds one is the only place its size is
+    /// known. These two methods are that loop's way in.
+    ///
+    /// The figure is the datagram's own length, header and address included, but not
+    /// the QUIC framing and AEAD tag quinn adds around it -- the same caveat every
+    /// QUIC inbound's accounting carries.
+    #[inline]
+    pub fn count_datagram_tx(&self, len: usize) {
+        self.add_tx(len as u64);
+    }
+
+    /// Count a datagram received from the client. See [`count_datagram_tx`].
+    ///
+    /// [`count_datagram_tx`]: ConnContext::count_datagram_tx
+    #[inline]
+    pub fn count_datagram_rx(&self, len: usize) {
+        self.add_rx(len as u64);
+    }
+
     #[inline]
     fn add_tx(&self, n: u64) {
         if n == 0 {

@@ -18,3 +18,21 @@ serde_yaml = { workspace = true }
 subtle = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+
+# Test-only, and only for the Hysteria2 suite: shoes ships no Hysteria2 *client*, so
+# unlike every other protocol the tests cannot borrow one from the crate under test
+# and must speak QUIC and HTTP/3 themselves. Versions are `*` and features mirror
+# `shoes/Cargo.toml` so the harness resolves to the same crates the server uses --
+# two rustls crypto providers in one process would be a problem all of its own.
+[dev-dependencies]
+bytes = "*"
+h3 = "*"
+h3-quinn = "*"
+http = "*"
+quinn = { version = "*", default-features = false, features = [
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+] }
+rustls = "*"

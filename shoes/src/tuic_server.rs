@@ -1063,8 +1063,14 @@ async fn process_udp_packet(
                         (None, None)
                     };
 
-                // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                // The family follows the first destination, as `SocketConnector` does for
+                // every other protocol (`tcp/socket_connector_impl.rs:328`). An AF_INET6
+                // socket is not a dual-stack shortcut here: sending to a plain
+                // `SocketAddr::V4` from one is a WSAEFAULT/EINVAL, and reaching an IPv4
+                // peer through its `::ffff:` form would put a mapped address in the
+                // source field written back to the client.
+                let client_socket =
+                    crate::socket_util::new_udp_socket(resolved_address.is_ipv6(), None)?;
 
                 let session = if is_uni_stream {
                     // TODO: should we only have a single send stream?
@@ -1431,11 +1437,14 @@ pub async fn start_tuic_server(
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+            //
+            // SO_REUSEPORT only when there is a second endpoint to share the port with:
+            // platforms without it panic rather than fail.
             let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
                 bind_address.is_ipv6(),
                 None,
                 Some(bind_address),
-                true,
+                num_endpoints > 1,
                 Some(8_625_000),
             )
             .unwrap();

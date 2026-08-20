@@ -6,6 +6,7 @@ use crate::address::NetLocationMask;
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
+use crate::socket_util::supports_reuse_port;
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
 
@@ -653,8 +654,22 @@ fn validate_server_config(
             }) => {
                 validate_client_fingerprints(client_fingerprints)?;
 
+                // One endpoint per thread, but only where several sockets can share a
+                // UDP port. Without SO_REUSEPORT the extra endpoints could not bind,
+                // so the default has to be one -- and an explicit request for more is
+                // a config error rather than the panic it used to be.
                 if *num_endpoints == 0 {
-                    *num_endpoints = get_num_threads();
+                    *num_endpoints = if supports_reuse_port() {
+                        get_num_threads()
+                    } else {
+                        1
+                    };
+                } else if *num_endpoints > 1 && !supports_reuse_port() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "num_endpoints above 1 needs SO_REUSEPORT, which this platform \
+                         does not have",
+                    ));
                 }
             }
             None => {

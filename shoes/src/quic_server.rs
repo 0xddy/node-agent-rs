@@ -16,7 +16,8 @@ use crate::config::{
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::dynamic::{
-    ConnContext, HandlerSlot, ServerHandle, TrafficMeterStream, UserRegistry, scope_connection,
+    ConnContext, HandlerSlot, ServerHandle, StaticUserRegistry, TrafficMeterStream, UserRegistry,
+    scope_connection,
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
@@ -60,8 +61,16 @@ async fn start_quic_server(
     for _ in 0..num_endpoints {
         let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
 
-        let socket2_socket =
-            new_socket2_udp_socket(bind_address.is_ipv6(), None, Some(bind_address), true).unwrap();
+        // Only ask for SO_REUSEPORT when there is actually a second endpoint to share
+        // the port with; a single endpoint does not need it, and platforms that lack
+        // it panic rather than fail.
+        let socket2_socket = new_socket2_udp_socket(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            num_endpoints > 1,
+        )
+        .unwrap();
 
         let endpoint = quinn::Endpoint::new(
             EndpointConfig::default(),
@@ -439,14 +448,21 @@ pub async fn start_quic_servers(
             password,
             udp_enabled,
         } => {
-            // TODO: hash password instead of passing directly
-            let hysteria2_password: Arc<str> = password.into();
+            // Hysteria2 sends its password in cleartext in a header, so the whole of
+            // authentication is one registry lookup. An injected registry takes it
+            // over; without one, the config's own password becomes a one-user
+            // registry, which is the same comparison this used to do inline.
+            let hysteria2_users = match users.as_ref() {
+                Some(users) => users.clone(),
+                None => StaticUserRegistry::single_password(&password),
+            };
 
             for bind_address in bind_addresses.into_iter() {
                 let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
                     quic_server_config.clone(),
-                    hysteria2_password.clone(),
+                    hysteria2_users.clone(),
+                    metered,
                     client_proxy_selector.clone(),
                     resolver.clone(),
                     num_endpoints,

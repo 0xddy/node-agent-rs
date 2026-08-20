@@ -130,6 +130,18 @@ impl Engine {
     /// This is the "empty state" requirement: the process is fully operational
     /// and merely has nothing to do yet.
     pub async fn bootstrap() -> EngineResult<Self> {
+        // What `main` does before it parses anything: shoes' QUIC paths read a
+        // process-wide thread count to size their endpoint pools, and they `unwrap`
+        // it, so an embedder that skipped this would panic the first time an operator
+        // added a QUIC inbound rather than at startup. Repeat calls are ignored, so
+        // this is safe in a process that bootstraps more than one engine.
+        shoes::dynamic::set_num_threads(std::cmp::max(
+            2,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        ));
+
         // An empty group list yields an empty registry that lazily creates the
         // default system resolver on first use (`dns/builder.rs:47`).
         let dns = build_dns_registry(vec![]).await?;

@@ -44,6 +44,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 // down the types the engine's own methods take.
 use shoes_engine::{Engine, InboundSpec, UserInfo, UserSpec};
 
+/// The client half of the Hysteria2 suite, which shoes cannot supply.
+pub mod hysteria2;
+
 /// Ceiling on every individual read in the harness.
 ///
 /// Generous, because it exists to turn a hung chain into a reported failure rather
@@ -351,6 +354,43 @@ pub fn ss_chain_without_identity(
     })
 }
 
+/// A Hysteria2 inbound over QUIC for **dynamic** mode, using the bundled self-signed
+/// cert.
+///
+/// No `password` field, which is not an omission: Hysteria2's password names nothing on
+/// the wire beyond the one user it belongs to, so an inbound with a registry has no use
+/// for one and the engine refuses a config that declares it. Shoes' schema still
+/// requires the field, so the engine fills in a throwaway -- see `PLACEHOLDER_FIELDS`
+/// in `shoes-engine`'s `protocol` module.
+///
+/// `alpn_protocols: ["h3"]` is not optional: Hysteria2 authenticates over HTTP/3, and a
+/// client offering `h3` to a server that does not is a failed handshake with nothing to
+/// do with credentials.
+pub fn hysteria2_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
+    json!({
+        "address": address.to_string(),
+        "transport": "quic",
+        "quic_settings": {
+            "cert": test_cert(),
+            "key": test_key(),
+            "alpn_protocols": ["h3"],
+        },
+        "protocol": {"type": "hysteria2", "udp_enabled": udp_enabled},
+    })
+}
+
+/// As [`hysteria2_inbound`], but declaring the password a classic-mode inbound
+/// authenticates against.
+pub fn hysteria2_inbound_with_password(
+    address: SocketAddr,
+    password: &str,
+    udp_enabled: bool,
+) -> Value {
+    let mut config = hysteria2_inbound(address, udp_enabled);
+    config["protocol"]["password"] = json!(password);
+    config
+}
+
 /// A deterministic base64 PSK of `len` bytes, derived from `seed`.
 ///
 /// Deterministic so a test can hand the same key to a client leg and to `add_user`
@@ -418,6 +458,27 @@ pub fn psk_user(id: &str, psk: &str) -> UserSpec {
         uuid: None,
         password: Some(psk.to_string()),
         enabled: true,
+    }
+}
+
+/// A user whose credential is a cleartext password, as Hysteria2 wants.
+///
+/// The same `UserSpec` shape as [`psk_user`], deliberately named apart: what the
+/// inbound's protocol does with the value is the whole difference between a password
+/// and key material, and a test reads better for saying which it meant.
+pub fn password_user(id: &str, password: &str) -> UserSpec {
+    UserSpec {
+        id: Some(id.to_string()),
+        uuid: None,
+        password: Some(password.to_string()),
+        enabled: true,
+    }
+}
+
+pub fn disabled_password_user(id: &str, password: &str) -> UserSpec {
+    UserSpec {
+        enabled: false,
+        ..password_user(id, password)
     }
 }
 
