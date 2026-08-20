@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
+use shoes::config::ServerConfig;
 use shoes::dynamic::{ServerHandle, UserRegistry};
 use shoes::resolver::Resolver;
 use shoes_api::InboundInfo;
-use shoes::config::ServerConfig;
 use tokio::task::JoinHandle;
 
 use crate::users::MemoryUserRegistry;
@@ -132,7 +132,9 @@ impl InboundSlot {
     /// panicked. Checking for an early exit is how the engine turns that into a
     /// synchronous API error.
     pub(crate) fn take_dead_listener(&self) -> Option<JoinHandle<()>> {
-        self.handles.iter().find_map(ServerHandle::take_dead_listener)
+        self.handles
+            .iter()
+            .find_map(ServerHandle::take_dead_listener)
     }
 
     /// Replaces this inbound's routing rules and protocol settings in place.
@@ -186,10 +188,7 @@ impl InboundSlot {
             revision = revision.max(handle.reload(config, &resolver, users.as_ref())?);
         }
 
-        debug!(
-            "inbound {} reloaded to revision {revision}",
-            self.info.tag
-        );
+        debug!("inbound {} reloaded to revision {revision}", self.info.tag);
 
         Ok(revision)
     }

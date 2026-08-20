@@ -18,7 +18,7 @@
 //! A lookup is one hash, one shard read lock, one 16 or 56 byte constant-time
 //! comparison, and an `Arc` clone. It happens once per connection, during the
 //! handshake, never per packet. The read guard is held only for the comparison, so
-//! a concurrent `POST /users` on the same shard waits nanoseconds, not for I/O.
+//! a concurrent `upsert` on the same shard waits nanoseconds, not for I/O.
 
 use std::sync::Arc;
 
@@ -223,10 +223,13 @@ impl MemoryUserRegistry {
     /// would need a per-user cancellation token, which is a different feature from
     /// revoking a credential.
     pub fn remove(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
-        let (_, entry) = self.users.remove(id).ok_or_else(|| EngineError::UnknownUser {
-            tag: tag.to_string(),
-            id: id.to_string(),
-        })?;
+        let (_, entry) = self
+            .users
+            .remove(id)
+            .ok_or_else(|| EngineError::UnknownUser {
+                tag: tag.to_string(),
+                id: id.to_string(),
+            })?;
 
         if let Some(uuid) = entry.uuid {
             self.by_uuid.remove(&uuid);
@@ -486,7 +489,9 @@ mod tests {
     #[test]
     fn rejects_a_credential_the_protocol_cannot_use() {
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
-        let err = registry.upsert(trojan_spec("alice", "hunter2")).unwrap_err();
+        let err = registry
+            .upsert(trojan_spec("alice", "hunter2"))
+            .unwrap_err();
         assert!(matches!(err, EngineError::InvalidUser(_)));
 
         let registry = MemoryUserRegistry::new(CredentialKinds::TROJAN_PASSWORD);
@@ -601,6 +606,9 @@ mod tests {
         // UserInfo has no credential field at all; assert the rendered form too, so
         // adding one later has to be a deliberate change to this test.
         let json = serde_json::to_string(&listed[0]).unwrap();
-        assert!(!json.contains(UUID_A), "credentials must not be echoed back");
+        assert!(
+            !json.contains(UUID_A),
+            "credentials must not be echoed back"
+        );
     }
 }

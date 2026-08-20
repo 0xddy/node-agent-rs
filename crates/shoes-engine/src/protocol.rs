@@ -96,8 +96,8 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
 /// This exists only to guarantee the label is non-empty. Upstream's `Display` builds a
 /// `Tls` label from its populated target maps and never consults `default_tls_target`
 /// (`shoes/src/config/types/server.rs:794`), so a TLS inbound configured with only a
-/// default target renders as the empty string -- which then surfaced as
-/// `"protocol": ""` in `GET /inbounds`. Substituting a label here keeps the fix on the
+/// default target renders as the empty string -- which then surfaced as an empty
+/// `InboundInfo::protocol`. Substituting a label here keeps the fix on the
 /// engine's side of the boundary; patching upstream's `Display` would mean carrying a
 /// cosmetic diff through every merge of `shoes/`.
 pub(crate) fn display_name(protocol: &ServerProxyConfig) -> String {
@@ -246,7 +246,10 @@ fn fill_protocol_object(map: &mut Map<String, Value>) -> EngineResult<()> {
         )));
     }
 
-    map.insert((*field).to_string(), Value::String(credential::random_uuid()));
+    map.insert(
+        (*field).to_string(),
+        Value::String(credential::random_uuid()),
+    );
     Ok(())
 }
 
@@ -416,9 +419,10 @@ mod tests {
         ];
 
         for (protocol, pointer) in cases {
-            let mut config: Value =
-                serde_json::from_str(&format!(r#"{{"address":"0.0.0.0:443","protocol":{protocol}}}"#))
-                    .unwrap();
+            let mut config: Value = serde_json::from_str(&format!(
+                r#"{{"address":"0.0.0.0:443","protocol":{protocol}}}"#
+            ))
+            .unwrap();
             install_placeholder_credentials(&mut config).unwrap();
             assert!(
                 config.pointer(pointer).and_then(Value::as_str).is_some(),

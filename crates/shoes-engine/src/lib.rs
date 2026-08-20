@@ -15,18 +15,19 @@
 //! nothing under `shoes/src/dynamic/` knows about HTTP, JSON, or a user database;
 //! that is why it pulls in no new dependency at all.
 //!
-//! Everything application-shaped lives out here, in three layers:
+//! Everything application-shaped lives out here:
 //!
 //! | crate | role |
 //! |---|---|
 //! | `shoes` | the proxy engine, plus the hooks below |
 //! | `shoes-engine` | **the integration point**: programmatic control of inbounds and users |
-//! | `shoes-api` | the wire types, if you want them |
-//! | `shoes-controller` | a reference binary over `shoes-engine`; not the product |
+//! | `shoes-api` | the argument and report types those methods use |
 //!
-//! An embedder writing its own control plane should depend on `shoes-engine` and
-//! drive [`Engine`] directly. `shoes-controller` exists to prove the surface is
-//! sufficient and to have something runnable; it is expected to be replaced.
+//! There is deliberately no crate above this one. An embedder links `shoes-engine`
+//! as a library and drives [`Engine`] directly from its own service layer -- gRPC,
+//! HTTP, FFI, whatever it already speaks. This repository does not ship a wire
+//! protocol or a daemon, because doing so would put policy and transport decisions
+//! in the one place that has to stay mergeable with upstream.
 //!
 //! # Invasiveness
 //!
@@ -364,8 +365,8 @@ impl Engine {
 
         if users.is_some() {
             return Err(EngineError::Unsupported(format!(
-                "a config update cannot carry users; change them through \
-                 /inbounds/{tag}/users, which applies one user at a time"
+                "a config update for {tag} cannot carry users; change them with \
+                 add_user/remove_user, which apply one user at a time"
             )));
         }
 
@@ -479,9 +480,7 @@ impl Engine {
             // overwrite an earlier entry.
             let id = user
                 .resolved_id()
-                .ok_or_else(|| {
-                    EngineError::InvalidUser("a user needs an `id` or a `uuid`".into())
-                })?
+                .ok_or_else(|| EngineError::InvalidUser("a user needs an `id` or a `uuid`".into()))?
                 .to_string();
             if registry.get(&id).is_some() {
                 return Err(EngineError::InvalidUser(format!(
@@ -536,7 +535,7 @@ impl Engine {
         slot.users().cloned().ok_or_else(|| {
             EngineError::Unsupported(format!(
                 "inbound {tag} was created without a `users` list, so its credentials come \
-                 from its config and cannot be changed through this endpoint"
+                 from its config and cannot be changed at runtime"
             ))
         })
     }
@@ -595,8 +594,8 @@ async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<
     let json_text = serde_json::to_string(&config)
         .map_err(|e| EngineError::InvalidConfig(format!("could not re-encode payload: {e}")))?;
 
-    let parsed: Config = serde_yaml::from_str(&json_text)
-        .map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
+    let parsed: Config =
+        serde_yaml::from_str(&json_text).map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
 
     if !matches!(parsed, Config::Server(_)) {
         return Err(EngineError::Unsupported(
@@ -605,7 +604,8 @@ async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<
     }
 
     // Reads any `cert`/`key` that names a file and replaces it with the PEM text.
-    // A missing or unreadable file surfaces here, as a 400, with the OS error.
+    // A missing or unreadable file surfaces here, as an `InvalidConfig` carrying
+    // the OS error, rather than as a panic inside a listener task.
     let (parsed, loaded) = convert_cert_paths(vec![parsed])
         .await
         .map_err(|e| EngineError::InvalidConfig(format!("could not load cert files: {e}")))?;

@@ -2,9 +2,11 @@ use std::fmt;
 
 /// Errors surfaced by the engine control plane.
 ///
-/// Each variant maps to a distinct HTTP status in `shoes-controller`, so the
-/// distinction between "the caller sent something invalid" and "the engine could
-/// not carry it out" is preserved all the way to the API response.
+/// The variants are kept distinct so an embedder can map them onto whatever its
+/// own service layer reports -- gRPC status codes, HTTP statuses, FFI error
+/// numbers. The distinction that matters, and the one worth preserving in any such
+/// mapping, is "the caller asked for something invalid" versus "the engine could
+/// not carry out something valid": the first must not invite a retry.
 #[derive(Debug)]
 pub enum EngineError {
     /// The submitted payload could not be turned into a shoes config.
@@ -75,9 +77,9 @@ impl EngineError {
     /// `shoes` reports its own refusals as `io::Error`, because that is the error
     /// type its APIs return -- but "this config does not describe the listeners
     /// that are running" is the caller's mistake, not the engine's failure, and
-    /// answering it with a 500 would tell the caller to retry something that can
-    /// never succeed. The two kinds shoes uses deliberately are mapped through;
-    /// anything else is a genuine I/O failure and stays one.
+    /// reporting it as an I/O failure would invite a retry that can never succeed.
+    /// The two kinds shoes uses deliberately are mapped through; anything else is a
+    /// genuine I/O failure and stays one.
     pub(crate) fn from_rejection(e: std::io::Error) -> Self {
         match e.kind() {
             std::io::ErrorKind::InvalidInput => Self::InvalidConfig(e.to_string()),

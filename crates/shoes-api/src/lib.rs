@@ -1,7 +1,14 @@
-//! Wire types for the shoes dynamic engine management API.
+//! Argument and report types for the shoes dynamic engine.
 //!
-//! This crate is deliberately dependency-light: it knows nothing about `shoes`
-//! itself, so it can be shared with external control planes and clients.
+//! These are the values [`shoes_engine::Engine`]'s methods take and return. They
+//! describe *what* a control plane asks for, and nothing about how it was asked:
+//! there is no transport, no status code and no error envelope here, because the
+//! transport is not this repository's business. A gRPC, HTTP or FFI layer converts
+//! its own request types into these at its boundary.
+//!
+//! The crate is deliberately dependency-light -- it knows nothing about `shoes`
+//! itself -- so that conversion code can depend on the types without pulling in
+//! the proxy engine.
 //!
 //! The inbound payload is carried as an opaque [`serde_json::Value`] rather than
 //! a mirrored config struct. `shoes` already has a complete, well-tested set of
@@ -9,6 +16,8 @@
 //! re-doing that work on every upstream merge. Because YAML 1.2 is a superset of
 //! JSON, the engine can feed the JSON payload straight into the same
 //! `serde_yaml` deserializers the YAML config files use.
+//!
+//! [`shoes_engine::Engine`]: https://docs.rs/shoes-engine
 
 use serde::{Deserialize, Serialize};
 
@@ -25,14 +34,15 @@ fn default_true() -> bool {
 /// dropped reads to the caller as a user who was added.
 ///
 /// `deny_unknown_fields` is deliberate for the same reason. This payload carries
-/// secrets, and a typo in a field name must be a 400, not a user with no
+/// secrets, and a typo in a field name must be an error, not a user with no
 /// credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserSpec {
     /// Stable identity for reporting, and the handle for
-    /// `DELETE /inbounds/{tag}/users/{id}`. Defaults to `uuid` when one is given,
-    /// since that is already how operators refer to a VLESS or VMess user.
+    /// [`Engine::remove_user`](https://docs.rs/shoes-engine). Defaults to `uuid`
+    /// when one is given, since that is already how operators refer to a VLESS or
+    /// VMess user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Canonical uuid, with or without dashes. Used by VLESS.
@@ -57,7 +67,7 @@ impl UserSpec {
 /// A registered user as reported by the engine.
 ///
 /// Credentials are never echoed back. The engine holds them only as index keys,
-/// and re-serving them would turn a read endpoint into a credential dump.
+/// and re-serving them would turn a status report into a credential dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     pub id: String,
@@ -72,16 +82,18 @@ pub struct UserInfo {
     pub total_conns: u64,
 }
 
-/// Request body for `POST /inbounds` and `PUT /inbounds/{tag}`.
+/// Argument to [`Engine::add_inbound`] and [`Engine::update_inbound`].
+///
+/// [`Engine::add_inbound`]: https://docs.rs/shoes-engine
+/// [`Engine::update_inbound`]: https://docs.rs/shoes-engine
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundSpec {
-    /// Caller-assigned identity, unique within the engine. Used as the handle
-    /// for `PUT`/`DELETE /inbounds/{tag}`.
+    /// Caller-assigned identity, unique within the engine. Every later operation
+    /// on this inbound names it by this tag.
     ///
-    /// Optional in a `PUT` body, where the path already names the inbound: when
-    /// given it must agree with the path, so a copy-pasted body cannot silently
-    /// reconfigure the wrong inbound. Required for `POST`, which has no path to
-    /// take it from.
+    /// Required by `add_inbound`. `update_inbound` also reads it, so a caller that
+    /// already knows the tag from elsewhere -- a URL path, a gRPC field -- must
+    /// still put it here rather than leaving the engine to guess.
     #[serde(default)]
     pub tag: String,
     /// A native shoes server config object, i.e. one element of the top-level
@@ -96,12 +108,14 @@ pub struct InboundSpec {
     /// Present -- **including an empty list** -- hands authority to the engine's
     /// in-memory registry instead. Any credential in `config` is then rejected as
     /// misleading rather than ignored, and an empty registry means nobody can
-    /// connect until users are added over `POST /inbounds/{tag}/users`. An empty
-    /// list is the normal way to bring an inbound up first and populate it after.
+    /// connect until users are added with [`Engine::add_user`]. An empty list is
+    /// the normal way to bring an inbound up first and populate it after.
     ///
     /// The distinction is why this is an `Option` and not a plain `Vec`: a `Vec`
     /// cannot tell "no users section" from "deliberately no users yet", and those
     /// two mean opposite things for who may connect.
+    ///
+    /// [`Engine::add_user`]: https://docs.rs/shoes-engine
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users: Option<Vec<UserSpec>>,
 }
@@ -119,11 +133,13 @@ pub struct InboundInfo {
     /// Number of live listener tasks backing this inbound.
     pub listeners: usize,
     /// How many times this inbound's rules and protocol settings have been
-    /// swapped since it started, i.e. how many `PUT /inbounds/{tag}` calls have
-    /// been applied. `0` for a freshly added inbound.
+    /// swapped since it started, i.e. how many [`Engine::update_inbound`] calls
+    /// have been applied. `0` for a freshly added inbound.
     ///
     /// Reported so a caller can tell an applied reload from a rejected one without
     /// inspecting traffic, and can spot one it did not make.
+    ///
+    /// [`Engine::update_inbound`]: https://docs.rs/shoes-engine
     #[serde(default)]
     pub revision: u64,
     /// Users registered against this inbound. `None` when the protocol does not
@@ -134,25 +150,13 @@ pub struct InboundInfo {
     pub users: Option<usize>,
 }
 
-/// Response body for `GET /status`.
+/// Engine-wide summary, as reported by [`Engine::status`].
+///
+/// [`Engine::status`]: https://docs.rs/shoes-engine
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineStatus {
     pub version: String,
     pub inbounds: usize,
     /// Bind addresses currently claimed by the engine.
     pub bound_addresses: Vec<String>,
-}
-
-/// Error envelope returned with every non-2xx response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiError {
-    pub error: String,
-}
-
-impl ApiError {
-    pub fn new(error: impl Into<String>) -> Self {
-        Self {
-            error: error.into(),
-        }
-    }
 }

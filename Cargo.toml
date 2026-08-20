@@ -7,7 +7,6 @@ members = [
     # Our additions live outside it.
     "crates/shoes-api",
     "crates/shoes-engine",
-    "crates/shoes-controller",
 ]
 
 [workspace.package]
@@ -25,10 +24,6 @@ shoes-engine = { path = "crates/shoes-engine" }
 arc-swap = "*"
 async-trait = "*"
 dashmap = "*"
-http = "*"
-http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
 log = { version = "*", features = ["std"] }
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
@@ -39,7 +34,6 @@ tokio = { version = "*", features = [
     "macros",
     "net",
     "rt-multi-thread",
-    "signal",
     "sync",
     "time",
 ] }
