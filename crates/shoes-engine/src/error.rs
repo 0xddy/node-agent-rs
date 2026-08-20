@@ -67,3 +67,22 @@ impl From<std::io::Error> for EngineError {
         Self::Io(e)
     }
 }
+
+impl EngineError {
+    /// Classifies an [`std::io::Error`] that came from a *rejected request*
+    /// rather than from a failed operation.
+    ///
+    /// `shoes` reports its own refusals as `io::Error`, because that is the error
+    /// type its APIs return -- but "this config does not describe the listeners
+    /// that are running" is the caller's mistake, not the engine's failure, and
+    /// answering it with a 500 would tell the caller to retry something that can
+    /// never succeed. The two kinds shoes uses deliberately are mapped through;
+    /// anything else is a genuine I/O failure and stays one.
+    pub(crate) fn from_rejection(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::InvalidInput => Self::InvalidConfig(e.to_string()),
+            std::io::ErrorKind::Unsupported => Self::Unsupported(e.to_string()),
+            _ => Self::Io(e),
+        }
+    }
+}

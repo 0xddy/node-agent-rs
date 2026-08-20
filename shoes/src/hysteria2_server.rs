@@ -42,7 +42,7 @@ use crate::util::allocate_vec;
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    password: &'static str,
+    password: Arc<str>,
     conn: quinn::Incoming,
     udp_enabled: bool,
 ) -> std::io::Result<()> {
@@ -68,7 +68,7 @@ async fn process_connection(
     // Per sing-box reference, authentication timeout is 3 seconds
     match timeout(
         AUTH_TIMEOUT,
-        auth_connection(&mut h3_conn, password, udp_enabled),
+        auth_connection(&mut h3_conn, &password, udp_enabled),
     )
     .await
     {
@@ -971,20 +971,24 @@ async fn read_varint(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_hysteria2_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    hysteria2_password: &'static str,
+    hysteria2_password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     udp_enabled: bool,
+    shutdown: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let hysteria2_password = hysteria2_password.clone();
+        let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
@@ -1029,14 +1033,23 @@ pub async fn start_hysteria2_server(
             )
             .unwrap();
 
-            while let Some(conn) = endpoint.accept().await {
+            loop {
+                let conn = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    incoming = endpoint.accept() => match incoming {
+                        Some(conn) => conn,
+                        None => break,
+                    },
+                };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
+                let cloned_password = hysteria2_password.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
-                        hysteria2_password,
+                        cloned_password,
                         conn,
                         udp_enabled,
                     )
@@ -1046,6 +1059,10 @@ pub async fn start_hysteria2_server(
                     }
                 });
             }
+
+            // The connections are multiplexed over this endpoint's socket, so
+            // letting them finish and giving the port back are the same act.
+            crate::quic_server::drain_endpoint(endpoint, bind_address).await;
         });
         join_handles.push(join_handle);
     }

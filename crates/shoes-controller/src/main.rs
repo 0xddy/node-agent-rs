@@ -48,6 +48,7 @@ The engine starts with no inbounds and no users. Populate it over the API:
   GET    /inbounds
   POST   /inbounds                       {{\"tag\": \"...\", \"config\": {{ ... }}, \"users\": []}}
   GET    /inbounds/{{tag}}
+  PUT    /inbounds/{{tag}}                 {{\"config\": {{ ... }}}}
   DELETE /inbounds/{{tag}}
   GET    /inbounds/{{tag}}/users
   POST   /inbounds/{{tag}}/users         {{\"id\": \"...\", \"uuid\": \"...\"}}
@@ -57,6 +58,11 @@ The engine starts with no inbounds and no users. Populate it over the API:
 Include \"users\" in POST /inbounds -- an empty list is fine -- to make the engine's
 in-memory registry the inbound's credential authority. Omit it to use the credential
 written in the config, as a config file would.
+
+PUT /inbounds/{{tag}} swaps rules and protocol settings without rebinding: established
+connections finish under the rules they were accepted with, new ones use the new config.
+It keeps the inbound's users, and refuses a config that changes the listen addresses or
+the transport -- do that as a DELETE plus a POST.
 "
     );
     std::process::exit(1);

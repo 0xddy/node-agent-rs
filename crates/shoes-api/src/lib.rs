@@ -72,11 +72,17 @@ pub struct UserInfo {
     pub total_conns: u64,
 }
 
-/// Request body for `POST /inbounds`.
+/// Request body for `POST /inbounds` and `PUT /inbounds/{tag}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundSpec {
     /// Caller-assigned identity, unique within the engine. Used as the handle
-    /// for `DELETE /inbounds/{tag}`.
+    /// for `PUT`/`DELETE /inbounds/{tag}`.
+    ///
+    /// Optional in a `PUT` body, where the path already names the inbound: when
+    /// given it must agree with the path, so a copy-pasted body cannot silently
+    /// reconfigure the wrong inbound. Required for `POST`, which has no path to
+    /// take it from.
+    #[serde(default)]
     pub tag: String,
     /// A native shoes server config object, i.e. one element of the top-level
     /// YAML config list, expressed as JSON.
@@ -112,6 +118,14 @@ pub struct InboundInfo {
     pub bind: Vec<String>,
     /// Number of live listener tasks backing this inbound.
     pub listeners: usize,
+    /// How many times this inbound's rules and protocol settings have been
+    /// swapped since it started, i.e. how many `PUT /inbounds/{tag}` calls have
+    /// been applied. `0` for a freshly added inbound.
+    ///
+    /// Reported so a caller can tell an applied reload from a rejected one without
+    /// inspecting traffic, and can spot one it did not make.
+    #[serde(default)]
+    pub revision: u64,
     /// Users registered against this inbound. `None` when the protocol does not
     /// authenticate through the engine's user registry, which is not the same as
     /// zero users: zero means nobody can connect, `None` means the question does

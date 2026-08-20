@@ -75,7 +75,7 @@ use shoes::config::{
     BindLocation, Config, ServerConfig, Transport, ValidatedConfigs, convert_cert_paths,
 };
 use shoes::dns::{DnsRegistry, build_dns_registry};
-use shoes::dynamic::UserRegistry;
+use shoes::dynamic::{ServerHandle, UserRegistry};
 use shoes::resolver::Resolver;
 use shoes::tcp::tcp_server::start_servers_with_users;
 use shoes_api::{EngineStatus, InboundInfo, InboundSpec, UserInfo, UserSpec};
@@ -240,35 +240,29 @@ impl Engine {
         let protocol = protocol::display_name(&server_configs[0].protocol);
         let transport = transport_name(&server_configs[0].transport).to_string();
 
-        let mut listeners: Vec<JoinHandle<()>> = Vec::new();
+        let mut handles: Vec<ServerHandle> = Vec::new();
         let mut bind_display: Vec<String> = Vec::new();
 
         for (server_config, target) in server_configs.into_iter().zip(targets.iter()) {
             let resolver = match Self::resolver_for(&mut control, &server_config).await {
                 Ok(resolver) => resolver,
                 Err(e) => {
-                    for handle in listeners {
-                        handle.abort();
-                    }
+                    inbound::abandon(handles).await;
                     return Err(e);
                 }
             };
 
             // `Arc<MemoryUserRegistry>` is cloned per listener, so every handler
             // built from this spec authenticates against the one same table.
-            let registry_ref = registry
-                .clone()
-                .map(|r| r as Arc<dyn UserRegistry>);
+            let registry_ref = registry.clone().map(|r| r as Arc<dyn UserRegistry>);
 
             match start_servers_with_users(Config::Server(server_config), resolver, registry_ref)
                 .await
             {
-                Ok(handles) => listeners.extend(handles),
+                Ok(handle) => handles.push(handle),
                 Err(e) => {
                     // Roll back anything already started under this tag.
-                    for handle in listeners {
-                        handle.abort();
-                    }
+                    inbound::abandon(handles).await;
                     return Err(EngineError::Io(e));
                 }
             }
@@ -281,8 +275,9 @@ impl Engine {
             protocol,
             transport,
             bind: bind_display,
-            listeners: listeners.len(),
-            // Filled in live by `InboundSlot::describe`; see its doc comment.
+            listeners: handles.iter().map(ServerHandle::listener_count).sum(),
+            // Both filled in live by `InboundSlot::describe`; see its doc comment.
+            revision: 0,
             users: None,
         };
 
@@ -294,7 +289,7 @@ impl Engine {
         let slot = Arc::new(InboundSlot::new(
             info.clone(),
             BindTargets::Addresses(all_addresses.clone()),
-            listeners,
+            handles,
             registry,
         ));
 
@@ -302,7 +297,7 @@ impl Engine {
         tokio::time::sleep(LISTENER_HEALTH_GRACE).await;
         if let Some(dead) = slot.take_dead_listener() {
             let reason = describe_dead_listener(dead).await;
-            slot.shutdown();
+            slot.shutdown().await;
             return Err(EngineError::Io(std::io::Error::other(format!(
                 "inbound {tag} failed to start: {reason}"
             ))));
@@ -331,10 +326,100 @@ impl Engine {
         Ok(info)
     }
 
+    /// Replaces the routing rules and protocol settings of a running inbound,
+    /// without restarting its listeners.
+    ///
+    /// This is the RCU path. Nothing rebinds, nothing is drained, and no
+    /// established connection is disturbed: each one holds the handler it was
+    /// accepted with, and therefore the rules it was accepted under, until it ends.
+    /// Connections accepted after this returns route by the new config.
+    ///
+    /// For a TCP inbound that covers everything above the socket, TLS certificates
+    /// included. For QUIC the certificates belong to the endpoint rather than the
+    /// handler, so those stay as they were until the inbound is replaced.
+    ///
+    /// # What it deliberately refuses
+    ///
+    /// - **A different listen set, or a different transport.** Either would mean
+    ///   closing sockets and opening others, which cannot be undone if the new bind
+    ///   fails, so the engine will not do it behind a caller's back. Do it as a
+    ///   [`Engine::remove_inbound`] plus an [`Engine::add_inbound`] and accept the
+    ///   gap in service that implies.
+    /// - **A `users` list.** Users have their own endpoints, which are atomic one
+    ///   user at a time; folding them into a config update would make a partly
+    ///   applied update possible, and would leave "the list omits Bob" ambiguous
+    ///   between revoking Bob and not mentioning him.
+    /// - **hysteria2 and TUIC.** They authenticate inside their own accept loop
+    ///   rather than through a handler, so there is nothing to swap. Said plainly
+    ///   rather than accepted as a no-op.
+    ///
+    /// The inbound's user registry is carried over untouched, so online users, their
+    /// credentials and their counters all survive the swap.
+    pub async fn update_inbound(&self, spec: InboundSpec) -> EngineResult<InboundInfo> {
+        let InboundSpec {
+            tag,
+            mut config,
+            users,
+        } = spec;
+
+        if users.is_some() {
+            return Err(EngineError::Unsupported(format!(
+                "a config update cannot carry users; change them through \
+                 /inbounds/{tag}/users, which applies one user at a time"
+            )));
+        }
+
+        // Unlike `add_inbound`, the payload is prepared under the control lock:
+        // whether the placeholder credential is needed depends on whether the
+        // running inbound is in dynamic mode, and reading that outside the lock
+        // would let a concurrent remove-and-re-add change the answer underneath.
+        let mut control = self.inner.control.lock().await;
+
+        let slot = self
+            .inner
+            .inbounds
+            .get(&tag)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| EngineError::UnknownTag(tag.clone()))?;
+
+        // In dynamic mode the protocol's credential field is dead but still
+        // mandatory in shoes' schema. Same treatment as at creation, so an update
+        // is written exactly like the add that created the inbound.
+        if slot.users().is_some() {
+            protocol::install_placeholder_credentials(&mut config)?;
+        }
+
+        let server_configs = validate_inbound_config(config).await?;
+
+        let mut paired = Vec::with_capacity(server_configs.len());
+        for server_config in server_configs {
+            let resolver = Self::resolver_for(&mut control, &server_config).await?;
+            paired.push((server_config, resolver));
+        }
+
+        let revision = slot.reload(paired).map_err(EngineError::from_rejection)?;
+
+        let info = slot.describe();
+        info!(
+            "inbound {} reloaded to revision {revision}; \
+             established connections keep their previous rules",
+            info.tag
+        );
+
+        Ok(info)
+    }
+
     /// Stops accepting new connections on `tag` and unregisters it.
     ///
-    /// Established TCP connections keep running to completion -- see
-    /// [`InboundSlot::shutdown`] for the mechanism and the QUIC caveat.
+    /// Established connections keep running to completion -- see
+    /// [`InboundSlot::shutdown`] for the mechanism.
+    ///
+    /// Awaits the listeners letting go of their sockets before it returns, so the
+    /// same addresses can be handed straight to a new inbound. For TCP that is
+    /// immediate; a QUIC inbound first drains the connections that share its UDP
+    /// socket, which is also why the control lock is held throughout -- the port is
+    /// genuinely still in use until the drain finishes, and another `add_inbound`
+    /// must not be told otherwise.
     pub async fn remove_inbound(&self, tag: &str) -> EngineResult<InboundInfo> {
         let _control = self.inner.control.lock().await;
 
@@ -344,7 +429,7 @@ impl Engine {
             .remove(tag)
             .ok_or_else(|| EngineError::UnknownTag(tag.to_string()))?;
 
-        slot.shutdown();
+        slot.shutdown().await;
 
         for address in slot.targets().addresses() {
             self.inner.bound.remove(address);

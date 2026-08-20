@@ -131,11 +131,12 @@ async fn route_inbound(
             Some(slot) => json_ok(&slot.describe()),
             None => engine_error_response(EngineError::UnknownTag(tag)),
         },
+        ("PUT", Target::Inbound) => update_inbound(engine, &tag, req).await,
         ("DELETE", Target::Inbound) => match engine.remove_inbound(&tag).await {
             Ok(info) => json_ok(&info),
             Err(e) => engine_error_response(e),
         },
-        (_, Target::Inbound) => method_not_allowed("GET, DELETE"),
+        (_, Target::Inbound) => method_not_allowed("GET, PUT, DELETE"),
 
         ("GET", Target::Users) => match engine.list_users(&tag) {
             Ok(users) => json_ok(&users),
@@ -202,6 +203,45 @@ async fn add_user(engine: &Engine, tag: &str, req: Request<Incoming>) -> ApiResp
 
     match engine.add_user(tag, spec) {
         Ok(info) => json_response(StatusCode::CREATED, &info),
+        Err(e) => engine_error_response(e),
+    }
+}
+
+/// `PUT /inbounds/{tag}` -- replace a running inbound's rules and protocol
+/// settings in place.
+///
+/// The path names the inbound, so the body may omit `tag`. A body that carries a
+/// different one is refused rather than followed: the alternative is silently
+/// reconfiguring an inbound the caller did not address.
+async fn update_inbound(engine: &Engine, tag: &str, req: Request<Incoming>) -> ApiResponse {
+    let body = match read_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+
+    let mut spec: InboundSpec = match serde_json::from_slice(&body) {
+        Ok(spec) => spec,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("could not parse request body: {e}"),
+            );
+        }
+    };
+
+    if !spec.tag.is_empty() && spec.tag != tag {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "body tag {:?} does not match the path, which addresses {tag:?}",
+                spec.tag
+            ),
+        );
+    }
+    spec.tag = tag.to_string();
+
+    match engine.update_inbound(spec).await {
+        Ok(info) => json_ok(&info),
         Err(e) => engine_error_response(e),
     }
 }

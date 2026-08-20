@@ -30,10 +30,20 @@
 //! traffic is counted. [`TrafficMeterStream`] does the counting; its own
 //! documentation covers where it sits in the stack and why the user is attached to
 //! a connection that is already being metered.
+//!
+//! ## Reloading
+//!
+//! Rules and protocol settings change the same way users do: in place, without
+//! restarting the listener and without disturbing what is already connected. A
+//! started inbound hands back a [`ServerHandle`], whose `reload` swaps the handler
+//! every new connection is given and whose `shutdown` stops the accept loops while
+//! leaving established sessions to finish. See the [`reload`] module docs for why
+//! that is enough to make the swap safe.
 
 pub mod credential;
 mod meter;
 mod registry;
+mod reload;
 mod static_registry;
 mod user;
 
@@ -41,5 +51,6 @@ pub use meter::{
     ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
 };
 pub use registry::UserRegistry;
+pub use reload::{HandlerSlot, ServerHandle};
 pub use static_registry::StaticUserRegistry;
 pub use user::{UserContext, UserStats};

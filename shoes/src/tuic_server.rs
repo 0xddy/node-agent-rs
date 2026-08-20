@@ -54,8 +54,8 @@ type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: Arc<[u8]>,
+    password: Arc<str>,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<()> {
@@ -79,7 +79,7 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, uuid, password)).await {
+    match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             connection.close(0u32.into(), b"auth failed");
@@ -191,16 +191,12 @@ async fn run_heartbeat_loop(
 
 async fn auth_connection(
     connection: &quinn::Connection,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: &[u8],
+    password: &str,
 ) -> std::io::Result<()> {
     let mut expected_token_bytes = [0u8; 32];
     connection
-        .export_keying_material(
-            &mut expected_token_bytes,
-            uuid.as_ref(),
-            password.as_bytes(),
-        )
+        .export_keying_material(&mut expected_token_bytes, uuid, password.as_bytes())
         .map_err(|e| std::io::Error::other(format!("Failed to export keying material: {e:?}")))?;
 
     // Loop until we receive an AUTH command.
@@ -1394,18 +1390,22 @@ async fn run_datagram_loop(
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: Arc<[u8]>,
+    password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     zero_rtt_handshake: bool,
+    shutdown: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let uuid = uuid.clone();
+        let password = password.clone();
+        let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
@@ -1448,15 +1448,25 @@ pub async fn start_tuic_server(
             )
             .unwrap();
 
-            while let Some(conn) = endpoint.accept().await {
+            loop {
+                let conn = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    incoming = endpoint.accept() => match incoming {
+                        Some(conn) => conn,
+                        None => break,
+                    },
+                };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
+                let cloned_uuid = uuid.clone();
+                let cloned_password = password.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
-                        uuid,
-                        password,
+                        cloned_uuid,
+                        cloned_password,
                         conn,
                         zero_rtt_handshake,
                     )
@@ -1466,6 +1476,10 @@ pub async fn start_tuic_server(
                     }
                 });
             }
+
+            // See `quic_server::drain_endpoint`: the port cannot come back before
+            // the connections sharing its socket are done with it.
+            crate::quic_server::drain_endpoint(endpoint, bind_address).await;
         });
         join_handles.push(join_handle);
     }

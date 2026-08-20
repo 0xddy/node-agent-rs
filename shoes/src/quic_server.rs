@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +7,7 @@ use quinn::EndpointConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ConnectDecision;
@@ -15,7 +15,9 @@ use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::dynamic::{ConnContext, TrafficMeterStream, UserRegistry, scope_connection};
+use crate::dynamic::{
+    ConnContext, HandlerSlot, ServerHandle, TrafficMeterStream, UserRegistry, scope_connection,
+};
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -27,13 +29,24 @@ use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 use crate::uuid_util::parse_uuid;
 
+/// How long a cancelled QUIC endpoint waits for its live connections before it
+/// drops the socket.
+///
+/// A QUIC connection is multiplexed over the endpoint's UDP socket, so unlike TCP
+/// the port cannot be released while connections are still using it -- letting them
+/// finish and freeing the port are the same act. The wait has to be bounded anyway:
+/// a client holding a connection open must not be able to keep the port claimed
+/// indefinitely and block whatever wants to listen there next.
+pub(crate) const QUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
 async fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<dyn TcpServerHandler>,
+    handler_slot: Arc<HandlerSlot>,
     num_endpoints: usize,
     metered: bool,
+    cancel: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // TODO: consider setting transport config
     //   Arc::get_mut(&mut server_config.transport)
@@ -58,11 +71,24 @@ async fn start_quic_server(
         )?;
 
         let resolver = resolver.clone();
-        let server_handler = server_handler.clone();
+        let handler_slot = handler_slot.clone();
+        let cancel = cancel.clone();
         let join_handle = tokio::spawn(async move {
-            while let Some(conn) = endpoint.accept().await {
+            loop {
+                let conn = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    incoming = endpoint.accept() => match incoming {
+                        Some(conn) => conn,
+                        // The endpoint closed on its own.
+                        None => break,
+                    },
+                };
                 let resolver = resolver.clone();
-                let server_handler = server_handler.clone();
+                // Read once per QUIC connection: every stream it goes on to open
+                // is served by the generation that was current when the connection
+                // was accepted.
+                let server_handler = handler_slot.load();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(resolver, server_handler, conn, metered).await
                     {
@@ -70,12 +96,35 @@ async fn start_quic_server(
                     }
                 });
             }
+
+            drain_endpoint(endpoint, bind_address).await;
         });
 
         join_handles.push(join_handle);
     }
 
     Ok(join_handles)
+}
+
+/// Stop taking new QUIC connections on `endpoint` and let the live ones finish.
+///
+/// Bounded by [`QUIC_DRAIN_TIMEOUT`]; see its documentation for why the port cannot
+/// simply be released the way a TCP listener's is.
+pub(crate) async fn drain_endpoint(endpoint: quinn::Endpoint, bind_address: SocketAddr) {
+    // quinn refuses an incoming handshake when the endpoint has no server config,
+    // which is how it spells "stop accepting" -- it is documented to affect new
+    // connections only, so the live ones are untouched.
+    endpoint.set_server_config(None);
+    if tokio::time::timeout(QUIC_DRAIN_TIMEOUT, endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        debug!(
+            "quic endpoint on {bind_address} still had {} live connection(s) after \
+             {QUIC_DRAIN_TIMEOUT:?}; closing anyway",
+            endpoint.open_connections()
+        );
+    }
 }
 
 async fn process_connection(
@@ -307,9 +356,10 @@ pub async fn start_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
+) -> std::io::Result<ServerHandle> {
     let ServerConfig {
         bind_location,
+        transport,
         quic_settings,
         protocol,
         rules,
@@ -379,7 +429,10 @@ pub async fn start_quic_servers(
         resolver.clone(),
     ));
 
-    let mut handles = vec![];
+    // One token for the whole inbound: every accept loop started below selects on
+    // it, so the embedder stops all of them together.
+    let cancel = CancellationToken::new();
+    let mut handle = ServerHandle::new(transport, cancel.clone());
 
     match protocol {
         ServerProxyConfig::Hysteria2 {
@@ -387,23 +440,27 @@ pub async fn start_quic_servers(
             udp_enabled,
         } => {
             // TODO: hash password instead of passing directly
-            let hysteria2_password: &'static str = Box::leak(password.into_boxed_str());
+            let hysteria2_password: Arc<str> = password.into();
 
             for bind_address in bind_addresses.into_iter() {
-                let quic_server_config = quic_server_config.clone();
-                let client_proxy_selector = client_proxy_selector.clone();
-                let resolver = resolver.clone();
                 let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
-                    quic_server_config,
-                    hysteria2_password,
-                    client_proxy_selector,
-                    resolver,
+                    quic_server_config.clone(),
+                    hysteria2_password.clone(),
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
                     num_endpoints,
                     udp_enabled,
+                    cancel.clone(),
                 )
                 .await?;
-                handles.extend(hysteria2_handles);
+                // No handler slot is recorded: hysteria2 authenticates inside its
+                // own accept loop rather than through a `TcpServerHandler`, so
+                // there is nothing here for a reload to swap.
+                for listener in hysteria2_handles {
+                    handle.push_listener(listener);
+                }
+                handle.push_address(bind_address);
             }
         }
         ServerProxyConfig::TuicV5 {
@@ -411,60 +468,59 @@ pub async fn start_quic_servers(
             password,
             zero_rtt_handshake,
         } => {
-            let uuid: &'static [u8] = Box::leak(parse_uuid(&uuid)?.into_boxed_slice());
-            let password: &'static str = Box::leak(password.into_boxed_str());
+            let uuid: Arc<[u8]> = parse_uuid(&uuid)?.into();
+            let password: Arc<str> = password.into();
             for bind_address in bind_addresses.into_iter() {
-                let quic_server_config = quic_server_config.clone();
-                let client_proxy_selector = client_proxy_selector.clone();
-                let resolver = resolver.clone();
                 let tuic_handles = crate::tuic_server::start_tuic_server(
                     bind_address,
-                    quic_server_config,
-                    uuid,
-                    password,
-                    client_proxy_selector,
-                    resolver,
+                    quic_server_config.clone(),
+                    uuid.clone(),
+                    password.clone(),
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
                     num_endpoints,
                     zero_rtt_handshake,
+                    cancel.clone(),
                 )
                 .await?;
-                handles.extend(tuic_handles);
+                // As above: nothing to swap.
+                for listener in tuic_handles {
+                    handle.push_listener(listener);
+                }
+                handle.push_address(bind_address);
             }
         }
         tcp_protocol => {
-            // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
-            let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
-
             for bind_address in bind_addresses.into_iter() {
-                let tcp_handler: Arc<dyn TcpServerHandler> = handlers
-                    .entry(bind_address.ip())
-                    .or_insert_with(|| {
-                        create_tcp_server_handler(
-                            tcp_protocol.clone(),
-                            &client_proxy_selector,
-                            &resolver,
-                            Some(bind_address.ip()),
-                            users.as_ref(),
-                        )
-                        .into()
-                    })
-                    .clone();
-                let quic_server_config = quic_server_config.clone();
-                let resolver = resolver.clone();
+                // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
+                let handler_slot = handle.slot_for_ip(bind_address.ip(), || {
+                    create_tcp_server_handler(
+                        tcp_protocol.clone(),
+                        &client_proxy_selector,
+                        &resolver,
+                        Some(bind_address.ip()),
+                        users.as_ref(),
+                    )
+                    .into()
+                });
                 let quic_handles = start_quic_server(
                     bind_address,
-                    quic_server_config,
-                    resolver,
-                    tcp_handler,
+                    quic_server_config.clone(),
+                    resolver.clone(),
+                    handler_slot,
                     num_endpoints,
                     metered,
+                    cancel.clone(),
                 )
                 .await?;
 
-                handles.extend(quic_handles);
+                for listener in quic_handles {
+                    handle.push_listener(listener);
+                }
+                handle.push_address(bind_address);
             }
         }
     }
 
-    Ok(handles)
+    Ok(handle)
 }

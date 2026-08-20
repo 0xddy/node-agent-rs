@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +7,7 @@ use log::{debug, error};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
@@ -19,7 +19,9 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
-use crate::dynamic::{ConnContext, TrafficMeterStream, UserRegistry, scope_connection};
+use crate::dynamic::{
+    ConnContext, HandlerSlot, ServerHandle, TrafficMeterStream, UserRegistry, scope_connection,
+};
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -33,20 +35,32 @@ async fn run_tcp_server(
     bind_address: SocketAddr,
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<dyn TcpServerHandler>,
+    handler_slot: Arc<HandlerSlot>,
     metered: bool,
+    cancel: CancellationToken,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
     let listener = new_tcp_listener(bind_address, 4096, None)?;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {e}");
-                continue;
+        // Returning here drops the listener, which is what frees the port. The
+        // connections accepted so far were spawned off this loop and keep running:
+        // they hold their own handler, so they finish under the rules they started
+        // with. That is the smooth handover.
+        let (stream, addr) = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                debug!("no longer accepting on {bind_address}");
+                return Ok(());
             }
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Accept failed: {e}");
+                    continue;
+                }
+            },
         };
 
         if let Err(e) = set_tcp_keepalive(
@@ -62,7 +76,9 @@ async fn run_tcp_server(
         }
 
         let cloned_resolver = resolver.clone();
-        let cloned_handler = server_handler.clone();
+        // Read once, here: this connection is pinned to the generation of rules and
+        // protocol settings that were current when it was accepted.
+        let cloned_handler = handler_slot.load();
         tokio::spawn(async move {
             if let Err(e) =
                 process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
@@ -79,8 +95,9 @@ async fn run_tcp_server(
 async fn run_unix_server(
     path_buf: PathBuf,
     resolver: Arc<dyn Resolver>,
-    server_handler: Arc<dyn TcpServerHandler>,
+    handler_slot: Arc<HandlerSlot>,
     metered: bool,
+    cancel: CancellationToken,
 ) -> std::io::Result<()> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
@@ -93,16 +110,24 @@ async fn run_unix_server(
     let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Accept failed: {e:?}");
-                continue;
+        // See `run_tcp_server`.
+        let (stream, addr) = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                debug!("no longer accepting on the unix socket");
+                return Ok(());
             }
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Accept failed: {e:?}");
+                    continue;
+                }
+            },
         };
 
         let cloned_resolver = resolver.clone();
-        let cloned_handler = server_handler.clone();
+        let cloned_handler = handler_slot.load();
         tokio::spawn(async move {
             if let Err(e) =
                 process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
@@ -380,7 +405,9 @@ pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    start_servers_with_users(config, resolver, None).await
+    start_servers_with_users(config, resolver, None)
+        .await
+        .map(ServerHandle::into_listeners)
 }
 
 /// Start one inbound, authenticating against a caller-supplied user registry.
@@ -392,19 +419,27 @@ pub async fn start_servers(
 /// handler builds a `StaticUserRegistry` from its own config section instead, which
 /// is what [`start_servers`] does and what a config file expects.
 ///
-/// Hysteria2 and TUIC are not covered yet: both authenticate inside
-/// `quic_server.rs` rather than through a `TcpServerHandler`, so they keep using
-/// their config credential even when a registry is supplied.
+/// The returned [`ServerHandle`] is what makes the inbound manageable afterwards:
+/// `reload` swaps its rules and protocol settings without rebinding, `shutdown`
+/// stops accepting while established connections finish. Dropping it stops
+/// nothing.
+///
+/// Hysteria2 and TUIC are not covered by the registry yet: both authenticate
+/// inside `quic_server.rs` rather than through a `TcpServerHandler`, so they keep
+/// using their config credential even when a registry is supplied, and their
+/// handle has nothing to reload.
 pub async fn start_servers_with_users(
     config: Config,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
+) -> std::io::Result<ServerHandle> {
     match config {
         #[cfg(unix)]
-        Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
-            .await
-            .map(|t| vec![t]),
+        Config::TunServer(tun_config) => {
+            let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+            handle.push_listener(start_tun_server(tun_config, resolver).await?);
+            Ok(handle)
+        }
         #[cfg(not(unix))]
         Config::TunServer(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -421,50 +456,28 @@ async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = Vec::with_capacity(3);
-
-    match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver, users).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
-        Transport::Quic => match start_quic_servers(config.clone(), resolver, users).await {
-            Ok(handles) => {
-                join_handles.extend(handles);
-            }
-            Err(e) => {
-                for join_handle in join_handles {
-                    join_handle.abort();
-                }
-                return Err(e);
-            }
-        },
+) -> std::io::Result<ServerHandle> {
+    let handle = match config.transport {
+        Transport::Tcp => start_tcp_servers(config.clone(), resolver, users).await?,
+        Transport::Quic => start_quic_servers(config.clone(), resolver, users).await?,
         Transport::Udp => todo!(),
-    }
+    };
 
-    if join_handles.is_empty() {
+    if handle.listener_count() == 0 {
         return Err(std::io::Error::other(format!(
             "failed to start servers at {}",
             &config.bind_location
         )));
     }
 
-    Ok(join_handles)
+    Ok(handle)
 }
 
 async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
-) -> std::io::Result<Vec<JoinHandle<()>>> {
+) -> std::io::Result<ServerHandle> {
     let ServerConfig {
         bind_location,
         tcp_settings,
@@ -491,58 +504,67 @@ async fn start_tcp_servers(
         resolver.clone(),
     ));
 
-    let mut handles = vec![];
+    let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
 
     match bind_location {
         BindLocation::Address(addresses) => {
-            // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
-            let mut handlers: HashMap<IpAddr, Arc<dyn TcpServerHandler>> = HashMap::new();
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
-                    let tcp_handler = handlers
-                        .entry(socket_addr.ip())
-                        .or_insert_with(|| {
-                            create_tcp_server_handler(
-                                protocol.clone(),
-                                &client_proxy_selector,
-                                &resolver,
-                                Some(socket_addr.ip()),
-                                users.as_ref(),
-                            )
-                            .into()
-                        })
-                        .clone();
-                    debug!("TCP handler for {}: {tcp_handler:?}", socket_addr.ip());
+                    // Shares protocol state across ports without reusing an
+                    // interface-specific UDP bind IP.
+                    let handler_slot = handle.slot_for_ip(socket_addr.ip(), || {
+                        create_tcp_server_handler(
+                            protocol.clone(),
+                            &client_proxy_selector,
+                            &resolver,
+                            Some(socket_addr.ip()),
+                            users.as_ref(),
+                        )
+                        .into()
+                    });
+                    debug!("TCP handler for {}: {handler_slot:?}", socket_addr.ip());
 
                     let tcp_config = tcp_config.clone();
                     let resolver = resolver.clone();
-                    let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler, metered)
-                            .await
-                            .unwrap();
+                    let cancel = handle.cancel_token();
+                    let listener = tokio::spawn(async move {
+                        run_tcp_server(
+                            socket_addr,
+                            tcp_config,
+                            resolver,
+                            handler_slot,
+                            metered,
+                            cancel,
+                        )
+                        .await
+                        .unwrap();
                     });
-                    handles.push(handle);
+                    handle.push_listener(listener);
+                    handle.push_address(socket_addr);
                 }
             }
         }
         BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
-                let tcp_handler: Arc<dyn TcpServerHandler> = create_tcp_server_handler(
-                    protocol,
-                    &client_proxy_selector,
-                    &resolver,
-                    None,
-                    users.as_ref(),
-                )
-                .into();
-                debug!("TCP handler: {tcp_handler:?}");
-                let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler, metered)
+                let handler_slot = handle.slot_for_path(
+                    create_tcp_server_handler(
+                        protocol,
+                        &client_proxy_selector,
+                        &resolver,
+                        None,
+                        users.as_ref(),
+                    )
+                    .into(),
+                );
+                debug!("TCP handler: {handler_slot:?}");
+                let cancel = handle.cancel_token();
+                let listener = tokio::spawn(async move {
+                    run_unix_server(path_buf, resolver, handler_slot, metered, cancel)
                         .await
                         .unwrap();
                 });
-                handles.push(handle);
+                handle.push_listener(listener);
             }
             #[cfg(not(target_family = "unix"))]
             {
@@ -554,5 +576,5 @@ async fn start_tcp_servers(
         }
     }
 
-    Ok(handles)
+    Ok(handle)
 }
