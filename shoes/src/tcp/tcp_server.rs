@@ -19,7 +19,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
-use crate::dynamic::UserRegistry;
+use crate::dynamic::{ConnContext, TrafficMeterStream, UserRegistry, scope_connection};
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -34,6 +34,7 @@ async fn run_tcp_server(
     tcp_config: TcpConfig,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
+    metered: bool,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
@@ -63,7 +64,9 @@ async fn run_tcp_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
+            if let Err(e) =
+                process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
+            {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
                 debug!("{}:{} finished successfully", addr.ip(), addr.port());
@@ -77,6 +80,7 @@ async fn run_unix_server(
     path_buf: PathBuf,
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
+    metered: bool,
 ) -> std::io::Result<()> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
@@ -100,13 +104,40 @@ async fn run_unix_server(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_stream(stream, cloned_handler, cloned_resolver).await {
+            if let Err(e) =
+                process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
+            {
                 error!("{addr:?} finished with error: {e:?}");
             } else {
                 debug!("{addr:?} finished successfully");
             }
         });
     }
+}
+
+/// Handle one accepted connection, counting its traffic if the inbound is metered.
+///
+/// The meter goes on before any protocol touches the stream, so it sees the bytes
+/// as they are on the wire. It cannot know whose they are yet -- the credential is
+/// still several reads away -- so the connection stays anonymous until a handler
+/// calls `bind_connection_user`, which finds this connection through the task local
+/// scope installed here.
+async fn process_metered_stream<AS>(
+    stream: AS,
+    metered: bool,
+    server_handler: Arc<dyn TcpServerHandler>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()>
+where
+    AS: AsyncStream + 'static,
+{
+    if !metered {
+        return process_stream(stream, server_handler, resolver).await;
+    }
+
+    let conn = ConnContext::new();
+    let stream = TrafficMeterStream::new(stream, Arc::clone(&conn));
+    scope_connection(conn, process_stream(stream, server_handler, resolver)).await
 }
 
 async fn setup_server_stream<AS>(
@@ -444,6 +475,11 @@ async fn start_tcp_servers(
 
     println!("Starting {} TCP server at {}", &protocol, &bind_location);
 
+    // Traffic is only counted for an inbound whose users the caller manages: those
+    // are the only `UserContext`s anyone can read the counters off. A config-file
+    // inbound gets the stream unwrapped, exactly as before.
+    let metered = users.is_some();
+
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // We should always have a direct entry.
     assert!(!rules.is_empty());
@@ -481,7 +517,7 @@ async fn start_tcp_servers(
                     let tcp_config = tcp_config.clone();
                     let resolver = resolver.clone();
                     let handle = tokio::spawn(async move {
-                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler)
+                        run_tcp_server(socket_addr, tcp_config, resolver, tcp_handler, metered)
                             .await
                             .unwrap();
                     });
@@ -502,7 +538,7 @@ async fn start_tcp_servers(
                 .into();
                 debug!("TCP handler: {tcp_handler:?}");
                 let handle = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, tcp_handler)
+                    run_unix_server(path_buf, resolver, tcp_handler, metered)
                         .await
                         .unwrap();
                 });

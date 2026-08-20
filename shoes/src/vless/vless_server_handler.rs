@@ -9,7 +9,7 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
-use crate::dynamic::UserRegistry;
+use crate::dynamic::{UserRegistry, bind_connection_user};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
@@ -153,11 +153,10 @@ impl TcpServerHandler for VlessTcpServerHandler {
         let mut user_uuid = [0u8; 16];
         user_uuid.copy_from_slice(&header[1..17]);
 
-        // NOTE(shoes-engine): the registry is the sole authority for this inbound, so
-        // an empty one rejects everyone. Phase 3 hands the returned context to the
-        // traffic meter; for now the lookup is purely the authentication step, and the
-        // registry has already recorded it against the user.
-        let _user = match self.users.find_uuid(&user_uuid) {
+        // The registry is the sole authority for this inbound, so an empty one
+        // rejects everyone. On success the connection's traffic is attributed to
+        // this user from here on, including the handshake bytes already read.
+        let user = match self.users.find_uuid(&user_uuid) {
             Some(user) => user,
             None => {
                 debug!("VLESS UUID mismatch");
@@ -173,6 +172,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 return Err(std::io::Error::other("Unknown user id"));
             }
         };
+        bind_connection_user(&user);
 
         stream_reader.consume(17);
 
@@ -333,8 +333,8 @@ where
     let mut user_uuid = [0u8; 16];
     user_uuid.copy_from_slice(&header[1..17]);
 
-    // NOTE(shoes-engine): see VlessTcpServerHandler::setup_server_stream.
-    let _user = match users.find_uuid(&user_uuid) {
+    // See VlessTcpServerHandler::setup_server_stream.
+    let user = match users.find_uuid(&user_uuid) {
         Some(user) => user,
         None => {
             debug!("VLESS/Vision UUID mismatch");
@@ -344,6 +344,7 @@ where
             return Err(std::io::Error::other("Unknown user id"));
         }
     };
+    bind_connection_user(&user);
 
     stream_reader.consume(17);
 

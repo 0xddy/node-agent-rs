@@ -9,7 +9,7 @@ use crate::address::{Address, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
-use crate::dynamic::UserRegistry;
+use crate::dynamic::{UserRegistry, bind_connection_user};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::shadowsocks::{
@@ -147,13 +147,15 @@ impl TcpServerHandler for TrojanTcpHandler {
             )));
         }
 
-        // NOTE(shoes-engine): the registry hashes to a bucket and finishes with a
-        // constant-time comparison, so this is still not a timing oracle. Phase 3 hands
-        // the returned context to the traffic meter.
-        let _user = match users.find_trojan_hash(received_hash) {
+        // The registry hashes to a bucket and finishes with a constant-time
+        // comparison, so this is still not a timing oracle. On success the
+        // connection's traffic is attributed to this user from here on, including
+        // the handshake bytes already read.
+        let user = match users.find_trojan_hash(received_hash) {
             Some(user) => user,
             None => return Err(std::io::Error::other("Invalid password hash")),
         };
+        bind_connection_user(&user);
 
         let command_type = stream_reader.read_u8(&mut server_stream).await?;
 

@@ -23,12 +23,23 @@
 //! Implementations are expected to be lock free; both of the ones shipped here are
 //! (an immutable map for static configs, a sharded concurrent map for dynamic
 //! ones), so authentication never contends with a config reload.
+//!
+//! ## Accounting
+//!
+//! A registry lookup returns the user's [`UserContext`], which is also where their
+//! traffic is counted. [`TrafficMeterStream`] does the counting; its own
+//! documentation covers where it sits in the stack and why the user is attached to
+//! a connection that is already being metered.
 
 pub mod credential;
+mod meter;
 mod registry;
 mod static_registry;
 mod user;
 
+pub use meter::{
+    ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
+};
 pub use registry::UserRegistry;
 pub use static_registry::StaticUserRegistry;
 pub use user::{UserContext, UserStats};

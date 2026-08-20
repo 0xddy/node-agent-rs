@@ -15,7 +15,7 @@ use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::dynamic::UserRegistry;
+use crate::dynamic::{ConnContext, TrafficMeterStream, UserRegistry, scope_connection};
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -33,6 +33,7 @@ async fn start_quic_server(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     num_endpoints: usize,
+    metered: bool,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     // TODO: consider setting transport config
     //   Arc::get_mut(&mut server_config.transport)
@@ -63,7 +64,8 @@ async fn start_quic_server(
                 let resolver = resolver.clone();
                 let server_handler = server_handler.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = process_connection(resolver, server_handler, conn).await {
+                    if let Err(e) = process_connection(resolver, server_handler, conn, metered).await
+                    {
                         error!("Connection ended with error: {e}");
                     }
                 });
@@ -80,6 +82,7 @@ async fn process_connection(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
+    metered: bool,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
 
@@ -97,7 +100,9 @@ async fn process_connection(
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream).await {
+            if let Err(e) =
+                process_streams(cloned_resolver, cloned_handler, stream, metered).await
+            {
                 error!("Failed to process streams: {e}");
             }
         });
@@ -106,13 +111,44 @@ async fn process_connection(
     Ok(())
 }
 
+/// Handle one QUIC bidirectional stream, counting its traffic if the inbound is
+/// metered.
+///
+/// Each bidi stream carries its own protocol handshake, so each one authenticates
+/// separately and is counted as its own connection even when several share a QUIC
+/// connection.
+///
+/// What gets counted here is stream bytes, not datagram bytes: quinn owns the
+/// framing, the packet encryption and the UDP socket, and a datagram on that socket
+/// can carry frames belonging to several streams or to no stream at all. So a QUIC
+/// inbound's figures exclude QUIC's own per-packet overhead, where a TCP inbound's
+/// include TLS's.
 async fn process_streams(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
+    metered: bool,
 ) -> std::io::Result<()> {
-    let quic_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
+    let quic_stream = QuicStream::from(send, recv);
 
+    if !metered {
+        return serve_stream(resolver, server_handler, Box::new(quic_stream)).await;
+    }
+
+    let conn = ConnContext::new();
+    let quic_stream = TrafficMeterStream::new(quic_stream, Arc::clone(&conn));
+    scope_connection(
+        conn,
+        serve_stream(resolver, server_handler, Box::new(quic_stream)),
+    )
+    .await
+}
+
+async fn serve_stream(
+    resolver: Arc<dyn Resolver>,
+    server_handler: Arc<dyn TcpServerHandler>,
+    quic_stream: Box<dyn AsyncStream>,
+) -> std::io::Result<()> {
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
         server_handler.setup_server_stream(quic_stream),
@@ -282,6 +318,10 @@ pub async fn start_quic_servers(
 
     println!("Starting {} QUIC server at {}", &protocol, &bind_location);
 
+    // See `start_tcp_servers`: only an inbound whose users the caller manages has
+    // counters anyone can read.
+    let metered = users.is_some();
+
     let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
     // A direct entry must always exist
     assert!(!rules.is_empty());
@@ -417,6 +457,7 @@ pub async fn start_quic_servers(
                     resolver,
                     tcp_handler,
                     num_endpoints,
+                    metered,
                 )
                 .await?;
 
