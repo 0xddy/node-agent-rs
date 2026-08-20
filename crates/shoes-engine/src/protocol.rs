@@ -108,9 +108,14 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
         // credential is complete.
         ServerProxyConfig::Anytls { .. } => kinds.merge(CredentialKinds::ANYTLS_PASSWORD),
 
-        // Authenticates, but not through the registry yet. Snell has no multi-user
-        // identity mechanism at all, and NaiveProxy still has its own table.
-        ServerProxyConfig::Snell { .. } | ServerProxyConfig::Naiveproxy { .. } => {}
+        // NaiveProxy authenticates with HTTP Basic. `UserSpec` has no `username`
+        // field, so the user's `id` is the username half -- which means the id is
+        // part of the credential here, and renaming a user rotates it.
+        ServerProxyConfig::Naiveproxy { .. } => kinds.merge(CredentialKinds::NAIVE_BASIC),
+
+        // Authenticates, but not through the registry. Snell has no multi-user
+        // identity mechanism at all, so there is nothing for a registry to answer.
+        ServerProxyConfig::Snell { .. } => {}
 
         // Either no credentials at all, or plain proxy credentials that identify a
         // client but not a billable user.
@@ -167,7 +172,13 @@ const PLACEHOLDER_FIELDS: &[(&str, &[&str])] = &[
 /// AnyTLS is the first of these. Its `users` is a `OneOrSome`, which refuses an empty
 /// list, so such an inbound cannot simply omit the field the way a leaf credential
 /// can be omitted -- the placeholder has to be a one-element list.
-const PLACEHOLDER_USER_LISTS: &[(&str, &[&str])] = &[("anytls", &["password"])];
+const PLACEHOLDER_USER_LISTS: &[(&str, &[&str])] = &[
+    ("anytls", &["password"]),
+    // Both spellings of the tag, as with TUIC: `rename_all = "lowercase"` makes the
+    // variant `naiveproxy`, and shoes accepts `naive` as an alias.
+    ("naiveproxy", &["username", "password"]),
+    ("naive", &["username", "password"]),
+];
 /// Fills in the credential fields shoes' schema requires but a registry supersedes.
 ///
 /// `ServerProxyConfig::Vless` has a non-optional `user_id`, so a payload without one
@@ -503,6 +514,19 @@ mod tests {
     }
 
     #[test]
+    fn classifies_naiveproxy_as_an_http_basic_credential() {
+        for json in [
+            r#"{"type":"naiveproxy","users":[{"username":"u","password":"p"}]}"#,
+            r#"{"type":"naive","users":[{"username":"u","password":"p"}]}"#,
+        ] {
+            let kinds = credential_kinds(&parse(json));
+            assert_eq!(kinds, CredentialKinds::NAIVE_BASIC, "for {json}");
+            // The password is half a credential here, never one on its own.
+            assert!(!kinds.plain_password && !kinds.trojan_password);
+        }
+    }
+
+    #[test]
     fn classifies_shadowsocks_only_where_identity_headers_exist() {
         // The two AES 2022 ciphers can name a user, and the length travels with them.
         for (cipher, len) in [("aes-128-gcm", 16), ("aes-256-gcm", 32)] {
@@ -790,6 +814,29 @@ mod tests {
                 matches!(err, EngineError::InvalidConfig(_)),
                 "for {declared}"
             );
+        }
+    }
+
+    #[test]
+    fn fills_in_a_naiveproxy_user_list() {
+        // Two fields per member rather than one, and both spellings of the tag.
+        for tag in ["naiveproxy", "naive"] {
+            let mut config: Value =
+                serde_json::from_str(&inbound(&format!(r#"{{"type":"{tag}"}}"#))).unwrap();
+            install_placeholder_credentials(&mut config).unwrap();
+
+            let users = config["protocol"]["users"].as_array().unwrap();
+            assert_eq!(users.len(), 1, "for {tag}");
+            let username = users[0]["username"].as_str().unwrap();
+            let password = users[0]["password"].as_str().unwrap();
+            assert!(!username.is_empty() && !password.is_empty());
+            assert_ne!(username, password, "two throwaways, not one value twice");
+
+            let mut declared: Value = serde_json::from_str(&inbound(&format!(
+                r#"{{"type":"{tag}","users":[{{"username":"u","password":"p"}}]}}"#
+            )))
+            .unwrap();
+            assert!(install_placeholder_credentials(&mut declared).is_err());
         }
     }
 

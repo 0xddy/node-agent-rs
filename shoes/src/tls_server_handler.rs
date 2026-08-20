@@ -9,7 +9,6 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::perform_crypto_handshake;
 use crate::crypto::{CryptoConnection, CryptoTlsStream};
 use crate::dynamic::UserRegistry;
-use crate::naiveproxy::UserLookup;
 use crate::reality::{RealityServerTarget, setup_reality_server_stream};
 use crate::resolver::Resolver;
 use crate::rustls_connection_util::feed_rustls_server_connection;
@@ -31,7 +30,7 @@ pub struct VisionVlessConfig {
 /// Configuration for NaiveProxy inner protocol
 #[derive(Debug, Clone)]
 pub struct NaiveConfig {
-    pub users: Arc<UserLookup>,
+    pub users: Arc<dyn UserRegistry>,
     pub fallback_path: Option<PathBuf>,
     pub udp_enabled: bool,
     pub padding_enabled: bool,

@@ -198,17 +198,54 @@ pub async fn engine() -> Engine {
         .expect("engine should bootstrap with no config")
 }
 
-/// A loopback address on a port the OS says is free.
+/// A loopback address on a port the OS says is free **for both TCP and UDP**.
 ///
-/// The listener is opened and dropped, so there is a window in which something else
-/// could take the port. Nothing better is available without teaching shoes to bind
-/// `:0` and report back what it got, and in practice the OS does not hand the same
-/// ephemeral port to two live sockets.
+/// Both, because the caller does not say which it wants and the QUIC inbounds want
+/// UDP. TCP and UDP port spaces are independent, so a port the TCP probe found idle
+/// can still be in use by a UDP socket -- which showed up as an intermittent
+/// `WSAEACCES` from a hysteria2 or TUIC listener when the whole workspace suite ran
+/// at once and enough ephemeral ports were in play.
+///
+/// Both sockets are opened and dropped, so there is still a window in which something
+/// else could take the port. Nothing better is available without teaching shoes to
+/// bind `:0` and report back what it got, and in practice the OS does not hand the
+/// same ephemeral port to two live sockets.
 pub fn free_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    let address = listener.local_addr().expect("read back the bound port");
-    drop(listener);
-    address
+    // UDP first, deliberately. Windows reserves whole blocks of UDP ports for
+    // Hyper-V, WSL and Docker -- `netsh int ipv4 show excludedportrange protocol=udp`
+    // lists them -- and those blocks overlap the ephemeral range the OS hands out for
+    // TCP. Asking for a TCP port and then binding UDP on it therefore fails with
+    // `WSAEACCES` for entire runs of ports, which is what made the hysteria2 and TUIC
+    // suites fail intermittently once the workspace run had enough listeners in play.
+    // The OS never hands out an excluded port for a UDP socket, so starting there
+    // gives a port that works for both.
+    // Rejected candidates stay bound for a while rather than being dropped at once:
+    // dropping one immediately lets the OS hand the same port straight back, and a
+    // port whose TCP side is blocked would then be retried instead of moved past.
+    //
+    // Only a window of them, though. The excluded blocks are a few hundred ports wide
+    // and several suites search at the same time, so pinning every rejected port until
+    // the search ended could tie up a large share of the 16k dynamic range.
+    const WINDOW: usize = 64;
+    let mut rejected: Vec<std::net::UdpSocket> = Vec::with_capacity(WINDOW);
+    for _ in 0..1024 {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral udp port");
+        let address = socket.local_addr().expect("read back the bound port");
+        // Probed while the UDP side is still held, so the OS cannot hand this port to
+        // the next caller in between. The reverse collision is rarer than the excluded
+        // ranges but real: a port the UDP probe found idle can still be held for TCP.
+        let listener = std::net::TcpListener::bind(address);
+        if listener.is_ok() {
+            drop(listener);
+            drop(socket);
+            return address;
+        }
+        if rejected.len() == WINDOW {
+            rejected.remove(0);
+        }
+        rejected.push(socket);
+    }
+    panic!("could not find a port free for both udp and tcp after 1024 tries");
 }
 
 // ------------------------------------------------------------------ config builders
@@ -494,6 +531,69 @@ pub fn tls_anytls_chain(server: SocketAddr, password: &str, udp_enabled: bool) -
                 "type": "anytls",
                 "password": password,
                 "udp_enabled": udp_enabled,
+            },
+        },
+    })
+}
+
+/// A NaiveProxy inbound for **dynamic** mode, wrapped in TLS as every real one is.
+///
+/// No `users`, for the same reason [`tls_anytls_inbound`] omits its list: with a
+/// registry injected the config's users are dead, the engine refuses a payload that
+/// declares them, and shoes' schema still requires the field -- so a one-element
+/// throwaway is filled in. NaiveProxy's throwaway needs two fields rather than one.
+pub fn tls_naive_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
+    json!({
+        "address": address.to_string(),
+        "protocol": {
+            "type": "tls",
+            "default_target": {
+                "cert": test_cert(),
+                "key": test_key(),
+                // Not optional: NaiveProxy proxies over HTTP/2 and serves static
+                // files over HTTP/1.1, so without `h2` negotiated the inbound comes
+                // up and quietly refuses to proxy anything.
+                "alpn_protocols": ["h2"],
+                "protocol": {"type": "naive", "udp_enabled": udp_enabled},
+            },
+        },
+    })
+}
+
+/// As [`tls_naive_inbound`], but declaring the users a classic-mode inbound
+/// authenticates against.
+pub fn tls_naive_inbound_with_users(
+    address: SocketAddr,
+    users: &[(&str, &str, &str)],
+    udp_enabled: bool,
+) -> Value {
+    let declared: Vec<Value> = users
+        .iter()
+        .map(|(name, username, password)| {
+            json!({"name": name, "username": username, "password": password})
+        })
+        .collect();
+    let mut config = tls_naive_inbound(address, udp_enabled);
+    config["protocol"]["default_target"]["protocol"]["users"] = json!(declared);
+    config
+}
+
+/// A NaiveProxy leg for one user, through TLS.
+///
+/// In dynamic mode `username` is the user's `id`: that is the half of the HTTP Basic
+/// credential `UserSpec` has no field of its own for.
+pub fn tls_naive_chain(server: SocketAddr, username: &str, password: &str) -> Value {
+    json!({
+        "address": server.to_string(),
+        "protocol": {
+            "type": "tls",
+            "verify": false,
+            "sni_hostname": "e2e.test",
+            "alpn_protocols": ["h2"],
+            "protocol": {
+                "type": "naive",
+                "username": username,
+                "password": password,
             },
         },
     })

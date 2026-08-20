@@ -76,6 +76,22 @@ pub fn password_sha256_prefix(hash: &[u8; 32]) -> [u8; 8] {
     prefix
 }
 
+/// Build the credential a NaiveProxy client sends in its `proxy-authorization`
+/// header: HTTP Basic, i.e. base64 of `username:password`, without the `Basic `
+/// prefix.
+///
+/// The index key for [`find_naive_basic`](super::UserRegistry::find_naive_basic).
+/// Deliberately the *encoded* form rather than the pair: it is what arrives on the
+/// wire, so a registry can compare it in constant time without decoding attacker
+/// controlled base64 first.
+pub fn naive_basic_credential(username: &str, password: &str) -> Box<[u8]> {
+    use base64::engine::{Engine as _, general_purpose::STANDARD as BASE64};
+    BASE64
+        .encode(format!("{username}:{password}"))
+        .into_bytes()
+        .into_boxed_slice()
+}
+
 /// Parse a uuid into the 16 raw bytes VLESS and VMess put on the wire.
 ///
 /// Dashes are optional and ignored, matching what `shoes` accepts in a config file.

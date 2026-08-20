@@ -90,6 +90,11 @@ pub struct CredentialKinds {
     /// cleartext value Trojan and Hysteria2 start from, not a third meaning of it,
     /// so it never conflicts with either.
     pub anytls_password: bool,
+    /// NaiveProxy: HTTP Basic, base64 of `username:password`. The username half is
+    /// the user's `id`, since [`UserSpec`] has no field of its own for it -- so on
+    /// such an inbound the id is part of the credential and renaming a user rotates
+    /// it.
+    pub naive_basic: bool,
 }
 
 impl CredentialKinds {
@@ -100,6 +105,7 @@ impl CredentialKinds {
         shadowsocks_psk: ShadowsocksPsk::None,
         tuic: false,
         anytls_password: false,
+        naive_basic: false,
     };
 
     pub const UUID: Self = Self {
@@ -130,6 +136,11 @@ impl CredentialKinds {
         ..Self::NONE
     };
 
+    pub const NAIVE_BASIC: Self = Self {
+        naive_basic: true,
+        ..Self::NONE
+    };
+
     /// Shadowsocks 2022 users whose PSKs are `len` bytes, i.e. whatever the inbound's
     /// cipher uses.
     pub const fn shadowsocks_psk(len: usize) -> Self {
@@ -149,6 +160,7 @@ impl CredentialKinds {
         self.plain_password |= other.plain_password;
         self.tuic |= other.tuic;
         self.anytls_password |= other.anytls_password;
+        self.naive_basic |= other.naive_basic;
         self.shadowsocks_psk = match (self.shadowsocks_psk, other.shadowsocks_psk) {
             (ShadowsocksPsk::None, only) | (only, ShadowsocksPsk::None) => only,
             (ShadowsocksPsk::Len(a), ShadowsocksPsk::Len(b)) if a == b => ShadowsocksPsk::Len(a),
@@ -162,6 +174,7 @@ impl CredentialKinds {
             || self.plain_password
             || self.tuic
             || self.anytls_password
+            || self.naive_basic
             || matches!(self.shadowsocks_psk, ShadowsocksPsk::Len(_))
     }
 
@@ -189,7 +202,10 @@ impl CredentialKinds {
                     .to_string(),
             ),
             ShadowsocksPsk::Len(_)
-                if self.trojan_password || self.plain_password || self.anytls_password =>
+                if self.trojan_password
+                    || self.plain_password
+                    || self.anytls_password
+                    || self.naive_basic =>
             {
                 Some(
                     "it mixes shadowsocks with a protocol that wants a cleartext password, \
@@ -248,6 +264,9 @@ struct Credentials {
     tuic_password: Option<Arc<str>>,
     /// Raw SHA-256 of the password, which is what an AnyTLS client puts on the wire.
     anytls_hash: Option<[u8; 32]>,
+    /// base64("id:password"), which is what a NaiveProxy client puts in its
+    /// `proxy-authorization` header.
+    naive_encoded: Option<Box<[u8]>>,
 }
 
 /// One user: their shared accounting record plus the credentials that reach it.
@@ -261,6 +280,7 @@ struct Entry {
     shadowsocks: Option<ShadowsocksCredential>,
     tuic_password: Option<Arc<str>>,
     anytls_hash: Option<[u8; 32]>,
+    naive_encoded: Option<Box<[u8]>>,
     /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
     /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
     /// schedule *per user* on every handshake.
@@ -320,6 +340,8 @@ pub struct MemoryUserRegistry {
     by_psk_hash: DashMap<[u8; 16], Arc<Entry>>,
     /// sha256(password) -> user. The index `find_password_sha256` hits.
     by_anytls_hash: DashMap<[u8; 32], Arc<Entry>>,
+    /// base64("id:password") -> user. The index `find_naive_basic` hits.
+    by_naive_encoded: DashMap<Box<[u8]>, Arc<Entry>>,
     /// How many live users' hashes start with each 8-byte prefix.
     ///
     /// A count rather than a set, because two users can share a prefix and removing
@@ -352,6 +374,7 @@ impl MemoryUserRegistry {
             by_psk_hash: DashMap::new(),
             by_anytls_hash: DashMap::new(),
             anytls_prefixes: DashMap::new(),
+            by_naive_encoded: DashMap::new(),
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
         })
     }
@@ -388,7 +411,7 @@ impl MemoryUserRegistry {
             }
         };
 
-        let credentials = self.parse_credentials(&spec)?;
+        let credentials = self.parse_credentials(&id, &spec)?;
         self.check_credentials_unclaimed(&id, &credentials)?;
 
         // Everything past here must succeed: the table is about to change.
@@ -410,6 +433,7 @@ impl MemoryUserRegistry {
             // the entry rather than indexed, so rotating it replaces the whole record.
             tuic_password: credentials.tuic_password,
             anytls_hash: credentials.anytls_hash,
+            naive_encoded: credentials.naive_encoded,
             // Built whenever the user has a uuid, whether or not this inbound speaks
             // VMess. One registry serves a whole inbound, and a TLS inbound can carry
             // VLESS on one SNI and VMess on another, so "is VMess in use here" is not
@@ -446,6 +470,11 @@ impl MemoryUserRegistry {
                 self.by_anytls_hash.remove(&hash);
                 self.release_anytls_prefix(&hash);
             }
+            if previous.naive_encoded != entry.naive_encoded
+                && let Some(encoded) = &previous.naive_encoded
+            {
+                self.by_naive_encoded.remove(encoded);
+            }
         }
 
         if let Some(uuid) = entry.uuid {
@@ -459,6 +488,9 @@ impl MemoryUserRegistry {
         }
         if let Some(shadowsocks) = &entry.shadowsocks {
             self.by_psk_hash.insert(shadowsocks.hash, entry.clone());
+        }
+        if let Some(encoded) = &entry.naive_encoded {
+            self.by_naive_encoded.insert(encoded.clone(), entry.clone());
         }
         if let Some(hash) = entry.anytls_hash
             && self.by_anytls_hash.insert(hash, entry.clone()).is_none()
@@ -505,6 +537,9 @@ impl MemoryUserRegistry {
             self.by_anytls_hash.remove(&hash);
             self.release_anytls_prefix(&hash);
         }
+        if let Some(encoded) = &entry.naive_encoded {
+            self.by_naive_encoded.remove(encoded);
+        }
         self.republish_vmess();
 
         Ok(user_info(&entry.context))
@@ -533,7 +568,10 @@ impl MemoryUserRegistry {
     /// `password` is read as whichever form the inbound wants. It cannot want both --
     /// [`CredentialKinds::conflict`] refuses that combination before a registry is
     /// built -- so there is no ambiguity to resolve here.
-    fn parse_credentials(&self, spec: &UserSpec) -> EngineResult<Credentials> {
+    ///
+    /// `id` is taken as well as the spec because NaiveProxy's credential contains it:
+    /// its wire form is base64 of `username:password`, and the id is the username.
+    fn parse_credentials(&self, id: &str, spec: &UserSpec) -> EngineResult<Credentials> {
         if spec.uuid.is_some() && !self.kinds.uuid {
             return Err(EngineError::InvalidUser(format!(
                 "this inbound does not authenticate by uuid; it accepts {}",
@@ -616,6 +654,17 @@ impl MemoryUserRegistry {
                 true => spec.password.as_deref().map(credential::password_sha256),
                 false => None,
             },
+            // The id is the username half. `UserSpec` has no field for one, and
+            // adding a public field for a single protocol is a worse trade than
+            // saying plainly that on a naive inbound the id is part of the
+            // credential -- so renaming a user rotates it.
+            naive_encoded: match self.kinds.naive_basic {
+                true => spec
+                    .password
+                    .as_deref()
+                    .map(|password| credential::naive_basic_credential(id, password)),
+                false => None,
+            },
         })
     }
 
@@ -670,6 +719,9 @@ impl MemoryUserRegistry {
                 owner: owner.to_string(),
             });
         }
+        // No check for `naive_encoded`: the id is baked into it, so two users cannot
+        // produce the same one without already colliding on their ids -- which the
+        // authoritative map refuses first.
         Ok(())
     }
 
@@ -827,6 +879,12 @@ impl UserRegistry for MemoryUserRegistry {
     /// method's docs.
     fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool {
         self.anytls_prefixes.contains_key(prefix)
+    }
+
+    fn find_naive_basic(&self, encoded: &[u8]) -> Option<Arc<UserContext>> {
+        let entry = self.by_naive_encoded.get(encoded)?;
+        let expected = entry.naive_encoded.as_deref()?;
+        entry.accept(expected, encoded)
     }
 
     fn user_count(&self) -> usize {
@@ -1578,6 +1636,94 @@ mod tests {
         let err = registry.upsert(trojan_spec("bob", "hunter2")).unwrap_err();
         assert!(matches!(err, EngineError::DuplicateCredential { .. }));
         assert_eq!(registry.user_count(), 1);
+    }
+
+    #[test]
+    fn finds_a_naive_user_by_their_basic_credential() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::NAIVE_BASIC);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+
+        let encoded = credential::naive_basic_credential("alice", "hunter2");
+        let found = registry.find_naive_basic(&encoded).unwrap();
+        assert_eq!(&**found.id(), "alice");
+        assert_eq!(found.total_conns(), 1);
+
+        // Neither half stands alone, and garbage off a header must not match.
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("alice", "hunter3"))
+                .is_none()
+        );
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("bob", "hunter2"))
+                .is_none()
+        );
+        assert!(registry.find_naive_basic(b"not base64").is_none());
+        assert!(registry.find_naive_basic(&[0xff, 0xfe]).is_none());
+    }
+
+    #[test]
+    fn renaming_a_naive_user_rotates_their_credential() {
+        // The consequence of the id being the username half. Worth pinning, because
+        // it is the one place in this crate where an id is not merely a label.
+        let registry = MemoryUserRegistry::new(CredentialKinds::NAIVE_BASIC);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        registry.upsert(trojan_spec("alice2", "hunter2")).unwrap();
+
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("alice2", "hunter2"))
+                .is_some()
+        );
+        // The old id is a separate user, not a retired name, so it still works --
+        // renaming is add-plus-remove, which is what the API offers.
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("alice", "hunter2"))
+                .is_some()
+        );
+        assert_eq!(registry.user_count(), 2);
+
+        registry.remove("naive", "alice").unwrap();
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("alice", "hunter2"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rotating_a_naive_password_retires_the_old_credential() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::NAIVE_BASIC);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        registry.upsert(trojan_spec("alice", "hunter3")).unwrap();
+
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("alice", "hunter3"))
+                .is_some()
+        );
+        assert!(
+            registry
+                .find_naive_basic(&credential::naive_basic_credential("alice", "hunter2"))
+                .is_none()
+        );
+        assert_eq!(registry.user_count(), 1);
+    }
+
+    #[test]
+    fn a_disabled_naive_user_looks_absent() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::NAIVE_BASIC);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        let encoded = credential::naive_basic_credential("alice", "hunter2");
+
+        let user = registry.find_naive_basic(&encoded).unwrap();
+        user.set_enabled(false);
+        assert!(registry.find_naive_basic(&encoded).is_none());
+        assert_eq!(user.total_conns(), 1, "a denial is not a connection");
+        user.set_enabled(true);
+        assert!(registry.find_naive_basic(&encoded).is_some());
     }
 
     #[test]

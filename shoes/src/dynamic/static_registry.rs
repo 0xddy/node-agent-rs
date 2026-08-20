@@ -10,7 +10,9 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 use subtle::ConstantTimeEq;
 
-use super::credential::{VmessAuthKey, password_sha256, password_sha256_prefix};
+use super::credential::{
+    VmessAuthKey, naive_basic_credential, password_sha256, password_sha256_prefix,
+};
 use super::registry::{TuicIdentity, UserRegistry, VmessIdentity};
 use super::user::UserContext;
 use crate::trojan_handler::create_password_hash;
@@ -115,6 +117,7 @@ pub struct StaticUserRegistry {
     by_trojan_hash: FxHashMap<Box<[u8]>, Entry>,
     by_password: FxHashMap<Box<str>, Entry>,
     by_anytls_hash: FxHashMap<[u8; 32], Entry>,
+    by_naive_encoded: FxHashMap<Box<[u8]>, Entry>,
     /// The 8-byte prefixes of everything in `by_anytls_hash`, for the probe AnyTLS
     /// makes before it has read a whole credential. A set rather than a count,
     /// because this map is immutable once built and nothing is ever removed from it.
@@ -231,6 +234,19 @@ impl StaticUserRegistry {
         Arc::new(registry)
     }
 
+    /// Register a NaiveProxy credential: a username and password, indexed by the
+    /// base64 pair the client actually sends.
+    ///
+    /// `name` is the config's display name, kept apart from `username` because
+    /// NaiveProxy has both and only the latter is part of the credential.
+    pub fn add_naive_user(&mut self, name: &str, username: &str, password: &str) -> &mut Self {
+        let encoded = naive_basic_credential(username, password);
+        let id = if name.is_empty() { username } else { name };
+        self.by_naive_encoded
+            .insert(encoded.clone(), Entry::new(id, encoded));
+        self
+    }
+
     /// Registry for a config that declares exactly one TUIC uuid and password.
     pub fn single_tuic(uuid_str: &str, password: &str) -> std::io::Result<Arc<dyn UserRegistry>> {
         let mut registry = Self::new();
@@ -267,6 +283,10 @@ impl UserRegistry for StaticUserRegistry {
         self.by_anytls_hash.get(hash)?.verify(&hash[..])
     }
 
+    fn find_naive_basic(&self, encoded: &[u8]) -> Option<Arc<UserContext>> {
+        self.by_naive_encoded.get(encoded)?.verify(encoded)
+    }
+
     fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool {
         // Deliberately no `is_enabled` check: see the trait method's docs. A
         // suspended user's connections must reach the same place a live user's do,
@@ -279,6 +299,7 @@ impl UserRegistry for StaticUserRegistry {
             + self.by_trojan_hash.len()
             + self.by_password.len()
             + self.by_anytls_hash.len()
+            + self.by_naive_encoded.len()
     }
 }
 
@@ -418,6 +439,7 @@ mod tests {
                 .find_password_sha256(&password_sha256("x"))
                 .is_none()
         );
+        assert!(registry.find_naive_basic(b"").is_none());
         assert!(!registry.has_password_sha256_prefix(&[0u8; 8]));
     }
 
@@ -582,6 +604,88 @@ mod tests {
         );
 
         assert!(!registry.has_password_sha256_prefix(&[0u8; 8]));
+    }
+
+    #[test]
+    fn finds_a_naive_user_by_the_basic_credential_they_send() {
+        let mut registry = StaticUserRegistry::new();
+        registry.add_naive_user("alice", "alice-user", "hunter2");
+        let registry: Arc<dyn UserRegistry> = Arc::new(registry);
+
+        let encoded = naive_basic_credential("alice-user", "hunter2");
+        let found = registry
+            .find_naive_basic(&encoded)
+            .expect("the config's own credential should authenticate");
+        assert_eq!(&**found.id(), "alice");
+        assert_eq!(found.total_conns(), 1);
+
+        // The username alone is not the credential, nor is the password.
+        assert!(
+            registry
+                .find_naive_basic(&naive_basic_credential("alice-user", "hunter3"))
+                .is_none()
+        );
+        assert!(
+            registry
+                .find_naive_basic(&naive_basic_credential("bob-user", "hunter2"))
+                .is_none()
+        );
+        // Garbage off a header must not panic or match.
+        assert!(registry.find_naive_basic(b"not base64 at all").is_none());
+        assert!(registry.find_naive_basic(&[0xff, 0xfe]).is_none());
+    }
+
+    #[test]
+    fn a_naive_credential_survives_a_colon_in_the_password() {
+        // Base64 hides it, and the server never splits the decoded pair -- it
+        // compares the encoding -- so a password containing the separator is fine.
+        let mut registry = StaticUserRegistry::new();
+        registry.add_naive_user("bob", "user", "p@ss:w0rd!");
+        registry.add_naive_user("empty", "user2", "");
+
+        assert!(
+            registry
+                .find_naive_basic(&naive_basic_credential("user", "p@ss:w0rd!"))
+                .is_some()
+        );
+        assert!(
+            registry
+                .find_naive_basic(&naive_basic_credential("user2", ""))
+                .is_some(),
+            "an empty password is still a credential, and must not match a missing one"
+        );
+        // And the naive reading -- split on the first colon -- must not authenticate.
+        assert!(
+            registry
+                .find_naive_basic(&naive_basic_credential("user", "p@ss"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_naive_user_without_a_name_is_reported_by_their_username() {
+        // Their username, never their password: the config's `name` is optional and
+        // the username is the half of the credential that is not a secret.
+        let mut registry = StaticUserRegistry::new();
+        registry.add_naive_user("", "alice-user", "hunter2");
+        let found = registry
+            .find_naive_basic(&naive_basic_credential("alice-user", "hunter2"))
+            .unwrap();
+        assert_eq!(&**found.id(), "alice-user");
+    }
+
+    #[test]
+    fn a_disabled_naive_user_looks_absent() {
+        let mut registry = StaticUserRegistry::new();
+        registry.add_naive_user("alice", "alice-user", "hunter2");
+        let encoded = naive_basic_credential("alice-user", "hunter2");
+
+        let user = registry.find_naive_basic(&encoded).unwrap();
+        user.set_enabled(false);
+        assert!(registry.find_naive_basic(&encoded).is_none());
+        assert_eq!(user.total_conns(), 1, "a denial is not a connection");
+        user.set_enabled(true);
+        assert!(registry.find_naive_basic(&encoded).is_some());
     }
 
     #[test]

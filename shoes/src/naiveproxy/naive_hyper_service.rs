@@ -22,6 +22,7 @@ use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::crypto::CryptoTlsStream;
+use crate::dynamic::{ConnContext, UserContext, UserRegistry, current_connection};
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
@@ -36,7 +37,6 @@ use super::naive_padding_stream::{
     NaivePaddingStream, PaddingDirection, PaddingType, generate_padding_header,
     parse_padding_type_request,
 };
-use super::user_lookup::UserLookup;
 
 /// Wrapper for hyper's upgraded stream that implements AsyncStream.
 ///
@@ -100,12 +100,35 @@ impl AsyncStream for HyperUpgradedStream {}
 
 /// Service configuration for hyper NaiveProxy handler
 struct NaiveServiceConfig {
-    users: Arc<UserLookup>,
+    users: Arc<dyn UserRegistry>,
     fallback_path: Option<PathBuf>,
     resolver: Arc<dyn Resolver>,
     proxy_selector: Arc<ClientProxySelector>,
     udp_enabled: bool,
     padding_enabled: bool,
+    /// The connection's accounting record, captured before the spawn below.
+    ///
+    /// Every other TCP protocol finds this through a task local, because it
+    /// authenticates inline on the task that accepted the connection. NaiveProxy
+    /// does not: hyper owns the task from `serve_connection` onward, and the
+    /// credential is not read until a request arrives on it. A task local does not
+    /// cross `tokio::spawn`, so without this the user's counters would sit at zero
+    /// while every byte still flowed correctly -- a silent failure.
+    meter: Option<Arc<ConnContext>>,
+}
+
+/// Resolve a `proxy-authorization` header to the user it belongs to.
+///
+/// The header value is compared as it arrived, never decoded: it is attacker
+/// controlled, and the registry indexes on the encoded form for that reason. A value
+/// that is not valid UTF-8, or does not start with `Basic `, is simply not anyone's
+/// credential.
+fn authenticate(
+    header: &http::HeaderValue,
+    config: &NaiveServiceConfig,
+) -> Option<Arc<UserContext>> {
+    let encoded = header.to_str().ok()?.strip_prefix("Basic ")?;
+    config.users.find_naive_basic(encoded.as_bytes())
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
@@ -138,6 +161,9 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         proxy_selector: effective_selector,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
+        // Read here, on the accepting task, which is the last point at which the
+        // task local is still reachable. `None` for an inbound that is not metered.
+        meter: current_connection(),
     });
 
     if use_h2 {
@@ -254,8 +280,17 @@ async fn naive_service(
     }
 
     let username = match req.headers().get("proxy-authorization") {
-        Some(auth) => match auth.to_str().ok().and_then(|s| config.users.validate(s)) {
-            Some(user) => user.to_string(),
+        Some(auth) => match authenticate(auth, &config) {
+            Some(user) => {
+                // Binds the whole connection, not this request: NaiveProxy
+                // multiplexes every CONNECT over one H2 connection, so the first
+                // request to authenticate is the one that names it, and a second
+                // bind is refused rather than double counted.
+                if let Some(meter) = &config.meter {
+                    meter.bind(Arc::clone(&user));
+                }
+                user.id().to_string()
+            }
             None => {
                 debug!("NaiveProxy: invalid credentials, returning 400");
                 return Ok(Response::builder()

@@ -15,7 +15,6 @@ use crate::config::{
 use crate::dynamic::{StaticUserRegistry, UserRegistry};
 use crate::http_handler::HttpTcpServerHandler;
 use crate::mixed_handler::MixedTcpServerHandler;
-use crate::naiveproxy::UserLookup;
 use crate::option_util::OneOrSome;
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::reality::RealityServerTarget;
@@ -89,6 +88,26 @@ fn resolve_anytls_users(
                 // cannot be used to authenticate, and an empty id would make two
                 // nameless users indistinguishable in a report.
                 registry.add_anytls_password(id, &user.password);
+            }
+            Arc::new(registry)
+        }
+    }
+}
+
+/// Registry for NaiveProxy, which authenticates by an HTTP Basic credential.
+///
+/// Like AnyTLS, its config is already a list, so without an injected registry every
+/// declared user goes into a static one rather than just the first.
+fn resolve_naive_users(
+    users: Option<&Arc<dyn UserRegistry>>,
+    config_users: &[crate::config::server::NaiveUserConfig],
+) -> Arc<dyn UserRegistry> {
+    match users {
+        Some(registry) => Arc::clone(registry),
+        None => {
+            let mut registry = StaticUserRegistry::new();
+            for user in config_users {
+                registry.add_naive_user(&user.name, &user.username, &user.password);
             }
             Arc::new(registry)
         }
@@ -449,21 +468,17 @@ fn create_tls_server_target(
 
     // Create inner_protocol based on protocol type
     let inner_protocol = if let ServerProxyConfig::Naiveproxy {
-        users,
+        // Renamed rather than destructured as `users`, which would shadow the
+        // registry parameter of the same name for the rest of this block.
+        users: config_users,
         padding,
         fallback,
         udp_enabled,
     } = protocol
     {
         // NaiveProxy uses hyper-based handler
-        let users_vec: Vec<(String, String, String)> = users
-            .into_vec()
-            .into_iter()
-            .map(|u| (u.name, u.username, u.password))
-            .collect();
-
         InnerProtocol::Naive(NaiveConfig {
-            users: Arc::new(UserLookup::new(users_vec)),
+            users: resolve_naive_users(users, &config_users.into_vec()),
             fallback_path: fallback.map(|f| f.0),
             udp_enabled,
             padding_enabled: padding,
@@ -609,21 +624,17 @@ fn create_reality_server_target(
 
     // Create inner_protocol based on protocol type
     let inner_protocol = if let ServerProxyConfig::Naiveproxy {
-        users,
+        // Renamed rather than destructured as `users`, which would shadow the
+        // registry parameter of the same name for the rest of this block.
+        users: config_users,
         padding,
         fallback,
         udp_enabled,
     } = protocol
     {
         // NaiveProxy uses hyper-based handler
-        let users_vec: Vec<(String, String, String)> = users
-            .into_vec()
-            .into_iter()
-            .map(|u| (u.name, u.username, u.password))
-            .collect();
-
         InnerProtocol::Naive(NaiveConfig {
-            users: Arc::new(UserLookup::new(users_vec)),
+            users: resolve_naive_users(users, &config_users.into_vec()),
             fallback_path: fallback.map(|f| f.0),
             udp_enabled,
             padding_enabled: padding,

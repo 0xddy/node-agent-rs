@@ -19,13 +19,14 @@ mergeable. Protocols are converted one at a time to authenticate through
 | Hysteria2 | yes | yes | `d439df4` |
 | TUIC v5 | yes | yes | `6f163d9` |
 | AnyTLS | yes | yes | increment 2 |
-| **NaiveProxy** | **no** — own `UserLookup` | **no** — auth is past a `tokio::spawn` | increment 3 |
+| NaiveProxy | yes | yes | increment 3 |
 | Snell | n/a | n/a | out of scope: no multi-user identity mechanism exists |
 
 Rules hot-reload works for every inbound, including Hysteria2 and TUIC — see
 increment 1, which has landed.
 
-One increment remains.
+All three have landed. What remains is listed under **Still open** at the foot of
+this document.
 
 ---
 
@@ -246,7 +247,21 @@ genuinely new pieces.
 
 ---
 
-## 3. NaiveProxy
+## 3. NaiveProxy — **landed**
+
+Built as designed below. `UserLookup` is gone entirely rather than patched: the
+registry answers for it, so the assert went with the type. The credential shape went
+the way the plan proposes — the user's `id` is the username half — and the
+`Arc<ConnContext>` is captured in `run_naive_hyper_service`, which is the last point
+before hyper takes the task.
+
+The plan missed one thing, found by the new suite: a NaiveProxy inbound only proxies
+over HTTP/2, and serves static files over HTTP/1.1. Without `alpn_protocols: ["h2"]`
+on the TLS target it comes up and quietly refuses to proxy anything, so the harness
+helper sets it on both sides.
+
+<details>
+<summary>The original plan, kept as the design record</summary>
 
 ### The gap
 
@@ -319,6 +334,8 @@ refuse everyone, not panic.
 **Risk: moderate.** The `Arc<ConnContext>` across the hyper boundary is the fiddly
 part, and it is the part a passing TCP-only suite would not catch.
 
+</details>
+
 ---
 
 ## What "done" means for an increment
@@ -341,9 +358,10 @@ The convention the last four commits established:
 
 ## Still open
 
-- **`docs/dynamic-engine-design.md`** — a design document to sit beside this plan,
-  covering the registry/metering architecture rather than the schedule. Offered
-  several times, never answered.
 - **Snell** stays out. It has no multi-user identity mechanism at all, so
   `credential_kinds` should keep classifying it as "no registry credentials" and the
   engine should keep refusing it a `users` list.
+- **The "Invasiveness" table in `crates/shoes-engine/src/lib.rs`** still describes the
+  phase-2a footprint — two authentication sites out of the eight there are now.
+  Section 8 of [dynamic-engine-design.md](dynamic-engine-design.md) supersedes it and
+  says so, but the module doc itself has not been corrected.

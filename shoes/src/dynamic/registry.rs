@@ -196,6 +196,17 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Look up the HTTP Basic credential NaiveProxy sends in `proxy-authorization`:
+    /// base64 of `username:password`, with the `Basic ` prefix already stripped.
+    ///
+    /// `encoded` is caller-supplied and comes straight off a header, so
+    /// implementations must not assume it is valid base64, valid UTF-8, or any
+    /// particular length -- only compare it, never decode it.
+    fn find_naive_basic(&self, encoded: &[u8]) -> Option<Arc<UserContext>> {
+        let _ = encoded;
+        None
+    }
+
     /// How many users are registered. For diagnostics and API responses only; this
     /// may take a lock or walk shards, so it must not be called per connection.
     fn user_count(&self) -> usize;
