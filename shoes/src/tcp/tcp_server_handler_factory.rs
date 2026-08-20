@@ -259,7 +259,7 @@ pub fn create_tcp_server_handler(
             udp_enabled,
         } => Box::new(VmessTcpServerHandler::new(
             &cipher,
-            &user_id,
+            resolve_uuid_users(users, &user_id),
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),

@@ -4,6 +4,24 @@ use std::sync::Arc;
 
 use super::user::UserContext;
 
+/// Who a VMess auth id belongs to, and what the rest of the handshake needs.
+///
+/// A VMess server cannot proceed on "yes, that is a valid user" alone -- the next
+/// thing it does is derive the request header's AEAD keys from that user's
+/// instruction key -- so the search hands back everything it recovered rather than a
+/// bare `Arc<UserContext>`.
+pub struct VmessIdentity {
+    /// The user whose key sealed the auth id.
+    pub user: Arc<UserContext>,
+    /// The key the request header's AEAD keys are derived from.
+    pub instruction_key: [u8; 16],
+    /// The unix timestamp, in seconds, that the client sealed into the auth id.
+    ///
+    /// Recovered but **not** judged: see [`UserRegistry::find_vmess_auth_id`] for why
+    /// the freshness check belongs to the caller.
+    pub timestamp: u64,
+}
+
 /// Resolves a credential presented during a handshake to the user it belongs to.
 ///
 /// One registry belongs to one inbound. Implementations must be cheap to call and
@@ -53,6 +71,26 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// Look up a plaintext password, as used by AnyTLS and Hysteria2.
     fn find_password(&self, password: &str) -> Option<Arc<UserContext>> {
         let _ = password;
+        None
+    }
+
+    /// Find whose VMess auth id this is, together with the material the rest of that
+    /// user's handshake is derived from.
+    ///
+    /// This one is a search rather than a lookup, because a VMess auth id carries no
+    /// identifier to index on -- see [`VmessAuthKey`](super::credential::VmessAuthKey)
+    /// for what is actually in those 16 bytes. An implementation is expected to try
+    /// each of its users' keys until one validates, so the cost is linear in the user
+    /// count. That is what every other implementation of this protocol does too, and
+    /// it is a per-connection cost of well under a microsecond per user.
+    ///
+    /// The timestamp is recovered but deliberately not checked. Judging freshness is
+    /// the handler's business: rejecting a recognised user's stale auth id inside the
+    /// search would send their connection on to the remaining users and have it come
+    /// back as an unknown credential, which is a much worse diagnostic than "your
+    /// clock is wrong".
+    fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
+        let _ = auth_id;
         None
     }
 

@@ -36,6 +36,9 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
         // Registry-backed today.
         ServerProxyConfig::Vless { .. } => kinds.merge(CredentialKinds::UUID),
         ServerProxyConfig::Trojan { .. } => kinds.merge(CredentialKinds::TROJAN_PASSWORD),
+        // VMess identifies users by the same uuid VLESS does, so it needs no credential
+        // form of its own -- only a different lookup, which the registry provides.
+        ServerProxyConfig::Vmess { .. } => kinds.merge(CredentialKinds::UUID),
 
         // Containers. Each target names its own inner protocol, so one inbound can
         // need more than one credential form -- e.g. VLESS on one SNI and Trojan on
@@ -68,13 +71,11 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
 
         // Authenticates, but not through the registry yet. Phase 2b wires these up:
         // Shadowsocks and Snell need the 2022 identity header to be multi-user at
-        // all, VMess needs trial decryption over a user snapshot, AnyTLS and
-        // NaiveProxy already have their own multi-user tables, and Hysteria2 and
-        // TUIC authenticate inside `quic_server.rs` rather than through a
-        // `TcpServerHandler`.
+        // all, AnyTLS and NaiveProxy already have their own multi-user tables, and
+        // Hysteria2 and TUIC authenticate inside `quic_server.rs` rather than through
+        // a `TcpServerHandler`.
         ServerProxyConfig::Shadowsocks { .. }
         | ServerProxyConfig::Snell { .. }
-        | ServerProxyConfig::Vmess { .. }
         | ServerProxyConfig::Anytls { .. }
         | ServerProxyConfig::Naiveproxy { .. }
         | ServerProxyConfig::Hysteria2 { .. }
@@ -115,7 +116,11 @@ pub(crate) fn display_name(protocol: &ServerProxyConfig) -> String {
 }
 
 /// The leaf credential field each registry-backed protocol declares in its config.
-const PLACEHOLDER_FIELDS: &[(&str, &str)] = &[("vless", "user_id"), ("trojan", "password")];
+const PLACEHOLDER_FIELDS: &[(&str, &str)] = &[
+    ("vless", "user_id"),
+    ("vmess", "user_id"),
+    ("trojan", "password"),
+];
 /// Fills in the credential fields shoes' schema requires but a registry supersedes.
 ///
 /// `ServerProxyConfig::Vless` has a non-optional `user_id`, so a payload without one

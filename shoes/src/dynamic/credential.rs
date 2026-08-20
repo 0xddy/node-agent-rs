@@ -8,6 +8,15 @@
 //! `StaticUserRegistry` does. Re-deriving either of them elsewhere would put a
 //! second implementation of a wire format in the tree, and the two would drift.
 
+/// A user's precomputed material for recognising their VMess auth id.
+///
+/// The odd one out here. The other two conversions turn a credential into an index
+/// key, because those protocols put something identifying on the wire; VMess does
+/// not, so this is a key a registry has to *try* rather than a value it can look up.
+/// [`VmessAuthKey`]'s own documentation covers why, and why deriving it once per user
+/// is what keeps the trial cheap.
+pub use crate::vmess::VmessAuthKey;
+
 /// Parse a uuid into the 16 raw bytes VLESS and VMess put on the wire.
 ///
 /// Dashes are optional and ignored, matching what `shoes` accepts in a config file.

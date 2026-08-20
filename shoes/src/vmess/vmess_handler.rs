@@ -7,8 +7,7 @@ use aws_lc_rs::aead::{
     AES_128_GCM, Aad, BoundKey, CHACHA20_POLY1305, OpeningKey, SealingKey, UnboundKey,
 };
 use aws_lc_rs::cipher::{
-    AES_128, DecryptingKey as CipherDecryptingKey, DecryptionContext,
-    EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
+    AES_128, EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
 };
 use bytes::BytesMut;
 use rand::{Rng, RngExt};
@@ -23,6 +22,7 @@ use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::dynamic::{UserRegistry, bind_connection_user};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
@@ -64,8 +64,7 @@ impl From<&str> for DataCipher {
 
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
-    instruction_key: [u8; 16],
-    aead_decrypting_key: CipherDecryptingKey,
+    users: Arc<dyn UserRegistry>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -83,23 +82,14 @@ impl std::fmt::Debug for VmessTcpServerHandler {
 impl VmessTcpServerHandler {
     pub fn new(
         cipher_name: &str,
-        user_id: &str,
+        users: Arc<dyn UserRegistry>,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
-        let mut user_id_bytes = parse_uuid(user_id).unwrap();
-        user_id_bytes.extend(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-        let instruction_key: [u8; 16] = compute_md5(&user_id_bytes);
-
-        let derived_key = super::sha2::kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
-        let unbound_key = UnboundCipherKey::new(&AES_128, &derived_key[0..16]).unwrap();
-        let aead_decrypting_key = CipherDecryptingKey::ecb(unbound_key).unwrap();
-
         Self {
             data_cipher: cipher_name.into(),
-            aead_decrypting_key,
-            instruction_key,
+            users,
             udp_enabled,
             proxy_selector,
             resolver,
@@ -120,30 +110,22 @@ impl TcpServerHandler for VmessTcpServerHandler {
             .read_slice_into(&mut server_stream, &mut cert_hash)
             .await?;
 
-        // we need to copy it over because if this is an aead request, we need the original
-        // bytes for decrypting the header.
-        let mut aead_bytes = [0u8; 16];
-        aead_bytes.copy_from_slice(&cert_hash);
-
-        self.aead_decrypting_key
-            .decrypt(&mut aead_bytes, DecryptionContext::None)
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "AEAD auth ID decryption failed",
-                )
-            })?;
-        let checksum = super::crc32::crc32c(&aead_bytes[0..12]);
-        let expected_checksum = u32::from_be_bytes(aead_bytes[12..16].try_into().unwrap());
-
-        if checksum != expected_checksum {
-            return Err(std::io::Error::new(
+        // VMess sends no identifier, so the only way to learn whose connection this is
+        // is to try each known user's key. The registry owns that search; what comes
+        // back is the user and the instruction key the rest of this header is derived
+        // from. `cert_hash` itself stays untouched -- the AEAD below authenticates the
+        // original ciphertext, not the plaintext inside it.
+        let identity = self.users.find_vmess_auth_id(&cert_hash).ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "AEAD authentication failed: checksum mismatch",
-            ));
-        }
+                "AEAD authentication failed: unknown auth ID",
+            )
+        })?;
+        let instruction_key = identity.instruction_key;
 
-        let time_secs = u64::from_be_bytes(aead_bytes[0..8].try_into().unwrap());
+        // Judged here rather than in the registry, so that a user we do recognise is
+        // told their clock is wrong instead of being reported as a stranger.
+        let time_secs = identity.timestamp;
         let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
         let time_delta = time_secs.abs_diff(current_time_secs);
         if time_delta > 120 {
@@ -152,6 +134,10 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
             ));
         }
+
+        // Attribute this connection's traffic from here on. Everything read so far is
+        // already counted against the inbound and is handed over by the meter.
+        bind_connection_user(&identity.user);
 
         let mut encrypted_payload_length = [0u8; 18];
         stream_reader
@@ -164,12 +150,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
             .await?;
 
         let header_length_aead_key = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Key_Length", &cert_hash, &nonce],
         );
 
         let header_length_nonce = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Nonce_Length", &cert_hash, &nonce],
         );
 
@@ -193,12 +179,12 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
 
         let header_aead_key = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Key", &cert_hash, &nonce],
         );
 
         let header_nonce = super::sha2::kdf(
-            &self.instruction_key,
+            &instruction_key,
             &[b"VMess Header AEAD Nonce", &cert_hash, &nonce],
         );
 

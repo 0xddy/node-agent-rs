@@ -19,11 +19,26 @@
 //! comparison, and an `Arc` clone. It happens once per connection, during the
 //! handshake, never per packet. The read guard is held only for the comparison, so
 //! a concurrent `upsert` on the same shard waits nanoseconds, not for I/O.
+//!
+//! # The exception: VMess
+//!
+//! VMess is the one protocol here whose credential cannot be indexed at all -- its
+//! auth id carries no identifier, only a sealed timestamp -- so recognising a user
+//! means trying every uuid-bearing user's key. Walking a `DashMap` to do that would
+//! take a read lock per shard on the connection path, which is exactly what this
+//! module exists to avoid, so those entries are *also* published as an immutable
+//! `Vec` behind an `ArcSwap`. A mutation rebuilds and stores a new one; a lookup
+//! reads a pointer and walks a slice.
+//!
+//! It is the same records either way: the snapshot holds the same `Arc<Entry>`s the
+//! maps do, so there is no second copy of anyone's state that could drift.
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use shoes::dynamic::{UserContext, UserRegistry, credential};
+use shoes::dynamic::credential::VmessAuthKey;
+use shoes::dynamic::{UserContext, UserRegistry, VmessIdentity, credential};
 use shoes_api::{UserInfo, UserSpec};
 use subtle::ConstantTimeEq;
 
@@ -91,6 +106,10 @@ struct Entry {
     /// that found this entry is not constant time and proves nothing on its own.
     uuid: Option<[u8; 16]>,
     trojan_hash: Option<Box<[u8]>>,
+    /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
+    /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
+    /// schedule *per user* on every handshake.
+    vmess: Option<VmessAuthKey>,
 }
 
 impl Entry {
@@ -106,6 +125,28 @@ impl Entry {
         self.context.note_auth();
         Some(self.context.clone())
     }
+
+    /// Whether this user sealed `auth_id`, and what the handshake needs next.
+    ///
+    /// No constant-time comparison here, unlike `accept`, and none is called for:
+    /// nothing is being compared against a stored secret. A valid checksum is itself
+    /// proof that the sender held the uuid, so there is no credential to leak a byte
+    /// at a time.
+    ///
+    /// A disabled user reports absent and is not counted, same as `accept`.
+    fn accept_vmess(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
+        let key = self.vmess.as_ref()?;
+        let timestamp = key.open(auth_id)?;
+        if !self.context.is_enabled() {
+            return None;
+        }
+        self.context.note_auth();
+        Some(VmessIdentity {
+            user: self.context.clone(),
+            instruction_key: *key.instruction_key(),
+            timestamp,
+        })
+    }
 }
 
 /// A user table that can be mutated while the inbound it belongs to is serving.
@@ -118,6 +159,10 @@ pub struct MemoryUserRegistry {
     by_uuid: DashMap<[u8; 16], Arc<Entry>>,
     /// wire hash -> user. The index `find_trojan_hash` hits.
     by_trojan_hash: DashMap<Box<[u8]>, Arc<Entry>>,
+    /// Every uuid-bearing user, as an immutable snapshot for VMess to walk. Not an
+    /// index -- there is nothing to index on -- so it is republished whole on each
+    /// mutation. See the module docs.
+    vmess_candidates: ArcSwap<Vec<Arc<Entry>>>,
 }
 
 impl std::fmt::Debug for MemoryUserRegistry {
@@ -136,6 +181,7 @@ impl MemoryUserRegistry {
             users: DashMap::new(),
             by_uuid: DashMap::new(),
             by_trojan_hash: DashMap::new(),
+            vmess_candidates: ArcSwap::from_pointee(Vec::new()),
         })
     }
 
@@ -187,6 +233,11 @@ impl MemoryUserRegistry {
             context,
             uuid: credentials.uuid,
             trojan_hash: credentials.trojan_hash,
+            // Built whenever the user has a uuid, whether or not this inbound speaks
+            // VMess. One registry serves a whole inbound, and a TLS inbound can carry
+            // VLESS on one SNI and VMess on another, so "is VMess in use here" is not
+            // a question this type is in a position to answer.
+            vmess: credentials.uuid.as_ref().map(VmessAuthKey::new),
         });
 
         // Retire index keys the user no longer presents, or an old credential would
@@ -211,6 +262,7 @@ impl MemoryUserRegistry {
             self.by_trojan_hash.insert(hash.clone(), entry.clone());
         }
         self.users.insert(id, entry.clone());
+        self.republish_vmess();
 
         Ok(user_info(&entry.context))
     }
@@ -237,6 +289,7 @@ impl MemoryUserRegistry {
         if let Some(hash) = &entry.trojan_hash {
             self.by_trojan_hash.remove(hash);
         }
+        self.republish_vmess();
 
         Ok(user_info(&entry.context))
     }
@@ -333,6 +386,29 @@ impl MemoryUserRegistry {
             .get(hash)
             .map(|e| e.context.id().clone())
     }
+
+    /// Republish the VMess trial snapshot from the authoritative map.
+    ///
+    /// Rebuilt whole rather than patched, so it cannot drift from the map it is
+    /// derived from. The cost is one allocation and one pass over the users, on a
+    /// control-plane path that already holds the engine's write lock -- and it buys a
+    /// connection path that takes no lock at all.
+    ///
+    /// The snapshot lags the maps by the few instructions between the two writes. What
+    /// a connection landing in that window sees is the *older* set, so a just-added
+    /// user is briefly unknown and a just-removed one briefly still works. Both fail
+    /// in the direction the rest of the design already accepts: `remove_user` is
+    /// documented not to disturb what is already connected, and a user added
+    /// microseconds ago has no client waiting on them.
+    fn republish_vmess(&self) {
+        let candidates: Vec<Arc<Entry>> = self
+            .users
+            .iter()
+            .filter(|entry| entry.value().vmess.is_some())
+            .map(|entry| entry.value().clone())
+            .collect();
+        self.vmess_candidates.store(Arc::new(candidates));
+    }
 }
 
 impl UserRegistry for MemoryUserRegistry {
@@ -346,6 +422,16 @@ impl UserRegistry for MemoryUserRegistry {
         let entry = self.by_trojan_hash.get(hash)?;
         let expected = entry.trojan_hash.as_deref()?;
         entry.accept(expected, hash)
+    }
+
+    fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
+        // Linear in the user count, by necessity -- see the trait method's docs. The
+        // `load` is a pointer read, so the walk holds no lock: a concurrent `upsert`
+        // neither blocks it nor mutates the slice underneath it.
+        self.vmess_candidates
+            .load()
+            .iter()
+            .find_map(|entry| entry.accept_vmess(auth_id))
     }
 
     fn user_count(&self) -> usize {
@@ -591,6 +677,157 @@ mod tests {
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
         let err = registry.remove("in", "nobody").unwrap_err();
         assert!(matches!(err, EngineError::UnknownUser { .. }));
+    }
+
+    // -- VMess: the same users, found by trial rather than by index ----------------
+
+    /// An auth id as a client would send it. The timestamp is irrelevant to the
+    /// registry, which recognises the user and leaves freshness to the handler.
+    fn vmess_auth_id(uuid: &str) -> [u8; 16] {
+        VmessAuthKey::new(&uuid_bytes(uuid)).seal(1_700_000_000, [1, 2, 3, 4])
+    }
+
+    #[test]
+    fn picks_the_right_user_out_of_a_crowd() {
+        // The property the trial exists for: no index, but still exactly one answer.
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        let uuids: Vec<String> = (0..64)
+            .map(|n| format!("00000000-0000-4000-8000-{n:012x}"))
+            .collect();
+        for (n, uuid) in uuids.iter().enumerate() {
+            registry
+                .upsert(uuid_spec(&format!("user{n}"), uuid))
+                .unwrap();
+        }
+
+        for (n, uuid) in uuids.iter().enumerate() {
+            let found = registry
+                .find_vmess_auth_id(&vmess_auth_id(uuid))
+                .unwrap_or_else(|| panic!("user{n} should be recognised"));
+            assert_eq!(&**found.user.id(), format!("user{n}"));
+            assert_eq!(found.timestamp, 1_700_000_000);
+            assert_eq!(
+                found.instruction_key,
+                *VmessAuthKey::new(&uuid_bytes(uuid)).instruction_key(),
+                "the handshake continues with this key, so it must be user{n}'s"
+            );
+        }
+
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none(),
+            "a uuid nobody registered must not match anyone"
+        );
+    }
+
+    #[test]
+    fn vmess_and_vless_reach_one_record() {
+        // Same user, two protocols, one set of counters. If the trial snapshot held
+        // its own contexts, half of a user's traffic would land somewhere nobody
+        // reports on.
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+
+        let by_uuid = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        let by_auth_id = registry
+            .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+            .unwrap()
+            .user;
+        assert!(Arc::ptr_eq(&by_uuid, &by_auth_id));
+
+        by_auth_id.add_rx(512);
+        assert_eq!(registry.get("alice").unwrap().rx, 512);
+        assert_eq!(by_uuid.total_conns(), 2);
+    }
+
+    #[test]
+    fn the_trial_snapshot_tracks_every_mutation() {
+        // The snapshot is a second structure derived from the same entries, so the
+        // risk it introduces is drift. Each mutation is checked through it.
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none()
+        );
+
+        // add
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_some()
+        );
+
+        // rotate: the old auth id must stop working the moment the new one starts
+        registry.upsert(uuid_spec("alice", UUID_B)).unwrap();
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none()
+        );
+        assert_eq!(
+            &**registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .unwrap()
+                .user
+                .id(),
+            "alice"
+        );
+
+        // disable: absent, not denied, and not counted
+        let mut disabled = uuid_spec("alice", UUID_B);
+        disabled.enabled = false;
+        registry.upsert(disabled).unwrap();
+        let before = registry.get("alice").unwrap().total_conns;
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .is_none()
+        );
+        assert_eq!(registry.get("alice").unwrap().total_conns, before);
+
+        // re-enable
+        registry.upsert(uuid_spec("alice", UUID_B)).unwrap();
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .is_some()
+        );
+
+        // remove
+        registry.remove("in", "alice").unwrap();
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_trojan_only_registry_has_nothing_to_try() {
+        // No uuids means an empty snapshot. The walk must come up empty rather than
+        // fall over, since one registry serves whatever the inbound turns out to be.
+        let registry = MemoryUserRegistry::new(CredentialKinds::TROJAN_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none()
+        );
+        assert!(registry.find_vmess_auth_id(&[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn garbage_is_not_recognised_as_anyone() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        for seed in 0u8..64 {
+            assert!(registry.find_vmess_auth_id(&[seed; 16]).is_none());
+        }
+        // Nothing was billed for the failures.
+        assert_eq!(registry.get("alice").unwrap().total_conns, 0);
     }
 
     #[test]

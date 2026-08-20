@@ -50,7 +50,7 @@ mod user;
 pub use meter::{
     ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
 };
-pub use registry::UserRegistry;
+pub use registry::{UserRegistry, VmessIdentity};
 pub use reload::{HandlerSlot, ServerHandle};
 pub use static_registry::StaticUserRegistry;
 pub use user::{UserContext, UserStats};

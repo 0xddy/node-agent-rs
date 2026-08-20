@@ -10,7 +10,8 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use subtle::ConstantTimeEq;
 
-use super::registry::UserRegistry;
+use super::credential::VmessAuthKey;
+use super::registry::{UserRegistry, VmessIdentity};
 use super::user::UserContext;
 use crate::trojan_handler::create_password_hash;
 use crate::uuid_util::parse_uuid;
@@ -27,6 +28,11 @@ struct Entry {
     /// be confirmed in constant time. The hash probe that found this entry is not
     /// constant time and is not treated as proof of anything.
     credential: Box<[u8]>,
+    /// Present only for uuid entries, since VMess is the one protocol here that
+    /// cannot be indexed on. Held inside the entry rather than in a list of its own
+    /// so that a user has exactly one record: re-registering a uuid replaces it
+    /// whole, with no second table left pointing at the superseded context.
+    vmess: Option<VmessAuthKey>,
 }
 
 impl Entry {
@@ -34,6 +40,14 @@ impl Entry {
         Self {
             context: UserContext::new(id),
             credential: credential.into(),
+            vmess: None,
+        }
+    }
+
+    fn uuid(id: &str, uuid: [u8; 16]) -> Self {
+        Self {
+            vmess: Some(VmessAuthKey::new(&uuid)),
+            ..Self::new(id, uuid)
         }
     }
 
@@ -43,6 +57,26 @@ impl Entry {
         }
         self.context.note_auth();
         Some(self.context.clone())
+    }
+
+    /// Whether this entry's user sealed `auth_id`.
+    ///
+    /// No constant-time comparison here, and none is called for: unlike `verify`,
+    /// nothing is being compared against a stored secret. A valid checksum is proof
+    /// that the sender held the uuid, so there is no credential to leak a byte at a
+    /// time.
+    fn verify_vmess(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
+        let key = self.vmess.as_ref()?;
+        let timestamp = key.open(auth_id)?;
+        if !self.context.is_enabled() {
+            return None;
+        }
+        self.context.note_auth();
+        Some(VmessIdentity {
+            user: self.context.clone(),
+            instruction_key: *key.instruction_key(),
+            timestamp,
+        })
     }
 }
 
@@ -75,7 +109,7 @@ impl StaticUserRegistry {
         let bytes = parse_uuid(uuid_str)?;
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&bytes);
-        self.by_uuid.insert(uuid, Entry::new(uuid_str, uuid));
+        self.by_uuid.insert(uuid, Entry::uuid(uuid_str, uuid));
         Ok(self)
     }
 
@@ -124,6 +158,13 @@ impl UserRegistry for StaticUserRegistry {
             .verify(password.as_bytes())
     }
 
+    fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
+        // A trial over every uuid entry, because there is nothing to index on. A
+        // config-built registry holds one, so the loop is a formality here; it is the
+        // dynamic registry that pays the linear cost.
+        self.by_uuid.values().find_map(|e| e.verify_vmess(auth_id))
+    }
+
     fn user_count(&self) -> usize {
         self.by_uuid.len() + self.by_trojan_hash.len() + self.by_password.len()
     }
@@ -134,6 +175,10 @@ mod tests {
     use super::*;
 
     const UUID: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
+
+    fn seal_auth_id(uuid: &str, time_secs: u64, padding: [u8; 4]) -> [u8; 16] {
+        VmessAuthKey::new(&uuid_bytes(uuid)).seal(time_secs, padding)
+    }
 
     fn uuid_bytes(s: &str) -> [u8; 16] {
         let mut out = [0u8; 16];
@@ -217,5 +262,70 @@ mod tests {
         assert!(registry.find_uuid(&uuid_bytes(UUID)).is_none());
         assert!(registry.find_trojan_hash(&create_password_hash("x")).is_none());
         assert!(registry.find_password("x").is_none());
+        assert!(registry.find_vmess_auth_id(&[0u8; 16]).is_none());
+    }
+
+    #[test]
+    fn recognises_a_vmess_auth_id_from_the_same_uuid() {
+        let registry = StaticUserRegistry::single_uuid(UUID).unwrap();
+        let auth_id = seal_auth_id(UUID, 1_700_000_000, [1, 2, 3, 4]);
+
+        let found = registry
+            .find_vmess_auth_id(&auth_id)
+            .expect("the config's uuid should recognise its own auth id");
+        assert_eq!(&**found.user.id(), UUID);
+        assert_eq!(found.timestamp, 1_700_000_000);
+        // The handshake cannot continue without this, so a zeroed key would be a
+        // silent failure much later.
+        assert_ne!(found.instruction_key, [0u8; 16]);
+
+        let other = seal_auth_id(
+            "11111111-1111-4111-8111-111111111111",
+            1_700_000_000,
+            [1, 2, 3, 4],
+        );
+        assert!(registry.find_vmess_auth_id(&other).is_none());
+    }
+
+    #[test]
+    fn vmess_shares_the_uuid_users_record() {
+        // One user, one set of counters, whichever of the two protocols they arrived
+        // over. If VMess had its own table these would be separate records and half
+        // the traffic would be invisible.
+        let registry = StaticUserRegistry::single_uuid(UUID).unwrap();
+        let by_uuid = registry.find_uuid(&uuid_bytes(UUID)).unwrap();
+        let by_auth_id = registry
+            .find_vmess_auth_id(&seal_auth_id(UUID, 1, [0; 4]))
+            .unwrap()
+            .user;
+        assert!(Arc::ptr_eq(&by_uuid, &by_auth_id));
+        assert_eq!(by_uuid.total_conns(), 2);
+    }
+
+    #[test]
+    fn a_disabled_user_looks_absent_to_vmess_too() {
+        let registry = StaticUserRegistry::single_uuid(UUID).unwrap();
+        let auth_id = seal_auth_id(UUID, 1, [0; 4]);
+        let user = registry.find_vmess_auth_id(&auth_id).unwrap().user;
+
+        user.set_enabled(false);
+        assert!(registry.find_vmess_auth_id(&auth_id).is_none());
+        // Suspension must not be billable: a denied attempt is not a connection.
+        assert_eq!(user.total_conns(), 1);
+
+        user.set_enabled(true);
+        assert!(registry.find_vmess_auth_id(&auth_id).is_some());
+    }
+
+    #[test]
+    fn a_password_only_registry_has_nothing_for_vmess() {
+        // Trojan and AnyTLS users have no uuid, so there is no key to try. The trial
+        // must come up empty rather than fall over.
+        let registry = StaticUserRegistry::single_trojan_password("hunter2");
+        assert!(
+            registry
+                .find_vmess_auth_id(&seal_auth_id(UUID, 1, [0; 4]))
+                .is_none()
+        );
     }
 }

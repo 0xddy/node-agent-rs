@@ -215,6 +215,18 @@ pub fn vless_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
     })
 }
 
+/// `cipher: "any"` lets each client pick its own data cipher.
+///
+/// That is the upstream default for a server and it keeps the two halves of a VMess
+/// connection independent: which cipher a user negotiates has nothing to do with how
+/// the server worked out who they are.
+pub fn vmess_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
+    json!({
+        "address": address.to_string(),
+        "protocol": {"type": "vmess", "cipher": "any", "udp_enabled": udp_enabled},
+    })
+}
+
 pub fn vless_inbound_with_rules(address: SocketAddr, udp_enabled: bool, rules: Value) -> Value {
     json!({
         "address": address.to_string(),
@@ -258,6 +270,18 @@ pub fn vless_chain(server: SocketAddr, uuid: &str) -> Value {
     json!({
         "address": server.to_string(),
         "protocol": {"type": "vless", "user_id": uuid},
+    })
+}
+
+/// A VMess leg, speaking `cipher` for its payload.
+///
+/// The cipher is a parameter because it is the one part of a VMess client the tests
+/// vary: the auth id that identifies the user is derived from the uuid alone, so two
+/// users on different ciphers are the sharpest way to show the two are unrelated.
+pub fn vmess_chain(server: SocketAddr, uuid: &str, cipher: &str) -> Value {
+    json!({
+        "address": server.to_string(),
+        "protocol": {"type": "vmess", "cipher": cipher, "user_id": uuid},
     })
 }
 
