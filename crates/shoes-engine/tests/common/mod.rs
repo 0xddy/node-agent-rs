@@ -438,6 +438,67 @@ pub fn tuic_inbound_with_credential(address: SocketAddr, uuid: &str, password: &
     config
 }
 
+/// An AnyTLS inbound for **dynamic** mode, wrapped in TLS as every real one is.
+///
+/// No `users` list, which is not an omission: with a registry injected the config's
+/// own users are dead, and the engine refuses a payload that declares them. Shoes'
+/// schema still requires the field -- its `OneOrSome` even refuses an empty list --
+/// so the engine stands in a one-element throwaway. See `PLACEHOLDER_USER_LISTS` in
+/// `shoes-engine`'s `protocol` module.
+pub fn tls_anytls_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
+    json!({
+        "address": address.to_string(),
+        "protocol": {
+            "type": "tls",
+            "default_target": {
+                "cert": test_cert(),
+                "key": test_key(),
+                "protocol": {"type": "anytls", "udp_enabled": udp_enabled},
+            },
+        },
+    })
+}
+
+/// As [`tls_anytls_inbound`], but declaring the users a classic-mode inbound
+/// authenticates against.
+///
+/// Takes several, because AnyTLS is the first protocol here whose *config* is already
+/// multi-user: without a registry all of them go into a static one, and a test that
+/// only ever declared one would not notice if that stopped being true.
+pub fn tls_anytls_inbound_with_users(
+    address: SocketAddr,
+    users: &[(&str, &str)],
+    udp_enabled: bool,
+) -> Value {
+    let declared: Vec<Value> = users
+        .iter()
+        .map(|(name, password)| json!({"name": name, "password": password}))
+        .collect();
+    let mut config = tls_anytls_inbound(address, udp_enabled);
+    config["protocol"]["default_target"]["protocol"]["users"] = json!(declared);
+    config
+}
+
+/// An AnyTLS leg for one user, through TLS.
+///
+/// `verify: false` for the same reason [`tls_vless_chain`] gives: the bundled cert is
+/// self-signed for `CN=e2e.test` and no CA store knows it.
+pub fn tls_anytls_chain(server: SocketAddr, password: &str, udp_enabled: bool) -> Value {
+    json!({
+        "address": server.to_string(),
+        "protocol": {
+            "type": "tls",
+            "verify": false,
+            "sni_hostname": "e2e.test",
+            "protocol": {
+                "type": "anytls",
+                "password": password,
+                "udp_enabled": udp_enabled,
+            },
+        },
+    })
+}
+
 /// A deterministic base64 PSK of `len` bytes, derived from `seed`.
 ///
 /// Deterministic so a test can hand the same key to a client leg and to `add_user`

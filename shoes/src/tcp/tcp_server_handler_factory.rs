@@ -64,6 +64,37 @@ fn resolve_uuid_users(
     }
 }
 
+/// Registry for AnyTLS, which authenticates by the raw SHA-256 of a password.
+///
+/// Takes the whole config list rather than one credential, because AnyTLS is the
+/// first protocol here whose config already declares several users. Without an
+/// injected registry all of them are loaded into a static one, so an inbound that
+/// listed three users in YAML still serves three.
+fn resolve_anytls_users(
+    users: Option<&Arc<dyn UserRegistry>>,
+    config_users: &[crate::config::server::AnyTlsUserConfig],
+) -> Arc<dyn UserRegistry> {
+    match users {
+        Some(registry) => Arc::clone(registry),
+        None => {
+            let mut registry = StaticUserRegistry::new();
+            for user in config_users {
+                let id = if user.name.is_empty() {
+                    &user.password
+                } else {
+                    &user.name
+                };
+                // A nameless config user is reported by their password only as a last
+                // resort: `add_anytls_password` never indexes on the id, so this
+                // cannot be used to authenticate, and an empty id would make two
+                // nameless users indistinguishable in a report.
+                registry.add_anytls_password(id, &user.password);
+            }
+            Arc::new(registry)
+        }
+    }
+}
+
 /// Registry for Trojan, which authenticates by the hex digest of a password.
 fn resolve_trojan_users(
     users: Option<&Arc<dyn UserRegistry>>,
@@ -312,16 +343,14 @@ pub fn create_tcp_server_handler(
             ))
         }
         ServerProxyConfig::Anytls {
-            users,
+            // Renamed rather than destructured as `users`, which would shadow the
+            // registry parameter of the same name for the rest of this arm.
+            users: config_users,
             padding_scheme,
             udp_enabled,
             fallback,
         } => {
-            let users: Vec<(String, String)> = users
-                .into_vec()
-                .into_iter()
-                .map(|u| (u.name, u.password))
-                .collect();
+            let anytls_users = resolve_anytls_users(users, &config_users.into_vec());
 
             let padding = if let Some(scheme_lines) = padding_scheme {
                 let scheme_str = scheme_lines.join("\n");
@@ -336,7 +365,7 @@ pub fn create_tcp_server_handler(
             // AnyTLS spawns its own task and returns AlreadyHandled, so it needs the proxy
             // provider directly (it won't inherit from outer handler through TcpForward)
             Box::new(AnyTlsServerHandler::new(
-                users,
+                anytls_users,
                 padding,
                 resolver.clone(),
                 Arc::clone(client_proxy_selector),
@@ -456,7 +485,8 @@ fn create_tls_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+        let handler =
+            create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
         InnerProtocol::Normal(handler)
     };
 
@@ -521,7 +551,8 @@ fn create_shadow_tls_server_target(
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+    let handler =
+        create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
 
     TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
@@ -614,7 +645,8 @@ fn create_reality_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+        let handler =
+            create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
         InnerProtocol::Normal(handler)
     };
 
@@ -687,7 +719,8 @@ fn create_websocket_server_target(
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+    let handler =
+        create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
 
     WebsocketServerTarget {
         matching_path,

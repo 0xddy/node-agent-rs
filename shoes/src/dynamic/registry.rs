@@ -163,6 +163,39 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Find whose AnyTLS credential this is: the raw SHA-256 of their password, as
+    /// [`password_sha256`](super::credential::password_sha256) derives it.
+    ///
+    /// Kept apart from [`find_password`](Self::find_password) because the hash is
+    /// what crosses the wire -- AnyTLS never sends the cleartext -- and apart from
+    /// [`find_trojan_hash`](Self::find_trojan_hash) because that is a different
+    /// digest in a different encoding. One password can be indexed under all three.
+    fn find_password_sha256(&self, hash: &[u8; 32]) -> Option<Arc<UserContext>> {
+        let _ = hash;
+        None
+    }
+
+    /// Whether any user's password hash *starts* with these 8 bytes.
+    ///
+    /// AnyTLS peeks at the first 8 bytes of a connection and, on a miss, diverts it
+    /// to a fallback destination without waiting for the remaining 24. That is what
+    /// stops a prober from hanging the handler, and it is why this question has to be
+    /// answerable before the credential is complete.
+    ///
+    /// **This is a plausibility test, not a lookup.** `true` means "keep reading",
+    /// never "this user exists" -- and in particular a **disabled user must still
+    /// answer `true`**. Answering `false` for them would send their connections to
+    /// the fallback while a live user's went to the handler, which is an observable
+    /// difference an attacker can use to enumerate which credentials are suspended.
+    ///
+    /// What the probe leaks is 8 bytes' worth of "some registered password hashes
+    /// start like this", which cannot be walked a byte at a time and does not narrow
+    /// the remaining 24 bytes or the password behind them.
+    fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool {
+        let _ = prefix;
+        false
+    }
+
     /// How many users are registered. For diagnostics and API responses only; this
     /// may take a lock or walk shards, so it must not be called per connection.
     fn user_count(&self) -> usize;

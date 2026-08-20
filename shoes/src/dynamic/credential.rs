@@ -50,6 +50,32 @@ pub fn encode_shadowsocks_psk(psk: &[u8]) -> String {
 /// whether a shadowsocks inbound can be registry-backed at all.
 pub use crate::shadowsocks::supports_identity_headers as shadowsocks_supports_multi_user;
 
+/// Derive the 32 bytes an AnyTLS client sends as the first field of its header:
+/// SHA-256 of the password, raw rather than hex.
+///
+/// The index key for
+/// [`find_password_sha256`](super::UserRegistry::find_password_sha256). Note this is
+/// a *different* derivation of the same cleartext password Trojan hashes -- Trojan
+/// sends 56 hex characters of SHA-224, AnyTLS sends 32 raw bytes of SHA-256 -- so an
+/// inbound speaking both indexes one password twice rather than sharing a key.
+pub fn password_sha256(password: &str) -> [u8; 32] {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, password.as_bytes());
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(digest.as_ref());
+    hash
+}
+
+/// The first 8 bytes of a password's SHA-256, which AnyTLS peeks at before it has
+/// read the whole credential.
+///
+/// See [`has_password_sha256_prefix`](super::UserRegistry::has_password_sha256_prefix)
+/// for what that probe is for and what it must not become.
+pub fn password_sha256_prefix(hash: &[u8; 32]) -> [u8; 8] {
+    let mut prefix = [0u8; 8];
+    prefix.copy_from_slice(&hash[..8]);
+    prefix
+}
+
 /// Parse a uuid into the 16 raw bytes VLESS and VMess put on the wire.
 ///
 /// Dashes are optional and ignored, matching what `shoes` accepts in a config file.

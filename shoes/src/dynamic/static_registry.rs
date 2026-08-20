@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use subtle::ConstantTimeEq;
 
-use super::credential::VmessAuthKey;
+use super::credential::{VmessAuthKey, password_sha256, password_sha256_prefix};
 use super::registry::{TuicIdentity, UserRegistry, VmessIdentity};
 use super::user::UserContext;
 use crate::trojan_handler::create_password_hash;
@@ -114,6 +114,11 @@ pub struct StaticUserRegistry {
     by_uuid: FxHashMap<[u8; 16], Entry>,
     by_trojan_hash: FxHashMap<Box<[u8]>, Entry>,
     by_password: FxHashMap<Box<str>, Entry>,
+    by_anytls_hash: FxHashMap<[u8; 32], Entry>,
+    /// The 8-byte prefixes of everything in `by_anytls_hash`, for the probe AnyTLS
+    /// makes before it has read a whole credential. A set rather than a count,
+    /// because this map is immutable once built and nothing is ever removed from it.
+    anytls_prefixes: FxHashSet<[u8; 8]>,
 }
 
 impl std::fmt::Debug for StaticUserRegistry {
@@ -197,6 +202,35 @@ impl StaticUserRegistry {
         Arc::new(registry)
     }
 
+    /// Register an AnyTLS credential, indexed by the SHA-256 of the password that
+    /// crosses the wire.
+    ///
+    /// Not registered as a plain password as well: AnyTLS never sends the cleartext,
+    /// so a `find_password` hit on this value would mean some *other* protocol on the
+    /// same inbound had accepted an AnyTLS user's secret in a form they never send.
+    pub fn add_anytls_password(&mut self, id: &str, password: &str) -> &mut Self {
+        let hash = password_sha256(password);
+        self.anytls_prefixes.insert(password_sha256_prefix(&hash));
+        self.by_anytls_hash.insert(hash, Entry::new(id, hash));
+        self
+    }
+
+    /// Registry for a config that declares exactly one AnyTLS user.
+    ///
+    /// Takes the name from the config, unlike the password-only builders: an AnyTLS
+    /// user config has a `name` field, so there is a real identity to report rather
+    /// than [`CONFIG_USER_ID`].
+    pub fn single_anytls_password(name: &str, password: &str) -> Arc<dyn UserRegistry> {
+        let mut registry = Self::new();
+        let id = if name.is_empty() {
+            CONFIG_USER_ID
+        } else {
+            name
+        };
+        registry.add_anytls_password(id, password);
+        Arc::new(registry)
+    }
+
     /// Registry for a config that declares exactly one TUIC uuid and password.
     pub fn single_tuic(uuid_str: &str, password: &str) -> std::io::Result<Arc<dyn UserRegistry>> {
         let mut registry = Self::new();
@@ -229,8 +263,22 @@ impl UserRegistry for StaticUserRegistry {
         self.by_uuid.get(uuid)?.verify_tuic(uuid)
     }
 
+    fn find_password_sha256(&self, hash: &[u8; 32]) -> Option<Arc<UserContext>> {
+        self.by_anytls_hash.get(hash)?.verify(&hash[..])
+    }
+
+    fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool {
+        // Deliberately no `is_enabled` check: see the trait method's docs. A
+        // suspended user's connections must reach the same place a live user's do,
+        // or the fallback becomes an oracle for who has been suspended.
+        self.anytls_prefixes.contains(prefix)
+    }
+
     fn user_count(&self) -> usize {
-        self.by_uuid.len() + self.by_trojan_hash.len() + self.by_password.len()
+        self.by_uuid.len()
+            + self.by_trojan_hash.len()
+            + self.by_password.len()
+            + self.by_anytls_hash.len()
     }
 }
 
@@ -365,6 +413,12 @@ mod tests {
         assert!(registry.find_password("x").is_none());
         assert!(registry.find_vmess_auth_id(&[0u8; 16]).is_none());
         assert!(registry.find_tuic_uuid(&uuid_bytes(UUID)).is_none());
+        assert!(
+            registry
+                .find_password_sha256(&password_sha256("x"))
+                .is_none()
+        );
+        assert!(!registry.has_password_sha256_prefix(&[0u8; 8]));
     }
 
     #[test]
@@ -475,5 +529,82 @@ mod tests {
     #[test]
     fn rejects_an_invalid_tuic_uuid_at_build_time() {
         assert!(StaticUserRegistry::single_tuic("not-a-uuid", "hunter2").is_err());
+    }
+
+    #[test]
+    fn finds_an_anytls_user_by_the_hash_they_send() {
+        let registry = StaticUserRegistry::single_anytls_password("alice", "hunter2");
+        let hash = password_sha256("hunter2");
+
+        let found = registry
+            .find_password_sha256(&hash)
+            .expect("the config's own password should authenticate");
+        assert_eq!(&**found.id(), "alice");
+        assert_eq!(found.total_conns(), 1);
+
+        assert!(
+            registry
+                .find_password_sha256(&password_sha256("hunter3"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_anytls_user_falls_back_to_the_config_id_without_a_name() {
+        let registry = StaticUserRegistry::single_anytls_password("", "hunter2");
+        let found = registry
+            .find_password_sha256(&password_sha256("hunter2"))
+            .unwrap();
+        assert_eq!(&**found.id(), CONFIG_USER_ID);
+    }
+
+    #[test]
+    fn the_anytls_prefix_probe_answers_for_a_disabled_user_too() {
+        // The whole point of the probe: it says "keep reading", not "this user
+        // exists". Answering `false` here would send a suspended user's connections
+        // to the fallback while a live user's went to the handler -- an observable
+        // difference that leaks who has been suspended.
+        let registry = StaticUserRegistry::single_anytls_password("alice", "hunter2");
+        let hash = password_sha256("hunter2");
+        let prefix = password_sha256_prefix(&hash);
+
+        assert!(registry.has_password_sha256_prefix(&prefix));
+
+        let user = registry.find_password_sha256(&hash).unwrap();
+        user.set_enabled(false);
+        assert!(
+            registry.find_password_sha256(&hash).is_none(),
+            "the lookup denies"
+        );
+        assert!(
+            registry.has_password_sha256_prefix(&prefix),
+            "but the probe must not"
+        );
+
+        assert!(!registry.has_password_sha256_prefix(&[0u8; 8]));
+    }
+
+    #[test]
+    fn an_anytls_password_is_not_a_plain_or_trojan_credential() {
+        // Three derivations of one cleartext value, and each protocol only ever sees
+        // its own. A hit on another would mean accepting a secret in a form its owner
+        // never sends.
+        let registry = StaticUserRegistry::single_anytls_password("alice", "hunter2");
+        assert!(registry.find_password("hunter2").is_none());
+        assert!(
+            registry
+                .find_trojan_hash(&create_password_hash("hunter2"))
+                .is_none()
+        );
+
+        let plain = StaticUserRegistry::single_password("hunter2");
+        assert!(
+            plain
+                .find_password_sha256(&password_sha256("hunter2"))
+                .is_none()
+        );
+        assert!(
+            !plain.has_password_sha256_prefix(&password_sha256_prefix(&password_sha256("hunter2")))
+        );
     }
 }

@@ -7,7 +7,6 @@
 //! 3. Runs the session which handles streams internally
 
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -18,11 +17,11 @@ use crate::anytls::anytls_server_session::AnyTlsSession;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::dynamic::{UserRegistry, bind_connection_user};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::write_all;
-use aws_lc_rs::digest::{SHA256, digest};
 
 /// AnyTLS server handler implementing TcpServerHandler
 ///
@@ -31,12 +30,11 @@ use aws_lc_rs::digest::{SHA256, digest};
 /// and runs the session which handles all streams internally.
 #[derive(Debug)]
 pub struct AnyTlsServerHandler {
-    /// Authenticated users (password_hash -> user name)
-    users: HashMap<[u8; 32], String>,
-    /// 8-byte prefixes of all user password hashes for quick fallback.
-    /// If incoming data doesn't match any prefix, we can fallback immediately
-    /// without waiting for the full 32-byte hash.
-    hash_prefixes: HashSet<[u8; 8]>,
+    /// Who a password hash belongs to, and the 8-byte-prefix probe that decides
+    /// whether to keep reading one. Both questions go to the same registry: an
+    /// injected one for a multi-user inbound, or a one-user registry built from this
+    /// inbound's own config credential.
+    users: Arc<dyn UserRegistry>,
     /// Padding factory for traffic obfuscation
     padding: Arc<PaddingFactory>,
     /// Resolver for destination addresses
@@ -53,39 +51,22 @@ impl AnyTlsServerHandler {
     /// Create a new AnyTLS server handler.
     ///
     /// # Arguments
-    /// * `users` - Vec of (name, password) tuples for authentication
+    /// * `users` - The registry this inbound authenticates against
     /// * `padding` - Padding factory for traffic obfuscation
     /// * `resolver` - DNS resolver for destination addresses
     /// * `proxy_provider` - Proxy selector for routing decisions
     /// * `udp_enabled` - Whether UDP-over-TCP is enabled
     /// * `fallback` - Optional fallback destination for failed auth
     pub fn new(
-        users: Vec<(String, String)>,
+        users: Arc<dyn UserRegistry>,
         padding: Arc<PaddingFactory>,
         resolver: Arc<dyn Resolver>,
         proxy_provider: Arc<ClientProxySelector>,
         udp_enabled: bool,
         fallback: Option<NetLocation>,
     ) -> Self {
-        // Build hash -> name map and collect prefixes
-        let mut user_map = HashMap::with_capacity(users.len());
-        let mut hash_prefixes = HashSet::with_capacity(users.len());
-
-        for (name, password) in users {
-            let hash_result = digest(&SHA256, password.as_bytes());
-            let mut password_hash = [0u8; 32];
-            password_hash.copy_from_slice(hash_result.as_ref());
-
-            // Extract 8-byte prefix for quick fallback lookup
-            let prefix: [u8; 8] = password_hash[..8].try_into().unwrap();
-            hash_prefixes.insert(prefix);
-
-            user_map.insert(password_hash, name);
-        }
-
         Self {
-            users: user_map,
-            hash_prefixes,
+            users,
             padding,
             resolver,
             proxy_provider,
@@ -113,8 +94,9 @@ impl TcpServerHandler for AnyTlsServerHandler {
         // is infeasible, and discovering a valid prefix doesn't help recover the
         // password or the remaining 24 bytes of the SHA256 hash.
         let prefix_data = reader.peek_slice(&mut server_stream, 8).await?;
+        let prefix: [u8; 8] = prefix_data.try_into().expect("peek_slice returned 8 bytes");
 
-        if !self.hash_prefixes.contains(prefix_data) {
+        if !self.users.has_password_sha256_prefix(&prefix) {
             log::debug!("AnyTLS quick fallback: 8-byte prefix doesn't match any user");
             if let Some(ref fallback) = self.fallback {
                 return self.fallback_to_dest(server_stream, reader, fallback).await;
@@ -127,17 +109,25 @@ impl TcpServerHandler for AnyTlsServerHandler {
 
         // Prefix matches - now read the full 32-byte hash
         let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
+        let hash: [u8; 32] = auth_data.try_into().expect("peek_slice returned 32 bytes");
 
-        let user_name = match self.users.get(auth_data) {
-            Some(name) => {
-                log::debug!("AnyTLS user authenticated: {}", name);
+        let user_name = match self.users.find_password_sha256(&hash) {
+            Some(user) => {
+                log::debug!("AnyTLS user authenticated: {}", user.id());
                 // Auth succeeded - consume the header bytes
                 reader.consume(32);
-                name.clone()
+                // The stream is metered from the moment it was accepted, so this hands
+                // the TLS handshake already counted against nobody over to whoever
+                // just proved they own it. Inline on the accepting task, before the
+                // session is spawned, which is what lets the task local reach it.
+                bind_connection_user(&user);
+                user.id().to_string()
             }
             None => {
                 log::debug!("AnyTLS authentication failed: unknown password");
-                // If fallback is configured, forward the connection there
+                // If fallback is configured, forward the connection there. A disabled
+                // user lands here too, deliberately: the registry reports them absent
+                // so that a suspension is not observable from outside.
                 if let Some(ref fallback) = self.fallback {
                     return self.fallback_to_dest(server_stream, reader, fallback).await;
                 }
@@ -248,75 +238,63 @@ impl AnyTlsServerHandler {
 mod tests {
     use super::*;
 
-    /// Helper to compute password hash the same way the handler does
-    fn compute_password_hash(password: &str) -> [u8; 32] {
-        let hash_result = digest(&SHA256, password.as_bytes());
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(hash_result.as_ref());
-        hash
+    use crate::dynamic::StaticUserRegistry;
+    use crate::dynamic::credential::{password_sha256, password_sha256_prefix};
+
+    #[test]
+    fn the_wire_credential_is_the_raw_sha256_of_the_password() {
+        // The handler compares what the client sends against this derivation, so if
+        // it ever drifted every AnyTLS client in the world would stop connecting.
+        let hash = password_sha256("secret123");
+        let expected = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"secret123");
+        assert_eq!(&hash[..], expected.as_ref());
+        assert_ne!(password_sha256("pass1"), password_sha256("pass2"));
     }
 
     #[test]
-    fn test_password_hashing() {
-        let hash = compute_password_hash("secret123");
+    fn a_config_built_registry_answers_both_questions_the_handler_asks() {
+        // The handler asks twice: an 8-byte prefix probe before it has read the whole
+        // credential, then the full 32 bytes. Both go to the registry.
+        let registry = StaticUserRegistry::single_anytls_password("alice", "password1");
+        let hash = password_sha256("password1");
 
-        let expected = digest(&SHA256, b"secret123");
-        let mut expected_bytes = [0u8; 32];
-        expected_bytes.copy_from_slice(expected.as_ref());
-
-        assert_eq!(hash, expected_bytes);
+        assert!(registry.has_password_sha256_prefix(&password_sha256_prefix(&hash)));
+        assert_eq!(
+            registry
+                .find_password_sha256(&hash)
+                .map(|user| user.id().to_string()),
+            Some("alice".to_string())
+        );
     }
 
     #[test]
-    fn test_different_passwords_different_hashes() {
-        let hash1 = compute_password_hash("pass1");
-        let hash2 = compute_password_hash("pass2");
-
-        assert_ne!(hash1, hash2);
+    fn a_probe_that_is_not_a_credential_is_turned_away_at_the_prefix() {
+        // What actually shows up on a public port: an HTTP request. It must be sent
+        // to the fallback after 8 bytes rather than hang the handler waiting for 32.
+        let registry = StaticUserRegistry::single_anytls_password("alice", "password1");
+        let http: [u8; 8] = *b"GET / HT";
+        assert!(!registry.has_password_sha256_prefix(&http));
     }
 
     #[test]
-    fn test_hash_map_and_prefix_construction() {
-        // Test that the handler correctly builds user map and prefix set
-        let users = vec![
-            ("alice".to_string(), "password1".to_string()),
-            ("bob".to_string(), "password2".to_string()),
-        ];
+    fn two_users_are_told_apart_by_the_full_hash() {
+        let mut registry = StaticUserRegistry::new();
+        registry.add_anytls_password("alice", "password1");
+        registry.add_anytls_password("bob", "password2");
+        let registry: Arc<dyn UserRegistry> = Arc::new(registry);
 
-        // Compute expected hashes
-        let hash1 = compute_password_hash("password1");
-        let hash2 = compute_password_hash("password2");
-
-        // Build the maps the same way the handler does
-        let mut user_map = HashMap::with_capacity(users.len());
-        let mut hash_prefixes = HashSet::with_capacity(users.len());
-
-        for (name, password) in users {
-            let hash = compute_password_hash(&password);
-            let prefix: [u8; 8] = hash[..8].try_into().unwrap();
-            hash_prefixes.insert(prefix);
-            user_map.insert(hash, name);
-        }
-
-        assert_eq!(user_map.len(), 2);
-        assert_eq!(hash_prefixes.len(), 2);
-
-        // Verify slice lookups work via Borrow<[u8]>
-        let prefix1_slice: &[u8] = &hash1[..8];
-        let prefix2_slice: &[u8] = &hash2[..8];
-        assert!(hash_prefixes.contains(prefix1_slice));
-        assert!(hash_prefixes.contains(prefix2_slice));
-
-        // Verify a random prefix is NOT in the set
-        let random_prefix: &[u8] = &[0x47, 0x45, 0x54, 0x20, 0x2f, 0x20, 0x48, 0x54]; // "GET / HT"
-        assert!(!hash_prefixes.contains(random_prefix));
-
-        // Verify full hash lookup returns correct name
-        let hash1_slice: &[u8] = &hash1[..];
-        assert!(user_map.get(hash1_slice).is_some());
-        assert_eq!(user_map.get(hash1_slice).unwrap(), "alice");
-
-        let hash2_slice: &[u8] = &hash2[..];
-        assert_eq!(user_map.get(hash2_slice).unwrap(), "bob");
+        assert_eq!(
+            registry
+                .find_password_sha256(&password_sha256("password1"))
+                .map(|u| u.id().to_string()),
+            Some("alice".to_string())
+        );
+        assert_eq!(
+            registry
+                .find_password_sha256(&password_sha256("password2"))
+                .map(|u| u.id().to_string()),
+            Some("bob".to_string())
+        );
+        assert_eq!(registry.user_count(), 2);
     }
 }

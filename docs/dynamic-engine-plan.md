@@ -18,14 +18,14 @@ mergeable. Protocols are converted one at a time to authenticate through
 | Shadowsocks 2022 | yes | yes | `d5c9ae3` |
 | Hysteria2 | yes | yes | `d439df4` |
 | TUIC v5 | yes | yes | `6f163d9` |
-| **AnyTLS** | **no** — own hash map | inherited from the TCP path | increment 2 |
+| AnyTLS | yes | yes | increment 2 |
 | **NaiveProxy** | **no** — own `UserLookup` | **no** — auth is past a `tokio::spawn` | increment 3 |
 | Snell | n/a | n/a | out of scope: no multi-user identity mechanism exists |
 
 Rules hot-reload works for every inbound, including Hysteria2 and TUIC — see
 increment 1, which has landed.
 
-Two increments remain, in this order. Each is one commit.
+One increment remains.
 
 ---
 
@@ -144,7 +144,24 @@ mitigation is that `SelectorSlot` is additive: nothing existing changes shape.
 
 ---
 
-## 2. AnyTLS
+## 2. AnyTLS — **landed**
+
+Built as designed below. Both questions the handler asks go to the registry:
+`find_password_sha256` for the full 32 bytes and `has_password_sha256_prefix` for the
+8-byte probe, the latter documented and tested as ignoring `is_enabled` so a
+suspension stays unobservable. The engine's prefix index is the refcounted
+`DashMap<[u8; 8], usize>` the plan calls for.
+
+Two things the plan got right and one it did not anticipate: the list-shaped
+placeholder became `PLACEHOLDER_USER_LISTS`, which NaiveProxy will reuse — but
+AnyTLS's `users` is a `OneOrSome`, which refuses an *empty* list, so the placeholder
+has to **insert** a one-element throwaway rather than merely reject a declared one.
+Separately, AnyTLS is the first protocol here whose config was already multi-user, so
+the classic-mode fallback loads *every* declared user into a static registry rather
+than one.
+
+<details>
+<summary>The original plan, kept as the design record</summary>
 
 ### The gap
 
@@ -224,6 +241,8 @@ between two users resolves to the right one.
 
 **Risk: low-moderate.** The prefix index and the list-shaped placeholder are the only
 genuinely new pieces.
+
+</details>
 
 ---
 

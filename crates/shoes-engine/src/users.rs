@@ -86,6 +86,10 @@ pub struct CredentialKinds {
     /// both: the uuid names them in cleartext and the password keys the 32 byte token
     /// beside it, so half a credential authenticates nobody.
     pub tuic: bool,
+    /// AnyTLS: the raw SHA-256 of a password. A third derivation of the same
+    /// cleartext value Trojan and Hysteria2 start from, not a third meaning of it,
+    /// so it never conflicts with either.
+    pub anytls_password: bool,
 }
 
 impl CredentialKinds {
@@ -95,6 +99,7 @@ impl CredentialKinds {
         plain_password: false,
         shadowsocks_psk: ShadowsocksPsk::None,
         tuic: false,
+        anytls_password: false,
     };
 
     pub const UUID: Self = Self {
@@ -120,6 +125,11 @@ impl CredentialKinds {
         ..Self::NONE
     };
 
+    pub const ANYTLS_PASSWORD: Self = Self {
+        anytls_password: true,
+        ..Self::NONE
+    };
+
     /// Shadowsocks 2022 users whose PSKs are `len` bytes, i.e. whatever the inbound's
     /// cipher uses.
     pub const fn shadowsocks_psk(len: usize) -> Self {
@@ -138,6 +148,7 @@ impl CredentialKinds {
         self.trojan_password |= other.trojan_password;
         self.plain_password |= other.plain_password;
         self.tuic |= other.tuic;
+        self.anytls_password |= other.anytls_password;
         self.shadowsocks_psk = match (self.shadowsocks_psk, other.shadowsocks_psk) {
             (ShadowsocksPsk::None, only) | (only, ShadowsocksPsk::None) => only,
             (ShadowsocksPsk::Len(a), ShadowsocksPsk::Len(b)) if a == b => ShadowsocksPsk::Len(a),
@@ -150,6 +161,7 @@ impl CredentialKinds {
         self.trojan_password
             || self.plain_password
             || self.tuic
+            || self.anytls_password
             || matches!(self.shadowsocks_psk, ShadowsocksPsk::Len(_))
     }
 
@@ -176,12 +188,16 @@ impl CredentialKinds {
                  `password` cannot serve them all; give each cipher its own inbound"
                     .to_string(),
             ),
-            ShadowsocksPsk::Len(_) if self.trojan_password || self.plain_password => Some(
-                "it mixes shadowsocks with a protocol that wants a cleartext password, \
-                 so its `password` field would mean two different things -- a password \
-                 and a base64 PSK; give each its own inbound"
-                    .to_string(),
-            ),
+            ShadowsocksPsk::Len(_)
+                if self.trojan_password || self.plain_password || self.anytls_password =>
+            {
+                Some(
+                    "it mixes shadowsocks with a protocol that wants a cleartext password, \
+                     so its `password` field would mean two different things -- a password \
+                     and a base64 PSK; give each its own inbound"
+                        .to_string(),
+                )
+            }
             _ => None,
         }
     }
@@ -230,6 +246,8 @@ struct Credentials {
     /// it is keyed with. Two TUIC users may share a password without conflict; it is
     /// their uuids that must differ.
     tuic_password: Option<Arc<str>>,
+    /// Raw SHA-256 of the password, which is what an AnyTLS client puts on the wire.
+    anytls_hash: Option<[u8; 32]>,
 }
 
 /// One user: their shared accounting record plus the credentials that reach it.
@@ -242,6 +260,7 @@ struct Entry {
     password: Option<Box<str>>,
     shadowsocks: Option<ShadowsocksCredential>,
     tuic_password: Option<Arc<str>>,
+    anytls_hash: Option<[u8; 32]>,
     /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
     /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
     /// schedule *per user* on every handshake.
@@ -299,6 +318,14 @@ pub struct MemoryUserRegistry {
     by_password: DashMap<Box<str>, Arc<Entry>>,
     /// named psk -> user. The index `find_shadowsocks_psk_hash` hits.
     by_psk_hash: DashMap<[u8; 16], Arc<Entry>>,
+    /// sha256(password) -> user. The index `find_password_sha256` hits.
+    by_anytls_hash: DashMap<[u8; 32], Arc<Entry>>,
+    /// How many live users' hashes start with each 8-byte prefix.
+    ///
+    /// A count rather than a set, because two users can share a prefix and removing
+    /// one must not blind the probe to the other. Entries are dropped when the count
+    /// reaches zero, so the map does not grow across rotations.
+    anytls_prefixes: DashMap<[u8; 8], usize>,
     /// Every uuid-bearing user, as an immutable snapshot for VMess to walk. Not an
     /// index -- there is nothing to index on -- so it is republished whole on each
     /// mutation. See the module docs.
@@ -323,6 +350,8 @@ impl MemoryUserRegistry {
             by_trojan_hash: DashMap::new(),
             by_password: DashMap::new(),
             by_psk_hash: DashMap::new(),
+            by_anytls_hash: DashMap::new(),
+            anytls_prefixes: DashMap::new(),
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
         })
     }
@@ -380,6 +409,7 @@ impl MemoryUserRegistry {
             // Nothing to retire below, unlike the fields above it: this is carried on
             // the entry rather than indexed, so rotating it replaces the whole record.
             tuic_password: credentials.tuic_password,
+            anytls_hash: credentials.anytls_hash,
             // Built whenever the user has a uuid, whether or not this inbound speaks
             // VMess. One registry serves a whole inbound, and a TLS inbound can carry
             // VLESS on one SNI and VMess on another, so "is VMess in use here" is not
@@ -410,6 +440,12 @@ impl MemoryUserRegistry {
             {
                 self.by_psk_hash.remove(&old.hash);
             }
+            if previous.anytls_hash != entry.anytls_hash
+                && let Some(hash) = previous.anytls_hash
+            {
+                self.by_anytls_hash.remove(&hash);
+                self.release_anytls_prefix(&hash);
+            }
         }
 
         if let Some(uuid) = entry.uuid {
@@ -423,6 +459,13 @@ impl MemoryUserRegistry {
         }
         if let Some(shadowsocks) = &entry.shadowsocks {
             self.by_psk_hash.insert(shadowsocks.hash, entry.clone());
+        }
+        if let Some(hash) = entry.anytls_hash
+            && self.by_anytls_hash.insert(hash, entry.clone()).is_none()
+        {
+            // Only on a genuinely new key: re-registering the same hash under the
+            // same id must not double-count the prefix.
+            self.claim_anytls_prefix(&hash);
         }
         self.users.insert(id, entry.clone());
         self.republish_vmess();
@@ -457,6 +500,10 @@ impl MemoryUserRegistry {
         }
         if let Some(shadowsocks) = &entry.shadowsocks {
             self.by_psk_hash.remove(&shadowsocks.hash);
+        }
+        if let Some(hash) = entry.anytls_hash {
+            self.by_anytls_hash.remove(&hash);
+            self.release_anytls_prefix(&hash);
         }
         self.republish_vmess();
 
@@ -565,6 +612,10 @@ impl MemoryUserRegistry {
                 true => spec.password.as_deref().map(Arc::from),
                 false => None,
             },
+            anytls_hash: match self.kinds.anytls_password {
+                true => spec.password.as_deref().map(credential::password_sha256),
+                false => None,
+            },
         })
     }
 
@@ -610,7 +661,38 @@ impl MemoryUserRegistry {
                 owner: owner.to_string(),
             });
         }
+        if let Some(hash) = &credentials.anytls_hash
+            && let Some(owner) = self.credential_owner_anytls(hash)
+            && &*owner != id
+        {
+            return Err(EngineError::DuplicateCredential {
+                id: id.to_string(),
+                owner: owner.to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// Note one more live user whose hash starts with this prefix.
+    fn claim_anytls_prefix(&self, hash: &[u8; 32]) {
+        *self
+            .anytls_prefixes
+            .entry(credential::password_sha256_prefix(hash))
+            .or_insert(0) += 1;
+    }
+
+    /// Drop one, removing the entry entirely at zero so the map does not grow.
+    fn release_anytls_prefix(&self, hash: &[u8; 32]) {
+        let prefix = credential::password_sha256_prefix(hash);
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            self.anytls_prefixes.entry(prefix)
+        {
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
+            }
+        }
     }
 
     fn credential_owner_uuid(&self, uuid: &[u8; 16]) -> Option<Arc<str>> {
@@ -631,6 +713,12 @@ impl MemoryUserRegistry {
 
     fn credential_owner_psk(&self, hash: &[u8; 16]) -> Option<Arc<str>> {
         self.by_psk_hash.get(hash).map(|e| e.context.id().clone())
+    }
+
+    fn credential_owner_anytls(&self, hash: &[u8; 32]) -> Option<Arc<str>> {
+        self.by_anytls_hash
+            .get(hash)
+            .map(|e| e.context.id().clone())
     }
 
     /// Republish the VMess trial snapshot from the authoritative map.
@@ -722,6 +810,23 @@ impl UserRegistry for MemoryUserRegistry {
             user: entry.context.clone(),
             password,
         })
+    }
+
+    fn find_password_sha256(&self, hash: &[u8; 32]) -> Option<Arc<UserContext>> {
+        let entry = self.by_anytls_hash.get(hash)?;
+        let expected = entry.anytls_hash.as_ref()?;
+        entry.accept(&expected[..], &hash[..])
+    }
+
+    /// Whether it is worth reading the other 24 bytes.
+    ///
+    /// Deliberately no `is_enabled` check, unlike every lookup here: this is a
+    /// plausibility test, and answering `false` for a suspended user would divert
+    /// their connections to the fallback while a live user's went to the handler --
+    /// an observable difference that leaks who has been suspended. See the trait
+    /// method's docs.
+    fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool {
+        self.anytls_prefixes.contains_key(prefix)
     }
 
     fn user_count(&self) -> usize {
@@ -1372,6 +1477,107 @@ mod tests {
             .upsert(tuic_spec("mallory", UUID_A, "hunter4"))
             .unwrap_err();
         assert!(matches!(err, EngineError::DuplicateCredential { .. }));
+    }
+
+    #[test]
+    fn finds_an_anytls_user_by_the_hash_they_send() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::ANYTLS_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+
+        let hash = credential::password_sha256("hunter2");
+        let found = registry.find_password_sha256(&hash).unwrap();
+        assert_eq!(&**found.id(), "alice");
+        assert_eq!(found.total_conns(), 1);
+
+        assert!(
+            registry
+                .find_password_sha256(&credential::password_sha256("hunter3"))
+                .is_none()
+        );
+        // And the cleartext is not a credential of its own: AnyTLS never sends it.
+        assert!(registry.find_password("hunter2").is_none());
+    }
+
+    #[test]
+    fn the_anytls_prefix_probe_ignores_whether_a_user_is_enabled() {
+        // A plausibility test, not a lookup. Answering `false` for a suspended user
+        // would divert their connections to the fallback while a live user's went to
+        // the handler, which is an observable difference an attacker can use.
+        let registry = MemoryUserRegistry::new(CredentialKinds::ANYTLS_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+
+        let hash = credential::password_sha256("hunter2");
+        let prefix = credential::password_sha256_prefix(&hash);
+        assert!(registry.has_password_sha256_prefix(&prefix));
+
+        let user = registry.find_password_sha256(&hash).unwrap();
+        user.set_enabled(false);
+        assert!(registry.find_password_sha256(&hash).is_none());
+        assert!(registry.has_password_sha256_prefix(&prefix));
+
+        assert!(!registry.has_password_sha256_prefix(&[0u8; 8]));
+    }
+
+    #[test]
+    fn the_anytls_prefix_index_is_counted_rather_than_a_set() {
+        // Two users can share an 8-byte prefix, so removing one must not blind the
+        // probe to the other. A set would.
+        let registry = MemoryUserRegistry::new(CredentialKinds::ANYTLS_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        registry.upsert(trojan_spec("bob", "hunter3")).unwrap();
+
+        let alice_hash = credential::password_sha256("hunter2");
+        let bob_hash = credential::password_sha256("hunter3");
+        let prefix = credential::password_sha256_prefix(&alice_hash);
+
+        // Force the collision the real world would only produce by accident: give
+        // bob's entry alice's prefix by claiming it directly, which is what two
+        // colliding hashes would do.
+        registry.claim_anytls_prefix(&alice_hash);
+        assert!(registry.has_password_sha256_prefix(&prefix));
+
+        registry.remove("anytls", "alice").unwrap();
+        assert!(
+            registry.has_password_sha256_prefix(&prefix),
+            "the second claim on this prefix is still live"
+        );
+        registry.release_anytls_prefix(&alice_hash);
+        assert!(
+            !registry.has_password_sha256_prefix(&prefix),
+            "and the last release drops it"
+        );
+
+        // Bob is untouched throughout.
+        assert!(registry.find_password_sha256(&bob_hash).is_some());
+    }
+
+    #[test]
+    fn rotating_an_anytls_password_retires_the_old_hash_and_its_prefix() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::ANYTLS_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+        let old = credential::password_sha256("hunter2");
+
+        registry.upsert(trojan_spec("alice", "hunter3")).unwrap();
+        let new = credential::password_sha256("hunter3");
+
+        assert!(registry.find_password_sha256(&new).is_some());
+        assert!(registry.find_password_sha256(&old).is_none());
+        assert!(
+            !registry.has_password_sha256_prefix(&credential::password_sha256_prefix(&old)),
+            "the retired prefix must not keep a probe alive"
+        );
+        assert!(registry.has_password_sha256_prefix(&credential::password_sha256_prefix(&new)));
+        assert_eq!(registry.user_count(), 1);
+    }
+
+    #[test]
+    fn rejects_an_anytls_password_owned_by_another_user() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::ANYTLS_PASSWORD);
+        registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
+
+        let err = registry.upsert(trojan_spec("bob", "hunter2")).unwrap_err();
+        assert!(matches!(err, EngineError::DuplicateCredential { .. }));
+        assert_eq!(registry.user_count(), 1);
     }
 
     #[test]

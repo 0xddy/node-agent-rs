@@ -101,12 +101,16 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
         // `TcpServerHandler`, so it takes the registry as a parameter.
         ServerProxyConfig::TuicV5 { .. } => kinds.merge(CredentialKinds::TUIC),
 
+        // AnyTLS sends the raw SHA-256 of its password, so the registry answers two
+        // questions for it: which user a full hash belongs to, and whether an 8-byte
+        // prefix is worth reading the rest of. The second is what keeps its
+        // probe-resistant fallback fast, and it has to be answerable before the
+        // credential is complete.
+        ServerProxyConfig::Anytls { .. } => kinds.merge(CredentialKinds::ANYTLS_PASSWORD),
+
         // Authenticates, but not through the registry yet. Snell has no multi-user
-        // identity mechanism at all, and AnyTLS and NaiveProxy already have their own
-        // multi-user tables.
-        ServerProxyConfig::Snell { .. }
-        | ServerProxyConfig::Anytls { .. }
-        | ServerProxyConfig::Naiveproxy { .. } => {}
+        // identity mechanism at all, and NaiveProxy still has its own table.
+        ServerProxyConfig::Snell { .. } | ServerProxyConfig::Naiveproxy { .. } => {}
 
         // Either no credentials at all, or plain proxy credentials that identify a
         // client but not a billable user.
@@ -156,6 +160,14 @@ const PLACEHOLDER_FIELDS: &[(&str, &[&str])] = &[
     ("tuicv5", &["uuid", "password"]),
     ("tuic", &["uuid", "password"]),
 ];
+
+/// Protocols whose credential is a *list* of user objects rather than a leaf field,
+/// and the fields a throwaway member of that list needs.
+///
+/// AnyTLS is the first of these. Its `users` is a `OneOrSome`, which refuses an empty
+/// list, so such an inbound cannot simply omit the field the way a leaf credential
+/// can be omitted -- the placeholder has to be a one-element list.
+const PLACEHOLDER_USER_LISTS: &[(&str, &[&str])] = &[("anytls", &["password"])];
 /// Fills in the credential fields shoes' schema requires but a registry supersedes.
 ///
 /// `ServerProxyConfig::Vless` has a non-optional `user_id`, so a payload without one
@@ -274,6 +286,37 @@ fn fill_protocol_object(map: &mut Map<String, Value>) -> EngineResult<()> {
         Some(Value::String(kind)) => kind.clone(),
         _ => return Ok(()),
     };
+
+    // A protocol whose credential is a list of user objects. Same rule, different
+    // shape: reject one the caller wrote, and stand in a throwaway otherwise.
+    if let Some((_, member_fields)) = PLACEHOLDER_USER_LISTS
+        .iter()
+        .find(|(name, _)| *name == kind)
+    {
+        // Both spellings shoes accepts for the field, or the alias would slip past.
+        for key in ["users", "user"] {
+            if map.contains_key(key) {
+                return Err(EngineError::InvalidConfig(format!(
+                    "remove `{key}` from the {kind} protocol: this inbound has a `users` \
+                     list of its own, which is its only authority, so credentials in the \
+                     config would be ignored"
+                )));
+            }
+        }
+
+        let mut member = Map::new();
+        for field in *member_fields {
+            member.insert(
+                (*field).to_string(),
+                Value::String(credential::random_uuid()),
+            );
+        }
+        map.insert(
+            "users".to_string(),
+            Value::Array(vec![Value::Object(member)]),
+        );
+        return Ok(());
+    }
 
     let Some((_, fields)) = PLACEHOLDER_FIELDS.iter().find(|(name, _)| *name == kind) else {
         return Ok(());
@@ -436,6 +479,27 @@ mod tests {
             assert!(!kinds.plain_password);
             assert!(kinds.conflict().is_none());
         }
+    }
+
+    #[test]
+    fn classifies_anytls_as_its_own_hashed_password() {
+        // The same cleartext value trojan and hysteria2 start from, hashed a third
+        // way. A distinct kind, not a shared one -- and not a conflict with either,
+        // because one `password` field still serves all three.
+        let kinds = credential_kinds(&parse(
+            r#"{"type":"anytls","users":[{"name":"alice","password":"p"}]}"#,
+        ));
+        assert_eq!(kinds, CredentialKinds::ANYTLS_PASSWORD);
+        assert!(!kinds.trojan_password && !kinds.plain_password);
+
+        let mut with_trojan = kinds;
+        with_trojan.merge(CredentialKinds::TROJAN_PASSWORD);
+        assert!(with_trojan.conflict().is_none());
+
+        // But a base64 PSK and a cleartext password still cannot share a field.
+        let mut with_ss = kinds;
+        with_ss.merge(CredentialKinds::shadowsocks_psk(16));
+        assert!(with_ss.conflict().is_some());
     }
 
     #[test]
@@ -695,6 +759,37 @@ mod tests {
                     "for {declared}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fills_in_an_anytls_user_list() {
+        // The list-shaped case. `users` is a `OneOrSome`, which refuses an empty
+        // list, so the placeholder has to be a one-element list rather than a value.
+        let mut config: Value = serde_json::from_str(&inbound(r#"{"type":"anytls"}"#)).unwrap();
+        install_placeholder_credentials(&mut config).unwrap();
+
+        let users = config["protocol"]["users"]
+            .as_array()
+            .expect("anytls should get a placeholder user list");
+        assert_eq!(users.len(), 1);
+        assert!(
+            users[0]["password"].as_str().is_some_and(|p| !p.is_empty()),
+            "the throwaway user needs a password"
+        );
+
+        // Declared credentials are refused rather than overwritten, under either
+        // spelling of the field.
+        for declared in [
+            r#"{"type":"anytls","users":[{"name":"alice","password":"p"}]}"#,
+            r#"{"type":"anytls","user":{"password":"p"}}"#,
+        ] {
+            let mut config: Value = serde_json::from_str(&inbound(declared)).unwrap();
+            let err = install_placeholder_credentials(&mut config).unwrap_err();
+            assert!(
+                matches!(err, EngineError::InvalidConfig(_)),
+                "for {declared}"
+            );
         }
     }
 
