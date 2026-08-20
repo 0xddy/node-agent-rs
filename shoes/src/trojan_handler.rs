@@ -3,13 +3,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aws_lc_rs::digest::SHA224;
 use log::debug;
-use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
+use crate::dynamic::UserRegistry;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::shadowsocks::{
@@ -30,7 +30,12 @@ struct ShadowsocksData {
 
 #[derive(Debug)]
 pub struct TrojanTcpHandler {
-    password_hash: Box<[u8]>,
+    /// Authenticates incoming connections. `Some` exactly when this handler was built
+    /// for server use; the client direction has nobody to authenticate.
+    users: Option<Arc<dyn UserRegistry>>,
+    /// The digest this handler presents when it is the client. `Some` exactly when this
+    /// handler was built for client use, since a server never sends a credential.
+    password_hash: Option<Box<[u8]>>,
     shadowsocks_data: Option<ShadowsocksData>,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
@@ -41,13 +46,14 @@ pub struct TrojanTcpHandler {
 impl TrojanTcpHandler {
     /// Create a new handler for server use (with proxy_selector for routing)
     pub fn new_server(
-        password: &str,
+        users: Arc<dyn UserRegistry>,
         shadowsocks_config: &Option<ShadowsocksConfig>,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         Self::new_inner(
-            password,
+            Some(users),
+            None,
             shadowsocks_config,
             Some(proxy_selector),
             Some(resolver),
@@ -56,16 +62,22 @@ impl TrojanTcpHandler {
 
     /// Create a new handler for client use (no proxy_selector needed)
     pub fn new_client(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
-        Self::new_inner(password, shadowsocks_config, None, None)
+        Self::new_inner(
+            None,
+            Some(create_password_hash(password)),
+            shadowsocks_config,
+            None,
+            None,
+        )
     }
 
     fn new_inner(
-        password: &str,
+        users: Option<Arc<dyn UserRegistry>>,
+        password_hash: Option<Box<[u8]>>,
         shadowsocks_config: &Option<ShadowsocksConfig>,
         proxy_selector: Option<Arc<ClientProxySelector>>,
         resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
-        let password_hash = create_password_hash(password);
         let shadowsocks_data = shadowsocks_config.as_ref().map(|config| match config {
             ShadowsocksConfig::Legacy {
                 cipher,
@@ -86,6 +98,7 @@ impl TrojanTcpHandler {
         });
 
         Self {
+            users,
             password_hash,
             shadowsocks_data,
             proxy_selector,
@@ -117,22 +130,30 @@ impl TcpServerHandler for TrojanTcpHandler {
 
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
 
+        let users = self
+            .users
+            .as_ref()
+            .expect("user registry required for server handler");
+
         // read the entire line rather than exactly 56 bytes, so that we can masquerade as an HTTP server
         // and handle the request as if it were a HTTP request.
         // TODO: implement http response
         let received_hash = stream_reader.read_line_bytes(&mut server_stream).await?;
-        if received_hash.len() != self.password_hash.len() {
+        if received_hash.len() != PASSWORD_HASH_LEN {
             return Err(std::io::Error::other(format!(
                 "Invalid password hash length, expected {}, got {}",
-                self.password_hash.len(),
+                PASSWORD_HASH_LEN,
                 received_hash.len()
             )));
         }
 
-        // Use constant-time comparison to prevent timing attacks
-        if self.password_hash.ct_eq(received_hash).unwrap_u8() == 0 {
-            return Err(std::io::Error::other("Invalid password hash"));
-        }
+        // NOTE(shoes-engine): the registry hashes to a bucket and finishes with a
+        // constant-time comparison, so this is still not a timing oracle. Phase 3 hands
+        // the returned context to the traffic meter.
+        let _user = match users.find_trojan_hash(received_hash) {
+            Some(user) => user,
+            None => return Err(std::io::Error::other("Invalid password hash")),
+        };
 
         let command_type = stream_reader.read_u8(&mut server_stream).await?;
 
@@ -227,7 +248,11 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        write_all(&mut client_stream, &self.password_hash).await?;
+        let password_hash = self
+            .password_hash
+            .as_ref()
+            .expect("password hash required for client handler");
+        write_all(&mut client_stream, password_hash).await?;
         write_all(&mut client_stream, &CRLF_BYTES).await?;
         write_all(&mut client_stream, &[CMD_CONNECT]).await?;
         let location_bytes = write_location_to_vec(remote_location.location());
@@ -251,7 +276,10 @@ impl TcpClientHandler for TrojanTcpHandler {
     // async fn setup_client_udp_bidirectional(...)
 }
 
-fn create_password_hash(password: &str) -> Box<[u8]> {
+/// Length of a Trojan credential on the wire: SHA-224 rendered as lowercase hex.
+pub(crate) const PASSWORD_HASH_LEN: usize = 56;
+
+pub(crate) fn create_password_hash(password: &str) -> Box<[u8]> {
     let digest = aws_lc_rs::digest::digest(&SHA224, password.as_bytes());
     let hash_bytes = digest.as_ref();
     let mut hex_str = String::with_capacity(hash_bytes.len() * 2);
@@ -259,9 +287,10 @@ fn create_password_hash(password: &str) -> Box<[u8]> {
         hex_str.push_str(&format!("{b:02x}"));
     }
     let hex_bytes = hex_str.into_bytes().into_boxed_slice();
-    if hex_bytes.len() != 56 {
+    if hex_bytes.len() != PASSWORD_HASH_LEN {
         panic!(
-            "Invalid password hash length, expected 56, got {}",
+            "Invalid password hash length, expected {}, got {}",
+            PASSWORD_HASH_LEN,
             hex_bytes.len()
         );
     }

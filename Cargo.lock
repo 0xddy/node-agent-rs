@@ -2182,6 +2182,7 @@ dependencies = [
  "serde_yaml",
  "shoes",
  "shoes-api",
+ "subtle",
  "tokio",
  "tokio-util",
 ]

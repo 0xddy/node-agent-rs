@@ -12,6 +12,7 @@ use crate::config::{
     ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
     ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, WebsocketServerConfig,
 };
+use crate::dynamic::{StaticUserRegistry, UserRegistry};
 use crate::http_handler::HttpTcpServerHandler;
 use crate::mixed_handler::MixedTcpServerHandler;
 use crate::naiveproxy::UserLookup;
@@ -31,7 +32,6 @@ use crate::tls_server_handler::{
     InnerProtocol, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
 };
 use crate::trojan_handler::TrojanTcpHandler;
-use crate::uuid_util::parse_uuid;
 use crate::vless::vless_server_handler::VlessTcpServerHandler;
 use crate::vmess::VmessTcpServerHandler;
 use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
@@ -48,6 +48,33 @@ fn create_auth_credentials(
     }
 }
 
+/// Registry for a protocol that authenticates by 16-byte uuid (VLESS, VMess).
+///
+/// An injected registry wins outright. Falling back to the config credential is
+/// what keeps a plain config file behaving exactly as it did before registries
+/// existed: one uuid, compared in constant time, nothing else accepted.
+fn resolve_uuid_users(
+    users: Option<&Arc<dyn UserRegistry>>,
+    config_uuid: &str,
+) -> Arc<dyn UserRegistry> {
+    match users {
+        Some(registry) => Arc::clone(registry),
+        // The uuid was already validated during config load.
+        None => StaticUserRegistry::single_uuid(config_uuid).expect("Invalid user_id UUID"),
+    }
+}
+
+/// Registry for Trojan, which authenticates by the hex digest of a password.
+fn resolve_trojan_users(
+    users: Option<&Arc<dyn UserRegistry>>,
+    config_password: &str,
+) -> Arc<dyn UserRegistry> {
+    match users {
+        Some(registry) => Arc::clone(registry),
+        None => StaticUserRegistry::single_trojan_password(config_password),
+    }
+}
+
 /// Create a TCP server handler from config.
 ///
 /// # Arguments
@@ -55,15 +82,23 @@ fn create_auth_credentials(
 /// * `client_proxy_selector` - Selector for outbound proxy routing
 /// * `resolver` - DNS resolver
 /// * `bind_ip` - Optional bind IP for handlers that need it (e.g., Socks5 UDP, Mixed)
+/// * `users` - Optional externally managed user registry for this inbound
 ///
 /// The `bind_ip` is required for:
 /// - `Socks` with `udp_enabled: true` (for UDP ASSOCIATE)
 /// - `Mixed` with `udp_enabled: true` (for UDP ASSOCIATE)
+///
+/// `users` is inherited by every nested protocol, so a VLESS handler inside TLS
+/// inside WebSocket authenticates against the same registry as the inbound that
+/// owns it. When it is `None`, each authenticating protocol builds an immutable
+/// registry from its own config credential; when it is `Some`, that registry is the
+/// only authority and the config credential is ignored.
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    users: Option<&Arc<dyn UserRegistry>>,
 ) -> Box<dyn TcpServerHandler> {
     match server_proxy_config {
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
@@ -139,7 +174,7 @@ pub fn create_tcp_server_handler(
             udp_enabled,
             fallback,
         } => Box::new(VlessTcpServerHandler::new(
-            &user_id,
+            resolve_uuid_users(users, &user_id),
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),
@@ -149,7 +184,7 @@ pub fn create_tcp_server_handler(
             password,
             shadowsocks,
         } => Box::new(TrojanTcpHandler::new_server(
-            &password,
+            resolve_trojan_users(users, &password),
             &shadowsocks,
             client_proxy_selector.clone(),
             resolver.clone(),
@@ -166,12 +201,18 @@ pub fn create_tcp_server_handler(
                 .map(|(sni, config)| {
                     (
                         sni,
-                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip),
+                        create_tls_server_target(
+                            config,
+                            client_proxy_selector,
+                            resolver,
+                            bind_ip,
+                            users,
+                        ),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();
             let default_tls_target = default_tls_target.map(|config| {
-                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
+                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip, users)
             });
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
@@ -183,6 +224,7 @@ pub fn create_tcp_server_handler(
                             client_proxy_selector,
                             resolver,
                             bind_ip,
+                            users,
                         ),
                     )
                 })
@@ -198,6 +240,7 @@ pub fn create_tcp_server_handler(
                             client_proxy_selector,
                             resolver,
                             bind_ip,
+                            users,
                         ),
                     )
                 })
@@ -226,7 +269,13 @@ pub fn create_tcp_server_handler(
                 .into_vec()
                 .into_iter()
                 .map(|config| {
-                    create_websocket_server_target(config, client_proxy_selector, resolver, bind_ip)
+                    create_websocket_server_target(
+                        config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        users,
+                    )
                 })
                 .collect::<Vec<_>>();
             Box::new(WebsocketTcpServerHandler::new(server_targets))
@@ -289,6 +338,7 @@ fn create_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    users: Option<&Arc<dyn UserRegistry>>,
 ) -> TlsServerTarget {
     let TlsServerConfig {
         cert,
@@ -373,11 +423,8 @@ fn create_tls_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
             InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
+                users: resolve_uuid_users(users, user_id),
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
             })
@@ -385,7 +432,7 @@ fn create_tls_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
         InnerProtocol::Normal(handler)
     };
 
@@ -401,6 +448,7 @@ fn create_shadow_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    users: Option<&Arc<dyn UserRegistry>>,
 ) -> TlsServerTarget {
     let ShadowTlsServerConfig {
         password,
@@ -449,7 +497,7 @@ fn create_shadow_tls_server_target(
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
 
     TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
@@ -463,6 +511,7 @@ fn create_reality_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    users: Option<&Arc<dyn UserRegistry>>,
 ) -> TlsServerTarget {
     let RealityServerConfig {
         private_key,
@@ -532,11 +581,8 @@ fn create_reality_server_target(
             fallback,
         } = &protocol
         {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
             InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
+                users: resolve_uuid_users(users, user_id),
                 udp_enabled: *udp_enabled,
                 fallback: fallback.clone(),
             })
@@ -544,7 +590,7 @@ fn create_reality_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
         InnerProtocol::Normal(handler)
     };
 
@@ -588,6 +634,7 @@ fn create_websocket_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
+    users: Option<&Arc<dyn UserRegistry>>,
 ) -> WebsocketServerTarget {
     let WebsocketServerConfig {
         matching_path,
@@ -616,7 +663,7 @@ fn create_websocket_server_target(
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
 
     WebsocketServerTarget {
         matching_path,

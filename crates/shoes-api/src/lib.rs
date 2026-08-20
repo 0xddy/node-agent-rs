@@ -12,6 +12,66 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
+/// A user to authenticate against an inbound.
+///
+/// Which credential field applies is decided by the inbound's protocol, not by
+/// this type: a VLESS inbound reads `uuid`, a Trojan inbound reads `password`. A
+/// spec that carries neither, or carries the wrong one for the protocol, is
+/// rejected rather than silently accepted, because a credential that is quietly
+/// dropped reads to the caller as a user who was added.
+///
+/// `deny_unknown_fields` is deliberate for the same reason. This payload carries
+/// secrets, and a typo in a field name must be a 400, not a user with no
+/// credential.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserSpec {
+    /// Stable identity for reporting, and the handle for
+    /// `DELETE /inbounds/{tag}/users/{id}`. Defaults to `uuid` when one is given,
+    /// since that is already how operators refer to a VLESS or VMess user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Canonical uuid, with or without dashes. Used by VLESS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Cleartext password. Used by Trojan, which hashes it before it goes on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// A disabled user keeps their counters and their established connections but
+    /// cannot authenticate again.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl UserSpec {
+    /// The identity this user will be reported under.
+    pub fn resolved_id(&self) -> Option<&str> {
+        self.id.as_deref().or(self.uuid.as_deref())
+    }
+}
+
+/// A registered user as reported by the engine.
+///
+/// Credentials are never echoed back. The engine holds them only as index keys,
+/// and re-serving them would turn a read endpoint into a credential dump.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub id: String,
+    pub enabled: bool,
+    /// Bytes sent to this user, as they went on the wire.
+    pub tx: u64,
+    /// Bytes received from this user, as they came off the wire.
+    pub rx: u64,
+    /// Connections currently open.
+    pub conns: u64,
+    /// Successful authentications since the user was added.
+    pub total_conns: u64,
+}
+
 /// Request body for `POST /inbounds`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboundSpec {
@@ -21,6 +81,23 @@ pub struct InboundSpec {
     /// A native shoes server config object, i.e. one element of the top-level
     /// YAML config list, expressed as JSON.
     pub config: serde_json::Value,
+    /// Users to authenticate with, opting this inbound into dynamic mode.
+    ///
+    /// Absent means the classic file-config behaviour: the credential written in
+    /// `config` is the authority, and the engine does not manage users for this
+    /// inbound.
+    ///
+    /// Present -- **including an empty list** -- hands authority to the engine's
+    /// in-memory registry instead. Any credential in `config` is then rejected as
+    /// misleading rather than ignored, and an empty registry means nobody can
+    /// connect until users are added over `POST /inbounds/{tag}/users`. An empty
+    /// list is the normal way to bring an inbound up first and populate it after.
+    ///
+    /// The distinction is why this is an `Option` and not a plain `Vec`: a `Vec`
+    /// cannot tell "no users section" from "deliberately no users yet", and those
+    /// two mean opposite things for who may connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<UserSpec>>,
 }
 
 /// A registered inbound as reported by the engine.
@@ -35,6 +112,12 @@ pub struct InboundInfo {
     pub bind: Vec<String>,
     /// Number of live listener tasks backing this inbound.
     pub listeners: usize,
+    /// Users registered against this inbound. `None` when the protocol does not
+    /// authenticate through the engine's user registry, which is not the same as
+    /// zero users: zero means nobody can connect, `None` means the question does
+    /// not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<usize>,
 }
 
 /// Response body for `GET /status`.

@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use shoes_api::InboundInfo;
 use tokio::task::JoinHandle;
+
+use crate::users::MemoryUserRegistry;
 
 /// The resolved listen targets of one inbound.
 #[derive(Debug, Clone)]
@@ -38,6 +40,15 @@ pub struct InboundSlot {
     info: InboundInfo,
     targets: BindTargets,
     listeners: Mutex<Vec<JoinHandle<()>>>,
+    /// The authority for this inbound's users, when it has one.
+    ///
+    /// `None` means the inbound was created without a `users` list and answers
+    /// from its config credential, so there is nothing here to add users to.
+    ///
+    /// The same `Arc` is inside the running handlers. Mutating it is what makes a
+    /// user addition take effect on the next handshake with no restart, and why
+    /// this is not behind the control lock: the registry is already concurrent.
+    users: Option<Arc<MemoryUserRegistry>>,
 }
 
 impl InboundSlot {
@@ -45,16 +56,29 @@ impl InboundSlot {
         info: InboundInfo,
         targets: BindTargets,
         listeners: Vec<JoinHandle<()>>,
+        users: Option<Arc<MemoryUserRegistry>>,
     ) -> Self {
         Self {
             info,
             targets,
             listeners: Mutex::new(listeners),
+            users,
         }
     }
 
-    pub fn info(&self) -> &InboundInfo {
-        &self.info
+    /// A snapshot of this inbound, with the current user count filled in.
+    ///
+    /// The count is computed here rather than stored, because it changes every time
+    /// a user is added or removed and a cached copy would go stale silently.
+    pub fn describe(&self) -> InboundInfo {
+        let mut info = self.info.clone();
+        info.users = self.users.as_ref().map(|users| users.len());
+        info
+    }
+
+    /// The user registry backing this inbound, or `None` if it has none.
+    pub fn users(&self) -> Option<&Arc<MemoryUserRegistry>> {
+        self.users.as_ref()
     }
 
     pub(crate) fn targets(&self) -> &BindTargets {
@@ -98,6 +122,7 @@ impl std::fmt::Debug for InboundSlot {
             .field("tag", &self.info.tag)
             .field("protocol", &self.info.protocol)
             .field("bind", &self.info.bind)
+            .field("users", &self.users.as_ref().map(|u| u.len()))
             .finish()
     }
 }

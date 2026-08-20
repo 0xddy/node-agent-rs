@@ -1,0 +1,15 @@
+# Cargo reads .cargo/config.toml from the directory it is invoked in and that
+# directory's ancestors -- never from a package directory. Now that shoes is a
+# workspace member, shoes/.cargo/config.toml is dead for any build started from
+# the workspace root, so its settings have to be mirrored here. The original file
+# is left in place untouched so upstream merges stay clean.
+
+# Static linking for musl targets
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[build]
+# shoes' incremental cache runs ~1.3 GB on its own, on top of a debug target dir
+# that is already ~2.7 GB. Rebuild times go up, but builds stop failing halfway
+# through with "no space left on device". Drop this line if you have the room.
+incremental = false

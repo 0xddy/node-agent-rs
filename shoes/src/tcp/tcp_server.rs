@@ -19,6 +19,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
+use crate::dynamic::UserRegistry;
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -348,6 +349,26 @@ pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
+    start_servers_with_users(config, resolver, None).await
+}
+
+/// Start one inbound, authenticating against a caller-supplied user registry.
+///
+/// This is the entry point for an embedder that manages users itself. When `users`
+/// is `Some`, it is the sole authority for this inbound and the credentials in the
+/// protocol config are not consulted, so an inbound whose registry is empty rejects
+/// every client until users are added to it. When `users` is `None` each protocol
+/// handler builds a `StaticUserRegistry` from its own config section instead, which
+/// is what [`start_servers`] does and what a config file expects.
+///
+/// Hysteria2 and TUIC are not covered yet: both authenticate inside
+/// `quic_server.rs` rather than through a `TcpServerHandler`, so they keep using
+/// their config credential even when a registry is supplied.
+pub async fn start_servers_with_users(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
+) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
         #[cfg(unix)]
         Config::TunServer(tun_config) => start_tun_server(tun_config, resolver)
@@ -358,7 +379,9 @@ pub async fn start_servers(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
         )),
-        Config::Server(server_config) => start_tcp_or_quic_servers(server_config, resolver).await,
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(server_config, resolver, users).await
+        }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
 }
@@ -366,11 +389,12 @@ pub async fn start_servers(
 async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = Vec::with_capacity(3);
 
     match config.transport {
-        Transport::Tcp => match start_tcp_servers(config.clone(), resolver).await {
+        Transport::Tcp => match start_tcp_servers(config.clone(), resolver, users).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -381,7 +405,7 @@ async fn start_tcp_or_quic_servers(
                 return Err(e);
             }
         },
-        Transport::Quic => match start_quic_servers(config.clone(), resolver).await {
+        Transport::Quic => match start_quic_servers(config.clone(), resolver, users).await {
             Ok(handles) => {
                 join_handles.extend(handles);
             }
@@ -408,6 +432,7 @@ async fn start_tcp_or_quic_servers(
 async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -446,6 +471,7 @@ async fn start_tcp_servers(
                                 &client_proxy_selector,
                                 &resolver,
                                 Some(socket_addr.ip()),
+                                users.as_ref(),
                             )
                             .into()
                         })
@@ -466,9 +492,14 @@ async fn start_tcp_servers(
         BindLocation::Path(path_buf) => {
             #[cfg(target_family = "unix")]
             {
-                let tcp_handler: Arc<dyn TcpServerHandler> =
-                    create_tcp_server_handler(protocol, &client_proxy_selector, &resolver, None)
-                        .into();
+                let tcp_handler: Arc<dyn TcpServerHandler> = create_tcp_server_handler(
+                    protocol,
+                    &client_proxy_selector,
+                    &resolver,
+                    None,
+                    users.as_ref(),
+                )
+                .into();
                 debug!("TCP handler: {tcp_handler:?}");
                 let handle = tokio::spawn(async move {
                     run_unix_server(path_buf, resolver, tcp_handler)

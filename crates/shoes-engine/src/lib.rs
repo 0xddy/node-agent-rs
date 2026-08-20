@@ -7,6 +7,27 @@
 //! same startup path *without* a config file, so the process can come up with
 //! **zero inbounds and zero users** and be populated afterwards over an API.
 //!
+//! # Layering
+//!
+//! `shoes/` stays an **engine**. It gets extension points -- a trait to look a
+//! credential up, a per-user record to account against -- and nothing that decides
+//! policy, speaks a wire protocol to an operator, or manages a process. Concretely,
+//! nothing under `shoes/src/dynamic/` knows about HTTP, JSON, or a user database;
+//! that is why it pulls in no new dependency at all.
+//!
+//! Everything application-shaped lives out here, in three layers:
+//!
+//! | crate | role |
+//! |---|---|
+//! | `shoes` | the proxy engine, plus the hooks below |
+//! | `shoes-engine` | **the integration point**: programmatic control of inbounds and users |
+//! | `shoes-api` | the wire types, if you want them |
+//! | `shoes-controller` | a reference binary over `shoes-engine`; not the product |
+//!
+//! An embedder writing its own control plane should depend on `shoes-engine` and
+//! drive [`Engine`] directly. `shoes-controller` exists to prove the surface is
+//! sufficient and to have something runnable; it is expected to be replaced.
+//!
 //! # Invasiveness
 //!
 //! Nothing here reimplements shoes logic. Every step reuses the exact upstream
@@ -17,14 +38,30 @@
 //! | inline file-backed certs | [`shoes::config::convert_cert_paths`] |
 //! | validate + expand groups | [`shoes::config::create_server_configs`] |
 //! | build resolvers | [`shoes::dns::build_dns_registry`] |
-//! | start listeners | [`shoes::tcp::tcp_server::start_servers`] |
+//! | start listeners | [`shoes::tcp::tcp_server::start_servers_with_users`] |
 //!
-//! The only changes required inside `shoes/` for this phase were three
-//! visibility widenings (`pub mod tcp;`, `pub mod socket_util;`, and exporting
-//! `DnsRegistry`). No upstream behaviour was modified.
+//! The footprint inside `shoes/`, which is what every future merge of upstream has
+//! to survive, is:
+//!
+//! - three visibility widenings (`pub mod tcp;`, `pub mod socket_util;`, and
+//!   exporting `DnsRegistry`), plus `[profile.release]` moved to the workspace root
+//!   because Cargo ignores profiles in a non-root member
+//! - a new `shoes::dynamic` module: the [`shoes::dynamic::UserRegistry`] trait,
+//!   the per-user record it returns, wire-format credential derivation, and a
+//!   `StaticUserRegistry` for config-file users
+//! - an `Option<Arc<dyn UserRegistry>>` threaded through the handler factory, and
+//!   two authentication sites (VLESS, Trojan) changed from comparing against one
+//!   hardcoded credential to asking the registry
+//!
+//! That last point is the only upstream *behaviour* change, and it is behaviour
+//! preserving by construction: with no registry injected, each handler builds a
+//! `StaticUserRegistry` holding exactly the credential from its own config, so a
+//! plain YAML config authenticates precisely as it did before.
 
 mod error;
 mod inbound;
+mod protocol;
+mod users;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,16 +69,20 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use tokio::task::{JoinHandle, JoinError};
+use tokio::task::{JoinError, JoinHandle};
 
-use shoes::config::{BindLocation, Config, ServerConfig, Transport, ValidatedConfigs};
+use shoes::config::{
+    BindLocation, Config, ServerConfig, Transport, ValidatedConfigs, convert_cert_paths,
+};
 use shoes::dns::{DnsRegistry, build_dns_registry};
+use shoes::dynamic::UserRegistry;
 use shoes::resolver::Resolver;
-use shoes::tcp::tcp_server::start_servers;
-use shoes_api::{EngineStatus, InboundInfo, InboundSpec};
+use shoes::tcp::tcp_server::start_servers_with_users;
+use shoes_api::{EngineStatus, InboundInfo, InboundSpec, UserInfo, UserSpec};
 
 pub use error::{EngineError, EngineResult};
 pub use inbound::InboundSlot;
+pub use users::{CredentialKinds, MemoryUserRegistry};
 
 use inbound::BindTargets;
 
@@ -117,7 +158,7 @@ impl Engine {
             .inner
             .inbounds
             .iter()
-            .map(|entry| entry.value().info().clone())
+            .map(|entry| entry.value().describe())
             .collect();
         infos.sort_by(|a, b| a.tag.cmp(&b.tag));
         infos
@@ -131,16 +172,38 @@ impl Engine {
     ///
     /// On any failure the engine is left exactly as it was: partially started
     /// listeners are torn down and no address is left claimed.
+    ///
+    /// When `spec.users` is present the inbound is put in dynamic mode: an
+    /// in-memory registry becomes its sole credential authority, and it is live
+    /// from the first accepted connection onward. See
+    /// [`Engine::build_user_registry`] for what "present" is allowed to mean.
     pub async fn add_inbound(&self, spec: InboundSpec) -> EngineResult<InboundInfo> {
-        let InboundSpec { tag, config } = spec;
+        let InboundSpec {
+            tag,
+            mut config,
+            users,
+        } = spec;
 
         if tag.trim().is_empty() {
             return Err(EngineError::InvalidConfig("tag must not be empty".into()));
         }
 
+        // In dynamic mode the protocol's own credential field is dead but still
+        // mandatory in shoes' schema, so fill it before deserializing. This also
+        // rejects a caller-supplied credential, which would otherwise be silently
+        // overruled by the registry.
+        if users.is_some() {
+            protocol::install_placeholder_credentials(&mut config)?;
+        }
+
         // Parse and validate *before* taking the control lock: a malformed
         // payload should not delay other operations.
-        let server_configs = validate_inbound_config(config)?;
+        let server_configs = validate_inbound_config(config).await?;
+
+        let registry = match users {
+            Some(users) => Some(Self::build_user_registry(&server_configs, users)?),
+            None => None,
+        };
 
         let mut control = self.inner.control.lock().await;
 
@@ -174,7 +237,7 @@ impl Engine {
             }
         }
 
-        let protocol = server_configs[0].protocol.to_string();
+        let protocol = protocol::display_name(&server_configs[0].protocol);
         let transport = transport_name(&server_configs[0].transport).to_string();
 
         let mut listeners: Vec<JoinHandle<()>> = Vec::new();
@@ -191,7 +254,15 @@ impl Engine {
                 }
             };
 
-            match start_servers(Config::Server(server_config), resolver).await {
+            // `Arc<MemoryUserRegistry>` is cloned per listener, so every handler
+            // built from this spec authenticates against the one same table.
+            let registry_ref = registry
+                .clone()
+                .map(|r| r as Arc<dyn UserRegistry>);
+
+            match start_servers_with_users(Config::Server(server_config), resolver, registry_ref)
+                .await
+            {
                 Ok(handles) => listeners.extend(handles),
                 Err(e) => {
                     // Roll back anything already started under this tag.
@@ -211,6 +282,8 @@ impl Engine {
             transport,
             bind: bind_display,
             listeners: listeners.len(),
+            // Filled in live by `InboundSlot::describe`; see its doc comment.
+            users: None,
         };
 
         let all_addresses: Vec<SocketAddr> = targets
@@ -222,6 +295,7 @@ impl Engine {
             info.clone(),
             BindTargets::Addresses(all_addresses.clone()),
             listeners,
+            registry,
         ));
 
         // Give the listener tasks a moment to fail, then confirm they are alive.
@@ -234,17 +308,24 @@ impl Engine {
             ))));
         }
 
+        let info = slot.describe();
+
         for address in &all_addresses {
             self.inner.bound.insert(*address, tag.clone());
         }
         self.inner.inbounds.insert(tag.clone(), slot);
 
         info!(
-            "inbound {} started: {} over {} on {}",
+            "inbound {} started: {} over {} on {} ({})",
             info.tag,
             info.protocol,
             info.transport,
-            info.bind.join(", ")
+            info.bind.join(", "),
+            match info.users {
+                Some(0) => "dynamic users, none registered yet".to_string(),
+                Some(n) => format!("{n} dynamic user(s)"),
+                None => "config credentials".to_string(),
+            }
         );
 
         Ok(info)
@@ -269,13 +350,110 @@ impl Engine {
             self.inner.bound.remove(address);
         }
 
-        let info = slot.info().clone();
+        let info = slot.describe();
         info!(
             "inbound {} stopped; established connections continue to drain",
             info.tag
         );
 
         Ok(info)
+    }
+
+    /// Builds the credential authority for an inbound in dynamic mode.
+    ///
+    /// The refusals here are the important part. Only VLESS and Trojan consult a
+    /// registry today, so accepting a `users` list on any other protocol would
+    /// leave the caller believing they had configured access control that is not
+    /// actually consulted -- fail-open, and invisible until someone connects with
+    /// a credential nobody granted. So a `users` list on an inbound the registry
+    /// cannot serve is an error, not a no-op.
+    ///
+    /// The check runs over the *expanded* configs, so it sees through TLS, Reality,
+    /// ShadowTLS and Websocket nesting rather than just the outer protocol name.
+    fn build_user_registry(
+        server_configs: &[ServerConfig],
+        users: Vec<UserSpec>,
+    ) -> EngineResult<Arc<MemoryUserRegistry>> {
+        let mut kinds = CredentialKinds::NONE;
+        for server_config in server_configs {
+            kinds.merge(protocol::credential_kinds(&server_config.protocol));
+        }
+
+        if kinds.is_empty() {
+            return Err(EngineError::Unsupported(format!(
+                "{} does not authenticate through the engine's user registry yet, so it \
+                 cannot take a `users` list; omit `users` to use the credential in `config`",
+                protocol::display_name(&server_configs[0].protocol)
+            )));
+        }
+
+        let registry = MemoryUserRegistry::new(kinds);
+        for user in users {
+            // Reported by id, and every id in one payload must be distinct: an
+            // upsert would otherwise let a duplicate id in the same list silently
+            // overwrite an earlier entry.
+            let id = user
+                .resolved_id()
+                .ok_or_else(|| {
+                    EngineError::InvalidUser("a user needs an `id` or a `uuid`".into())
+                })?
+                .to_string();
+            if registry.get(&id).is_some() {
+                return Err(EngineError::InvalidUser(format!(
+                    "user {id} is listed twice"
+                )));
+            }
+            registry.upsert(user)?;
+        }
+
+        Ok(registry)
+    }
+
+    /// Adds or updates one user on `tag`, effective on the next handshake.
+    ///
+    /// Updating an existing id keeps that user's counters and their established
+    /// connections; only the credential and the enabled flag are replaced.
+    pub fn add_user(&self, tag: &str, user: UserSpec) -> EngineResult<UserInfo> {
+        self.registry_for(tag)?.upsert(user)
+    }
+
+    /// Removes one user from `tag`.
+    ///
+    /// Their established connections keep running and keep being accounted for --
+    /// each one holds its own `Arc<UserContext>`, taken at handshake time. Only
+    /// the lookup path forgets the credential, so no new session can use it.
+    pub fn remove_user(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        self.registry_for(tag)?.remove(tag, id)
+    }
+
+    pub fn list_users(&self, tag: &str) -> EngineResult<Vec<UserInfo>> {
+        Ok(self.registry_for(tag)?.list())
+    }
+
+    pub fn get_user(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        self.registry_for(tag)?
+            .get(id)
+            .ok_or_else(|| EngineError::UnknownUser {
+                tag: tag.to_string(),
+                id: id.to_string(),
+            })
+    }
+
+    /// The user authority for `tag`, or an error explaining which of the two ways
+    /// to have none applies.
+    fn registry_for(&self, tag: &str) -> EngineResult<Arc<MemoryUserRegistry>> {
+        let slot = self
+            .inner
+            .inbounds
+            .get(tag)
+            .ok_or_else(|| EngineError::UnknownTag(tag.to_string()))?;
+
+        slot.users().cloned().ok_or_else(|| {
+            EngineError::Unsupported(format!(
+                "inbound {tag} was created without a `users` list, so its credentials come \
+                 from its config and cannot be changed through this endpoint"
+            ))
+        })
     }
 
     /// Picks the resolver for one server config, mirroring `main.rs`.
@@ -315,7 +493,14 @@ impl Engine {
 /// to `serde_yaml` runs it through the *same* deserializers the YAML config files
 /// use -- including `ServerConfig`'s hand-written `Deserialize` impl. No parallel
 /// JSON schema to maintain.
-fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<ServerConfig>> {
+///
+/// The step order mirrors `shoes/src/main.rs:339`: certs are inlined *before*
+/// validation. That order is load-bearing rather than cosmetic --
+/// `create_server_configs` reaches `embed_pem_from_map`, which `panic!`s on a PEM
+/// path it has not seen loaded (`shoes/src/config/pem.rs:466`). Skipping the
+/// conversion turns any file-backed cert into a panicked request task instead of an
+/// error response.
+async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<ServerConfig>> {
     if !config.is_object() {
         return Err(EngineError::InvalidConfig(
             "config must be a single server config object".into(),
@@ -334,7 +519,16 @@ fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<Server
         ));
     }
 
-    let ValidatedConfigs { configs, .. } = shoes::config::create_server_configs(vec![parsed])
+    // Reads any `cert`/`key` that names a file and replaces it with the PEM text.
+    // A missing or unreadable file surfaces here, as a 400, with the OS error.
+    let (parsed, loaded) = convert_cert_paths(vec![parsed])
+        .await
+        .map_err(|e| EngineError::InvalidConfig(format!("could not load cert files: {e}")))?;
+    if loaded > 0 {
+        debug!("inlined {loaded} cert(s)/key(s) from files");
+    }
+
+    let ValidatedConfigs { configs, .. } = shoes::config::create_server_configs(parsed)
         .map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
 
     let mut server_configs = Vec::with_capacity(configs.len());

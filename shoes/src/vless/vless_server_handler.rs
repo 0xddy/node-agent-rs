@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use log::debug;
-use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -10,12 +9,12 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
+use crate::dynamic::UserRegistry;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::util::write_all;
-use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
 use super::vision_stream::VisionStream;
@@ -26,7 +25,7 @@ use super::vless_util::{
 };
 
 pub struct VlessTcpServerHandler {
-    user_id: Box<[u8]>,
+    users: Arc<dyn UserRegistry>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -36,7 +35,7 @@ pub struct VlessTcpServerHandler {
 impl std::fmt::Debug for VlessTcpServerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VlessTcpServerHandler")
-            .field("user_id", &self.user_id)
+            .field("users", &self.users)
             .field("udp_enabled", &self.udp_enabled)
             .field("fallback", &self.fallback)
             .finish()
@@ -45,14 +44,14 @@ impl std::fmt::Debug for VlessTcpServerHandler {
 
 impl VlessTcpServerHandler {
     pub fn new(
-        user_id: &str,
+        users: Arc<dyn UserRegistry>,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
         fallback: Option<NetLocation>,
     ) -> Self {
         Self {
-            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+            users,
             udp_enabled,
             proxy_selector,
             resolver,
@@ -151,21 +150,29 @@ impl TcpServerHandler for VlessTcpServerHandler {
         }
 
         let header = stream_reader.peek_slice(&mut server_stream, 17).await?;
-        let target_id = &header[1..17];
+        let mut user_uuid = [0u8; 16];
+        user_uuid.copy_from_slice(&header[1..17]);
 
-        if self.user_id.ct_eq(target_id).unwrap_u8() == 0 {
-            debug!("VLESS UUID mismatch");
-            if let Some(ref fallback) = self.fallback {
-                return vless_fallback_to_dest(
-                    server_stream,
-                    stream_reader,
-                    fallback,
-                    &self.resolver,
-                )
-                .await;
+        // NOTE(shoes-engine): the registry is the sole authority for this inbound, so
+        // an empty one rejects everyone. Phase 3 hands the returned context to the
+        // traffic meter; for now the lookup is purely the authentication step, and the
+        // registry has already recorded it against the user.
+        let _user = match self.users.find_uuid(&user_uuid) {
+            Some(user) => user,
+            None => {
+                debug!("VLESS UUID mismatch");
+                if let Some(ref fallback) = self.fallback {
+                    return vless_fallback_to_dest(
+                        server_stream,
+                        stream_reader,
+                        fallback,
+                        &self.resolver,
+                    )
+                    .await;
+                }
+                return Err(std::io::Error::other("Unknown user id"));
             }
-            return Err(std::io::Error::other("Unknown user id"));
-        }
+        };
 
         stream_reader.consume(17);
 
@@ -295,7 +302,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
 /// Setup a VISION+VLESS stream from a CryptoTlsStream (for REALITY+Vision support)
 pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
     mut tls_stream: CryptoTlsStream<IO>,
-    user_id: &[u8],
+    users: &Arc<dyn UserRegistry>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
@@ -321,20 +328,23 @@ where
     }
 
     let header = stream_reader.peek_slice(&mut tls_stream, 17).await?;
-    let target_id = &header[1..17];
-
-    // Verify user ID using constant-time comparison to prevent timing attacks
-    if user_id.ct_eq(target_id).unwrap_u8() == 0 {
-        debug!("VLESS/Vision UUID mismatch");
-        if let Some(ref fb) = fallback {
-            return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
-        }
-        return Err(std::io::Error::other("Unknown user id"));
-    }
-
-    // Both checks passed - copy UUID for VisionStream, then consume version + UUID
+    // Copied out of the peek buffer right away so the reader is unborrowed again.
+    // VisionStream needs the uuid later regardless, since it keys its framing on it.
     let mut user_uuid = [0u8; 16];
-    user_uuid.copy_from_slice(target_id);
+    user_uuid.copy_from_slice(&header[1..17]);
+
+    // NOTE(shoes-engine): see VlessTcpServerHandler::setup_server_stream.
+    let _user = match users.find_uuid(&user_uuid) {
+        Some(user) => user,
+        None => {
+            debug!("VLESS/Vision UUID mismatch");
+            if let Some(ref fb) = fallback {
+                return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
+            }
+            return Err(std::io::Error::other("Unknown user id"));
+        }
+    };
+
     stream_reader.consume(17);
 
     let addon_length = stream_reader.read_u8(&mut tls_stream).await?;

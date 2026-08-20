@@ -65,6 +65,7 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 pub mod dns;
+pub mod dynamic;
 mod h2mux;
 mod http_handler;
 mod hysteria2_server;

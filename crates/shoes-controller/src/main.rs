@@ -1,4 +1,4 @@
-//! Control plane binary for the shoes dynamic engine.
+//! Reference control plane for the shoes dynamic engine.
 //!
 //! Unlike the `shoes` binary, this one takes **no proxy config**. It starts the
 //! Tokio runtime, brings the engine up empty, and exposes a management API. Every
@@ -7,6 +7,12 @@
 //! ```text
 //! shoes-controller [--api-listen ADDR] [--log-level LEVEL]
 //! ```
+//!
+//! This binary is a thin HTTP shell over `shoes_engine::Engine` and holds no logic
+//! of its own beyond routing and serialisation. It is here to demonstrate that the
+//! engine's surface is sufficient to drive from outside, and to give the end-to-end
+//! tests something to talk to. A real deployment is expected to write its own glue
+//! layer against `shoes-engine` and drop this crate.
 
 mod http;
 
@@ -40,8 +46,17 @@ The engine starts with no inbounds and no users. Populate it over the API:
 
   GET    /status
   GET    /inbounds
-  POST   /inbounds            {{\"tag\": \"...\", \"config\": {{ ...shoes server config... }}}}
+  POST   /inbounds                       {{\"tag\": \"...\", \"config\": {{ ... }}, \"users\": []}}
+  GET    /inbounds/{{tag}}
   DELETE /inbounds/{{tag}}
+  GET    /inbounds/{{tag}}/users
+  POST   /inbounds/{{tag}}/users         {{\"id\": \"...\", \"uuid\": \"...\"}}
+  GET    /inbounds/{{tag}}/users/{{id}}
+  DELETE /inbounds/{{tag}}/users/{{id}}
+
+Include \"users\" in POST /inbounds -- an empty list is fine -- to make the engine's
+in-memory registry the inbound's credential authority. Omit it to use the credential
+written in the config, as a config file would.
 "
     );
     std::process::exit(1);

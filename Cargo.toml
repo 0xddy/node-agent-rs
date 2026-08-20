@@ -33,6 +33,7 @@ log = { version = "*", features = ["std"] }
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
 serde_yaml = "*"
+subtle = "*"
 tokio = { version = "*", features = [
     "io-util",
     "macros",

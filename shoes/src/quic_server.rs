@@ -15,6 +15,7 @@ use crate::config::{
     BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, ServerQuicConfig,
 };
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::dynamic::UserRegistry;
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
@@ -269,6 +270,7 @@ async fn process_streams(
 pub async fn start_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let ServerConfig {
         bind_location,
@@ -402,6 +404,7 @@ pub async fn start_quic_servers(
                             &client_proxy_selector,
                             &resolver,
                             Some(bind_address.ip()),
+                            users.as_ref(),
                         )
                         .into()
                     })

@@ -9,6 +9,11 @@ mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
 mod dns;
+// NOTE(shoes-engine): the binary only reaches the config-file half of this module,
+// so the parts meant for an embedding control plane read as dead here. They are
+// exercised by the library target and by this module's own tests.
+#[allow(dead_code, unused_imports)]
+mod dynamic;
 mod h2mux;
 mod http_handler;
 mod hysteria2_server;

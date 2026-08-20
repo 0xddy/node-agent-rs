@@ -1,0 +1,34 @@
+//! Extension points for driving shoes from a control plane instead of a config file.
+//!
+//! Nothing in here is used when shoes runs as a plain CLI with a YAML config: the
+//! protocol handlers fall back to a [`StaticUserRegistry`] built from the config's
+//! own credentials, which behaves exactly like the hardcoded comparison it replaced.
+//!
+//! The point of the indirection is that an embedder can hand each inbound its own
+//! [`UserRegistry`] implementation and then add, update, and remove users at
+//! runtime without restarting the listener.
+//!
+//! ## Why a registry and not an interceptor
+//!
+//! Authentication cannot be wrapped from the outside, because each protocol
+//! carries its credential differently and at a different point in its handshake:
+//! VLESS puts a raw uuid at byte offset 1, Trojan sends a hex digest terminated by
+//! CRLF, VMess hides an AEAD-sealed auth id that can only be found by trial
+//! decryption. So the credential lookup itself is what gets abstracted, and it is
+//! injected into the existing handlers rather than layered on top of them.
+//!
+//! ## Hot path cost
+//!
+//! Lookups happen once per connection, during the handshake, never per packet.
+//! Implementations are expected to be lock free; both of the ones shipped here are
+//! (an immutable map for static configs, a sharded concurrent map for dynamic
+//! ones), so authentication never contends with a config reload.
+
+pub mod credential;
+mod registry;
+mod static_registry;
+mod user;
+
+pub use registry::UserRegistry;
+pub use static_registry::StaticUserRegistry;
+pub use user::{UserContext, UserStats};

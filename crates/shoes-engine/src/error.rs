@@ -13,6 +13,12 @@ pub enum EngineError {
     DuplicateTag(String),
     /// The requested tag is not registered.
     UnknownTag(String),
+    /// The submitted user could not be accepted.
+    InvalidUser(String),
+    /// A different user on this inbound already presents the same credential.
+    DuplicateCredential { id: String, owner: String },
+    /// The requested user id is not registered on this inbound.
+    UnknownUser { tag: String, id: String },
     /// Another inbound already listens on one of the requested addresses.
     AddressInUse { address: String, tag: String },
     /// The engine could not bind or start the listeners.
@@ -30,6 +36,14 @@ impl fmt::Display for EngineError {
             Self::InvalidConfig(msg) => write!(f, "invalid inbound config: {msg}"),
             Self::DuplicateTag(tag) => write!(f, "inbound tag already registered: {tag}"),
             Self::UnknownTag(tag) => write!(f, "no such inbound tag: {tag}"),
+            Self::InvalidUser(msg) => write!(f, "invalid user: {msg}"),
+            Self::DuplicateCredential { id, owner } => write!(
+                f,
+                "cannot add user {id}: that credential already belongs to user {owner}"
+            ),
+            Self::UnknownUser { tag, id } => {
+                write!(f, "no such user on inbound {tag}: {id}")
+            }
             Self::AddressInUse { address, tag } => {
                 write!(f, "address {address} is already used by inbound {tag}")
             }

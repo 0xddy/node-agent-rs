@@ -284,7 +284,7 @@ pub async fn setup_reality_server_stream(
         InnerProtocol::VisionVless(vision_cfg) => {
             crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                 tls_stream,
-                &vision_cfg.user_id,
+                &vision_cfg.users,
                 vision_cfg.udp_enabled,
                 target.effective_selector.clone(),
                 resolver,

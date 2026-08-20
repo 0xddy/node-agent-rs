@@ -10,11 +10,11 @@ use std::sync::Arc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use log::{error, info, warn};
 
-use shoes_api::{ApiError, InboundSpec};
+use shoes_api::{ApiError, InboundSpec, UserSpec};
 use shoes_engine::{Engine, EngineError};
 
 /// Refuse request bodies larger than this. An inbound config is a few KiB at
@@ -72,26 +72,88 @@ async fn route(engine: Arc<Engine>, req: Request<Incoming>) -> ApiResponse {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    let response = match (&method, path.as_str()) {
-        (&Method::GET, "/status") => json_ok(&engine.status()),
-        (&Method::GET, "/inbounds") => json_ok(&engine.list_inbounds()),
-        (&Method::POST, "/inbounds") => add_inbound(&engine, req).await,
-        (&Method::DELETE, _) if path.starts_with("/inbounds/") => {
-            let tag = percent_decode(&path["/inbounds/".len()..]);
-            if tag.is_empty() {
-                error_response(StatusCode::BAD_REQUEST, "missing inbound tag")
-            } else {
-                match engine.remove_inbound(&tag).await {
-                    Ok(info) => json_ok(&info),
-                    Err(e) => engine_error_response(e),
-                }
-            }
+    let response = match (method.as_str(), path.as_str()) {
+        ("GET", "/status") => json_ok(&engine.status()),
+        ("GET", "/inbounds") => json_ok(&engine.list_inbounds()),
+        ("POST", "/inbounds") => add_inbound(&engine, req).await,
+        _ if path.starts_with("/inbounds/") => {
+            let rest = &path["/inbounds/".len()..];
+            route_inbound(&engine, method.as_str(), rest, req).await
         }
         _ => error_response(StatusCode::NOT_FOUND, "no such endpoint"),
     };
 
     info!("{method} {path} -> {}", response.status().as_u16());
     response
+}
+
+/// What a `/inbounds/{tag}/...` path addresses.
+enum Target {
+    /// `/inbounds/{tag}`
+    Inbound,
+    /// `/inbounds/{tag}/users`
+    Users,
+    /// `/inbounds/{tag}/users/{id}`
+    User(String),
+}
+
+async fn route_inbound(
+    engine: &Engine,
+    method: &str,
+    rest: &str,
+    req: Request<Incoming>,
+) -> ApiResponse {
+    let (raw_tag, remainder) = match rest.split_once('/') {
+        Some((tag, remainder)) => (tag, remainder),
+        None => (rest, ""),
+    };
+
+    let tag = percent_decode(raw_tag);
+    if tag.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "missing inbound tag");
+    }
+
+    let target = match remainder {
+        "" => Target::Inbound,
+        "users" => Target::Users,
+        _ => match remainder.strip_prefix("users/") {
+            // A tag may contain an encoded slash, a user id may not: the id is the
+            // last segment, so anything after it is a path that does not exist.
+            Some(raw_id) if !raw_id.is_empty() && !raw_id.contains('/') => {
+                Target::User(percent_decode(raw_id))
+            }
+            _ => return error_response(StatusCode::NOT_FOUND, "no such endpoint"),
+        },
+    };
+
+    match (method, target) {
+        ("GET", Target::Inbound) => match engine.get_inbound(&tag) {
+            Some(slot) => json_ok(&slot.describe()),
+            None => engine_error_response(EngineError::UnknownTag(tag)),
+        },
+        ("DELETE", Target::Inbound) => match engine.remove_inbound(&tag).await {
+            Ok(info) => json_ok(&info),
+            Err(e) => engine_error_response(e),
+        },
+        (_, Target::Inbound) => method_not_allowed("GET, DELETE"),
+
+        ("GET", Target::Users) => match engine.list_users(&tag) {
+            Ok(users) => json_ok(&users),
+            Err(e) => engine_error_response(e),
+        },
+        ("POST", Target::Users) => add_user(engine, &tag, req).await,
+        (_, Target::Users) => method_not_allowed("GET, POST"),
+
+        ("GET", Target::User(id)) => match engine.get_user(&tag, &id) {
+            Ok(info) => json_ok(&info),
+            Err(e) => engine_error_response(e),
+        },
+        ("DELETE", Target::User(id)) => match engine.remove_user(&tag, &id) {
+            Ok(info) => json_ok(&info),
+            Err(e) => engine_error_response(e),
+        },
+        (_, Target::User(_)) => method_not_allowed("GET, DELETE"),
+    }
 }
 
 async fn add_inbound(engine: &Engine, req: Request<Incoming>) -> ApiResponse {
@@ -111,6 +173,34 @@ async fn add_inbound(engine: &Engine, req: Request<Incoming>) -> ApiResponse {
     };
 
     match engine.add_inbound(spec).await {
+        Ok(info) => json_response(StatusCode::CREATED, &info),
+        Err(e) => engine_error_response(e),
+    }
+}
+
+/// `POST /inbounds/{tag}/users` -- add or update one user.
+///
+/// An update is not distinguished from an insert in the status code, because the
+/// caller's intent is the same either way and the response body reports which one
+/// happened: an update carries the existing traffic counters, an insert reports
+/// zeroes.
+async fn add_user(engine: &Engine, tag: &str, req: Request<Incoming>) -> ApiResponse {
+    let body = match read_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+
+    let spec: UserSpec = match serde_json::from_slice(&body) {
+        Ok(spec) => spec,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("could not parse request body: {e}"),
+            );
+        }
+    };
+
+    match engine.add_user(tag, spec) {
         Ok(info) => json_response(StatusCode::CREATED, &info),
         Err(e) => engine_error_response(e),
     }
@@ -141,13 +231,27 @@ async fn read_body(req: Request<Incoming>) -> Result<Bytes, ApiResponse> {
 /// from "engine could not do it".
 fn engine_error_response(error: EngineError) -> ApiResponse {
     let status = match &error {
-        EngineError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
-        EngineError::DuplicateTag(_) | EngineError::AddressInUse { .. } => StatusCode::CONFLICT,
-        EngineError::UnknownTag(_) => StatusCode::NOT_FOUND,
+        EngineError::InvalidConfig(_) | EngineError::InvalidUser(_) => StatusCode::BAD_REQUEST,
+        EngineError::DuplicateTag(_)
+        | EngineError::AddressInUse { .. }
+        | EngineError::DuplicateCredential { .. } => StatusCode::CONFLICT,
+        EngineError::UnknownTag(_) | EngineError::UnknownUser { .. } => StatusCode::NOT_FOUND,
         EngineError::Unsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
         EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error_response(status, error.to_string())
+}
+
+/// 405 with the `Allow` header RFC 9110 requires on that status.
+fn method_not_allowed(allow: &str) -> ApiResponse {
+    let mut response = error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        format!("method not allowed here; try {allow}"),
+    );
+    if let Ok(value) = allow.parse() {
+        response.headers_mut().insert(hyper::header::ALLOW, value);
+    }
+    response
 }
 
 fn json_ok<T: serde::Serialize>(value: &T) -> ApiResponse {

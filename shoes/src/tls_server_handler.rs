@@ -8,6 +8,7 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::perform_crypto_handshake;
 use crate::crypto::{CryptoConnection, CryptoTlsStream};
+use crate::dynamic::UserRegistry;
 use crate::naiveproxy::UserLookup;
 use crate::reality::{RealityServerTarget, setup_reality_server_stream};
 use crate::resolver::Resolver;
@@ -22,7 +23,7 @@ use crate::address::NetLocation;
 /// Configuration for Vision VLESS inner protocol
 #[derive(Debug, Clone)]
 pub struct VisionVlessConfig {
-    pub user_id: Box<[u8]>,
+    pub users: Arc<dyn UserRegistry>,
     pub udp_enabled: bool,
     pub fallback: Option<NetLocation>,
 }
@@ -179,7 +180,7 @@ impl TcpServerHandler for TlsServerHandler {
                     InnerProtocol::VisionVless(vision_cfg) => {
                         crate::vless::vless_server_handler::setup_custom_tls_vision_vless_server_stream(
                             tls_stream,
-                            &vision_cfg.user_id,
+                            &vision_cfg.users,
                             vision_cfg.udp_enabled,
                             effective_selector.clone(),
                             &self.fallback_resolver,
