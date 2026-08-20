@@ -38,11 +38,30 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use shoes::dynamic::credential::VmessAuthKey;
-use shoes::dynamic::{UserContext, UserRegistry, VmessIdentity, credential};
+use shoes::dynamic::{ShadowsocksIdentity, UserContext, UserRegistry, VmessIdentity, credential};
 use shoes_api::{UserInfo, UserSpec};
 use subtle::ConstantTimeEq;
 
 use crate::error::{EngineError, EngineResult};
+
+/// What a `password` means to an inbound's Shadowsocks 2022 targets, if any.
+///
+/// The length matters because a PSK is raw key material: a 16 byte key is not a
+/// short aes-256-gcm key, it is a key that cipher can never use. Carrying the
+/// expected length here is what lets a wrong-sized key be refused when the user is
+/// added, rather than accepted into the table and then silently unable to connect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShadowsocksPsk {
+    /// No Shadowsocks target here, or one that cannot tell users apart.
+    #[default]
+    None,
+    /// Every Shadowsocks target here wants a PSK of this many bytes: 16 for
+    /// aes-128-gcm, 32 for aes-256-gcm.
+    Len(usize),
+    /// Two targets disagree about the length. Refused rather than resolved; see
+    /// [`CredentialKinds::conflict`].
+    Mixed,
+}
 
 /// The credential forms an inbound authenticates with.
 ///
@@ -55,23 +74,36 @@ pub struct CredentialKinds {
     pub uuid: bool,
     /// Trojan: SHA-224 of a password, hex encoded, terminated by CRLF.
     pub trojan_password: bool,
+    /// Shadowsocks 2022: a raw PSK, given base64 encoded, recognised on the wire by
+    /// the identity header a client seals with it.
+    pub shadowsocks_psk: ShadowsocksPsk,
 }
 
 impl CredentialKinds {
     pub const NONE: Self = Self {
         uuid: false,
         trojan_password: false,
+        shadowsocks_psk: ShadowsocksPsk::None,
     };
 
     pub const UUID: Self = Self {
         uuid: true,
-        trojan_password: false,
+        ..Self::NONE
     };
 
     pub const TROJAN_PASSWORD: Self = Self {
-        uuid: false,
         trojan_password: true,
+        ..Self::NONE
     };
+
+    /// Shadowsocks 2022 users whose PSKs are `len` bytes, i.e. whatever the inbound's
+    /// cipher uses.
+    pub const fn shadowsocks_psk(len: usize) -> Self {
+        Self {
+            shadowsocks_psk: ShadowsocksPsk::Len(len),
+            ..Self::NONE
+        }
+    }
 
     pub fn is_empty(&self) -> bool {
         *self == Self::NONE
@@ -80,23 +112,78 @@ impl CredentialKinds {
     pub fn merge(&mut self, other: Self) {
         self.uuid |= other.uuid;
         self.trojan_password |= other.trojan_password;
+        self.shadowsocks_psk = match (self.shadowsocks_psk, other.shadowsocks_psk) {
+            (ShadowsocksPsk::None, only) | (only, ShadowsocksPsk::None) => only,
+            (ShadowsocksPsk::Len(a), ShadowsocksPsk::Len(b)) if a == b => ShadowsocksPsk::Len(a),
+            _ => ShadowsocksPsk::Mixed,
+        };
+    }
+
+    /// Whether a user's `password` means anything to this inbound.
+    fn takes_password(&self) -> bool {
+        self.trojan_password || matches!(self.shadowsocks_psk, ShadowsocksPsk::Len(_))
+    }
+
+    /// Why this combination of credential forms cannot share one user table.
+    ///
+    /// Both cases come down to `password` having to mean one thing. A control plane
+    /// sends one credential per user, so if that field would have to be a cleartext
+    /// password on one target and a base64 PSK on another -- or a 16 byte key here and
+    /// a 32 byte key there -- there is no value it could hold that reaches the whole
+    /// inbound. Saying so when the inbound is added is better than accepting users who
+    /// can only reach half of it.
+    ///
+    /// Checked by the engine before building a registry; [`MemoryUserRegistry::new`]
+    /// takes the kinds as given.
+    pub fn conflict(&self) -> Option<String> {
+        match self.shadowsocks_psk {
+            ShadowsocksPsk::Mixed => Some(
+                "its shadowsocks targets use ciphers with different key lengths, so one \
+                 `password` cannot serve them all; give each cipher its own inbound"
+                    .to_string(),
+            ),
+            ShadowsocksPsk::Len(_) if self.trojan_password => Some(
+                "it mixes trojan and shadowsocks targets, whose `password` fields mean \
+                 different things -- a cleartext password and a base64 PSK; give each its \
+                 own inbound"
+                    .to_string(),
+            ),
+            _ => None,
+        }
     }
 
     /// The credential fields a caller may set, for use in error messages.
-    fn accepted_fields(&self) -> &'static str {
-        match (self.uuid, self.trojan_password) {
-            (true, true) => "`uuid` or `password`",
-            (true, false) => "`uuid`",
-            (false, true) => "`password`",
-            (false, false) => "nothing",
+    fn accepted_fields(&self) -> String {
+        let mut fields = Vec::new();
+        if self.uuid {
+            fields.push("`uuid`");
         }
+        if self.takes_password() {
+            fields.push("`password`");
+        }
+        if fields.is_empty() {
+            return "nothing".to_string();
+        }
+        fields.join(" or ")
     }
+}
+
+/// A user's Shadowsocks 2022 key, and the 16 bytes that name it on the wire.
+struct ShadowsocksCredential {
+    /// Truncated blake3 of `psk` -- what a client's identity header decrypts to, and
+    /// so the index key.
+    hash: [u8; 16],
+    /// The key itself. Handed back on a hit because the handler derives the session
+    /// keys from it; the identity PSK it arrived under is the inbound's, not this
+    /// user's.
+    psk: Box<[u8]>,
 }
 
 /// The wire-form credentials of one user, already converted to index keys.
 struct Credentials {
     uuid: Option<[u8; 16]>,
     trojan_hash: Option<Box<[u8]>>,
+    shadowsocks: Option<ShadowsocksCredential>,
 }
 
 /// One user: their shared accounting record plus the credentials that reach it.
@@ -106,6 +193,7 @@ struct Entry {
     /// that found this entry is not constant time and proves nothing on its own.
     uuid: Option<[u8; 16]>,
     trojan_hash: Option<Box<[u8]>>,
+    shadowsocks: Option<ShadowsocksCredential>,
     /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
     /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
     /// schedule *per user* on every handshake.
@@ -159,6 +247,8 @@ pub struct MemoryUserRegistry {
     by_uuid: DashMap<[u8; 16], Arc<Entry>>,
     /// wire hash -> user. The index `find_trojan_hash` hits.
     by_trojan_hash: DashMap<Box<[u8]>, Arc<Entry>>,
+    /// named psk -> user. The index `find_shadowsocks_psk_hash` hits.
+    by_psk_hash: DashMap<[u8; 16], Arc<Entry>>,
     /// Every uuid-bearing user, as an immutable snapshot for VMess to walk. Not an
     /// index -- there is nothing to index on -- so it is republished whole on each
     /// mutation. See the module docs.
@@ -181,6 +271,7 @@ impl MemoryUserRegistry {
             users: DashMap::new(),
             by_uuid: DashMap::new(),
             by_trojan_hash: DashMap::new(),
+            by_psk_hash: DashMap::new(),
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
         })
     }
@@ -233,6 +324,7 @@ impl MemoryUserRegistry {
             context,
             uuid: credentials.uuid,
             trojan_hash: credentials.trojan_hash,
+            shadowsocks: credentials.shadowsocks,
             // Built whenever the user has a uuid, whether or not this inbound speaks
             // VMess. One registry serves a whole inbound, and a TLS inbound can carry
             // VLESS on one SNI and VMess on another, so "is VMess in use here" is not
@@ -253,6 +345,11 @@ impl MemoryUserRegistry {
             {
                 self.by_trojan_hash.remove(hash);
             }
+            if let Some(old) = &previous.shadowsocks
+                && entry.shadowsocks.as_ref().map(|new| new.hash) != Some(old.hash)
+            {
+                self.by_psk_hash.remove(&old.hash);
+            }
         }
 
         if let Some(uuid) = entry.uuid {
@@ -260,6 +357,9 @@ impl MemoryUserRegistry {
         }
         if let Some(hash) = &entry.trojan_hash {
             self.by_trojan_hash.insert(hash.clone(), entry.clone());
+        }
+        if let Some(shadowsocks) = &entry.shadowsocks {
+            self.by_psk_hash.insert(shadowsocks.hash, entry.clone());
         }
         self.users.insert(id, entry.clone());
         self.republish_vmess();
@@ -289,6 +389,9 @@ impl MemoryUserRegistry {
         if let Some(hash) = &entry.trojan_hash {
             self.by_trojan_hash.remove(hash);
         }
+        if let Some(shadowsocks) = &entry.shadowsocks {
+            self.by_psk_hash.remove(&shadowsocks.hash);
+        }
         self.republish_vmess();
 
         Ok(user_info(&entry.context))
@@ -313,6 +416,10 @@ impl MemoryUserRegistry {
     /// A credential this inbound's protocol cannot use is an error rather than a
     /// field that gets dropped: silently ignoring it would report success for a
     /// user who can never connect.
+    ///
+    /// `password` is read as whichever form the inbound wants. It cannot want both --
+    /// [`CredentialKinds::conflict`] refuses that combination before a registry is
+    /// built -- so there is no ambiguity to resolve here.
     fn parse_credentials(&self, spec: &UserSpec) -> EngineResult<Credentials> {
         if spec.uuid.is_some() && !self.kinds.uuid {
             return Err(EngineError::InvalidUser(format!(
@@ -320,7 +427,7 @@ impl MemoryUserRegistry {
                 self.kinds.accepted_fields()
             )));
         }
-        if spec.password.is_some() && !self.kinds.trojan_password {
+        if spec.password.is_some() && !self.kinds.takes_password() {
             return Err(EngineError::InvalidUser(format!(
                 "this inbound does not authenticate by password; it accepts {}",
                 self.kinds.accepted_fields()
@@ -341,12 +448,36 @@ impl MemoryUserRegistry {
             None => None,
         };
 
+        let shadowsocks = match (spec.password.as_deref(), self.kinds.shadowsocks_psk) {
+            (Some(password), ShadowsocksPsk::Len(len)) => {
+                let psk = credential::decode_shadowsocks_psk(password)
+                    .map_err(|e| EngineError::InvalidUser(e.to_string()))?;
+                if psk.len() != len {
+                    return Err(EngineError::InvalidUser(format!(
+                        "this inbound's cipher needs a {} byte psk, and `password` \
+                         base64 decoded to {}",
+                        len,
+                        psk.len()
+                    )));
+                }
+                Some(ShadowsocksCredential {
+                    hash: credential::shadowsocks_psk_hash(&psk),
+                    psk,
+                })
+            }
+            _ => None,
+        };
+
         Ok(Credentials {
             uuid,
-            trojan_hash: spec
-                .password
-                .as_deref()
-                .map(credential::trojan_password_hash),
+            trojan_hash: match self.kinds.trojan_password {
+                true => spec
+                    .password
+                    .as_deref()
+                    .map(credential::trojan_password_hash),
+                false => None,
+            },
+            shadowsocks,
         })
     }
 
@@ -374,6 +505,15 @@ impl MemoryUserRegistry {
                 owner: owner.to_string(),
             });
         }
+        if let Some(shadowsocks) = &credentials.shadowsocks
+            && let Some(owner) = self.credential_owner_psk(&shadowsocks.hash)
+            && &*owner != id
+        {
+            return Err(EngineError::DuplicateCredential {
+                id: id.to_string(),
+                owner: owner.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -385,6 +525,10 @@ impl MemoryUserRegistry {
         self.by_trojan_hash
             .get(hash)
             .map(|e| e.context.id().clone())
+    }
+
+    fn credential_owner_psk(&self, hash: &[u8; 16]) -> Option<Arc<str>> {
+        self.by_psk_hash.get(hash).map(|e| e.context.id().clone())
     }
 
     /// Republish the VMess trial snapshot from the authoritative map.
@@ -434,6 +578,16 @@ impl UserRegistry for MemoryUserRegistry {
             .find_map(|entry| entry.accept_vmess(auth_id))
     }
 
+    fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
+        let entry = self.by_psk_hash.get(hash)?;
+        let credential = entry.shadowsocks.as_ref()?;
+        let user = entry.accept(&credential.hash[..], &hash[..])?;
+        Some(ShadowsocksIdentity {
+            user,
+            psk: credential.psk.clone(),
+        })
+    }
+
     fn user_count(&self) -> usize {
         self.users.len()
     }
@@ -478,6 +632,26 @@ mod tests {
             password: Some(password.to_string()),
             enabled: true,
         }
+    }
+
+    /// A 2022 PSK spec. The key is `len` bytes derived from `id`, so distinct users
+    /// get distinct keys without any of them being a real secret.
+    fn ss_spec(id: &str, len: usize) -> UserSpec {
+        UserSpec {
+            id: Some(id.to_string()),
+            uuid: None,
+            password: Some(credential::encode_shadowsocks_psk(&ss_psk(id, len))),
+            enabled: true,
+        }
+    }
+
+    fn ss_psk(id: &str, len: usize) -> Vec<u8> {
+        id.bytes().cycle().take(len).collect()
+    }
+
+    /// The 16 bytes a client's identity header decrypts to for this user.
+    fn ss_name(id: &str, len: usize) -> [u8; 16] {
+        credential::shadowsocks_psk_hash(&ss_psk(id, len))
     }
 
     #[test]
@@ -677,6 +851,183 @@ mod tests {
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
         let err = registry.remove("in", "nobody").unwrap_err();
         assert!(matches!(err, EngineError::UnknownUser { .. }));
+    }
+
+    // -- Shadowsocks 2022: found by the name in an identity header ------------------
+
+    #[test]
+    fn finds_a_shadowsocks_user_by_their_named_psk() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(16));
+        registry.upsert(ss_spec("alice", 16)).unwrap();
+        registry.upsert(ss_spec("bob", 16)).unwrap();
+
+        let found = registry
+            .find_shadowsocks_psk_hash(&ss_name("alice", 16))
+            .unwrap();
+        assert_eq!(&**found.user.id(), "alice");
+        // The handler derives session keys from this, so it must be the *user's* key
+        // and not the inbound's identity PSK.
+        assert_eq!(&*found.psk, &ss_psk("alice", 16)[..]);
+
+        assert_eq!(
+            &**registry
+                .find_shadowsocks_psk_hash(&ss_name("bob", 16))
+                .unwrap()
+                .user
+                .id(),
+            "bob"
+        );
+        assert!(registry.find_shadowsocks_psk_hash(&[0u8; 16]).is_none());
+        assert_eq!(registry.get("alice").unwrap().total_conns, 1);
+    }
+
+    #[test]
+    fn rotating_a_psk_retires_the_old_name() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(32));
+        registry.upsert(ss_spec("alice", 32)).unwrap();
+        let before = registry
+            .find_shadowsocks_psk_hash(&ss_name("alice", 32))
+            .unwrap()
+            .user;
+        before.add_tx(64);
+
+        let mut rotated = ss_spec("alice", 32);
+        rotated.password = Some(credential::encode_shadowsocks_psk(&ss_psk("rotated", 32)));
+        registry.upsert(rotated).unwrap();
+
+        assert!(
+            registry
+                .find_shadowsocks_psk_hash(&ss_name("alice", 32))
+                .is_none()
+        );
+        let after = registry
+            .find_shadowsocks_psk_hash(&ss_name("rotated", 32))
+            .unwrap();
+        assert!(Arc::ptr_eq(&before, &after.user));
+        assert_eq!(after.user.tx(), 64);
+
+        registry.remove("in", "alice").unwrap();
+        assert!(
+            registry
+                .find_shadowsocks_psk_hash(&ss_name("rotated", 32))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_disabled_shadowsocks_user_looks_absent() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(16));
+        let mut spec = ss_spec("alice", 16);
+        spec.enabled = false;
+        registry.upsert(spec).unwrap();
+        assert!(
+            registry
+                .find_shadowsocks_psk_hash(&ss_name("alice", 16))
+                .is_none()
+        );
+        assert_eq!(registry.get("alice").unwrap().total_conns, 0);
+    }
+
+    #[test]
+    fn refuses_a_psk_the_cipher_cannot_use() {
+        // A PSK is raw key material: 32 bytes is not an over-long aes-128-gcm key, it
+        // is one that cipher can never load. Caught here rather than at the handshake,
+        // where it would look like a user who simply cannot connect.
+        let registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(16));
+        let err = registry.upsert(ss_spec("alice", 32)).unwrap_err();
+        assert!(matches!(err, EngineError::InvalidUser(_)));
+        assert!(err.to_string().contains("16 byte psk"));
+        assert_eq!(registry.user_count(), 0);
+
+        // And a password that is not base64 at all.
+        let err = registry
+            .upsert(trojan_spec("alice", "not base64!"))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidUser(_)));
+        assert_eq!(registry.user_count(), 0);
+    }
+
+    #[test]
+    fn rejects_a_psk_owned_by_another_user() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(16));
+        registry.upsert(ss_spec("alice", 16)).unwrap();
+
+        let mut bob = ss_spec("bob", 16);
+        bob.password = ss_spec("alice", 16).password;
+        let err = registry.upsert(bob).unwrap_err();
+        assert!(matches!(err, EngineError::DuplicateCredential { .. }));
+        assert_eq!(registry.user_count(), 1);
+        assert_eq!(
+            &**registry
+                .find_shadowsocks_psk_hash(&ss_name("alice", 16))
+                .unwrap()
+                .user
+                .id(),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn a_uuid_registry_answers_no_shadowsocks_lookup() {
+        // One registry serves whatever the inbound turns out to be, so every lookup has
+        // to be safe to ask -- and must not match.
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        assert!(registry.find_shadowsocks_psk_hash(&[0u8; 16]).is_none());
+        assert!(
+            registry
+                .find_shadowsocks_psk_hash(&ss_name("alice", 16))
+                .is_none()
+        );
+        // And a PSK is not a credential it will accept.
+        assert!(registry.upsert(ss_spec("bob", 16)).is_err());
+    }
+
+    #[test]
+    fn shadowsocks_and_vless_can_share_an_inbound() {
+        // Not a common shape, but `tls_targets` allows it, and the union has to work:
+        // one user reaches their record by uuid, another by named psk.
+        let mut kinds = CredentialKinds::UUID;
+        kinds.merge(CredentialKinds::shadowsocks_psk(16));
+        assert!(kinds.conflict().is_none());
+        let registry = MemoryUserRegistry::new(kinds);
+
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        registry.upsert(ss_spec("bob", 16)).unwrap();
+        assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_some());
+        assert!(
+            registry
+                .find_shadowsocks_psk_hash(&ss_name("bob", 16))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn refuses_an_inbound_whose_password_would_mean_two_things() {
+        // Trojan wants a cleartext password, shadowsocks a base64 PSK. There is no one
+        // value a user could send that serves both, so the combination is refused when
+        // the inbound is added rather than accepted and half-working.
+        let mut trojan_and_ss = CredentialKinds::TROJAN_PASSWORD;
+        trojan_and_ss.merge(CredentialKinds::shadowsocks_psk(16));
+        assert!(trojan_and_ss.conflict().is_some());
+
+        // Same for two shadowsocks ciphers with different key lengths.
+        let mut two_lengths = CredentialKinds::shadowsocks_psk(16);
+        two_lengths.merge(CredentialKinds::shadowsocks_psk(32));
+        assert_eq!(two_lengths.shadowsocks_psk, ShadowsocksPsk::Mixed);
+        assert!(two_lengths.conflict().is_some());
+
+        // The same length twice is not a conflict: two SNIs, one cipher.
+        let mut same = CredentialKinds::shadowsocks_psk(32);
+        same.merge(CredentialKinds::shadowsocks_psk(32));
+        assert_eq!(same.shadowsocks_psk, ShadowsocksPsk::Len(32));
+        assert!(same.conflict().is_none());
+
+        // And merging with nothing is still nothing to conflict with.
+        let mut alone = CredentialKinds::shadowsocks_psk(16);
+        alone.merge(CredentialKinds::NONE);
+        assert_eq!(alone.shadowsocks_psk, ShadowsocksPsk::Len(16));
+        assert!(!alone.is_empty());
     }
 
     // -- VMess: the same users, found by trial rather than by index ----------------

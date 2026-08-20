@@ -73,8 +73,18 @@ pub fn create_tcp_client_handler(
             ShadowsocksConfig::Legacy { cipher, password } => Box::new(
                 ShadowsocksTcpHandler::new_client(cipher, &password, udp_enabled),
             ),
-            ShadowsocksConfig::Aead2022 { cipher, key_bytes } => Box::new(
-                ShadowsocksTcpHandler::new_aead2022_client(cipher, &key_bytes, udp_enabled),
+            ShadowsocksConfig::Aead2022 {
+                cipher,
+                key_bytes,
+                identity_keys,
+            } => Box::new(
+                ShadowsocksTcpHandler::new_aead2022_client_with_identity(
+                    cipher,
+                    &identity_keys,
+                    &key_bytes,
+                    udp_enabled,
+                )
+                .expect("Invalid shadowsocks 2022 client keys"),
             ),
         },
         ClientProxyConfig::Snell {

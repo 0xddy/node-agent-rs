@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use log::debug;
 use parking_lot::Mutex;
 use rand::{Rng, RngExt};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::salt_checker::SaltChecker;
 use super::timed_salt_checker::TimedSaltChecker;
@@ -12,6 +12,7 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::dynamic::{UserRegistry, bind_connection_user};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::socks_handler::{read_location, write_location_to_vec};
@@ -24,10 +25,46 @@ use crate::util::write_all;
 
 use super::blake3_key::Blake3Key;
 use super::default_key::DefaultKey;
+use super::eih;
 use super::shadowsocks_cipher::ShadowsocksCipher;
 use super::shadowsocks_key::ShadowsocksKey;
 use super::shadowsocks_stream::ShadowsocksStream;
 use super::shadowsocks_stream_type::ShadowsocksStreamType;
+
+/// What this handler does about identity headers, if anything.
+///
+/// Absent on every path shoes had before: a 2022 endpoint that speaks for exactly one
+/// key sends no header and needs no registry, which is what a config file describes.
+enum IdentityRole {
+    /// An inbound serving many users. `identity_psk` is its own key -- the one all of
+    /// its clients know -- and it opens a header whose contents name which of `users`'
+    /// PSKs the session keys should come from.
+    Server {
+        identity_psk: Box<[u8]>,
+        users: Arc<dyn UserRegistry>,
+    },
+    /// An outbound speaking to such an inbound. The chain runs from the outermost
+    /// identity PSK to this client's own key, which is also the key it derives sessions
+    /// from, so `chain.last()` is what a single-user client would have been given.
+    Client { chain: Box<[Box<[u8]>]> },
+}
+
+impl std::fmt::Debug for IdentityRole {
+    /// Written by hand so that key material stays out of logs. (The `key` field beside
+    /// it is upstream's and is left as it is.)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Server { users, .. } => f
+                .debug_struct("Server")
+                .field("num_users", &users.user_count())
+                .finish(),
+            Self::Client { chain } => f
+                .debug_struct("Client")
+                .field("chain_len", &chain.len())
+                .finish(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ShadowsocksTcpHandler {
@@ -40,6 +77,8 @@ pub struct ShadowsocksTcpHandler {
     proxy_selector: Option<Arc<ClientProxySelector>>,
     /// DNS resolver for h2mux sessions. None when used as client handler.
     resolver: Option<Arc<dyn Resolver>>,
+    /// Set only for the two multi-user constructors; see [`IdentityRole`].
+    identity: Option<IdentityRole>,
 }
 
 impl ShadowsocksTcpHandler {
@@ -63,6 +102,7 @@ impl ShadowsocksTcpHandler {
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
+            identity: None,
         }
     }
 
@@ -80,6 +120,7 @@ impl ShadowsocksTcpHandler {
             udp_enabled,
             proxy_selector: None,
             resolver: None,
+            identity: None,
         }
     }
 
@@ -103,6 +144,7 @@ impl ShadowsocksTcpHandler {
             udp_enabled,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
+            identity: None,
         }
     }
 
@@ -124,15 +166,194 @@ impl ShadowsocksTcpHandler {
             udp_enabled,
             proxy_selector: None,
             resolver: None,
+            identity: None,
         }
     }
+
+    /// Create a new AEAD2022 handler for a server whose users come from a registry.
+    ///
+    /// `identity_psk` is the inbound's own key, the one every client of it knows.
+    /// Whose connection it is comes from the identity header instead, which `users`
+    /// resolves to that client's own PSK -- and it is that PSK, not this one, that the
+    /// session keys derive from.
+    ///
+    /// This is the only 2022 arrangement that can serve more than one user, and it
+    /// exists only for the AES ciphers, so an unsuitable cipher is refused here rather
+    /// than accepted into an inbound nobody can reach.
+    pub fn new_aead2022_multi_user_server(
+        cipher: ShadowsocksCipher,
+        identity_psk: &[u8],
+        users: Arc<dyn UserRegistry>,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+    ) -> std::io::Result<Self> {
+        if !eih::supports_identity_headers(&cipher) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "shadowsocks cipher {} has no identity headers, so it cannot serve more than one user",
+                    cipher.name()
+                ),
+            ));
+        }
+        check_psk_len(&cipher, identity_psk.len())?;
+
+        // `key` ends up holding the identity PSK, which is never used as a session key
+        // on this path: `setup_server_stream` resolves one per connection.
+        let mut handler = Self::new_aead2022_server(
+            cipher,
+            identity_psk,
+            udp_enabled,
+            proxy_selector,
+            resolver,
+        );
+        handler.identity = Some(IdentityRole::Server {
+            identity_psk: identity_psk.to_vec().into_boxed_slice(),
+            users,
+        });
+        Ok(handler)
+    }
+
+    /// Create a new AEAD2022 handler for a client that names itself to a multi-user
+    /// server.
+    ///
+    /// `identity_keys` runs outermost first and `key_bytes` is this client's own key,
+    /// the one it derives sessions from. With no identity keys there is nothing to name,
+    /// so nothing is sent and the handler is exactly what [`Self::new_aead2022_client`]
+    /// would have built.
+    pub fn new_aead2022_client_with_identity(
+        cipher: ShadowsocksCipher,
+        identity_keys: &[Box<[u8]>],
+        key_bytes: &[u8],
+        udp_enabled: bool,
+    ) -> std::io::Result<Self> {
+        check_psk_len(&cipher, key_bytes.len())?;
+        for key in identity_keys {
+            check_psk_len(&cipher, key.len())?;
+        }
+
+        let mut handler = Self::new_aead2022_client(cipher, key_bytes, udp_enabled);
+        if identity_keys.is_empty() {
+            return Ok(handler);
+        }
+
+        if !eih::supports_identity_headers(&handler.cipher) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "shadowsocks cipher {} has no identity headers, so it cannot use identity keys",
+                    handler.cipher.name()
+                ),
+            ));
+        }
+
+        let chain = identity_keys
+            .iter()
+            .cloned()
+            .chain(std::iter::once(key_bytes.to_vec().into_boxed_slice()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        handler.identity = Some(IdentityRole::Client { chain });
+        Ok(handler)
+    }
+
+    /// Read the salt and identity header, and resolve them to the user whose key this
+    /// connection speaks.
+    ///
+    /// Returns that user's session key together with the salt, which has to be handed
+    /// to the record layer afterwards: it was consumed from the socket here, and it is
+    /// what the session key is derived against on both sides.
+    async fn resolve_identity(
+        &self,
+        stream: &mut Box<dyn AsyncStream>,
+        identity_psk: &[u8],
+        users: &Arc<dyn UserRegistry>,
+    ) -> std::io::Result<(Arc<Box<dyn ShadowsocksKey>>, Box<[u8]>)> {
+        let salt_len = self.cipher.salt_len();
+        let mut prefix = [0u8; eih::MAX_SALT_LEN + eih::IDENTITY_HEADER_LEN];
+        let prefix = &mut prefix[..salt_len + eih::IDENTITY_HEADER_LEN];
+        stream.read_exact(prefix).await?;
+
+        let (salt, header) = prefix.split_at(salt_len);
+        // Always succeeds for a well-formed read: a wrong identity PSK yields 16 bytes
+        // that name nobody rather than an error, and the lookup below is what turns
+        // that into a refusal.
+        let named = eih::open_identity_header(identity_psk, salt, header.try_into().unwrap())?;
+
+        let identity = users.find_shadowsocks_psk_hash(&named).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unknown shadowsocks identity",
+            )
+        })?;
+
+        // Attribute this connection from here on. The salt and header just read are
+        // already counted against the inbound, and the meter hands them over.
+        bind_connection_user(&identity.user);
+
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
+            identity.psk,
+            self.cipher.algorithm().key_len(),
+        )));
+
+        Ok((key, salt.to_vec().into_boxed_slice()))
+    }
+
+    /// Build the outgoing record layer, naming this client to the server when it
+    /// speaks for a chain of keys.
+    fn new_client_stream(
+        &self,
+        client_stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<Box<dyn AsyncStream>> {
+        let stream_type = if self.aead2022 {
+            ShadowsocksStreamType::AEAD2022Client
+        } else {
+            ShadowsocksStreamType::Aead
+        };
+
+        let mut stream = ShadowsocksStream::new(
+            client_stream,
+            stream_type,
+            self.cipher.algorithm(),
+            self.cipher.salt_len(),
+            self.key.clone(),
+            self.salt_checker.clone(),
+        );
+
+        if let Some(IdentityRole::Client { chain }) = &self.identity {
+            // Sealed against the salt this stream is about to send, so what goes out
+            // is good for this connection only.
+            let headers = eih::seal_identity_headers(chain, stream.write_salt())?;
+            stream.set_identity_headers(headers);
+        }
+
+        Ok(Box::new(stream))
+    }
+}
+
+/// Reject a 2022 key of the wrong size here, where it can be reported, rather than
+/// leaving it to the assertion inside `Blake3Key::create_session_key`.
+fn check_psk_len(cipher: &ShadowsocksCipher, len: usize) -> std::io::Result<()> {
+    if len != cipher.salt_len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "shadowsocks cipher {} needs {} byte keys, got {} bytes",
+                cipher.name(),
+                cipher.salt_len(),
+                len
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
 impl TcpServerHandler for ShadowsocksTcpHandler {
     async fn setup_server_stream(
         &self,
-        server_stream: Box<dyn AsyncStream>,
+        mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let stream_type = if self.aead2022 {
             ShadowsocksStreamType::AEAD2022Server
@@ -140,14 +361,37 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
             ShadowsocksStreamType::Aead
         };
 
+        // A multi-user inbound resolves its session key per connection, out of the
+        // identity header. The arms are spelled out rather than defaulted because
+        // reaching the fallback with a `Server` role would mean accepting the inbound's
+        // own identity PSK as somebody's session key.
+        let (key, replayed_salt) = match &self.identity {
+            Some(IdentityRole::Server {
+                identity_psk,
+                users,
+            }) => {
+                let (key, salt) = self
+                    .resolve_identity(&mut server_stream, identity_psk, users)
+                    .await?;
+                (key, Some(salt))
+            }
+            Some(IdentityRole::Client { .. }) | None => (self.key.clone(), None),
+        };
+
         let mut server_stream = ShadowsocksStream::new(
             server_stream,
             stream_type,
             self.cipher.algorithm(),
             self.cipher.salt_len(),
-            self.key.clone(),
+            key,
             self.salt_checker.clone(),
         );
+
+        if let Some(salt) = replayed_salt {
+            // Put back what `resolve_identity` took, minus the identity header, which
+            // has served its purpose and is not part of the record layer's handshake.
+            server_stream.feed_initial_read_data(&salt)?;
+        }
 
         let mut stream_reader = StreamReader::new_with_buffer_size(1024);
 
@@ -308,20 +552,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
-        let stream_type = if self.aead2022 {
-            ShadowsocksStreamType::AEAD2022Client
-        } else {
-            ShadowsocksStreamType::Aead
-        };
-
-        let mut client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
-            client_stream,
-            stream_type,
-            self.cipher.algorithm(),
-            self.cipher.salt_len(),
-            self.key.clone(),
-            self.salt_checker.clone(),
-        ));
+        let mut client_stream = self.new_client_stream(client_stream)?;
 
         let mut location_vec = write_location_to_vec(remote_location.location());
 
@@ -358,20 +589,7 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         use crate::uot::{UOT_V2_MAGIC_ADDRESS, UotV2Stream};
 
-        let stream_type = if self.aead2022 {
-            ShadowsocksStreamType::AEAD2022Client
-        } else {
-            ShadowsocksStreamType::Aead
-        };
-
-        let mut client_stream: Box<dyn AsyncStream> = Box::new(ShadowsocksStream::new(
-            client_stream,
-            stream_type,
-            self.cipher.algorithm(),
-            self.cipher.salt_len(),
-            self.key.clone(),
-            self.salt_checker.clone(),
-        ));
+        let mut client_stream = self.new_client_stream(client_stream)?;
 
         // UoT V2 connect mode: Single destination. Writes magic address first.
         let magic_location =

@@ -454,12 +454,16 @@ impl Engine {
 
     /// Builds the credential authority for an inbound in dynamic mode.
     ///
-    /// The refusals here are the important part. Only VLESS and Trojan consult a
-    /// registry today, so accepting a `users` list on any other protocol would
-    /// leave the caller believing they had configured access control that is not
-    /// actually consulted -- fail-open, and invisible until someone connects with
-    /// a credential nobody granted. So a `users` list on an inbound the registry
-    /// cannot serve is an error, not a no-op.
+    /// The refusals here are the important part. Only some protocols consult a
+    /// registry, so accepting a `users` list on any other one would leave the caller
+    /// believing they had configured access control that is not actually consulted --
+    /// fail-open, and invisible until someone connects with a credential nobody
+    /// granted. So a `users` list on an inbound the registry cannot serve is an error,
+    /// not a no-op.
+    ///
+    /// The second refusal is narrower: the inbound *is* registry-backed, but its
+    /// targets disagree about what a user's one `password` field means. See
+    /// [`CredentialKinds::conflict`].
     ///
     /// The check runs over the *expanded* configs, so it sees through TLS, Reality,
     /// ShadowTLS and Websocket nesting rather than just the outer protocol name.
@@ -477,6 +481,11 @@ impl Engine {
                 "{} does not authenticate through the engine's user registry yet, so it \
                  cannot take a `users` list; omit `users` to use the credential in `config`",
                 protocol::display_name(&server_configs[0].protocol)
+            )));
+        }
+        if let Some(reason) = kinds.conflict() {
+            return Err(EngineError::InvalidConfig(format!(
+                "this inbound cannot take a single `users` list: {reason}"
             )));
         }
 

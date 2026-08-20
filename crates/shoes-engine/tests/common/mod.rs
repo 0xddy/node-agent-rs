@@ -285,6 +285,81 @@ pub fn vmess_chain(server: SocketAddr, uuid: &str, cipher: &str) -> Value {
     })
 }
 
+/// A Shadowsocks 2022 inbound.
+///
+/// Its `password` is the *identity PSK*. Unlike a VLESS `user_id`, that value stays
+/// live in dynamic mode: it names the inbound rather than a user, every client has to
+/// know it to be understood at all, and the engine neither replaces nor rejects it.
+pub fn ss_inbound(
+    address: SocketAddr,
+    cipher: &str,
+    identity_psk: &str,
+    udp_enabled: bool,
+) -> Value {
+    json!({
+        "address": address.to_string(),
+        "protocol": {
+            "type": "ss",
+            "cipher": format!("2022-blake3-{cipher}"),
+            "password": identity_psk,
+            "udp_enabled": udp_enabled,
+        },
+    })
+}
+
+/// A Shadowsocks 2022 leg for one user.
+///
+/// The colon-joined password is how a 2022 client says which server *and* which user
+/// it is: it seals one identity header per leading key, each naming the next, and the
+/// last segment is its own session key.
+pub fn ss_chain(
+    server: SocketAddr,
+    cipher: &str,
+    identity_psk: &str,
+    user_psk: &str,
+    udp_enabled: bool,
+) -> Value {
+    json!({
+        "address": server.to_string(),
+        "protocol": {
+            "type": "ss",
+            "cipher": format!("2022-blake3-{cipher}"),
+            "password": format!("{identity_psk}:{user_psk}"),
+            "udp_enabled": udp_enabled,
+        },
+    })
+}
+
+/// A Shadowsocks leg with no identity header at all -- a plain single-user client.
+///
+/// What an old client, or one pointed at the wrong server, actually sends. A
+/// multi-user inbound has to refuse it rather than fall back to its own key.
+pub fn ss_chain_without_identity(
+    server: SocketAddr,
+    cipher: &str,
+    user_psk: &str,
+    udp_enabled: bool,
+) -> Value {
+    json!({
+        "address": server.to_string(),
+        "protocol": {
+            "type": "ss",
+            "cipher": format!("2022-blake3-{cipher}"),
+            "password": user_psk,
+            "udp_enabled": udp_enabled,
+        },
+    })
+}
+
+/// A deterministic base64 PSK of `len` bytes, derived from `seed`.
+///
+/// Deterministic so a test can hand the same key to a client leg and to `add_user`
+/// and know they match, and derived from the seed so no two named keys collide.
+pub fn psk(seed: &str, len: usize) -> String {
+    let bytes: Vec<u8> = seed.bytes().cycle().take(len).collect();
+    shoes::dynamic::credential::encode_shadowsocks_psk(&bytes)
+}
+
 /// `verify: false` because the bundled cert is self-signed for `CN=e2e.test` and no
 /// CA store knows it. These tests are about accounting and reloads, not about
 /// certificate validation.
@@ -333,6 +408,16 @@ pub fn disabled_user(id: &str, uuid: &str) -> UserSpec {
     UserSpec {
         enabled: false,
         ..user(id, uuid)
+    }
+}
+
+/// A user whose credential is a base64 Shadowsocks 2022 PSK.
+pub fn psk_user(id: &str, psk: &str) -> UserSpec {
+    UserSpec {
+        id: Some(id.to_string()),
+        uuid: None,
+        password: Some(psk.to_string()),
+        enabled: true,
     }
 }
 

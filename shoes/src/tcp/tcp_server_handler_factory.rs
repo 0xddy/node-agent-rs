@@ -148,14 +148,38 @@ pub fn create_tcp_server_handler(
                     resolver.clone(),
                 ))
             }
-            ShadowsocksConfig::Aead2022 { cipher, key_bytes } => {
-                Box::new(ShadowsocksTcpHandler::new_aead2022_server(
-                    cipher,
-                    &key_bytes,
-                    udp_enabled,
-                    client_proxy_selector.clone(),
-                    resolver.clone(),
-                ))
+            ShadowsocksConfig::Aead2022 {
+                cipher,
+                key_bytes,
+                identity_keys,
+            } => {
+                assert!(
+                    identity_keys.is_empty(),
+                    "shadowsocks identity keys belong on a client; an inbound's own password is its identity PSK"
+                );
+                match users {
+                    // Many users, told apart by the identity header each one sends. The
+                    // inbound's own key opens the header; the session keys come from
+                    // whichever user it named.
+                    Some(users) => Box::new(
+                        ShadowsocksTcpHandler::new_aead2022_multi_user_server(
+                            cipher,
+                            &key_bytes,
+                            users.clone(),
+                            udp_enabled,
+                            client_proxy_selector.clone(),
+                            resolver.clone(),
+                        )
+                        .expect("Invalid multi-user shadowsocks inbound"),
+                    ),
+                    None => Box::new(ShadowsocksTcpHandler::new_aead2022_server(
+                        cipher,
+                        &key_bytes,
+                        udp_enabled,
+                        client_proxy_selector.clone(),
+                        resolver.clone(),
+                    )),
+                }
             }
         },
         ServerProxyConfig::Snell {

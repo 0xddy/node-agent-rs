@@ -4,6 +4,19 @@ use std::sync::Arc;
 
 use super::user::UserContext;
 
+/// Who a Shadowsocks 2022 identity header names, and the key that follows from it.
+///
+/// The header names a PSK, and every session key for the connection derives from that
+/// PSK -- so, as with VMess, "yes, that is a user" is not enough to carry on with. The
+/// lookup hands back the key material it found alongside the user.
+pub struct ShadowsocksIdentity {
+    /// The user whose PSK the identity header named.
+    pub user: Arc<UserContext>,
+    /// That user's PSK, which the connection's session keys derive from. Note this is
+    /// the user's own key, *not* the inbound's identity PSK that opened the header.
+    pub psk: Box<[u8]>,
+}
+
 /// Who a VMess auth id belongs to, and what the rest of the handshake needs.
 ///
 /// A VMess server cannot proceed on "yes, that is a valid user" alone -- the next
@@ -91,6 +104,17 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// clock is wrong".
     fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
         let _ = auth_id;
+        None
+    }
+
+    /// Find whose PSK a Shadowsocks 2022 identity header named.
+    ///
+    /// `hash` is the plaintext recovered from the header: blake3 of the user's PSK,
+    /// truncated to 16 bytes (see [`psk_hash`](crate::shadowsocks::psk_hash)). Unlike
+    /// VMess this really is a lookup -- the client did the work of naming itself -- so
+    /// implementations should index on the hash rather than walk their users.
+    fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
+        let _ = hash;
         None
     }
 

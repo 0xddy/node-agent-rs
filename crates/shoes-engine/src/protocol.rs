@@ -14,7 +14,7 @@
 //! consult, which is a fail-open bug rather than a cosmetic one.
 
 use serde_json::{Map, Value};
-use shoes::config::ServerProxyConfig;
+use shoes::config::{ServerProxyConfig, ShadowsocksConfig};
 use shoes::dynamic::credential;
 
 use crate::error::{EngineError, EngineResult};
@@ -39,6 +39,25 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
         // VMess identifies users by the same uuid VLESS does, so it needs no credential
         // form of its own -- only a different lookup, which the registry provides.
         ServerProxyConfig::Vmess { .. } => kinds.merge(CredentialKinds::UUID),
+
+        // Shadowsocks tells users apart only under 2022 with an AES cipher, where each
+        // client prefixes an identity header naming its own PSK. Legacy shadowsocks has
+        // no such header and the 2022 chacha20 cipher has no way to build one, so an
+        // inbound using either stays single-user and is refused a `users` list.
+        //
+        // The key length travels with the kind: a PSK is raw key material, so a 16 byte
+        // key is not a short aes-256-gcm key, it is one that cipher can never use.
+        //
+        // Note that such an inbound's own `password` stays live in dynamic mode, unlike
+        // VLESS' `user_id` -- it is the identity PSK every client must know to reach the
+        // inbound at all, and it names no user. Hence no `PLACEHOLDER_FIELDS` entry.
+        ServerProxyConfig::Shadowsocks { config, .. } => {
+            if let ShadowsocksConfig::Aead2022 { cipher, .. } = config
+                && credential::shadowsocks_supports_multi_user(cipher)
+            {
+                kinds.merge(CredentialKinds::shadowsocks_psk(cipher.key_len()));
+            }
+        }
 
         // Containers. Each target names its own inner protocol, so one inbound can
         // need more than one credential form -- e.g. VLESS on one SNI and Trojan on
@@ -69,13 +88,11 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
             }
         }
 
-        // Authenticates, but not through the registry yet. Phase 2b wires these up:
-        // Shadowsocks and Snell need the 2022 identity header to be multi-user at
-        // all, AnyTLS and NaiveProxy already have their own multi-user tables, and
-        // Hysteria2 and TUIC authenticate inside `quic_server.rs` rather than through
-        // a `TcpServerHandler`.
-        ServerProxyConfig::Shadowsocks { .. }
-        | ServerProxyConfig::Snell { .. }
+        // Authenticates, but not through the registry yet. Snell has no multi-user
+        // identity mechanism at all, AnyTLS and NaiveProxy already have their own
+        // multi-user tables, and Hysteria2 and TUIC authenticate inside their QUIC
+        // accept loops rather than through a `TcpServerHandler`.
+        ServerProxyConfig::Snell { .. }
         | ServerProxyConfig::Anytls { .. }
         | ServerProxyConfig::Naiveproxy { .. }
         | ServerProxyConfig::Hysteria2 { .. }
@@ -277,6 +294,11 @@ mod tests {
         )
     }
 
+    /// A base64 key of `len` bytes, for a 2022 cipher's `password`.
+    fn base64_of(len: usize) -> String {
+        credential::encode_shadowsocks_psk(&vec![7u8; len])
+    }
+
     /// The placeholder pass takes a whole inbound, not a bare protocol, because
     /// `rules` sit alongside `protocol` and must be left alone.
     fn inbound(protocol: &str) -> String {
@@ -360,6 +382,63 @@ mod tests {
                 "expected no registry credentials for {json}"
             );
         }
+    }
+
+    #[test]
+    fn classifies_shadowsocks_only_where_identity_headers_exist() {
+        // The two AES 2022 ciphers can name a user, and the length travels with them.
+        for (cipher, len) in [("aes-128-gcm", 16), ("aes-256-gcm", 32)] {
+            let json = format!(
+                r#"{{"type":"ss","cipher":"2022-blake3-{cipher}","password":"{}"}}"#,
+                base64_of(len)
+            );
+            assert_eq!(
+                credential_kinds(&parse(&json)),
+                CredentialKinds::shadowsocks_psk(len),
+                "{cipher} should be registry-backed with a {len} byte psk"
+            );
+        }
+
+        // chacha20 has no way to build an identity header, and legacy shadowsocks has
+        // no header at all -- both stay single-user.
+        for json in [
+            &format!(
+                r#"{{"type":"ss","cipher":"2022-blake3-chacha20-ietf-poly1305","password":"{}"}}"#,
+                base64_of(32)
+            ),
+            &r#"{"type":"ss","cipher":"aes-256-gcm","password":"hunter2"}"#.to_string(),
+        ] {
+            assert!(
+                credential_kinds(&parse(json)).is_empty(),
+                "expected no registry credentials for {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_through_tls_to_a_shadowsocks_target() {
+        let inner = format!(
+            r#"{{"type":"ss","cipher":"2022-blake3-aes-128-gcm","password":"{}"}}"#,
+            base64_of(16)
+        );
+        assert_eq!(
+            credential_kinds(&parse(&tls_wrapping(&inner))),
+            CredentialKinds::shadowsocks_psk(16)
+        );
+    }
+
+    #[test]
+    fn a_shadowsocks_inbound_keeps_its_own_password() {
+        // Unlike VLESS' `user_id`, an SS2022 inbound's `password` is its identity PSK:
+        // it names the inbound, every client must know it, and it is still consulted in
+        // dynamic mode. So it must not be rejected or replaced.
+        let original = inbound(&format!(
+            r#"{{"type":"ss","cipher":"2022-blake3-aes-128-gcm","password":"{}"}}"#,
+            base64_of(16)
+        ));
+        let mut config: Value = serde_json::from_str(&original).unwrap();
+        install_placeholder_credentials(&mut config).unwrap();
+        assert_eq!(config, serde_json::from_str::<Value>(&original).unwrap());
     }
 
     #[test]

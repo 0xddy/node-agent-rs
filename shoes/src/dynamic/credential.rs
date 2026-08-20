@@ -17,6 +17,39 @@
 /// is what keeps the trial cheap.
 pub use crate::vmess::VmessAuthKey;
 
+/// Derive the 16 bytes a Shadowsocks 2022 client sends to name its PSK: blake3 of the
+/// key, truncated to one AES block.
+///
+/// The index key for [`find_shadowsocks_psk_hash`](super::UserRegistry::find_shadowsocks_psk_hash).
+/// Unlike the others this takes raw key bytes rather than something an operator typed,
+/// because a 2022 PSK *is* raw bytes; [`decode_shadowsocks_psk`] is how a control plane
+/// gets from the one to the other.
+pub use crate::shadowsocks::psk_hash as shadowsocks_psk_hash;
+
+/// Decode a Shadowsocks 2022 PSK from base64, the way a config file spells it.
+///
+/// Does not check the length: how many bytes a key must be depends on the inbound's
+/// cipher, and refusing a mismatch with a message naming that cipher is the caller's
+/// job.
+pub fn decode_shadowsocks_psk(encoded: &str) -> std::io::Result<Box<[u8]>> {
+    crate::config::ShadowsocksConfig::decode_key(encoded)
+}
+
+/// Encode a Shadowsocks 2022 PSK the way a config file spells it.
+///
+/// The inverse of [`decode_shadowsocks_psk`], for a control plane that mints a key
+/// and has to hand it back for the client's own config.
+pub fn encode_shadowsocks_psk(psk: &[u8]) -> String {
+    crate::config::ShadowsocksConfig::encode_key(psk)
+}
+
+/// Whether a Shadowsocks cipher, named as it is in a config file, can serve more than
+/// one user.
+///
+/// Only the AES ciphers have identity headers, so this is the check that decides
+/// whether a shadowsocks inbound can be registry-backed at all.
+pub use crate::shadowsocks::supports_identity_headers as shadowsocks_supports_multi_user;
+
 /// Parse a uuid into the 16 raw bytes VLESS and VMess put on the wire.
 ///
 /// Dashes are optional and ignored, matching what `shoes` accepts in a config file.
@@ -77,5 +110,16 @@ mod tests {
         let second = random_uuid();
         assert_ne!(first, second);
         assert!(parse_uuid(&first).is_ok());
+    }
+
+    #[test]
+    fn decodes_a_shadowsocks_psk_and_names_it() {
+        // 16 bytes, standard base64 with padding -- an aes-128-gcm key.
+        let psk = decode_shadowsocks_psk("MDEyMzQ1Njc4OWFiY2RlZg==").unwrap();
+        assert_eq!(&*psk, b"0123456789abcdef");
+        assert_eq!(encode_shadowsocks_psk(&psk), "MDEyMzQ1Njc4OWFiY2RlZg==");
+        assert_eq!(shadowsocks_psk_hash(&psk).len(), 16);
+        assert_ne!(shadowsocks_psk_hash(&psk), shadowsocks_psk_hash(&psk[1..]));
+        assert!(decode_shadowsocks_psk("not base64!").is_err());
     }
 }

@@ -59,6 +59,9 @@ pub struct ShadowsocksStream {
     salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
     encrypt_iv: Box<[u8]>,
     decrypt_iv: Option<Box<[u8]>>,
+    /// Raw bytes to send between the salt and the first chunk. Empty except on a
+    /// multi-user 2022 client, where they are the identity headers naming its PSK.
+    identity_headers: Box<[u8]>,
 
     sealing_key: SealingKey<IncreasingSequence>,
     opening_key: Option<OpeningKey<IncreasingSequence>>,
@@ -125,6 +128,7 @@ impl ShadowsocksStream {
             encrypt_iv,
             // Needed for AEAD2022 server response.
             decrypt_iv: None,
+            identity_headers: Box::new([]),
 
             sealing_key,
             opening_key: None,
@@ -145,6 +149,43 @@ impl ShadowsocksStream {
             is_initial_write: true,
             is_eof: false,
         }
+    }
+
+    /// The salt this stream will send, available before it goes out.
+    ///
+    /// Generated in [`Self::new`] but not written until the first `poll_write`, which
+    /// is the window a 2022 client needs in order to seal identity headers against it.
+    pub fn write_salt(&self) -> &[u8] {
+        &self.encrypt_iv
+    }
+
+    /// Set the raw bytes to send between the salt and the first chunk.
+    ///
+    /// Meaningful only on a 2022 client, and only before the first write. What they
+    /// mean stays out of the record layer: [`super::eih`] builds them, this places them.
+    pub fn set_identity_headers(&mut self, identity_headers: Box<[u8]>) {
+        assert!(self.is_initial_write);
+        self.identity_headers = identity_headers;
+    }
+
+    /// Replay bytes a caller consumed from the stream before handing it over.
+    ///
+    /// A multi-user 2022 server has to read the salt and the identity header itself,
+    /// since which key this stream gets built with is exactly what the header answers.
+    /// Feeding the salt back leaves the handshake the record layer expects to find.
+    pub fn feed_initial_read_data(&mut self, data: &[u8]) -> std::io::Result<()> {
+        assert!(self.is_initial_read && self.unprocessed_end_offset == 0);
+
+        if data.len() > self.unprocessed_buf.len() {
+            return Err(std::io::Error::other(
+                "feed_initial_read_data called with too much data",
+            ));
+        }
+
+        self.unprocessed_buf[0..data.len()].copy_from_slice(data);
+        self.unprocessed_end_offset = data.len();
+
+        Ok(())
     }
 
     fn process_opening_key(&mut self) -> std::io::Result<()> {
@@ -619,6 +660,13 @@ impl ShadowsocksStream {
                 self.write_cache[0..self.salt_len].copy_from_slice(&self.encrypt_iv);
                 self.write_cache_end_offset = self.salt_len;
 
+                // Identity headers, when there are any, sit in the clear between the
+                // salt and the first chunk.
+                let headers_end = self.write_cache_end_offset + self.identity_headers.len();
+                self.write_cache[self.write_cache_end_offset..headers_end]
+                    .copy_from_slice(&self.identity_headers);
+                self.write_cache_end_offset = headers_end;
+
                 let mut request_header = allocate_vec(1 + 8 + 2);
 
                 // HeaderTypeClientStream = 0
@@ -631,7 +679,7 @@ impl ShadowsocksStream {
                 assert!(
                     buf_len
                         <= self.write_cache.len()
-                            - self.salt_len
+                            - self.write_cache_end_offset
                             - (request_header.len() + TAG_LEN)
                             - TAG_LEN
                 );
