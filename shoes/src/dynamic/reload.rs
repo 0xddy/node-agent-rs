@@ -48,7 +48,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::config::{BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, Transport};
+use crate::config::{
+    BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, TcpConfig, Transport,
+};
 use crate::dynamic::UserRegistry;
 use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
@@ -63,9 +65,21 @@ use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 /// period so much as the last chance for the runtime to run the cancellation.
 const ABORT_GRACE: Duration = Duration::from_millis(250);
 
-/// `ArcSwap` stores a thin pointer and `Arc<dyn TcpServerHandler>` is a fat one,
-/// so the trait object goes behind one sized indirection.
-struct HandlerCell(Arc<dyn TcpServerHandler>);
+/// One generation of everything a connection is pinned to when it is accepted.
+///
+/// The resolver belongs here, next to the handler, and not in the accept loop. A
+/// reload rebuilds the handler *with a new resolver* -- an inbound may carry its own
+/// `dns` section -- so a loop holding its own copy from startup would hand every new
+/// connection the rules from one generation and the DNS from another. The call would
+/// report success and traffic would go on resolving the old way, which is the exact
+/// failure the swap exists to avoid.
+///
+/// `ArcSwap` also needs a sized value, and `Arc<dyn TcpServerHandler>` is a fat
+/// pointer, so this doubles as the indirection that used to be a newtype.
+struct HandlerCell {
+    handler: Arc<dyn TcpServerHandler>,
+    resolver: Arc<dyn Resolver>,
+}
 
 /// The handler an accept loop hands to each connection it accepts, replaceable
 /// while the listener stays up.
@@ -77,29 +91,33 @@ pub struct HandlerSlot {
 }
 
 impl HandlerSlot {
-    pub fn new(handler: Arc<dyn TcpServerHandler>) -> Arc<Self> {
+    pub fn new(handler: Arc<dyn TcpServerHandler>, resolver: Arc<dyn Resolver>) -> Arc<Self> {
         Arc::new(Self {
-            current: ArcSwap::from_pointee(HandlerCell(handler)),
+            current: ArcSwap::from_pointee(HandlerCell { handler, resolver }),
             generation: AtomicU64::new(0),
         })
     }
 
-    /// The handler for a connection being accepted now.
+    /// What a connection being accepted now runs under: its handler and the resolver
+    /// that handler's rules were built against.
     ///
-    /// On the hot path, once per connection. `load` is a lock-free read; the clone
-    /// is one uncontended refcount bump, the same one the old
-    /// `server_handler.clone()` did.
+    /// On the hot path, once per connection. `load` is a lock-free read; the clones
+    /// are two uncontended refcount bumps, one of which the old
+    /// `server_handler.clone()` already did and the other of which replaces the
+    /// accept loop's own `resolver.clone()`.
     #[inline]
-    pub fn load(&self) -> Arc<dyn TcpServerHandler> {
-        Arc::clone(&self.current.load().0)
+    pub fn load(&self) -> (Arc<dyn TcpServerHandler>, Arc<dyn Resolver>) {
+        let current = self.current.load();
+        (Arc::clone(&current.handler), Arc::clone(&current.resolver))
     }
 
     /// Install `handler` for connections accepted from here on, and return the
     /// generation it was given.
     ///
     /// Connections already running keep the handler they were accepted with.
-    pub fn store(&self, handler: Arc<dyn TcpServerHandler>) -> u64 {
-        self.current.store(Arc::new(HandlerCell(handler)));
+    pub fn store(&self, handler: Arc<dyn TcpServerHandler>, resolver: Arc<dyn Resolver>) -> u64 {
+        self.current
+            .store(Arc::new(HandlerCell { handler, resolver }));
         self.generation.fetch_add(1, Ordering::Release) + 1
     }
 
@@ -113,7 +131,7 @@ impl std::fmt::Debug for HandlerSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandlerSlot")
             .field("generation", &self.generation())
-            .field("handler", &self.current.load().0)
+            .field("handler", &self.current.load().handler)
             .finish()
     }
 }
@@ -132,31 +150,38 @@ impl std::fmt::Debug for HandlerSlot {
 /// out into, so the connection is pinned to the generation it started on and a
 /// [`store`](Self::store) can only change what the *next* `load` returns.
 ///
-/// `ClientProxySelector` is sized, so unlike `dyn TcpServerHandler` it needs no cell
-/// to go behind the `ArcSwap`.
+/// The rules and the resolver they were built against, swapped as one. Same
+/// reasoning as [`HandlerCell`]: a connection must not mix generations.
+struct SelectorCell {
+    selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+}
+
 pub struct SelectorSlot {
-    current: ArcSwap<ClientProxySelector>,
+    current: ArcSwap<SelectorCell>,
     generation: AtomicU64,
 }
 
 impl SelectorSlot {
-    pub fn new(selector: Arc<ClientProxySelector>) -> Arc<Self> {
+    pub fn new(selector: Arc<ClientProxySelector>, resolver: Arc<dyn Resolver>) -> Arc<Self> {
         Arc::new(Self {
-            current: ArcSwap::from(selector),
+            current: ArcSwap::from_pointee(SelectorCell { selector, resolver }),
             generation: AtomicU64::new(0),
         })
     }
 
-    /// The rules for a connection being accepted now.
+    /// The rules for a connection being accepted now, and the resolver they route by.
     #[inline]
-    pub fn load(&self) -> Arc<ClientProxySelector> {
-        self.current.load_full()
+    pub fn load(&self) -> (Arc<ClientProxySelector>, Arc<dyn Resolver>) {
+        let current = self.current.load();
+        (Arc::clone(&current.selector), Arc::clone(&current.resolver))
     }
 
     /// Install `selector` for connections accepted from here on, and return the
     /// generation it was given.
-    pub fn store(&self, selector: Arc<ClientProxySelector>) -> u64 {
-        self.current.store(selector);
+    pub fn store(&self, selector: Arc<ClientProxySelector>, resolver: Arc<dyn Resolver>) -> u64 {
+        self.current
+            .store(Arc::new(SelectorCell { selector, resolver }));
         self.generation.fetch_add(1, Ordering::Release) + 1
     }
 
@@ -304,6 +329,99 @@ impl QuicNativeSettings {
     }
 }
 
+/// What the *listener* baked in at start, as opposed to what the handler carries.
+///
+/// [`FixedProtocol`] covers a QUIC-native inbound's protocol object. This covers the
+/// layer beneath it, which no inbound can reload: an accept loop reads `tcp_settings`
+/// once before it starts, a QUIC endpoint owns its certificate and ALPN list rather
+/// than handing them to each connection, and a unix socket's path is the socket. A
+/// reload rebuilds handlers and nothing else, so every one of these silently kept its
+/// original value while the call reported success -- which is the worst possible
+/// answer for a certificate rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedListener {
+    /// Read once by the accept loop and passed to each accepted socket.
+    no_delay: bool,
+    /// `None` for a TCP listener.
+    quic: Option<FixedQuic>,
+    /// `None` for an address-backed listener. Compared by
+    /// [`ServerHandle::check_bind_location`], which can otherwise only tell that
+    /// both sides are unix sockets.
+    path: Option<String>,
+}
+
+/// The endpoint's own settings, which live below the handler and outlive a swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedQuic {
+    cert: String,
+    key: String,
+    alpn_protocols: Vec<String>,
+    client_ca_certs: Vec<String>,
+    client_fingerprints: Vec<String>,
+    num_endpoints: usize,
+}
+
+impl FixedListener {
+    fn extract(config: &ServerConfig) -> Self {
+        Self {
+            // Defaulted the same way `start_tcp_servers` defaults it, so an omitted
+            // section and an explicitly-default one compare equal rather than
+            // reading as a change.
+            no_delay: config
+                .tcp_settings
+                .as_ref()
+                .map(|tcp| tcp.no_delay)
+                .unwrap_or_else(|| TcpConfig::default().no_delay),
+            quic: config.quic_settings.as_ref().map(|quic| FixedQuic {
+                cert: quic.cert.clone(),
+                key: quic.key.clone(),
+                alpn_protocols: quic.alpn_protocols.iter().cloned().collect(),
+                client_ca_certs: quic.client_ca_certs.iter().cloned().collect(),
+                client_fingerprints: quic.client_fingerprints.iter().cloned().collect(),
+                num_endpoints: quic.num_endpoints,
+            }),
+            path: match &config.bind_location {
+                BindLocation::Path(path) => Some(path.display().to_string()),
+                BindLocation::Address(_) => None,
+            },
+        }
+    }
+
+    /// Names the first setting that cannot be changed in place.
+    ///
+    /// The path is deliberately not named here: a changed listen location is
+    /// [`ServerHandle::check_bind_location`]'s to report, and it words it better.
+    fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        if self.no_delay != other.no_delay {
+            return Some("tcp_settings.no_delay");
+        }
+        match (&self.quic, &other.quic) {
+            (Some(mine), Some(theirs)) => {
+                if mine.cert != theirs.cert {
+                    Some("quic_settings.cert")
+                } else if mine.key != theirs.key {
+                    Some("quic_settings.key")
+                } else if mine.alpn_protocols != theirs.alpn_protocols {
+                    Some("quic_settings.alpn_protocols")
+                } else if mine.client_ca_certs != theirs.client_ca_certs {
+                    Some("quic_settings.client_ca_certs")
+                } else if mine.client_fingerprints != theirs.client_fingerprints {
+                    Some("quic_settings.client_fingerprints")
+                } else if mine.num_endpoints != theirs.num_endpoints {
+                    Some("quic_settings.num_endpoints")
+                } else {
+                    None
+                }
+            }
+            (None, None) => None,
+            // Gaining or losing the whole section. `check_reload` refuses a
+            // transport change before this can be reached, so this is a config that
+            // kept its transport and dropped the settings that transport needs.
+            _ => Some("quic_settings"),
+        }
+    }
+}
+
 /// Which listener a [`HandlerSlot`] belongs to.
 ///
 /// Handlers are shared per bind IP rather than per port: a protocol's state does
@@ -340,6 +458,9 @@ pub struct ServerHandle {
     /// What such an inbound cannot change in place. `None` until a selector slot is
     /// recorded, and for every handler-based inbound.
     fixed: Option<FixedProtocol>,
+    /// What the *listener* baked in, which no inbound of any kind can change in
+    /// place. `None` only for a handle nothing recorded settings on.
+    fixed_listener: Option<FixedListener>,
     cancel: CancellationToken,
     listeners: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -352,6 +473,7 @@ impl ServerHandle {
             slots: Vec::new(),
             selectors: Vec::new(),
             fixed: None,
+            fixed_listener: None,
             cancel,
             listeners: Mutex::new(Vec::new()),
         }
@@ -370,6 +492,14 @@ impl ServerHandle {
         self.binds.push(address);
     }
 
+    /// Record what this inbound's listeners baked in, so a later reload can refuse
+    /// to change it rather than report success and ignore it.
+    ///
+    /// Called by the start functions with the config they are about to start from.
+    pub(crate) fn record_listener_settings(&mut self, config: &ServerConfig) {
+        self.fixed_listener = Some(FixedListener::extract(config));
+    }
+
     /// Record the slot serving `ip`, or return the one already recorded for it.
     ///
     /// Mirrors the `HashMap<IpAddr, _>` the start functions use to share a handler
@@ -377,19 +507,24 @@ impl ServerHandle {
     pub(crate) fn slot_for_ip(
         &mut self,
         ip: IpAddr,
+        resolver: &Arc<dyn Resolver>,
         build: impl FnOnce() -> Arc<dyn TcpServerHandler>,
     ) -> Arc<HandlerSlot> {
         let key = HandlerKey::Ip(ip);
         if let Some((_, slot)) = self.slots.iter().find(|(k, _)| *k == key) {
             return Arc::clone(slot);
         }
-        let slot = HandlerSlot::new(build());
+        let slot = HandlerSlot::new(build(), Arc::clone(resolver));
         self.slots.push((key, Arc::clone(&slot)));
         slot
     }
 
-    pub(crate) fn slot_for_path(&mut self, handler: Arc<dyn TcpServerHandler>) -> Arc<HandlerSlot> {
-        let slot = HandlerSlot::new(handler);
+    pub(crate) fn slot_for_path(
+        &mut self,
+        handler: Arc<dyn TcpServerHandler>,
+        resolver: &Arc<dyn Resolver>,
+    ) -> Arc<HandlerSlot> {
+        let slot = HandlerSlot::new(handler, Arc::clone(resolver));
         self.slots.push((HandlerKey::Path, Arc::clone(&slot)));
         slot
     }
@@ -404,10 +539,11 @@ impl ServerHandle {
     pub(crate) fn push_selector(
         &mut self,
         selector: Arc<ClientProxySelector>,
+        resolver: &Arc<dyn Resolver>,
         protocol: &ServerProxyConfig,
         has_registry: bool,
     ) -> Arc<SelectorSlot> {
-        let slot = SelectorSlot::new(selector);
+        let slot = SelectorSlot::new(selector, Arc::clone(resolver));
         self.selectors.push(Arc::clone(&slot));
         if self.fixed.is_none() {
             self.fixed = FixedProtocol::extract(protocol, has_registry);
@@ -484,6 +620,21 @@ impl ServerHandle {
             ));
         }
 
+        // Below the handler: the accept loop's own settings, the QUIC endpoint's
+        // certificate and ALPN list. A reload rebuilds handlers and nothing else, so
+        // accepting a change to any of these would report a certificate rotation as
+        // applied while the endpoint went on presenting the old one.
+        if let Some(fixed) = &self.fixed_listener
+            && let Some(field) = fixed.first_difference(&FixedListener::extract(config))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot change `{field}` in place: it belongs to the listener,                      which a reload does not rebuild. Replace the inbound to change it"
+                ),
+            ));
+        }
+
         self.check_bind_location(&config.bind_location)?;
 
         if config.rules.is_empty() {
@@ -549,12 +700,14 @@ impl ServerHandle {
 
         let mut generation = 0;
         for (slot, handler) in rebuilt {
-            generation = generation.max(slot.store(handler));
+            // The resolver goes in with the handler, so a connection cannot be
+            // accepted under one generation's rules and route by another's DNS.
+            generation = generation.max(slot.store(handler, Arc::clone(resolver)));
         }
         // The same selector into every slot: they are per bind address only because
         // each QUIC-native listener holds its own, not because they can differ.
         for slot in &self.selectors {
-            generation = generation.max(slot.store(Arc::clone(&selector)));
+            generation = generation.max(slot.store(Arc::clone(&selector), Arc::clone(resolver)));
         }
 
         debug!(
@@ -594,14 +747,28 @@ impl ServerHandle {
                 }
                 Ok(())
             }
-            BindLocation::Path(_) => {
-                if self.slots.iter().any(|(key, _)| *key == HandlerKey::Path) {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
+            BindLocation::Path(path) => {
+                if !self.slots.iter().any(|(key, _)| *key == HandlerKey::Path) {
+                    return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "cannot move from an address to a unix socket in place",
-                    ))
+                    ));
+                }
+                // Being a unix socket is not enough: the path *is* the socket, so a
+                // different one is a different listener. Without this, moving from
+                // `/tmp/a` to `/tmp/b` reported success and went on serving `/tmp/a`.
+                let wanted = path.display().to_string();
+                match self.fixed_listener.as_ref().and_then(|f| f.path.as_deref()) {
+                    Some(running) if running == wanted => Ok(()),
+                    Some(running) => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "cannot change the listen path in place: listening on                              {running}, config says {wanted}"
+                        ),
+                    )),
+                    // Nothing recorded the path, so there is nothing to compare
+                    // against and claiming a match would be a guess.
+                    None => Ok(()),
                 }
             }
         }
@@ -616,6 +783,23 @@ impl ServerHandle {
     /// accept loop to notice; for QUIC it also covers the endpoint's own drain,
     /// which is why there is a bound. A listener still running when `drain`
     /// elapses is aborted, which for QUIC does cut its connections short.
+    /// Tell the accept loops to stop, without waiting for them.
+    ///
+    /// The synchronous half of [`shutdown`](Self::shutdown), for a caller that has no
+    /// `await` to spend -- a `Drop` impl cleaning up after a cancelled request, say.
+    /// Established connections are untouched either way: they were spawned off the
+    /// accept loop and hold their own handler.
+    ///
+    /// What this does *not* give you is [`shutdown`]'s guarantee that the sockets are
+    /// free when it returns. For TCP the listener drops almost immediately; a QUIC
+    /// endpoint drains its live connections first, and nothing here waits for that.
+    /// So this frees the port eventually, not by the time it returns.
+    ///
+    /// [`shutdown`]: Self::shutdown
+    pub fn stop_accepting(&self) {
+        self.cancel.cancel();
+    }
+
     pub async fn shutdown(&self, drain: Duration) {
         self.cancel.cancel();
 
@@ -732,12 +916,41 @@ mod tests {
         }
     }
 
+    impl HandlerSlot {
+        /// The slot's real constructor takes the resolver its handler routes by.
+        /// These tests are about the swap itself, so they hand it a stand-in.
+        fn new_for_test(handler: Arc<dyn TcpServerHandler>) -> Arc<Self> {
+            Self::new(handler, resolver())
+        }
+
+        fn store_for_test(&self, handler: Arc<dyn TcpServerHandler>) -> u64 {
+            self.store(handler, resolver())
+        }
+    }
+
+    impl ServerHandle {
+        fn slot_for_path_for_test(
+            &mut self,
+            handler: Arc<dyn TcpServerHandler>,
+        ) -> Arc<HandlerSlot> {
+            self.slot_for_path(handler, &resolver())
+        }
+    }
+
+    impl SelectorSlot {
+        fn new_for_test(selector: Arc<ClientProxySelector>) -> Arc<Self> {
+            Self::new(selector, resolver())
+        }
+    }
+
     fn marker(name: &'static str) -> Arc<dyn TcpServerHandler> {
         Arc::new(Marker(name))
     }
 
-    fn name_of(handler: &Arc<dyn TcpServerHandler>) -> String {
-        format!("{handler:?}")
+    /// The handler half of a `load`, named. A slot hands back the resolver too, but
+    /// these tests are about which *handler* a connection is pinned to.
+    fn name_of(loaded: &(Arc<dyn TcpServerHandler>, Arc<dyn Resolver>)) -> String {
+        format!("{:?}", loaded.0)
     }
 
     fn resolver() -> Arc<dyn Resolver> {
@@ -746,26 +959,62 @@ mod tests {
 
     #[test]
     fn load_returns_the_current_handler() {
-        let slot = HandlerSlot::new(marker("first"));
+        let slot = HandlerSlot::new_for_test(marker("first"));
         assert_eq!(name_of(&slot.load()), "Marker(\"first\")");
         assert_eq!(slot.generation(), 0);
     }
 
     #[test]
     fn store_changes_what_the_next_load_sees() {
-        let slot = HandlerSlot::new(marker("first"));
-        assert_eq!(slot.store(marker("second")), 1);
+        let slot = HandlerSlot::new_for_test(marker("first"));
+        assert_eq!(slot.store_for_test(marker("second")), 1);
         assert_eq!(name_of(&slot.load()), "Marker(\"second\")");
         assert_eq!(slot.generation(), 1);
+    }
+
+    #[test]
+    fn the_resolver_changes_generation_with_the_handler() {
+        // The resolver is in the slot rather than captured by the accept loop, so
+        // that a connection cannot be accepted under one generation's rules and
+        // route by another's DNS. An inbound may carry its own `dns` section, so a
+        // reload really can hand the rebuilt handler a different resolver.
+        let first = resolver();
+        let second = resolver();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the two stand-ins must be distinguishable"
+        );
+
+        let slot = HandlerSlot::new(marker("old"), Arc::clone(&first));
+        let (_, loaded) = slot.load();
+        assert!(Arc::ptr_eq(&loaded, &first));
+
+        // A connection accepted now holds both halves of its own generation.
+        let in_flight = slot.load();
+
+        slot.store(marker("new"), Arc::clone(&second));
+        let (handler, loaded) = slot.load();
+        assert_eq!(format!("{handler:?}"), "Marker(\"new\")");
+        assert!(
+            Arc::ptr_eq(&loaded, &second),
+            "a new connection must get the resolver that came with the new handler"
+        );
+
+        // And the in-flight one is untouched, in both halves.
+        assert_eq!(format!("{:?}", in_flight.0), "Marker(\"old\")");
+        assert!(
+            Arc::ptr_eq(&in_flight.1, &first),
+            "an established connection keeps the DNS it started with"
+        );
     }
 
     #[test]
     fn a_handler_already_loaded_is_unaffected_by_a_store() {
         // The whole of the RCU guarantee: a connection accepted before the swap
         // keeps the handler it was given, for as long as it holds the `Arc`.
-        let slot = HandlerSlot::new(marker("old"));
+        let slot = HandlerSlot::new_for_test(marker("old"));
         let in_flight = slot.load();
-        slot.store(marker("new"));
+        slot.store_for_test(marker("new"));
         assert_eq!(name_of(&in_flight), "Marker(\"old\")");
         assert_eq!(name_of(&slot.load()), "Marker(\"new\")");
     }
@@ -773,9 +1022,9 @@ mod tests {
     #[test]
     fn slots_are_shared_per_ip_and_not_across_ips() {
         let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
-        let first = handle.slot_for_ip("127.0.0.1".parse().unwrap(), || marker("a"));
-        let same = handle.slot_for_ip("127.0.0.1".parse().unwrap(), || marker("b"));
-        let other = handle.slot_for_ip("127.0.0.2".parse().unwrap(), || marker("c"));
+        let first = handle.slot_for_ip("127.0.0.1".parse().unwrap(), &resolver(), || marker("a"));
+        let same = handle.slot_for_ip("127.0.0.1".parse().unwrap(), &resolver(), || marker("b"));
+        let other = handle.slot_for_ip("127.0.0.2".parse().unwrap(), &resolver(), || marker("c"));
 
         assert!(Arc::ptr_eq(&first, &same), "one handler per bind IP");
         assert!(!Arc::ptr_eq(&first, &other), "never shared across IPs");
@@ -838,7 +1087,7 @@ mod tests {
         ));
 
         let mut handle = ServerHandle::new(Transport::Quic, CancellationToken::new());
-        let slot = handle.push_selector(selector, &config.protocol, has_registry);
+        let slot = handle.push_selector(selector, &resolver(), &config.protocol, has_registry);
         handle.push_address("127.0.0.1:18443".parse().unwrap());
         (handle, slot)
     }
@@ -931,7 +1180,9 @@ mod tests {
     fn reload_rejects_a_different_listen_set() {
         let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
         handle.push_address("127.0.0.1:1080".parse().unwrap());
-        handle.slot_for_ip("127.0.0.1".parse().unwrap(), || marker("running"));
+        handle.slot_for_ip("127.0.0.1".parse().unwrap(), &resolver(), || {
+            marker("running")
+        });
 
         let config: ServerConfig =
             serde_yaml::from_str("address: 127.0.0.1:1081\nprotocol:\n  type: socks\n").unwrap();
@@ -949,7 +1200,9 @@ mod tests {
     fn reload_rejects_a_different_transport() {
         let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
         handle.push_address("127.0.0.1:1080".parse().unwrap());
-        handle.slot_for_ip("127.0.0.1".parse().unwrap(), || marker("running"));
+        handle.slot_for_ip("127.0.0.1".parse().unwrap(), &resolver(), || {
+            marker("running")
+        });
 
         let config: ServerConfig = serde_yaml::from_str(
             "address: 127.0.0.1:1080\ntransport: quic\nprotocol:\n  type: socks\n",
@@ -966,7 +1219,8 @@ mod tests {
         let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
         handle.push_address("127.0.0.1:1080".parse().unwrap());
         handle.push_address("127.0.0.1:1081".parse().unwrap());
-        let shared = handle.slot_for_ip("127.0.0.1".parse().unwrap(), || marker("old"));
+        let shared =
+            handle.slot_for_ip("127.0.0.1".parse().unwrap(), &resolver(), || marker("old"));
 
         let config: ServerConfig = serde_yaml::from_str(
             "address:\n  - 127.0.0.1:1080\n  - 127.0.0.1:1081\nprotocol:\n  type: socks\n",

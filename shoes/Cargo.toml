@@ -25,6 +25,15 @@ path = "src/main.rs"
 default = []
 ffi = []  # Enable FFI module for non-Android builds
 
+# NOTE(shoes-engine): scoped to this package so our own crates keep the lint at its
+# default level. Three of upstream's vmess tests assert `length_mask <= u16::MAX` on
+# a value that is already a `u16`, which clippy denies by default -- that made
+# `cargo clippy --workspace --all-targets` fail to *compile*, so no test code in the
+# workspace could be linted at all. Allowing it here beats editing upstream test
+# bodies, which every future merge would have to carry.
+[lints.clippy]
+absurd_extreme_comparisons = "allow"
+
 [dependencies]
 arc-swap = "*"
 async-trait = "*"

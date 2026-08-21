@@ -176,5 +176,234 @@ async fn boundary_cases() {
         "tag must not be empty",
     );
 
+    // -- G. a target that cannot act on the user list -------------------------
+    //
+    // "Does anything here authenticate through the registry" and "can everything
+    // here act on one" are different questions, and a tree can answer yes to the
+    // first while one of its targets answers no to the second. The shadowsocks
+    // handler is the one that branches on whether a registry was injected, so it is
+    // the one that can be handed a registry it has no identity header to consult --
+    // which used to abort the call rather than refuse it.
+    checks.section("G. a target that cannot serve the list");
+    checks.refused(
+        "a chacha20 shadowsocks target refuses the whole inbound",
+        engine
+            .add_inbound(dynamic(
+                "mixed",
+                json!({
+                    "address": free_addr().to_string(),
+                    "protocol": {
+                        "type": "tls",
+                        "tls_targets": {
+                            "vless.example.com": {
+                                "cert": test_cert(),
+                                "key": test_key(),
+                                "protocol": {"type": "vless"},
+                            },
+                            "ss.example.com": {
+                                "cert": test_cert(),
+                                "key": test_key(),
+                                "protocol": {
+                                    "type": "shadowsocks",
+                                    "cipher": "2022-blake3-chacha20-ietf-poly1305",
+                                    "password": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                                },
+                            },
+                        },
+                    },
+                }),
+            ))
+            .await,
+        "identity header",
+    );
+
+    // The same shape with an aes cipher is exactly what identity headers are for,
+    // so it must still start -- the refusal above has to be about the cipher, not
+    // about mixing protocols under one inbound.
+    checks.that(
+        "the aes spelling of the same shape still starts",
+        engine
+            .add_inbound(dynamic(
+                "mixed-aes",
+                json!({
+                    "address": free_addr().to_string(),
+                    "protocol": {
+                        "type": "tls",
+                        "tls_targets": {
+                            "vless.example.com": {
+                                "cert": test_cert(),
+                                "key": test_key(),
+                                "protocol": {"type": "vless"},
+                            },
+                            "ss.example.com": {
+                                "cert": test_cert(),
+                                "key": test_key(),
+                                "protocol": {
+                                    "type": "shadowsocks",
+                                    "cipher": "2022-blake3-aes-128-gcm",
+                                    "password": "MDEyMzQ1Njc4OWFiY2RlZg==",
+                                },
+                            },
+                        },
+                    },
+                }),
+            ))
+            .await
+            .is_ok(),
+    );
+
+    // And an *update* has to refuse it for the same reason an add does: a reload
+    // rebuilds the handlers from the new config and hands them the registry the
+    // inbound already has, so the target that cannot act on one would be built the
+    // same way. The path never goes through `build_user_registry`, so the check has
+    // to exist twice.
+    checks.refused(
+        "swapping the aes target for a chacha20 one is refused too",
+        engine
+            .update_inbound(InboundSpec {
+                tag: "mixed-aes".into(),
+                config: json!({
+                    "address": engine
+                        .get_inbound("mixed-aes")
+                        .expect("just added")
+                        .describe()
+                        .bind[0],
+                    "protocol": {
+                        "type": "tls",
+                        "tls_targets": {
+                            "vless.example.com": {
+                                "cert": test_cert(),
+                                "key": test_key(),
+                                "protocol": {"type": "vless"},
+                            },
+                            "ss.example.com": {
+                                "cert": test_cert(),
+                                "key": test_key(),
+                                "protocol": {
+                                    "type": "shadowsocks",
+                                    "cipher": "2022-blake3-chacha20-ietf-poly1305",
+                                    "password": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                                },
+                            },
+                        },
+                    },
+                }),
+                users: None,
+            })
+            .await,
+        "identity header",
+    );
+
+    // -- H. what an address claim actually covers -----------------------------
+    //
+    // A claim is a socket, not a port number. Serving HTTP/3 beside HTTP/2 means a
+    // TCP listener and a QUIC endpoint on the same port, which is ordinary -- and
+    // keying the engine's registry on the address alone refused the second as a
+    // conflict with the first.
+    checks.section("H. tcp and quic are different sockets");
+    let shared = free_addr();
+    checks.that(
+        "a tcp inbound takes the port",
+        engine
+            .add_inbound(dynamic("tcp-side", vless_inbound(shared, false)))
+            .await
+            .is_ok(),
+    );
+    checks.that(
+        "and a quic inbound may take the same number",
+        engine
+            .add_inbound(dynamic("quic-side", hysteria2_inbound(shared, false)))
+            .await
+            .is_ok(),
+    );
+    checks.eq(
+        "both claims are recorded, and they are distinguishable",
+        {
+            let mut claims: Vec<String> = engine
+                .status()
+                .bound_addresses
+                .into_iter()
+                .filter(|a| a.starts_with(&shared.to_string()))
+                .collect();
+            claims.sort();
+            claims
+        },
+        vec![format!("{shared} (tcp)"), format!("{shared} (udp)")],
+    );
+    // The same socket twice is still a conflict, which is the half that has to keep
+    // working for the other half to be safe.
+    checks.refused(
+        "a second tcp inbound on that port is still refused",
+        engine
+            .add_inbound(dynamic("tcp-again", vless_inbound(shared, false)))
+            .await,
+        "tcp-side",
+    );
+    checks.refused(
+        "and so is a second quic one",
+        engine
+            .add_inbound(dynamic("quic-again", hysteria2_inbound(shared, false)))
+            .await,
+        "quic-side",
+    );
+
+    // Releasing one leaves the other holding its own socket.
+    engine
+        .remove_inbound("tcp-side")
+        .await
+        .expect("the tcp inbound should stop");
+    checks.eq(
+        "removing the tcp side releases only the tcp claim",
+        engine
+            .status()
+            .bound_addresses
+            .into_iter()
+            .filter(|a| a.starts_with(&shared.to_string()))
+            .collect::<Vec<_>>(),
+        vec![format!("{shared} (udp)")],
+    );
+
+    // -- I. an inbound may declare its own DNS -------------------------------
+    //
+    // Validation rewrites an inline `dns.servers` list into a generated group and
+    // leaves a reference to it behind. The groups and the configs are therefore one
+    // result, and separating them -- which the engine used to do, re-expanding the
+    // already-rewritten config to recover them -- leaves the reference naming a
+    // group nothing produced. Every inbound with a `dns` section was rejected, under
+    // an internal name its author never wrote.
+    checks.section("I. per-inbound dns");
+    let dns_addr = free_addr();
+    let with_dns = |address: std::net::SocketAddr, server: &str| {
+        json!({
+            "address": address.to_string(),
+            "protocol": {"type": "vless"},
+            "rules": allow_all(),
+            "dns": {"servers": [server]},
+        })
+    };
+    checks.that(
+        "an inline dns list is accepted",
+        engine
+            .add_inbound(dynamic("dns", with_dns(dns_addr, "udp://127.0.0.1:5353")))
+            .await
+            .is_ok(),
+    );
+    // And the same path runs again on reload, which is where the rebuilt handler is
+    // handed its resolver.
+    checks.that(
+        "and the inbound reloads with a different one",
+        engine
+            .update_inbound(classic("dns", with_dns(dns_addr, "udp://127.0.0.1:5354")))
+            .await
+            .is_ok(),
+    );
+    checks.that(
+        "an inbound without a dns section is unaffected",
+        engine
+            .add_inbound(dynamic("no-dns", vless_inbound(free_addr(), false)))
+            .await
+            .is_ok(),
+    );
+
     checks.finish();
 }

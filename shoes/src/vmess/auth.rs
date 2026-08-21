@@ -122,14 +122,18 @@ impl VmessAuthKey {
     /// keeps its own copy of this construction and is left alone -- it is upstream code
     /// on the client side of a server-side change, and rewriting it to call this would
     /// buy nothing but merge conflicts.
+    // NOTE(shoes-engine): reached from this crate's own tests, from the engine's,
+    // and by an out-of-crate registry through the `dynamic::credential` re-export --
+    // but by nothing the binary links, which is the only target without a blanket
+    // `dead_code` allow.
+    #[allow(dead_code)]
     pub fn seal(&self, timestamp: u64, padding: [u8; 4]) -> [u8; 16] {
         use aws_lc_rs::cipher::{EncryptingKey as CipherEncryptingKey, EncryptionContext};
 
         let derived_key = super::sha2::kdf(&self.instruction_key, &[b"AES Auth ID Encryption"]);
         let unbound_key =
             UnboundCipherKey::new(&AES_128, &derived_key[0..16]).expect("16 byte AES-128 key");
-        let key =
-            CipherEncryptingKey::ecb(unbound_key).expect("ECB mode from a valid AES key");
+        let key = CipherEncryptingKey::ecb(unbound_key).expect("ECB mode from a valid AES key");
 
         let mut block = [0u8; 16];
         block[0..8].copy_from_slice(&timestamp.to_be_bytes());

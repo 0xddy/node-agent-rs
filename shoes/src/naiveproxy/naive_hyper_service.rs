@@ -286,8 +286,26 @@ async fn naive_service(
                 // multiplexes every CONNECT over one H2 connection, so the first
                 // request to authenticate is the one that names it, and a second
                 // bind is refused rather than double counted.
-                if let Some(meter) = &config.meter {
-                    meter.bind(Arc::clone(&user));
+                //
+                // Which makes *whose* connection it is a question that has to be
+                // answered, not ignored. A refused bind is fine when it is the same
+                // user asking again -- the common case, one request per CONNECT --
+                // but a second, different user on the same connection cannot be let
+                // through: every byte they move would be billed to whoever bound it
+                // first, and the meter has no way to separate them afterwards. One
+                // connection, one user; a client wanting to be somebody else opens
+                // another.
+                if let Some(meter) = &config.meter
+                    && !meter.bind_or_matches(&user)
+                {
+                    debug!(
+                        "NaiveProxy: a second user on a connection already bound to \
+                         another, returning 400"
+                    );
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(empty_body())
+                        .unwrap());
                 }
                 user.id().to_string()
             }

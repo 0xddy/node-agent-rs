@@ -2,12 +2,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
 use log::debug;
 use shoes::config::ServerConfig;
 use shoes::dynamic::{ServerHandle, UserRegistry};
 use shoes::resolver::Resolver;
 use shoes_api::InboundInfo;
-use tokio::task::JoinHandle;
 
 use crate::users::MemoryUserRegistry;
 
@@ -21,10 +22,58 @@ use crate::users::MemoryUserRegistry;
 /// mid-drain and cut exactly the connections the drain exists to protect.
 const LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Which kind of socket actually occupies an address.
+///
+/// Not [`shoes::config::Transport`], for two reasons. It is narrower -- by the time
+/// an inbound starts, the transport has been resolved to one of these two -- and it
+/// derives `Hash`, which the upstream type does not and which nothing here should
+/// make it start doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SocketKind {
+    Tcp,
+    Udp,
+}
+
+impl SocketKind {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// One thing an inbound occupies exclusively, and the unit the engine's address
+/// registry is keyed by.
+///
+/// The address alone is not it. A TCP listener and a QUIC endpoint on `:443` are two
+/// different sockets, and running both is the ordinary way to serve HTTP/3 beside
+/// HTTP/2 -- keying on the address alone made the engine refuse the second as a
+/// conflict. A unix socket has no address at all, so it needs its own variant rather
+/// than being left out of the registry entirely, which is what let two inbounds claim
+/// one path and the second silently delete the first one's socket file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum BindKey {
+    Socket(SocketAddr, SocketKind),
+    Path(String),
+}
+
+impl std::fmt::Display for BindKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(address, kind) => write!(f, "{address} ({})", kind.name()),
+            Self::Path(path) => write!(f, "{path}"),
+        }
+    }
+}
+
 /// The resolved listen targets of one inbound.
 #[derive(Debug, Clone)]
 pub(crate) enum BindTargets {
-    Addresses(Vec<SocketAddr>),
+    Addresses {
+        addresses: Vec<SocketAddr>,
+        kind: SocketKind,
+    },
     /// Unix domain socket path (TCP transport only, unix only).
     Path(String),
 }
@@ -32,14 +81,36 @@ pub(crate) enum BindTargets {
 impl BindTargets {
     pub(crate) fn addresses(&self) -> &[SocketAddr] {
         match self {
-            Self::Addresses(addrs) => addrs,
+            Self::Addresses { addresses, .. } => addresses,
             Self::Path(_) => &[],
+        }
+    }
+
+    /// The socket kind, for an address-backed target that needs a pre-flight bind.
+    pub(crate) fn kind(&self) -> Option<SocketKind> {
+        match self {
+            Self::Addresses { kind, .. } => Some(*kind),
+            Self::Path(_) => None,
+        }
+    }
+
+    /// Everything this target claims, in the form the engine's registry is keyed by.
+    ///
+    /// A unix path is included here even though it has no `SocketAddr`, which is the
+    /// whole point: it is claimed exclusively just as an address is.
+    pub(crate) fn keys(&self) -> Vec<BindKey> {
+        match self {
+            Self::Addresses { addresses, kind } => addresses
+                .iter()
+                .map(|address| BindKey::Socket(*address, *kind))
+                .collect(),
+            Self::Path(path) => vec![BindKey::Path(path.clone())],
         }
     }
 
     pub(crate) fn display(&self) -> Vec<String> {
         match self {
-            Self::Addresses(addrs) => addrs.iter().map(|a| a.to_string()).collect(),
+            Self::Addresses { addresses, .. } => addresses.iter().map(|a| a.to_string()).collect(),
             Self::Path(p) => vec![p.clone()],
         }
     }
@@ -55,7 +126,23 @@ impl BindTargets {
 /// sessions.
 pub struct InboundSlot {
     info: InboundInfo,
-    targets: BindTargets,
+    /// The protocol label, which a reload can change.
+    ///
+    /// Separate from `info` because it is the one field of it that is not fixed for
+    /// the life of the inbound. A reload rebuilds the handlers from a new config, and
+    /// while a *dynamic* inbound may not change the credential shape it authenticates
+    /// with, a classic one may become another protocol entirely -- and reporting the
+    /// protocol it was created as would then be a plain lie to whoever is listing
+    /// inbounds. The transport needs no such treatment: `check_reload` refuses to
+    /// change it.
+    protocol: ArcSwap<String>,
+    /// Everything this inbound claims exclusively, as the engine's registry keys it.
+    ///
+    /// Stored as keys rather than as the `BindTargets` they came from, because an
+    /// inbound can expand to several targets of different shapes and the flattening
+    /// this replaced kept only their addresses -- so a unix socket was never released
+    /// on removal, having never been recorded as claimed.
+    keys: Vec<BindKey>,
     /// One handle per server config this inbound expanded to, in start order.
     ///
     /// A reload re-expands the incoming config and pairs the result against this
@@ -78,25 +165,28 @@ pub struct InboundSlot {
 impl InboundSlot {
     pub(crate) fn new(
         info: InboundInfo,
-        targets: BindTargets,
+        keys: Vec<BindKey>,
         handles: Vec<ServerHandle>,
         users: Option<Arc<MemoryUserRegistry>>,
     ) -> Self {
         Self {
+            protocol: ArcSwap::from_pointee(info.protocol.clone()),
             info,
-            targets,
+            keys,
             handles,
             users,
         }
     }
 
-    /// A snapshot of this inbound, with the current user count and revision filled
-    /// in.
+    /// A snapshot of this inbound, with the current protocol, user count and
+    /// revision filled in.
     ///
-    /// Both are computed here rather than stored, because both change without
-    /// going through this struct -- a cached copy would go stale silently.
+    /// All three are read here rather than served from `info`, because all three
+    /// change without going through it -- a cached copy would go stale silently, and
+    /// a stale *protocol* is the one that misleads rather than merely lags.
     pub fn describe(&self) -> InboundInfo {
         let mut info = self.info.clone();
+        info.protocol = self.protocol.load().as_str().to_string();
         info.users = self.users.as_ref().map(|users| users.len());
         info.revision = self.revision();
         info
@@ -121,21 +211,9 @@ impl InboundSlot {
         self.users.as_ref()
     }
 
-    pub(crate) fn targets(&self) -> &BindTargets {
-        &self.targets
-    }
-
-    /// Returns the first listener task that has already exited, if any.
-    ///
-    /// `run_tcp_server` creates its listener *inside* the spawned task and
-    /// `.unwrap()`s the result, so a failed bind does not come back as an `Err`
-    /// from `start_servers_with_users` -- it shows up as a listener task that
-    /// panicked. Checking for an early exit is how the engine turns that into a
-    /// synchronous API error.
-    pub(crate) fn take_dead_listener(&self) -> Option<JoinHandle<()>> {
-        self.handles
-            .iter()
-            .find_map(ServerHandle::take_dead_listener)
+    /// What this inbound is holding, to be released when it stops.
+    pub(crate) fn keys(&self) -> &[BindKey] {
+        &self.keys
     }
 
     /// Replaces this inbound's routing rules and protocol settings in place.
@@ -184,10 +262,17 @@ impl InboundSlot {
             .clone()
             .map(|registry| registry as Arc<dyn UserRegistry>);
 
+        // Read before the configs are consumed below. The first expansion names the
+        // inbound, the same way it did at creation.
+        let protocol = crate::protocol::display_name(&configs[0].0.protocol);
+
         let mut revision = 0;
         for (handle, (config, resolver)) in self.handles.iter().zip(configs) {
             revision = revision.max(handle.reload(config, &resolver, users.as_ref())?);
         }
+
+        // After the swaps, not before: until they land, the old label is the true one.
+        self.protocol.store(Arc::new(protocol));
 
         debug!("inbound {} reloaded to revision {revision}", self.info.tag);
 
@@ -204,6 +289,16 @@ impl InboundSlot {
     /// this returns, so the caller can hand the same addresses to a new inbound. For
     /// TCP that is immediate; for QUIC the endpoint first drains its live
     /// connections, because they share the socket the port belongs to.
+    /// Stop accepting, without waiting. See [`ServerHandle::stop_accepting`].
+    ///
+    /// For the paths that have no `await` to spend: a `Drop` cleaning up after a
+    /// request that was cancelled part-way through.
+    pub(crate) fn stop_accepting(&self) {
+        for handle in &self.handles {
+            handle.stop_accepting();
+        }
+    }
+
     pub(crate) async fn shutdown(&self) {
         for handle in &self.handles {
             handle.shutdown(LISTENER_DRAIN_TIMEOUT).await;

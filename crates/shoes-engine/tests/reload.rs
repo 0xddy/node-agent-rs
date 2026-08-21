@@ -168,7 +168,9 @@ async fn config_swaps_are_forward_looking() {
             .status()
             .bound_addresses
             .iter()
-            .filter(|a| *a == &vless.to_string())
+            // A claim names the socket, not just the address: `:443` over TCP and
+            // `:443` over QUIC are two of them.
+            .filter(|a| a.starts_with(&vless.to_string()))
             .count(),
         1,
     );
@@ -500,6 +502,100 @@ async fn a_quic_native_inbound_swaps_its_rules_in_place() {
         "bob reaches B like everyone else",
         tu::reach(tuic, BOB, "bob-password", nowhere).await.ok(),
         Some("B".to_string()),
+    );
+
+    checks.finish();
+}
+
+/// A reload rebuilds handlers. Everything below a handler therefore cannot change,
+/// and the only honest answer to a config that changes one is to refuse it.
+///
+/// Reporting success instead is worse than it sounds. The caller's next act after
+/// rotating a certificate is to stop worrying about the old one -- so a swap that
+/// returns `Ok` while the endpoint goes on presenting the previous cert is a
+/// rotation that never happened and nothing says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn listener_settings_are_refused_rather_than_ignored() {
+    let mut checks = Checks::new("listener-fixed settings");
+    let engine = engine().await;
+
+    // -- 1. tcp: the accept loop reads `tcp_settings` once, before it starts ----
+    checks.section("1. tcp_settings");
+    let tcp = free_addr();
+    let with_no_delay = |value: bool| {
+        json!({
+            "address": tcp.to_string(),
+            "protocol": {"type": "vless"},
+            "tcp_settings": {"no_delay": value},
+            "rules": allow_all(),
+        })
+    };
+    engine
+        .add_inbound(dynamic("tcp", with_no_delay(true)))
+        .await
+        .expect("the inbound should start");
+
+    checks.refused(
+        "turning no_delay off is refused",
+        engine
+            .update_inbound(classic("tcp", with_no_delay(false)))
+            .await,
+        "tcp_settings.no_delay",
+    );
+    checks.that(
+        "an otherwise identical config still reloads",
+        engine
+            .update_inbound(classic("tcp", with_no_delay(true)))
+            .await
+            .is_ok(),
+    );
+    // Omitting the section entirely must compare equal to writing its default,
+    // or every caller who leaves it out would be told they changed something.
+    checks.that(
+        "and so does one that omits the section, since its default matches",
+        engine
+            .update_inbound(classic(
+                "tcp",
+                json!({
+                    "address": tcp.to_string(),
+                    "protocol": {"type": "vless"},
+                    "rules": allow_all(),
+                }),
+            ))
+            .await
+            .is_ok(),
+    );
+
+    // -- 2. quic: the endpoint owns the certificate, not the handler ------------
+    checks.section("2. quic_settings");
+    let quic = free_addr();
+    engine
+        .add_inbound(dynamic("quic", hysteria2_inbound(quic, true)))
+        .await
+        .expect("the quic inbound should start");
+
+    let mut different_alpn = hysteria2_inbound(quic, true);
+    different_alpn["quic_settings"]["alpn_protocols"] = json!(["h3", "something-else"]);
+    checks.refused(
+        "changing the alpn list is refused",
+        engine.update_inbound(classic("quic", different_alpn)).await,
+        "quic_settings.alpn_protocols",
+    );
+
+    let mut different_cert = hysteria2_inbound(quic, true);
+    different_cert["quic_settings"]["cert"] = json!(format!("{}\n", test_cert()));
+    checks.refused(
+        "and so is rotating the certificate, which is the one that matters",
+        engine.update_inbound(classic("quic", different_cert)).await,
+        "quic_settings.cert",
+    );
+
+    checks.that(
+        "the unchanged config still reloads, so rules remain swappable",
+        engine
+            .update_inbound(classic("quic", hysteria2_inbound(quic, true)))
+            .await
+            .is_ok(),
     );
 
     checks.finish();

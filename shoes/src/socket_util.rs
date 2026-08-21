@@ -49,7 +49,10 @@ pub fn new_socket2_udp_socket(
 /// every datagram would go to just one of the sockets, so the only safe number of
 /// endpoints on such a platform is one.
 pub const fn supports_reuse_port() -> bool {
-    cfg!(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))
+    cfg!(all(
+        unix,
+        not(any(target_os = "solaris", target_os = "illumos"))
+    ))
 }
 
 pub fn new_socket2_udp_socket_with_buffer_size(

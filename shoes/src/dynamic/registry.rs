@@ -81,11 +81,19 @@ pub struct VmessIdentity {
 ///
 /// A lookup that returns `Some` has already called
 /// [`note_auth`](UserContext::note_auth), so that a handler cannot forget to. That
-/// works because for every credential here the key *is* the proof: a password or a
-/// hash is compared against the stored value, and a VMess auth id carries a checksum
-/// only the uuid holder can produce.
+/// works wherever the key *is* the proof: a password or a hash is compared against
+/// the stored value, and a client that did not hold it could not have sent it.
 ///
-/// [`find_tuic_uuid`](Self::find_tuic_uuid) is the one exception, and it says so.
+/// Three lookups here are **not** in that position, and each says so on its own
+/// method: [`find_tuic_uuid`](Self::find_tuic_uuid),
+/// [`find_vmess_auth_id`](Self::find_vmess_auth_id) and
+/// [`find_shadowsocks_psk_hash`](Self::find_shadowsocks_psk_hash). What they have in
+/// common is that the bytes they match on cross the wire in a form an observer can
+/// copy, so matching them shows only that *somebody* held the credential once --
+/// possibly the victim, on a connection the sender recorded. Those three hand back an
+/// identity without counting it, and their handlers count once the protocol produces
+/// something a copy could not: a token keyed to this connection, an AEAD opened under
+/// the user's own key.
 pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// Look up the 16-byte uuid that VLESS sends in cleartext at offset 1 of its
     /// request header, and that VMess seals into its auth id.
@@ -127,6 +135,18 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// search would send their connection on to the remaining users and have it come
     /// back as an unknown credential, which is a much worse diagnostic than "your
     /// clock is wrong".
+    ///
+    /// **This lookup does not authenticate.** A valid checksum shows the sixteen
+    /// bytes were produced by someone holding the uuid -- not that the *sender* holds
+    /// it, since they travel in the clear and can be replayed. So implementations must
+    /// not call [`note_auth`](UserContext::note_auth); the handler calls it once the
+    /// header AEAD opens under the instruction key, which a replayer of the auth id
+    /// alone cannot produce. They must still treat a disabled user as absent.
+    ///
+    /// Replaying the *whole* recorded prefix -- auth id and header together -- is
+    /// openable by construction and would still be counted. Closing that needs an
+    /// auth-id replay cache, which VMess has no salt filter to lean on the way
+    /// Shadowsocks 2022 does.
     fn find_vmess_auth_id(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
         let _ = auth_id;
         None
@@ -138,6 +158,14 @@ pub trait UserRegistry: Send + Sync + std::fmt::Debug {
     /// truncated to 16 bytes (see [`psk_hash`](crate::shadowsocks::psk_hash)). Unlike
     /// VMess this really is a lookup -- the client did the work of naming itself -- so
     /// implementations should index on the hash rather than walk their users.
+    ///
+    /// **This lookup does not authenticate.** The header is sealed under the
+    /// *inbound's* identity PSK, which every client of the inbound knows, so it names
+    /// a user without showing the sender is one -- and a recorded salt and header can
+    /// be replayed verbatim by anyone who saw them. Implementations must not call
+    /// [`note_auth`](UserContext::note_auth); the handler calls it once the record
+    /// layer has passed the salt through its replay filter and opened a chunk under
+    /// the returned PSK. They must still treat a disabled user as absent.
     fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
         let _ = hash;
         None

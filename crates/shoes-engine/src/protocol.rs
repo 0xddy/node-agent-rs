@@ -128,6 +128,138 @@ pub(crate) fn credential_kinds(protocol: &ServerProxyConfig) -> CredentialKinds 
     kinds
 }
 
+/// Names a nested target that would leave a dynamic inbound admitting somebody the
+/// caller's `users` list never mentions.
+///
+/// [`credential_kinds`] answers "does *anything* in this tree authenticate through a
+/// registry", which is the right question for whether a `users` list is meaningful at
+/// all. It is the wrong question for whether the list actually governs the inbound: a
+/// tree can answer yes on one target and leave another wide open, and the caller is
+/// then told they configured access control that half the inbound never consults.
+///
+/// Two shapes end up there, and both are fail-open:
+///
+/// 1. **A target that cannot act on a registry it is handed.** Shadowsocks is the only
+///    protocol whose handler *branches* on whether a registry was injected, so it is
+///    the only one that can be given one it has no way to consult -- a 2022 chacha20
+///    target has no identity header to name a user with. That combination cannot even
+///    start.
+/// 2. **A target that authenticates nobody at all.** A plain HTTP, SOCKS or mixed
+///    target with neither `username` nor `password`, or a port-forward, admits every
+///    client that reaches it. Sharing an inbound with VLESS does not change that, and
+///    it is exactly the case where a `users` list reads as protection it is not.
+///
+/// What is deliberately *not* named here is a target that authenticates on its own
+/// terms without the registry: legacy shadowsocks, Snell, or an HTTP target with a
+/// username and password. Those keep the credential the operator actually wrote --
+/// nothing invented one for them, since only [`PLACEHOLDER_FIELDS`] protocols get a
+/// throwaway -- so the inbound is not open, it is simply not per-user on that target.
+pub(crate) fn unservable_registry_target(protocol: &ServerProxyConfig) -> Option<String> {
+    match protocol {
+        ServerProxyConfig::Shadowsocks { config, .. } => match config {
+            ShadowsocksConfig::Aead2022 { cipher, .. }
+                if !credential::shadowsocks_supports_multi_user(cipher) =>
+            {
+                Some(format!(
+                    "a shadowsocks target using {} cannot serve a `users` list, so \
+                     neither can the inbound carrying it: only the aes ciphers carry \
+                     the identity header that names which user a connection belongs \
+                     to, which is what the engine's user registry is consulted with",
+                    cipher.name()
+                ))
+            }
+            _ => None,
+        },
+
+        // `create_auth_credentials` treats "neither field" as "no authentication at
+        // all", so that is exactly the condition here -- either field alone still
+        // produces a credential to compare against.
+        ServerProxyConfig::Http { username, password } => {
+            unauthenticated_target("http", username, password)
+        }
+        ServerProxyConfig::Socks {
+            username, password, ..
+        } => unauthenticated_target("socks", username, password),
+        ServerProxyConfig::Mixed {
+            username, password, ..
+        } => unauthenticated_target("mixed", username, password),
+
+        ServerProxyConfig::PortForward { .. } => Some(
+            "a port-forward target forwards every client that reaches it, so an \
+             inbound carrying one cannot be governed by a `users` list: add it as its \
+             own inbound if that is what you meant"
+                .to_string(),
+        ),
+
+        // Containers: ask every target they nest.
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            // Iterated separately rather than chained: the four collections hold
+            // four different target types, exactly as in `credential_kinds`.
+            for target in tls_targets.values() {
+                if let Some(reason) = unservable_registry_target(&target.protocol) {
+                    return Some(reason);
+                }
+            }
+            if let Some(target) = default_tls_target
+                && let Some(reason) = unservable_registry_target(&target.protocol)
+            {
+                return Some(reason);
+            }
+            for target in shadowtls_targets.values() {
+                if let Some(reason) = unservable_registry_target(&target.protocol) {
+                    return Some(reason);
+                }
+            }
+            for target in reality_targets.values() {
+                if let Some(reason) = unservable_registry_target(&target.protocol) {
+                    return Some(reason);
+                }
+            }
+            None
+        }
+        ServerProxyConfig::Websocket { targets } => targets
+            .iter()
+            .find_map(|target| unservable_registry_target(&target.protocol)),
+
+        // Every one of these authenticates: through the registry, or -- for Snell --
+        // on a credential of its own that nothing here replaced.
+        //
+        // Exhaustive for the same reason `credential_kinds` is: absorbing a new
+        // protocol from upstream should stop the build here rather than default to
+        // "nothing to worry about".
+        ServerProxyConfig::Vless { .. }
+        | ServerProxyConfig::Vmess { .. }
+        | ServerProxyConfig::Trojan { .. }
+        | ServerProxyConfig::Hysteria2 { .. }
+        | ServerProxyConfig::TuicV5 { .. }
+        | ServerProxyConfig::Anytls { .. }
+        | ServerProxyConfig::Naiveproxy { .. }
+        | ServerProxyConfig::Snell { .. } => None,
+    }
+}
+
+/// The message for a plain-proxy target that was configured with no credential.
+fn unauthenticated_target(
+    kind: &str,
+    username: &Option<String>,
+    password: &Option<String>,
+) -> Option<String> {
+    if username.is_some() || password.is_some() {
+        return None;
+    }
+    Some(format!(
+        "a {kind} target with no `username` or `password` admits every client that \
+         reaches it, so a `users` list would not govern this inbound: give the target \
+         a credential, or add it as its own inbound"
+    ))
+}
+
 /// A human-readable label for an inbound's protocol, for logs and API responses.
 ///
 /// This exists only to guarantee the label is non-empty. Upstream's `Display` builds a
@@ -570,6 +702,44 @@ mod tests {
     }
 
     #[test]
+    fn a_target_that_cannot_serve_a_registry_is_named() {
+        // A tree mixing a registry-backed target with one that cannot act on a
+        // registry. `credential_kinds` is non-empty because of the VLESS half, so
+        // this is the check that has to catch the other half -- otherwise the
+        // shadowsocks handler is built with a registry and no identity header to
+        // consult it with, which is not a listener that can start.
+        let mixed = format!(
+            r#"{{"type":"tls","tls_targets":{{
+                 "a.example.com":{{"cert":"c","key":"k","protocol":{VLESS}}},
+                 "b.example.com":{{"cert":"c","key":"k","protocol":{{
+                    "type":"ss","cipher":"2022-blake3-chacha20-ietf-poly1305","password":"{}"
+                 }}}}
+               }}}}"#,
+            base64_of(32)
+        );
+        let reason = unservable_registry_target(&parse(&mixed))
+            .expect("the chacha20 target cannot serve a user list");
+        assert!(reason.contains("chacha20"), "unexpected reason: {reason}");
+        assert!(
+            !credential_kinds(&parse(&mixed)).is_empty(),
+            "the vless half is what makes this tree look servable"
+        );
+
+        // The aes ciphers can, and nothing else in the tree objects.
+        let aes = format!(
+            r#"{{"type":"ss","cipher":"2022-blake3-aes-128-gcm","password":"{}"}}"#,
+            base64_of(16)
+        );
+        assert!(unservable_registry_target(&parse(&tls_wrapping(&aes))).is_none());
+        assert!(unservable_registry_target(&parse(VLESS)).is_none());
+
+        // Legacy shadowsocks keeps the credential the operator wrote, the same as a
+        // snell or http target sharing the inbound would, so it is not refused.
+        let legacy = r#"{"type":"ss","cipher":"aes-256-gcm","password":"hunter2"}"#;
+        assert!(unservable_registry_target(&parse(legacy)).is_none());
+    }
+
+    #[test]
     fn a_shadowsocks_inbound_keeps_its_own_password() {
         // Unlike VLESS' `user_id`, an SS2022 inbound's `password` is its identity PSK:
         // it names the inbound, every client must know it, and it is still consulted in
@@ -585,9 +755,9 @@ mod tests {
 
     #[test]
     fn installs_a_placeholder_at_every_depth() {
-        let mut config: Value = serde_json::from_str(&format!(
-            r#"{{"address":"0.0.0.0:443","protocol":{{"type":"tls","tls_targets":{{"a":{{"cert":"c","key":"k","protocol":{{"type":"vless"}}}}}}}}}}"#
-        ))
+        let mut config: Value = serde_json::from_str(
+            r#"{"address":"0.0.0.0:443","protocol":{"type":"tls","tls_targets":{"a":{"cert":"c","key":"k","protocol":{"type":"vless"}}}}}"#,
+        )
         .unwrap();
 
         install_placeholder_credentials(&mut config).unwrap();

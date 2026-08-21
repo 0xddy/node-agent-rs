@@ -77,16 +77,20 @@ fn resolve_anytls_users(
         Some(registry) => Arc::clone(registry),
         None => {
             let mut registry = StaticUserRegistry::new();
-            for user in config_users {
+            for (index, user) in config_users.iter().enumerate() {
+                // A nameless config user is reported by position. Never by their
+                // password: an id is not a secret -- it reaches logs and reports --
+                // and `add_anytls_password` does not index on it, so using the
+                // credential there bought nothing and leaked it. An empty id would
+                // instead make two nameless users indistinguishable in a report,
+                // which is what the position avoids.
+                let fallback;
                 let id = if user.name.is_empty() {
-                    &user.password
+                    fallback = format!("anytls-user-{index}");
+                    &fallback
                 } else {
                     &user.name
                 };
-                // A nameless config user is reported by their password only as a last
-                // resort: `add_anytls_password` never indexes on the id, so this
-                // cannot be used to authenticate, and an empty id would make two
-                // nameless users indistinguishable in a report.
                 registry.add_anytls_password(id, &user.password);
             }
             Arc::new(registry)
@@ -107,7 +111,16 @@ fn resolve_naive_users(
         None => {
             let mut registry = StaticUserRegistry::new();
             for user in config_users {
-                registry.add_naive_user(&user.name, &user.username, &user.password);
+                // A nameless user falls back to their `username`, which is the same
+                // thing dynamic mode reports: on a naive inbound the username *is*
+                // the id, and unlike the password it is not a secret. An empty id
+                // would make two nameless users indistinguishable in a report.
+                let id = if user.name.is_empty() {
+                    &user.username
+                } else {
+                    &user.name
+                };
+                registry.add_naive_user(id, &user.username, &user.password);
             }
             Arc::new(registry)
         }
@@ -203,10 +216,10 @@ pub fn create_tcp_server_handler(
                 key_bytes,
                 identity_keys,
             } => {
-                assert!(
-                    identity_keys.is_empty(),
-                    "shadowsocks identity keys belong on a client; an inbound's own password is its identity PSK"
-                );
+                // Outbound-only, and `validate_server_proxy_config` refuses a
+                // server config that carries any -- so there is nothing to do with
+                // them here beyond naming why they are ignored.
+                let _ = identity_keys;
                 match users {
                     // Many users, told apart by the identity header each one sends. The
                     // inbound's own key opens the header; the session keys come from
@@ -738,5 +751,68 @@ fn create_websocket_server_target(
         matching_headers,
         ping_type,
         handler,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::server::{AnyTlsUserConfig, NaiveUserConfig};
+    use crate::dynamic::credential::{naive_basic_credential, password_sha256};
+
+    /// NOTE(shoes-engine): a user's id reaches logs and reports -- the AnyTLS handler
+    /// debug-logs it on every successful authentication -- so it must never be their
+    /// credential. Config users may omit a name, and the fallback is what this guards.
+    #[test]
+    fn a_nameless_config_user_is_never_identified_by_their_secret() {
+        let users = vec![
+            AnyTlsUserConfig {
+                name: String::new(),
+                password: "hunter2".to_string(),
+            },
+            AnyTlsUserConfig {
+                name: String::new(),
+                password: "correcthorse".to_string(),
+            },
+            AnyTlsUserConfig {
+                name: "named".to_string(),
+                password: "third".to_string(),
+            },
+        ];
+        let registry = resolve_anytls_users(None, &users);
+
+        let first = registry
+            .find_password_sha256(&password_sha256("hunter2"))
+            .expect("the first user still authenticates");
+        let second = registry
+            .find_password_sha256(&password_sha256("correcthorse"))
+            .expect("the second user still authenticates");
+        let third = registry
+            .find_password_sha256(&password_sha256("third"))
+            .expect("the named user still authenticates");
+
+        assert_ne!(&**first.id(), "hunter2");
+        assert_ne!(&**second.id(), "correcthorse");
+        // Positional, so two nameless users stay distinguishable in a report.
+        assert_ne!(first.id(), second.id());
+        // A name that was given is still what gets reported.
+        assert_eq!(&**third.id(), "named");
+    }
+
+    #[test]
+    fn a_nameless_naive_user_is_reported_by_their_username() {
+        let users = vec![NaiveUserConfig {
+            name: String::new(),
+            username: "alice".to_string(),
+            password: "hunter2".to_string(),
+        }];
+        let registry = resolve_naive_users(None, &users);
+
+        let user = registry
+            .find_naive_basic(&naive_basic_credential("alice", "hunter2"))
+            .expect("the user still authenticates");
+        // The username, which is half the credential but not the secret half, and is
+        // what dynamic mode reports for the same user.
+        assert_eq!(&**user.id(), "alice");
     }
 }

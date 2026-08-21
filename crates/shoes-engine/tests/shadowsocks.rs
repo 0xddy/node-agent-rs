@@ -403,6 +403,11 @@ async fn only_the_aes_2022_ciphers_accept_a_user_list() {
     checks.section("3. everything else is refused a user list");
     // chacha20 has no bare-block construction to build an identity header from, and
     // legacy shadowsocks has no header at all. Both stay single-user.
+    //
+    // The two are refused by different checks, and the messages say so. chacha20 is
+    // named as a target that cannot act on a registry -- the check that also covers
+    // it sharing an inbound with a protocol that can -- while legacy shadowsocks
+    // falls out of the broader "nothing here authenticates through the registry".
     checks.refused(
         "2022 chacha20 cannot take users",
         engine
@@ -411,7 +416,7 @@ async fn only_the_aes_2022_ciphers_accept_a_user_list() {
                 ss_inbound(free_addr(), "chacha20-ietf-poly1305", &identity_32, false),
             ))
             .await,
-        "user registry",
+        "only the aes ciphers carry the identity header",
     );
     checks.refused(
         "legacy shadowsocks cannot take users",

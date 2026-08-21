@@ -1,4 +1,7 @@
 use std::net::SocketAddr;
+// NOTE(shoes-engine): only `run_unix_server` names this type, and that is
+// unix-only, so an unconditional import is unused everywhere else.
+#[cfg(target_family = "unix")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +37,6 @@ use crate::util::write_all;
 async fn run_tcp_server(
     bind_address: SocketAddr,
     tcp_config: TcpConfig,
-    resolver: Arc<dyn Resolver>,
     handler_slot: Arc<HandlerSlot>,
     metered: bool,
     cancel: CancellationToken,
@@ -75,10 +77,11 @@ async fn run_tcp_server(
             error!("Failed to set TCP nodelay: {e}");
         }
 
-        let cloned_resolver = resolver.clone();
-        // Read once, here: this connection is pinned to the generation of rules and
-        // protocol settings that were current when it was accepted.
-        let cloned_handler = handler_slot.load();
+        // Read once, here: this connection is pinned to the generation of rules,
+        // protocol settings *and DNS* that were current when it was accepted. The
+        // resolver comes out of the slot rather than from this loop's own capture,
+        // because a reload can hand the rebuilt handler a different one.
+        let (cloned_handler, cloned_resolver) = handler_slot.load();
         tokio::spawn(async move {
             if let Err(e) =
                 process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
@@ -94,7 +97,6 @@ async fn run_tcp_server(
 #[cfg(target_family = "unix")]
 async fn run_unix_server(
     path_buf: PathBuf,
-    resolver: Arc<dyn Resolver>,
     handler_slot: Arc<HandlerSlot>,
     metered: bool,
     cancel: CancellationToken,
@@ -126,8 +128,8 @@ async fn run_unix_server(
             },
         };
 
-        let cloned_resolver = resolver.clone();
-        let cloned_handler = handler_slot.load();
+        // See `run_tcp_server`.
+        let (cloned_handler, cloned_resolver) = handler_slot.load();
         tokio::spawn(async move {
             if let Err(e) =
                 process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
@@ -478,6 +480,12 @@ async fn start_tcp_servers(
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
 ) -> std::io::Result<ServerHandle> {
+    // Recorded before the config is taken apart. These are the settings the accept
+    // loop is about to bake in, and `check_reload` compares against them so that a
+    // later update changing one is refused rather than silently ignored.
+    let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+    handle.record_listener_settings(&config);
+
     let ServerConfig {
         bind_location,
         tcp_settings,
@@ -504,15 +512,13 @@ async fn start_tcp_servers(
         resolver.clone(),
     ));
 
-    let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
-
     match bind_location {
         BindLocation::Address(addresses) => {
             for address in addresses.into_vec() {
                 for socket_addr in address.to_socket_addrs()? {
                     // Shares protocol state across ports without reusing an
                     // interface-specific UDP bind IP.
-                    let handler_slot = handle.slot_for_ip(socket_addr.ip(), || {
+                    let handler_slot = handle.slot_for_ip(socket_addr.ip(), &resolver, || {
                         create_tcp_server_handler(
                             protocol.clone(),
                             &client_proxy_selector,
@@ -525,19 +531,13 @@ async fn start_tcp_servers(
                     debug!("TCP handler for {}: {handler_slot:?}", socket_addr.ip());
 
                     let tcp_config = tcp_config.clone();
-                    let resolver = resolver.clone();
                     let cancel = handle.cancel_token();
                     let listener = tokio::spawn(async move {
-                        run_tcp_server(
-                            socket_addr,
-                            tcp_config,
-                            resolver,
-                            handler_slot,
-                            metered,
-                            cancel,
-                        )
-                        .await
-                        .unwrap();
+                        // No resolver here: the loop takes it from the slot, with the
+                        // handler, so both come from one generation.
+                        run_tcp_server(socket_addr, tcp_config, handler_slot, metered, cancel)
+                            .await
+                            .unwrap();
                     });
                     handle.push_listener(listener);
                     handle.push_address(socket_addr);
@@ -560,7 +560,7 @@ async fn start_tcp_servers(
                 debug!("TCP handler: {handler_slot:?}");
                 let cancel = handle.cancel_token();
                 let listener = tokio::spawn(async move {
-                    run_unix_server(path_buf, resolver, handler_slot, metered, cancel)
+                    run_unix_server(path_buf, handler_slot, metered, cancel)
                         .await
                         .unwrap();
                 });

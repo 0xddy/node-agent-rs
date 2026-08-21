@@ -47,13 +47,15 @@
 //! | start listeners | [`shoes::tcp::tcp_server::start_servers_with_users`] |
 //!
 //! The footprint inside `shoes/`, which is what every future merge of upstream has
-//! to survive, is roughly 2,900 new lines under `src/dynamic/` plus 28 touched files
+//! to survive, is roughly 3,200 new lines under `src/dynamic/` plus 28 touched files
 //! elsewhere. Those 28 are of four kinds:
 //!
 //! - **Visibility widenings**: `pub mod tcp;`, `pub mod socket_util;`,
 //!   `pub mod dynamic;`, and exporting `DnsRegistry`. Plus one dependency,
-//!   `arc-swap`, and `[profile.release]` moved to the workspace root because Cargo
-//!   ignores profiles declared by a non-root member.
+//!   `arc-swap`; `[profile.release]` moved to the workspace root because Cargo
+//!   ignores profiles declared by a non-root member; and a package-scoped
+//!   `[lints.clippy]` allow, without which `--all-targets` will not lint any test
+//!   code in the workspace.
 //! - **The new `shoes::dynamic` module**: the [`shoes::dynamic::UserRegistry`] trait,
 //!   the per-user record it returns, the traffic meter, the reload slots, wire-format
 //!   credential derivation, and a `StaticUserRegistry` for config-file users.
@@ -93,7 +95,8 @@ use log::{debug, info, warn};
 use tokio::task::{JoinError, JoinHandle};
 
 use shoes::config::{
-    BindLocation, Config, ServerConfig, Transport, ValidatedConfigs, convert_cert_paths,
+    BindLocation, Config, ExpandedDnsGroup, ServerConfig, Transport, ValidatedConfigs,
+    convert_cert_paths,
 };
 use shoes::dns::{DnsRegistry, build_dns_registry};
 use shoes::dynamic::{ServerHandle, UserRegistry};
@@ -112,7 +115,7 @@ pub use inbound::InboundSlot;
 pub use shoes_api::{EngineStatus, InboundInfo, InboundSpec, UserInfo, UserSpec};
 pub use users::{CredentialKinds, MemoryUserRegistry};
 
-use inbound::BindTargets;
+use inbound::{BindKey, BindTargets, SocketKind};
 
 /// How long to wait before deciding a freshly started listener is healthy.
 ///
@@ -135,7 +138,25 @@ struct EngineInner {
     /// contends with an in-flight reload.
     inbounds: DashMap<String, Arc<InboundSlot>>,
     /// bind address -> owning tag.
-    bound: DashMap<SocketAddr, String>,
+    bound: DashMap<BindKey, String>,
+}
+
+impl Drop for EngineInner {
+    /// Stop accepting on every inbound when the last [`Engine`] handle goes.
+    ///
+    /// An engine is the only thing that can name its inbounds, so an engine that has
+    /// been dropped leaves listeners nobody can reach: still bound, still serving,
+    /// still authenticating against registries no caller can change. Whatever an
+    /// embedder meant by dropping their last handle, it was not that.
+    ///
+    /// Only the synchronous half -- `Drop` cannot await a drain, and this may well be
+    /// running with no runtime left to spawn one on. Established connections are left
+    /// to finish, which is the same thing `remove_inbound` does.
+    fn drop(&mut self) {
+        for entry in self.inbounds.iter() {
+            entry.value().stop_accepting();
+        }
+    }
 }
 
 /// Handle to a running engine. Cheap to clone; all clones share one instance.
@@ -217,6 +238,16 @@ impl Engine {
     /// in-memory registry becomes its sole credential authority, and it is live
     /// from the first accepted connection onward. See
     /// [`Engine::build_user_registry`] for what "present" is allowed to mean.
+    ///
+    /// # If this future is dropped
+    ///
+    /// Sockets are opened before the inbound is registered, so a cancelled call can
+    /// land in between. It does not leak: the listeners are told to stop, and the
+    /// addresses are never claimed. What it cannot promise is *when* they are free,
+    /// since nothing is left to await the drain -- so a caller that retries the same
+    /// address immediately may lose a race with the listener it just cancelled.
+    /// Driving this future to completion and calling [`Engine::remove_inbound`]
+    /// avoids the question.
     pub async fn add_inbound(&self, spec: InboundSpec) -> EngineResult<InboundInfo> {
         let InboundSpec {
             tag,
@@ -238,7 +269,10 @@ impl Engine {
 
         // Parse and validate *before* taking the control lock: a malformed
         // payload should not delay other operations.
-        let server_configs = validate_inbound_config(config).await?;
+        let ValidatedInbound {
+            configs: server_configs,
+            dns_groups,
+        } = validate_inbound_config(config).await?;
 
         let registry = match users {
             Some(users) => Some(Self::build_user_registry(&server_configs, users)?),
@@ -255,24 +289,41 @@ impl Engine {
         // single socket is opened.
         let mut targets = Vec::with_capacity(server_configs.len());
         for server_config in &server_configs {
-            targets.push(resolve_bind_targets(&server_config.bind_location)?);
+            targets.push(resolve_bind_targets(
+                &server_config.bind_location,
+                &server_config.transport,
+            )?);
         }
 
+        // Two inbounds in one payload can collide with each other as easily as with
+        // one already running, and neither is registered yet.
+        let mut claimed: Vec<BindKey> = Vec::new();
         for target in &targets {
-            for address in target.addresses() {
-                if let Some(owner) = self.inner.bound.get(address) {
+            for key in target.keys() {
+                if let Some(owner) = self.inner.bound.get(&key) {
                     return Err(EngineError::AddressInUse {
-                        address: address.to_string(),
+                        address: key.to_string(),
                         tag: owner.value().clone(),
                     });
                 }
-                // Faithful pre-flight bind, using the same socket options as the
-                // real listener (`shoes::socket_util::new_tcp_listener`). This
-                // catches permission errors and invalid addresses synchronously,
-                // with the actual OS error, instead of letting them surface as a
-                // panic inside a detached listener task.
-                if matches!(target, BindTargets::Addresses(_)) {
-                    probe_bind(*address)?;
+                if claimed.contains(&key) {
+                    return Err(EngineError::AddressInUse {
+                        address: key.to_string(),
+                        tag: tag.clone(),
+                    });
+                }
+                claimed.push(key);
+            }
+
+            // Faithful pre-flight bind, using the same socket options as the real
+            // listener. This catches permission errors and invalid addresses
+            // synchronously, with the actual OS error, instead of letting them
+            // surface as a panic inside a detached listener task. A unix socket has
+            // no `kind`, and probing one would create the very file the listener is
+            // about to warn about replacing.
+            if let Some(kind) = target.kind() {
+                for address in target.addresses() {
+                    probe_bind(*address, kind)?;
                 }
             }
         }
@@ -280,14 +331,21 @@ impl Engine {
         let protocol = protocol::display_name(&server_configs[0].protocol);
         let transport = transport_name(&server_configs[0].transport).to_string();
 
-        let mut handles: Vec<ServerHandle> = Vec::new();
+        // Listeners are live from the moment `start_servers_with_users` returns, but
+        // this inbound is not registered until the health probe below passes -- and
+        // in between there are awaits. A caller whose request is cancelled there (a
+        // gRPC client hanging up, a request timeout) drops this whole future, and
+        // without the guard the listeners would go on serving with no tag left to
+        // name them and no way to stop them. See [`AbandonOnDrop`].
+        let mut started = AbandonOnDrop::new();
         let mut bind_display: Vec<String> = Vec::new();
 
         for (server_config, target) in server_configs.into_iter().zip(targets.iter()) {
-            let resolver = match Self::resolver_for(&mut control, &server_config).await {
+            let resolver = match Self::resolver_for(&mut control, &server_config, &dns_groups).await
+            {
                 Ok(resolver) => resolver,
                 Err(e) => {
-                    inbound::abandon(handles).await;
+                    inbound::abandon(started.disarm()).await;
                     return Err(e);
                 }
             };
@@ -299,10 +357,10 @@ impl Engine {
             match start_servers_with_users(Config::Server(server_config), resolver, registry_ref)
                 .await
             {
-                Ok(handle) => handles.push(handle),
+                Ok(handle) => started.push(handle),
                 Err(e) => {
                     // Roll back anything already started under this tag.
-                    inbound::abandon(handles).await;
+                    inbound::abandon(started.disarm()).await;
                     return Err(EngineError::Io(e));
                 }
             }
@@ -315,38 +373,42 @@ impl Engine {
             protocol,
             transport,
             bind: bind_display,
-            listeners: handles.iter().map(ServerHandle::listener_count).sum(),
+            listeners: started.listener_count(),
             // Both filled in live by `InboundSlot::describe`; see its doc comment.
             revision: 0,
             users: None,
         };
 
-        let all_addresses: Vec<SocketAddr> = targets
-            .iter()
-            .flat_map(|t| t.addresses().to_vec())
-            .collect();
-
-        let slot = Arc::new(InboundSlot::new(
-            info.clone(),
-            BindTargets::Addresses(all_addresses.clone()),
-            handles,
-            registry,
-        ));
-
-        // Give the listener tasks a moment to fail, then confirm they are alive.
+        // Give the listener tasks a moment to fail, then confirm they are alive. The
+        // guard is still armed across this await, which is the longest of the
+        // unregistered windows.
         tokio::time::sleep(LISTENER_HEALTH_GRACE).await;
-        if let Some(dead) = slot.take_dead_listener() {
+        if let Some(dead) = started.take_dead_listener() {
             let reason = describe_dead_listener(dead).await;
-            slot.shutdown().await;
+            inbound::abandon(started.disarm()).await;
             return Err(EngineError::Io(std::io::Error::other(format!(
                 "inbound {tag} failed to start: {reason}"
             ))));
         }
 
+        // From here the slot owns the listeners and registration is synchronous, so
+        // there is no longer a window for the guard to cover.
+        //
+        // `claimed` is every key across every target, already checked for conflicts
+        // above. Reusing it rather than re-deriving addresses is what makes a unix
+        // socket releasable: the flattening this replaced kept only `SocketAddr`s,
+        // so a path was never recorded and never freed.
+        let slot = Arc::new(InboundSlot::new(
+            info.clone(),
+            claimed.clone(),
+            started.disarm(),
+            registry,
+        ));
+
         let info = slot.describe();
 
-        for address in &all_addresses {
-            self.inner.bound.insert(*address, tag.clone());
+        for key in &claimed {
+            self.inner.bound.insert(key.clone(), tag.clone());
         }
         self.inner.inbounds.insert(tag.clone(), slot);
 
@@ -431,11 +493,39 @@ impl Engine {
             protocol::install_placeholder_credentials(&mut config)?;
         }
 
-        let server_configs = validate_inbound_config(config).await?;
+        let ValidatedInbound {
+            configs: server_configs,
+            dns_groups,
+        } = validate_inbound_config(config).await?;
+
+        // A reload rebuilds the handlers from this config and hands them the registry
+        // the inbound already has, so an update can do everything an add can -- and an
+        // update never goes through `build_user_registry`, so the refusals have to be
+        // repeated here rather than inherited.
+        //
+        // The extra rule an update needs is that the credential shape may not change.
+        // The registry was built to answer one set of questions and its users hold
+        // credentials of those shapes, so a swap to a protocol asking different ones
+        // is never what the caller meant. It fails in both directions and neither is
+        // visible: swapping VLESS for Trojan leaves every user unable to authenticate,
+        // and swapping VLESS for a plain SOCKS proxy leaves the inbound open to
+        // everyone while the API still reports the users it is no longer consulting.
+        if let Some(registry) = slot.users() {
+            let kinds = Self::registry_kinds_for(&server_configs)?;
+            if kinds != registry.kinds() {
+                return Err(EngineError::Unsupported(format!(
+                    "cannot change what this inbound authenticates with in place: its \
+                     users hold {} and the new config asks for {}. Their credentials \
+                     would have to be reissued, so do it as a remove plus an add",
+                    registry.kinds().accepted_fields(),
+                    kinds.accepted_fields()
+                )));
+            }
+        }
 
         let mut paired = Vec::with_capacity(server_configs.len());
         for server_config in server_configs {
-            let resolver = Self::resolver_for(&mut control, &server_config).await?;
+            let resolver = Self::resolver_for(&mut control, &server_config, &dns_groups).await?;
             paired.push((server_config, resolver));
         }
 
@@ -462,6 +552,15 @@ impl Engine {
     /// socket, which is also why the control lock is held throughout -- the port is
     /// genuinely still in use until the drain finishes, and another `add_inbound`
     /// must not be told otherwise.
+    ///
+    /// # If this future is dropped
+    ///
+    /// Cancelling it -- a request timeout, a client hanging up -- still stops the
+    /// listeners and still releases their addresses, but does not wait for the drain.
+    /// So the inbound is gone either way; what a cancelled call gives up is the
+    /// guarantee that the port is free the instant it returns. Rebinding the same
+    /// address immediately afterwards may lose a race with a QUIC endpoint still
+    /// finishing its connections.
     pub async fn remove_inbound(&self, tag: &str) -> EngineResult<InboundInfo> {
         let _control = self.inner.control.lock().await;
 
@@ -471,11 +570,18 @@ impl Engine {
             .remove(tag)
             .ok_or_else(|| EngineError::UnknownTag(tag.to_string()))?;
 
-        slot.shutdown().await;
+        // The slot is out of `inbounds` and its keys are still in `bound`, and the
+        // drain below is an await. A caller cancelled there used to leave the
+        // addresses claimed by a tag that no longer exists -- unusable, and with
+        // nothing left to release them. The guard releases them whichever way this
+        // future ends.
+        let release = ReleaseOnDrop {
+            inner: Arc::clone(&self.inner),
+            slot: Arc::clone(&slot),
+        };
 
-        for address in slot.targets().addresses() {
-            self.inner.bound.remove(address);
-        }
+        slot.shutdown().await;
+        drop(release);
 
         let info = slot.describe();
         info!(
@@ -501,27 +607,14 @@ impl Engine {
     ///
     /// The check runs over the *expanded* configs, so it sees through TLS, Reality,
     /// ShadowTLS and Websocket nesting rather than just the outer protocol name.
+    ///
+    /// [`Engine::registry_kinds_for`] is where the refusals live, so that
+    /// [`Engine::update_inbound`] applies exactly the same ones.
     fn build_user_registry(
         server_configs: &[ServerConfig],
         users: Vec<UserSpec>,
     ) -> EngineResult<Arc<MemoryUserRegistry>> {
-        let mut kinds = CredentialKinds::NONE;
-        for server_config in server_configs {
-            kinds.merge(protocol::credential_kinds(&server_config.protocol));
-        }
-
-        if kinds.is_empty() {
-            return Err(EngineError::Unsupported(format!(
-                "{} does not authenticate through the engine's user registry yet, so it \
-                 cannot take a `users` list; omit `users` to use the credential in `config`",
-                protocol::display_name(&server_configs[0].protocol)
-            )));
-        }
-        if let Some(reason) = kinds.conflict() {
-            return Err(EngineError::InvalidConfig(format!(
-                "this inbound cannot take a single `users` list: {reason}"
-            )));
-        }
+        let kinds = Self::registry_kinds_for(server_configs)?;
 
         let registry = MemoryUserRegistry::new(kinds);
         for user in users {
@@ -543,6 +636,47 @@ impl Engine {
         Ok(registry)
     }
 
+    /// The credential forms a dynamic inbound's registry must answer, or the reason
+    /// this config cannot be governed by a `users` list at all.
+    ///
+    /// Three refusals, in the order that produces the most specific message:
+    ///
+    /// 1. **A target that leaves the inbound open, or cannot act on a registry.** The
+    ///    narrowest question and the only fail-open one, so it is asked first --
+    ///    `credential_kinds` returning non-empty on some *other* target would
+    ///    otherwise let it through. See [`protocol::unservable_registry_target`].
+    /// 2. **Nothing here authenticates through a registry.** The list would never be
+    ///    consulted, so accepting it would report access control that does not exist.
+    /// 3. **The targets disagree about what one `password` means.** See
+    ///    [`CredentialKinds::conflict`].
+    fn registry_kinds_for(server_configs: &[ServerConfig]) -> EngineResult<CredentialKinds> {
+        for server_config in server_configs {
+            if let Some(reason) = protocol::unservable_registry_target(&server_config.protocol) {
+                return Err(EngineError::Unsupported(reason));
+            }
+        }
+
+        let mut kinds = CredentialKinds::NONE;
+        for server_config in server_configs {
+            kinds.merge(protocol::credential_kinds(&server_config.protocol));
+        }
+
+        if kinds.is_empty() {
+            return Err(EngineError::Unsupported(format!(
+                "{} does not authenticate through the engine's user registry yet, so it \
+                 cannot take a `users` list; omit `users` to use the credential in `config`",
+                protocol::display_name(&server_configs[0].protocol)
+            )));
+        }
+        if let Some(reason) = kinds.conflict() {
+            return Err(EngineError::InvalidConfig(format!(
+                "this inbound cannot take a single `users` list: {reason}"
+            )));
+        }
+
+        Ok(kinds)
+    }
+
     /// Adds or updates one user on `tag`, effective on the next handshake.
     ///
     /// Updating an existing id keeps that user's counters and their established
@@ -562,6 +696,31 @@ impl Engine {
 
     pub fn list_users(&self, tag: &str) -> EngineResult<Vec<UserInfo>> {
         Ok(self.registry_for(tag)?.list())
+    }
+
+    /// Reports one user's traffic and zeroes it in the same step, for closing a
+    /// billing period.
+    ///
+    /// The returned [`UserInfo`] carries the bytes that were taken, not the zeroes
+    /// left behind. Reading with [`Self::get_user`] and zeroing afterwards would
+    /// drop whatever moved in between; this cannot.
+    ///
+    /// Live and lifetime connection counts are deliberately untouched: one is
+    /// current state and the other is a total, and neither belongs to a period.
+    pub fn take_user_traffic(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        self.registry_for(tag)?.take_traffic(tag, id)
+    }
+
+    /// The same for every user on `tag` at once, which is the usual shape of a
+    /// billing sweep.
+    ///
+    /// Each user is taken individually rather than as one snapshot, so traffic
+    /// moving while the sweep runs is split between two periods rather than
+    /// double-counted or lost. A user removed mid-sweep may be absent from the
+    /// result -- [`Self::remove_user`] already reports their final counters, which is
+    /// where their last bytes are.
+    pub fn take_inbound_traffic(&self, tag: &str) -> EngineResult<Vec<UserInfo>> {
+        Ok(self.registry_for(tag)?.take_all_traffic())
     }
 
     pub fn get_user(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
@@ -602,6 +761,7 @@ impl Engine {
     async fn resolver_for(
         control: &mut ControlState,
         server_config: &ServerConfig,
+        dns_groups: &[ExpandedDnsGroup],
     ) -> EngineResult<Arc<dyn Resolver>> {
         let dns_ref = server_config.dns.as_ref();
 
@@ -609,14 +769,14 @@ impl Engine {
             return Ok(control.dns.get_for_server(None));
         }
 
-        // `create_server_configs` already expanded and validated this config's DNS
-        // group, so re-running the expansion for a single config is safe and keeps
-        // the resolver private to the inbound.
-        let ValidatedConfigs { dns_groups, .. } =
-            shoes::config::create_server_configs(vec![Config::Server(server_config.clone())])
-                .map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
-
-        let mut registry = build_dns_registry(dns_groups).await?;
+        // The groups come from the *same* expansion that produced `server_config`,
+        // and they have to: validation rewrites an inline `dns.servers` list into a
+        // generated group named `__inline_dns_N` and leaves a reference to it behind.
+        // Re-expanding the rewritten config -- which is what this used to do -- finds
+        // nothing inline left to extract, so the reference dangles and every inbound
+        // carrying a `dns` section was rejected with the name of a group its author
+        // never wrote.
+        let mut registry = build_dns_registry(dns_groups.to_vec()).await?;
         Ok(registry.get_for_server(dns_ref))
     }
 }
@@ -634,7 +794,17 @@ impl Engine {
 /// path it has not seen loaded (`shoes/src/config/pem.rs:466`). Skipping the
 /// conversion turns any file-backed cert into a panicked request task instead of an
 /// error response.
-async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<ServerConfig>> {
+/// One inbound's startable configs, together with the DNS groups they reference.
+///
+/// The two travel as a pair because validation rewrites an inline `dns.servers` list
+/// into a generated group and leaves a *reference* behind. Separating them loses the
+/// group, and the reference then names something nothing can resolve.
+pub(crate) struct ValidatedInbound {
+    configs: Vec<ServerConfig>,
+    dns_groups: Vec<ExpandedDnsGroup>,
+}
+
+async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<ValidatedInbound> {
     if !config.is_object() {
         return Err(EngineError::InvalidConfig(
             "config must be a single server config object".into(),
@@ -663,7 +833,10 @@ async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<
         debug!("inlined {loaded} cert(s)/key(s) from files");
     }
 
-    let ValidatedConfigs { configs, .. } = shoes::config::create_server_configs(parsed)
+    let ValidatedConfigs {
+        configs,
+        dns_groups,
+    } = shoes::config::create_server_configs(parsed)
         .map_err(|e| EngineError::InvalidConfig(e.to_string()))?;
 
     let mut server_configs = Vec::with_capacity(configs.len());
@@ -694,10 +867,16 @@ async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vec<
         ));
     }
 
-    Ok(server_configs)
+    Ok(ValidatedInbound {
+        configs: server_configs,
+        dns_groups,
+    })
 }
 
-fn resolve_bind_targets(bind_location: &BindLocation) -> EngineResult<BindTargets> {
+fn resolve_bind_targets(
+    bind_location: &BindLocation,
+    transport: &Transport,
+) -> EngineResult<BindTargets> {
     match bind_location {
         BindLocation::Address(addresses) => {
             let mut resolved = Vec::new();
@@ -709,17 +888,147 @@ fn resolve_bind_targets(bind_location: &BindLocation) -> EngineResult<BindTarget
                     "bind location resolved to no addresses".into(),
                 ));
             }
-            Ok(BindTargets::Addresses(resolved))
+            Ok(BindTargets::Addresses {
+                addresses: resolved,
+                kind: socket_kind(transport),
+            })
         }
         BindLocation::Path(path) => Ok(BindTargets::Path(path.display().to_string())),
     }
 }
 
+/// Which socket a transport actually opens.
+///
+/// QUIC is carried on UDP, which is the whole reason the engine's registry cannot be
+/// keyed on the address alone: `:443` over TCP and `:443` over QUIC are two sockets,
+/// and serving HTTP/3 beside HTTP/2 means holding both.
+fn socket_kind(transport: &Transport) -> SocketKind {
+    match transport {
+        Transport::Tcp => SocketKind::Tcp,
+        // Rejected long before here as unimplemented upstream, but it is a UDP
+        // socket either way and guessing TCP would be the wrong guess.
+        Transport::Quic | Transport::Udp => SocketKind::Udp,
+    }
+}
+
+/// Releases an inbound's address claims once it has stopped, cancelled or not.
+///
+/// The two steps of `remove_inbound` -- drain the listeners, then let go of the
+/// addresses -- are separated by an await, and dropping the future in between left
+/// the addresses claimed forever by a tag already gone from `inbounds`. Since the
+/// slot is removed first, nothing else could have released them.
+///
+/// Deliberately releases even on the cancelled path. The listeners have been told to
+/// stop by then, so holding the claim would outlast the thing it was protecting.
+struct ReleaseOnDrop {
+    inner: Arc<EngineInner>,
+    slot: Arc<InboundSlot>,
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        // Cheap insurance on the cancelled path: `shutdown` may not have run at all.
+        self.slot.stop_accepting();
+        for key in self.slot.keys() {
+            self.inner.bound.remove(key);
+        }
+    }
+}
+
+/// Listeners that are running but not yet owned by a registered inbound.
+///
+/// `add_inbound` starts sockets and only registers them once they have proved
+/// healthy, and there are awaits in between. Dropping the future in that window --
+/// which is what a cancelled request does -- would otherwise leave the listeners
+/// serving with nothing left that names them: no tag to remove, no handle to stop,
+/// and the port held until the process ends.
+///
+/// `Drop` cannot await, so this cancels the accept loops synchronously and leaves the
+/// drain to whatever runtime is still there. That is weaker than
+/// [`InboundSlot::shutdown`], which every non-cancelled path still uses: the sockets
+/// are released shortly after rather than by the time anything returns. It is the
+/// difference between a port that frees itself and one that never does.
+struct AbandonOnDrop {
+    handles: Vec<ServerHandle>,
+}
+
+impl AbandonOnDrop {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, handle: ServerHandle) {
+        self.handles.push(handle);
+    }
+
+    fn listener_count(&self) -> usize {
+        self.handles.iter().map(ServerHandle::listener_count).sum()
+    }
+
+    /// The first listener task that has already exited, if any.
+    ///
+    /// `run_tcp_server` creates its listener *inside* the spawned task and
+    /// `.unwrap()`s the result, so a failed bind does not come back as an `Err` from
+    /// `start_servers_with_users` -- it shows up as a listener task that panicked.
+    /// Checking for an early exit is how the engine turns that into a synchronous
+    /// API error instead of a port that silently never opened.
+    fn take_dead_listener(&self) -> Option<JoinHandle<()>> {
+        self.handles
+            .iter()
+            .find_map(ServerHandle::take_dead_listener)
+    }
+
+    /// Hand the listeners on to whoever will own them, so `Drop` has nothing to do.
+    ///
+    /// Every path out of `add_inbound` calls this: the success path passes them to
+    /// the slot, the error paths pass them to `abandon`, which awaits the drain
+    /// properly. Only a dropped future leaves them here.
+    fn disarm(&mut self) -> Vec<ServerHandle> {
+        std::mem::take(&mut self.handles)
+    }
+}
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        if self.handles.is_empty() {
+            return;
+        }
+        warn!(
+            "abandoning {} listener group(s) started for an inbound that was never              registered: the request was cancelled part-way through",
+            self.handles.len()
+        );
+        for handle in &self.handles {
+            handle.stop_accepting();
+        }
+    }
+}
+
 /// Opens and immediately closes a listener with the production socket options.
-fn probe_bind(address: SocketAddr) -> EngineResult<()> {
-    let listener = shoes::socket_util::new_tcp_listener(address, 1, None)?;
-    drop(listener);
-    debug!("pre-flight bind ok for {address}");
+///
+/// The socket has to match the one the listener will really open. Probing a TCP
+/// listener for a QUIC inbound tests the wrong port entirely: it passes while the UDP
+/// port is taken, and fails while it is free but a TCP listener holds the number.
+fn probe_bind(address: SocketAddr, kind: SocketKind) -> EngineResult<()> {
+    match kind {
+        SocketKind::Tcp => {
+            let listener = shoes::socket_util::new_tcp_listener(address, 1, None)?;
+            drop(listener);
+        }
+        SocketKind::Udp => {
+            // Same options `start_quic_servers` uses, so a failure here is the one
+            // the endpoint would have hit.
+            let socket = shoes::socket_util::new_socket2_udp_socket(
+                address.is_ipv6(),
+                None,
+                Some(address),
+                false,
+            )?;
+            drop(socket);
+        }
+    }
+    debug!("pre-flight bind ok for {address} ({})", kind.name());
     Ok(())
 }
 

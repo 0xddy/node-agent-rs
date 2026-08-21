@@ -43,12 +43,36 @@ pub struct UserSpec {
     /// [`Engine::remove_user`](https://docs.rs/shoes-engine). Defaults to `uuid`
     /// when one is given, since that is already how operators refer to a VLESS or
     /// VMess user.
+    ///
+    /// Normally a label and nothing more. **NaiveProxy is the exception**: its
+    /// credential is HTTP Basic, i.e. base64 of `username:password`, and this field
+    /// is the username half -- so on such an inbound the id is part of the
+    /// credential, and renaming a user rotates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Canonical uuid, with or without dashes. Used by VLESS.
+    /// Canonical uuid, with or without dashes.
+    ///
+    /// Read by **VLESS**, **VMess** and **TUIC**. TUIC needs `password` alongside
+    /// it: the uuid crosses the wire in cleartext and names the user, the password
+    /// keys the token beside it, and a user carrying only one of the two is refused
+    /// when added rather than left unable to connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
-    /// Cleartext password. Used by Trojan, which hashes it before it goes on the wire.
+    /// The user's secret, in the form an operator writes it. Which form that is
+    /// depends on the inbound's protocol, not on this type:
+    ///
+    /// - **Trojan** hashes it (SHA-224, hex) before it goes on the wire;
+    /// - **Hysteria2** compares it as cleartext;
+    /// - **AnyTLS** sends raw SHA-256 of it;
+    /// - **NaiveProxy** sends it base64'd beside the user's id;
+    /// - **TUIC** keys its authentication token with it;
+    /// - **Shadowsocks 2022** reads it as a *base64 PSK*, not as a password, and
+    ///   rejects one whose decoded length the inbound's cipher cannot use.
+    ///
+    /// One inbound can serve several of these at once -- Trojan and Hysteria2 on two
+    /// SNIs share this one cleartext value, indexed twice. What it cannot do is mean
+    /// two *different* things at once, such as a cleartext password on one target and
+    /// a base64 PSK on another; that combination is refused when the inbound is added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// A disabled user keeps their counters and their established connections but
@@ -157,6 +181,10 @@ pub struct InboundInfo {
 pub struct EngineStatus {
     pub version: String,
     pub inbounds: usize,
-    /// Bind addresses currently claimed by the engine.
+    /// Everything the engine currently holds exclusively, one entry per claim.
+    ///
+    /// A claim names the *socket*, not just the address -- `"127.0.0.1:443 (tcp)"` --
+    /// because `:443` over TCP and `:443` over QUIC are two different sockets and
+    /// holding both at once is ordinary. A unix socket appears as its path.
     pub bound_addresses: Vec<String>,
 }

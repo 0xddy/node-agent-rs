@@ -311,17 +311,21 @@ async fn auth_connection(
         let mut specified_uuid = [0u8; 16];
         specified_uuid.copy_from_slice(stream_reader.read_slice(&mut recv_stream, 16).await?);
 
-        // Looked up now, acted on after the token is read. An unknown uuid and a
-        // suspended user give the same answer, and neither gives it early: closing on
-        // the uuid alone, before the client has finished sending, would tell an
-        // observer which uuids this inbound knows.
-        let identity = users.find_tuic_uuid(&specified_uuid);
-
+        // Read the whole credential before looking anything up. An unknown uuid and a
+        // suspended user must give the same answer and neither may give it early:
+        // closing on the uuid alone, before the client has finished sending, would
+        // tell an observer which uuids this inbound knows.
+        //
+        // Looking up *after* the read rather than before it is what keeps the answer
+        // current. This read is a network read the client controls, so it can be held
+        // open indefinitely; a lookup on the near side of it would let a client that
+        // sent its uuid and then stalled authenticate on a password that was rotated,
+        // or as a user who was suspended, in the meantime.
         let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
 
         // The value is not echoed back into the error. With more than one user it is
         // somebody's live credential, or a guess at one, and neither belongs in a log.
-        let Some(identity) = identity else {
+        let Some(identity) = users.find_tuic_uuid(&specified_uuid) else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "unrecognized uuid",
@@ -1585,8 +1589,9 @@ pub async fn start_tuic_server(
     metered: bool,
     // Read once per accepted connection, so a rules reload reaches the next
     // connection and never one already running. See `SelectorSlot`.
+    // The resolver travels inside the slot, alongside the rules it was built with,
+    // so this loop takes no copy of its own.
     selector: Arc<SelectorSlot>,
-    resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     zero_rtt_handshake: bool,
     shutdown: CancellationToken,
@@ -1594,7 +1599,8 @@ pub async fn start_tuic_server(
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
-        let resolver = resolver.clone();
+        // No resolver clone: the accept loop takes it from the selector slot, so the
+        // rules and the DNS a connection routes by are always one generation.
         let selector = selector.clone();
         let users = users.clone();
         let shutdown = shutdown.clone();
@@ -1655,8 +1661,9 @@ pub async fn start_tuic_server(
                 // Loaded here rather than inside the spawned task: a connection
                 // must be pinned to the rules it was *accepted* under, not to
                 // whichever generation happened to be current when its task ran.
-                let cloned_selector = selector.load();
-                let cloned_resolver = resolver.clone();
+                // The resolver travels with the rules, so a connection cannot be
+                // accepted under one generation and route by another's DNS.
+                let (cloned_selector, cloned_resolver) = selector.load();
                 let cloned_users = users.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(

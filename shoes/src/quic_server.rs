@@ -42,7 +42,8 @@ pub(crate) const QUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 async fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    resolver: Arc<dyn Resolver>,
+    // No resolver: this loop takes it from the slot, with the handler, so a
+    // connection cannot mix one generation's rules with another's DNS.
     handler_slot: Arc<HandlerSlot>,
     num_endpoints: usize,
     metered: bool,
@@ -78,7 +79,6 @@ async fn start_quic_server(
             Arc::new(quinn::TokioRuntime),
         )?;
 
-        let resolver = resolver.clone();
         let handler_slot = handler_slot.clone();
         let cancel = cancel.clone();
         let join_handle = tokio::spawn(async move {
@@ -92,11 +92,11 @@ async fn start_quic_server(
                         None => break,
                     },
                 };
-                let resolver = resolver.clone();
                 // Read once per QUIC connection: every stream it goes on to open
                 // is served by the generation that was current when the connection
-                // was accepted.
-                let server_handler = handler_slot.load();
+                // was accepted -- the resolver included, so its rules and its DNS
+                // are always from the same reload.
+                let (server_handler, resolver) = handler_slot.load();
                 tokio::spawn(async move {
                     if let Err(e) =
                         process_connection(resolver, server_handler, conn, metered).await
@@ -365,9 +365,18 @@ pub async fn start_quic_servers(
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
 ) -> std::io::Result<ServerHandle> {
+    // One token for the whole inbound: every accept loop started below selects on
+    // it, so the embedder stops all of them together.
+    let cancel = CancellationToken::new();
+
+    // Created here, before the config is taken apart, so it can record what the
+    // endpoint below is about to bake in -- the certificate and the ALPN list, which
+    // a reload cannot rebuild. `check_reload` compares against these.
+    let mut handle = ServerHandle::new(config.transport.clone(), cancel.clone());
+    handle.record_listener_settings(&config);
+
     let ServerConfig {
         bind_location,
-        transport,
         quic_settings,
         protocol,
         rules,
@@ -437,11 +446,6 @@ pub async fn start_quic_servers(
         resolver.clone(),
     ));
 
-    // One token for the whole inbound: every accept loop started below selects on
-    // it, so the embedder stops all of them together.
-    let cancel = CancellationToken::new();
-    let mut handle = ServerHandle::new(transport, cancel.clone());
-
     // Kept for the two arms below, which record what their accept loops bake in so
     // that a later reload can refuse to change it. The `match` consumes `protocol`.
     let started_protocol = protocol.clone();
@@ -466,6 +470,7 @@ pub async fn start_quic_servers(
                 // the rules are the only thing above the socket a reload can reach.
                 let selector_slot = handle.push_selector(
                     client_proxy_selector.clone(),
+                    &resolver,
                     &started_protocol,
                     users.is_some(),
                 );
@@ -475,7 +480,6 @@ pub async fn start_quic_servers(
                     hysteria2_users.clone(),
                     metered,
                     selector_slot,
-                    resolver.clone(),
                     num_endpoints,
                     udp_enabled,
                     cancel.clone(),
@@ -505,6 +509,7 @@ pub async fn start_quic_servers(
                 // As above: rules only.
                 let selector_slot = handle.push_selector(
                     client_proxy_selector.clone(),
+                    &resolver,
                     &started_protocol,
                     users.is_some(),
                 );
@@ -514,7 +519,6 @@ pub async fn start_quic_servers(
                     tuic_users.clone(),
                     metered,
                     selector_slot,
-                    resolver.clone(),
                     num_endpoints,
                     zero_rtt_handshake,
                     cancel.clone(),
@@ -529,7 +533,7 @@ pub async fn start_quic_servers(
         tcp_protocol => {
             for bind_address in bind_addresses.into_iter() {
                 // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
-                let handler_slot = handle.slot_for_ip(bind_address.ip(), || {
+                let handler_slot = handle.slot_for_ip(bind_address.ip(), &resolver, || {
                     create_tcp_server_handler(
                         tcp_protocol.clone(),
                         &client_proxy_selector,
@@ -542,7 +546,6 @@ pub async fn start_quic_servers(
                 let quic_handles = start_quic_server(
                     bind_address,
                     quic_server_config.clone(),
-                    resolver.clone(),
                     handler_slot,
                     num_endpoints,
                     metered,

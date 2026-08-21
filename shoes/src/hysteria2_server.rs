@@ -1068,8 +1068,9 @@ pub async fn start_hysteria2_server(
     metered: bool,
     // Read once per accepted connection, so a rules reload reaches the next
     // connection and never one already running. See `SelectorSlot`.
+    // The resolver travels inside the slot, alongside the rules it was built with,
+    // so this loop takes no copy of its own.
     selector: Arc<SelectorSlot>,
-    resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     udp_enabled: bool,
     shutdown: CancellationToken,
@@ -1077,7 +1078,8 @@ pub async fn start_hysteria2_server(
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
-        let resolver = resolver.clone();
+        // No resolver clone: the accept loop takes it from the selector slot, so the
+        // rules and the DNS a connection routes by are always one generation.
         let selector = selector.clone();
         let users = users.clone();
         let shutdown = shutdown.clone();
@@ -1140,8 +1142,9 @@ pub async fn start_hysteria2_server(
                 // Loaded here rather than inside the spawned task: a connection
                 // must be pinned to the rules it was *accepted* under, not to
                 // whichever generation happened to be current when its task ran.
-                let cloned_selector = selector.load();
-                let cloned_resolver = resolver.clone();
+                // The resolver travels with the rules, so a connection cannot be
+                // accepted under one generation and route by another's DNS.
+                let (cloned_selector, cloned_resolver) = selector.load();
                 let cloned_users = users.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(

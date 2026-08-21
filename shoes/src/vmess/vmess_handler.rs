@@ -135,10 +135,6 @@ impl TcpServerHandler for VmessTcpServerHandler {
             ));
         }
 
-        // Attribute this connection's traffic from here on. Everything read so far is
-        // already counted against the inbound and is handed over by the meter.
-        bind_connection_user(&identity.user);
-
         let mut encrypted_payload_length = [0u8; 18];
         stream_reader
             .read_slice_into(&mut server_stream, &mut encrypted_payload_length)
@@ -175,6 +171,22 @@ impl TcpServerHandler for VmessTcpServerHandler {
                 "failed to open encrypted header length",
             ));
         }
+
+        // Only here is the client shown to hold this user's key. The auth id above
+        // named them, but naming is not proving: those sixteen bytes carry no secret
+        // an observer could not have copied off the wire, so counting or billing on
+        // them alone let anyone who had seen one of this user's connections inflate
+        // their connection count and their traffic by replaying the prefix.
+        //
+        // This is the first thing on the connection an attacker cannot produce
+        // without the uuid. What it does *not* stop is a replay of the whole recorded
+        // prefix, auth id and header together, which is by construction openable --
+        // that needs an auth-id replay cache, which is a feature of its own with its
+        // own memory and lifetime questions. See `UserRegistry::find_vmess_auth_id`.
+        identity.user.note_auth();
+        // Everything read so far is already counted against the inbound; the meter
+        // hands it over.
+        bind_connection_user(&identity.user);
 
         let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
 

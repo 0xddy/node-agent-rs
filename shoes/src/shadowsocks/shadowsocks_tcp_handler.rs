@@ -12,7 +12,7 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::dynamic::{UserRegistry, bind_connection_user};
+use crate::dynamic::{UserContext, UserRegistry, bind_connection_user};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::socks_handler::{read_location, write_location_to_vec};
@@ -201,13 +201,8 @@ impl ShadowsocksTcpHandler {
 
         // `key` ends up holding the identity PSK, which is never used as a session key
         // on this path: `setup_server_stream` resolves one per connection.
-        let mut handler = Self::new_aead2022_server(
-            cipher,
-            identity_psk,
-            udp_enabled,
-            proxy_selector,
-            resolver,
-        );
+        let mut handler =
+            Self::new_aead2022_server(cipher, identity_psk, udp_enabled, proxy_selector, resolver);
         handler.identity = Some(IdentityRole::Server {
             identity_psk: identity_psk.to_vec().into_boxed_slice(),
             users,
@@ -263,13 +258,15 @@ impl ShadowsocksTcpHandler {
     ///
     /// Returns that user's session key together with the salt, which has to be handed
     /// to the record layer afterwards: it was consumed from the socket here, and it is
-    /// what the session key is derived against on both sides.
+    /// what the session key is derived against on both sides. The user comes back
+    /// too, **unauthenticated** -- see the note on counting at the end of this
+    /// function.
     async fn resolve_identity(
         &self,
         stream: &mut Box<dyn AsyncStream>,
         identity_psk: &[u8],
         users: &Arc<dyn UserRegistry>,
-    ) -> std::io::Result<(Arc<Box<dyn ShadowsocksKey>>, Box<[u8]>)> {
+    ) -> std::io::Result<(Arc<Box<dyn ShadowsocksKey>>, Box<[u8]>, Arc<UserContext>)> {
         let salt_len = self.cipher.salt_len();
         let mut prefix = [0u8; eih::MAX_SALT_LEN + eih::IDENTITY_HEADER_LEN];
         let prefix = &mut prefix[..salt_len + eih::IDENTITY_HEADER_LEN];
@@ -288,16 +285,23 @@ impl ShadowsocksTcpHandler {
             )
         })?;
 
-        // Attribute this connection from here on. The salt and header just read are
-        // already counted against the inbound, and the meter hands them over.
-        bind_connection_user(&identity.user);
-
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
             identity.psk,
             self.cipher.algorithm().key_len(),
         )));
 
-        Ok((key, salt.to_vec().into_boxed_slice()))
+        // Deliberately neither counted nor bound here, unlike every other protocol
+        // that authenticates in one step. An identity header is sealed under the
+        // *inbound's* key, not the user's, so it names a user without proving the
+        // sender is one: those bytes cross the wire in the clear and replaying them
+        // costs nothing. Counting here let anyone who had recorded one of a user's
+        // connections inflate that user's connection count, and bill them for
+        // whatever garbage followed.
+        //
+        // The proof is the record layer: it checks the salt against the replay filter
+        // and then opens the first chunk under a key derived from the user's own PSK.
+        // `setup_server_stream` counts once that succeeds.
+        Ok((key, salt.to_vec().into_boxed_slice(), identity.user))
     }
 
     /// Build the outgoing record layer, naming this client to the server when it
@@ -365,17 +369,17 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
         // identity header. The arms are spelled out rather than defaulted because
         // reaching the fallback with a `Server` role would mean accepting the inbound's
         // own identity PSK as somebody's session key.
-        let (key, replayed_salt) = match &self.identity {
+        let (key, replayed_salt, named_user) = match &self.identity {
             Some(IdentityRole::Server {
                 identity_psk,
                 users,
             }) => {
-                let (key, salt) = self
+                let (key, salt, user) = self
                     .resolve_identity(&mut server_stream, identity_psk, users)
                     .await?;
-                (key, Some(salt))
+                (key, Some(salt), Some(user))
             }
-            Some(IdentityRole::Client { .. }) | None => (self.key.clone(), None),
+            Some(IdentityRole::Client { .. }) | None => (self.key.clone(), None, None),
         };
 
         let mut server_stream = ShadowsocksStream::new(
@@ -397,6 +401,18 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
         // Blocks waiting for the location since the client always sends it before expecting a response.
         let remote_location = read_location(&mut server_stream, &mut stream_reader).await?;
+
+        // The first read through the record layer is what proves the client holds
+        // this user's PSK: it rejects a replayed salt outright and then opens a chunk
+        // under a key only that PSK derives. Until it returns, the identity header
+        // was a claim; from here it is a fact, so this is where the authentication is
+        // counted and the connection starts being billed.
+        if let Some(user) = named_user {
+            user.note_auth();
+            // Everything read so far -- salt, header, the first chunk -- is already
+            // counted against the inbound, and the meter hands it over.
+            bind_connection_user(&user);
+        }
 
         if self.aead2022 {
             let padding_len = stream_reader.read_u16_be(&mut server_stream).await?;

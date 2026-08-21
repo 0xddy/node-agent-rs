@@ -1015,6 +1015,26 @@ fn validate_server_proxy_config(
                  Configure it as the inner protocol of tls: or reality: targets.",
             ));
         }
+        ServerProxyConfig::Shadowsocks { config, .. } => {
+            // NOTE(shoes-engine): a 2022 password may be several base64 keys joined
+            // by colons, which is a *client* saying which identity it presents to a
+            // multi-user server. An inbound has nobody to name: its own key is its
+            // identity PSK, and whose connection it is comes from the header the
+            // client seals, not from its config. Before the colon spelling was
+            // understood at all this failed as a base64 error; refusing it by name
+            // keeps it a config error rather than letting it reach a handler that
+            // cannot act on it.
+            if let ShadowsocksConfig::Aead2022 { identity_keys, .. } = config
+                && !identity_keys.is_empty()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a shadowsocks server's password must be a single base64 key; the \
+                     colon-joined form names identity keys, which only a client sends. \
+                     An inbound's own key is already its identity PSK.",
+                ));
+            }
+        }
         ServerProxyConfig::Vless { user_id, .. } => {
             parse_uuid(user_id)?;
         }
@@ -1686,6 +1706,47 @@ mod tests {
                 .to_string()
                 .contains("named pem already exists: duplicate-name")
         );
+    }
+
+    /// NOTE(shoes-engine): a colon-joined 2022 password names identity keys, which
+    /// only a client sends. It used to fail as a base64 error before the spelling was
+    /// understood at all, so a server config carrying one has never worked -- this
+    /// keeps it a config error instead of a value that reaches a handler.
+    #[tokio::test]
+    async fn shadowsocks_server_rejects_client_identity_keys() {
+        crate::thread_util::set_num_threads(1);
+
+        let one_key = "MDEyMzQ1Njc4OWFiY2RlZg==";
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:8388"
+  protocol:
+    type: shadowsocks
+    cipher: 2022-blake3-aes-128-gcm
+    password: "{one_key}:{one_key}"
+"#
+        );
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        let error = validate_configs_test(configs)
+            .await
+            .expect_err("an inbound has no identity to present");
+        assert!(
+            error.to_string().contains("single base64 key"),
+            "unexpected error: {error}"
+        );
+
+        // The single-key spelling is the ordinary one and must still validate.
+        let yaml = format!(
+            r#"
+- address: "127.0.0.1:8388"
+  protocol:
+    type: shadowsocks
+    cipher: 2022-blake3-aes-128-gcm
+    password: "{one_key}"
+"#
+        );
+        let configs: Vec<Config> = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate_configs_test(configs).await.is_ok());
     }
 
     #[tokio::test]

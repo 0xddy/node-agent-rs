@@ -76,16 +76,17 @@ impl Entry {
     /// Whether this entry's user sealed `auth_id`.
     ///
     /// No constant-time comparison here, and none is called for: unlike `verify`,
-    /// nothing is being compared against a stored secret. A valid checksum is proof
-    /// that the sender held the uuid, so there is no credential to leak a byte at a
-    /// time.
+    /// nothing is being compared against a stored secret. A valid checksum means the
+    /// sixteen bytes were produced by somebody holding the uuid -- which is not the
+    /// same as the *sender* holding it, since those bytes cross the wire in the
+    /// clear and can be copied. So this does not call `note_auth`; the handler does,
+    /// once the header AEAD proves it. See [`UserRegistry::find_vmess_auth_id`].
     fn verify_vmess(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
         let key = self.vmess.as_ref()?;
         let timestamp = key.open(auth_id)?;
         if !self.context.is_enabled() {
             return None;
         }
-        self.context.note_auth();
         Some(VmessIdentity {
             user: self.context.clone(),
             instruction_key: *key.instruction_key(),
@@ -477,7 +478,12 @@ mod tests {
             .unwrap()
             .user;
         assert!(Arc::ptr_eq(&by_uuid, &by_auth_id));
-        assert_eq!(by_uuid.total_conns(), 2);
+
+        // One authentication, not two. VLESS' lookup counts, because a client that
+        // did not hold the uuid could not have sent it; VMess' does not, because its
+        // auth id can be copied off the wire and replayed, so the handler counts once
+        // the header AEAD proves the sender holds the key.
+        assert_eq!(by_uuid.total_conns(), 1);
     }
 
     #[test]
@@ -488,11 +494,14 @@ mod tests {
 
         user.set_enabled(false);
         assert!(registry.find_vmess_auth_id(&auth_id).is_none());
-        // Suspension must not be billable: a denied attempt is not a connection.
-        assert_eq!(user.total_conns(), 1);
 
         user.set_enabled(true);
         assert!(registry.find_vmess_auth_id(&auth_id).is_some());
+
+        // Not once, across all three lookups. This one names a user rather than
+        // authenticating them -- the handler counts, once the header AEAD opens --
+        // so nothing here is billable however many times it is asked.
+        assert_eq!(user.total_conns(), 0);
     }
 
     #[test]

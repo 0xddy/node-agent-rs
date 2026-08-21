@@ -27,20 +27,32 @@
 //! accumulated so far and every subsequent byte goes straight to the user's
 //! counters.
 //!
-//! The handler finds the context through a task local rather than through a
-//! parameter. Threading an `Arc<ConnContext>` from the accept loop down to the
-//! byte offset where a uuid appears would mean touching every handler signature in
+//! # How the context reaches the handler: two shapes
+//!
+//! **Shape A -- task local.** The handler finds the context through
+//! [`bind_connection_user`], which reads it from a task local rather than from a
+//! parameter. Threading an `Arc<ConnContext>` from the accept loop down to the byte
+//! offset where a uuid appears would mean touching every handler signature in
 //! between, including the ones that have nothing to do with users. The task local
 //! costs one thread-local read per connection, once, and leaves those signatures
-//! untouched.
+//! untouched. VLESS, VMess, Trojan, Shadowsocks 2022 and AnyTLS all work this way:
+//! each authenticates inline on the task that accepted the connection, and only
+//! spawns afterwards, by which point the meter holds its own `Arc<ConnContext>`.
 //!
-//! Task locals do not cross [`tokio::spawn`]. That is fine for every handler that
-//! authenticates today, because authentication always happens inline on the task
-//! that accepted the connection -- handlers only spawn *after* the credential has
-//! been checked, and by then the meter is holding its own `Arc<ConnContext>` and no
-//! longer needs the task local. A future protocol that authenticates inside a
-//! spawned task has to pass the context explicitly; [`current_connection`] exists
-//! for that.
+//! **Shape B -- explicit parameter.** Task locals do not cross [`tokio::spawn`], so
+//! Shape A works only where authentication is inline. Three protocols authenticate
+//! somewhere else and must carry the context themselves, as
+//! `type Meter = Option<Arc<ConnContext>>`, obtained from [`current_connection`]:
+//!
+//! - **Hysteria2** authenticates once and then fans out into three loops, each its
+//!   own task;
+//! - **TUIC** does the same with four;
+//! - **NaiveProxy** hands the task to hyper at `serve_connection`, and the
+//!   credential is not read until a request arrives on it.
+//!
+//! Getting this wrong fails silently -- TCP still adds up perfectly and the user's
+//! counters simply sit at zero -- so every acceptance suite has a section that moves
+//! traffic on the path that crosses the spawn.
 //!
 //! # Hot path cost
 //!
@@ -131,6 +143,29 @@ impl ConnContext {
         user.add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
         user.add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
         true
+    }
+
+    /// Bind this connection to `user`, or confirm it already belongs to them.
+    ///
+    /// For a protocol that reads a credential more than once on one connection.
+    /// NaiveProxy is the case that needs it: it multiplexes every CONNECT over a
+    /// single HTTP/2 connection and each request carries its own
+    /// `proxy-authorization`, so the same user re-presenting their credential is
+    /// ordinary and must not be treated as a failure.
+    ///
+    /// Returns `false` only when the connection is already bound to somebody *else*,
+    /// which a caller must refuse. There is one meter per connection and it cannot
+    /// separate two users' bytes after the fact, so letting the second one through
+    /// would bill everything they move to the first. One connection, one user.
+    ///
+    /// The comparison is `Arc` identity rather than id equality: exactly one
+    /// [`UserContext`] exists per user, so two records for one user cannot exist to
+    /// be confused, and two users can never share one.
+    pub fn bind_or_matches(&self, user: &Arc<UserContext>) -> bool {
+        if self.bind(Arc::clone(user)) {
+            return true;
+        }
+        self.user().is_some_and(|bound| Arc::ptr_eq(bound, user))
     }
 
     /// Count a datagram sent to the client, for a protocol whose datagrams never
@@ -319,10 +354,7 @@ impl<T: AsyncPing + Unpin> AsyncPing for TrafficMeterStream<T> {
         self.inner.supports_ping()
     }
 
-    fn poll_write_ping(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<bool>> {
+    fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
         // Deliberately not counted. A ping is written by the stream underneath this
         // one, which meters it on the way out.
         Pin::new(&mut self.get_mut().inner).poll_write_ping(cx)
@@ -381,6 +413,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_connection_belongs_to_one_user() {
+        // The shape NaiveProxy needs: a credential is read once per request, many
+        // requests ride one connection, and there is one meter for all of them.
+        let alice = UserContext::new("alice");
+        let bob = UserContext::new("bob");
+        let conn = ConnContext::new();
+
+        assert!(
+            conn.bind_or_matches(&alice),
+            "the first user names the connection"
+        );
+        assert!(
+            conn.bind_or_matches(&alice),
+            "and re-presenting the same credential is ordinary, not a failure"
+        );
+        assert!(
+            !conn.bind_or_matches(&bob),
+            "but a second user must be refused: their bytes would land on alice"
+        );
+
+        // The refusal changes nothing -- the connection is still alice's.
+        assert_eq!(
+            conn.user().map(|u| u.id().to_string()),
+            Some("alice".into())
+        );
+        assert_eq!(bob.conns(), 0, "and bob was never opened against");
+        assert_eq!(bob.total_conns(), 0);
+
+        let (mut peer, mut stream) = metered(&conn);
+        peer.write_all(b"payload").await.unwrap();
+        let mut buf = [0u8; 7];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(alice.rx(), 7);
+        assert_eq!(bob.rx(), 0);
+    }
+
+    #[tokio::test]
     async fn traffic_from_a_client_that_never_authenticates_belongs_to_nobody() {
         let conn = ConnContext::new();
         let (mut peer, mut stream) = metered(&conn);
@@ -410,7 +479,11 @@ mod tests {
 
         drop(stream);
         assert_eq!(user.conns(), 0);
-        assert_eq!(user.total_conns(), 0, "counting an auth is the registry's job");
+        assert_eq!(
+            user.total_conns(),
+            0,
+            "counting an auth is the registry's job"
+        );
     }
 
     #[tokio::test]

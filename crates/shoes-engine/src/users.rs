@@ -20,6 +20,18 @@
 //! handshake, never per packet. The read guard is held only for the comparison, so
 //! a concurrent `upsert` on the same shard waits nanoseconds, not for I/O.
 //!
+//! # Writers, unlike readers, are serialised
+//!
+//! Readers concern one user, but a *writer* does not: one `upsert` reads the
+//! indexes to reject a credential another user already holds, reads the previous
+//! entry to work out which index keys to retire, and then writes to as many as six
+//! maps. Each of those steps is individually atomic and the sequence is not, so two
+//! writers interleaving produce exactly the outcomes the steps exist to prevent --
+//! two users both told they were granted one uuid, or a rotated-away credential
+//! left live in an index. A `Mutex` around the mutations is what closes that
+//! window; see [`MemoryUserRegistry::writer`]. No lookup takes it, so the
+//! connection path is unaffected.
+//!
 //! # The exception: VMess
 //!
 //! VMess is the one protocol here whose credential cannot be indexed at all -- its
@@ -33,7 +45,7 @@
 //! It is the same records either way: the snapshot holds the same `Arc<Entry>`s the
 //! maps do, so there is no second copy of anyone's state that could drift.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -219,7 +231,7 @@ impl CredentialKinds {
     }
 
     /// The credential fields a caller may set, for use in error messages.
-    fn accepted_fields(&self) -> String {
+    pub fn accepted_fields(&self) -> String {
         // TUIC wants both at once, which "or" would misstate.
         if self.tuic {
             return "`uuid` and `password`".to_string();
@@ -308,14 +320,16 @@ impl Entry {
     /// proof that the sender held the uuid, so there is no credential to leak a byte
     /// at a time.
     ///
-    /// A disabled user reports absent and is not counted, same as `accept`.
+    /// A disabled user reports absent, same as `accept`. Unlike `accept` this does
+    /// **not** count the authentication: an auth id names a user without proving
+    /// anything an observer could not have copied, so the handler counts it once the
+    /// header AEAD opens. See [`UserRegistry::find_vmess_auth_id`].
     fn accept_vmess(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
         let key = self.vmess.as_ref()?;
         let timestamp = key.open(auth_id)?;
         if !self.context.is_enabled() {
             return None;
         }
-        self.context.note_auth();
         Some(VmessIdentity {
             user: self.context.clone(),
             instruction_key: *key.instruction_key(),
@@ -327,6 +341,26 @@ impl Entry {
 /// A user table that can be mutated while the inbound it belongs to is serving.
 pub struct MemoryUserRegistry {
     kinds: CredentialKinds,
+    /// Serialises `upsert` and `remove`, and nothing else.
+    ///
+    /// The maps below are individually concurrent, but a mutation touches several of
+    /// them and has to look before it writes: `check_credentials_unclaimed` reads the
+    /// indexes, and `upsert` reads the previous entry to work out which index keys to
+    /// retire. Without this lock those reads are a time-of-check window, and two
+    /// concurrent writers walk straight through it -- two users are both told they
+    /// were granted the same uuid when only one of them can ever authenticate, and a
+    /// credential rotated away by one writer stays live in an index the other
+    /// rebuilt. Both were reproducible on the first try, not rare races.
+    ///
+    /// It is deliberately *not* the engine's control lock. That one is async and is
+    /// held across socket work; this one is a `std::sync::Mutex` held for a few map
+    /// writes with no await in between, which is what keeps `add_user` a synchronous
+    /// method.
+    ///
+    /// **No lookup ever takes it.** The connection path reads the maps directly, so
+    /// authentication still never waits on a control-plane call -- the invariant this
+    /// module exists to hold.
+    writer: Mutex<()>,
     /// id -> user. Authoritative: `list` and `remove` work from this map, and it is
     /// the only place a user without a usable credential could be observed.
     users: DashMap<Arc<str>, Arc<Entry>>,
@@ -376,6 +410,7 @@ impl MemoryUserRegistry {
             anytls_prefixes: DashMap::new(),
             by_naive_encoded: DashMap::new(),
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
+            writer: Mutex::new(()),
         })
     }
 
@@ -398,10 +433,16 @@ impl MemoryUserRegistry {
     /// keep hitting the same one. Replacing the record instead would strand every
     /// in-flight byte in an object nobody reports on.
     ///
-    /// Writers are serialised by the engine's control lock, so the authoritative
-    /// map and the credential indexes cannot be observed disagreeing about which
-    /// user owns a credential.
+    /// Writers are serialised by [`MemoryUserRegistry::writer`], so the
+    /// authoritative map and the credential indexes cannot be observed disagreeing
+    /// about which user owns a credential. The engine's control lock is *not* what
+    /// does this -- user mutations are deliberately outside it, so that adding a user
+    /// never waits on a reload.
     pub fn upsert(&self, spec: UserSpec) -> EngineResult<UserInfo> {
+        // Held across the whole check-then-write below, which is the only reason the
+        // duplicate-credential check and the index retirement mean anything.
+        let _writer = self.lock_writer();
+
         let id: Arc<str> = match spec.resolved_id() {
             Some(id) if !id.trim().is_empty() => id.into(),
             _ => {
@@ -513,6 +554,11 @@ impl MemoryUserRegistry {
     /// would need a per-user cancellation token, which is a different feature from
     /// revoking a credential.
     pub fn remove(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        // Same lock as `upsert`: removing a user reads their entry to learn which
+        // index keys are theirs, and a concurrent upsert of the same id would make
+        // that answer stale between the read and the removals.
+        let _writer = self.lock_writer();
+
         let (_, entry) = self
             .users
             .remove(id)
@@ -547,6 +593,41 @@ impl MemoryUserRegistry {
 
     pub fn get(&self, id: &str) -> Option<UserInfo> {
         self.users.get(id).map(|entry| user_info(&entry.context))
+    }
+
+    /// Reports one user's traffic and zeroes it, in a single step.
+    ///
+    /// For closing a billing period. Reading and then zeroing as two calls would drop
+    /// whatever moved in between; the swap underneath this is what makes every byte
+    /// land in exactly one period.
+    ///
+    /// The returned [`UserInfo`] carries the bytes that were *taken*, not the zeroes
+    /// left behind. `conns` and `total_conns` are untouched -- they are live state and
+    /// a lifetime count, neither of which belongs to a period.
+    pub fn take_traffic(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        let entry = self.users.get(id).ok_or_else(|| EngineError::UnknownUser {
+            tag: tag.to_string(),
+            id: id.to_string(),
+        })?;
+        Ok(taken_user_info(&entry.context))
+    }
+
+    /// The same, for every user at once: the usual shape of a billing sweep.
+    ///
+    /// Not a snapshot. Each user is taken individually, so a user metering traffic
+    /// while the sweep runs has their bytes split across two periods rather than
+    /// counted twice or lost -- which is the property that actually matters here.
+    ///
+    /// A user removed mid-sweep may be missing from the result; [`Self::remove`]
+    /// already reports their final counters, so that is where their last bytes are.
+    pub fn take_all_traffic(&self) -> Vec<UserInfo> {
+        let mut infos: Vec<UserInfo> = self
+            .users
+            .iter()
+            .map(|entry| taken_user_info(&entry.value().context))
+            .collect();
+        infos.sort_by(|a, b| a.id.cmp(&b.id));
+        infos
     }
 
     pub fn list(&self) -> Vec<UserInfo> {
@@ -719,10 +800,33 @@ impl MemoryUserRegistry {
                 owner: owner.to_string(),
             });
         }
-        // No check for `naive_encoded`: the id is baked into it, so two users cannot
-        // produce the same one without already colliding on their ids -- which the
-        // authoritative map refuses first.
+        // The id being baked into this one does *not* make it collision-free, which
+        // is what an earlier version of this function assumed. `id:password` is
+        // ambiguous where an id may contain a colon: ("alice", "b:c") and
+        // ("alice:b", "c") encode the same bytes, so without this check the second
+        // one silently takes over the first one's index entry and the first user is
+        // listed but can never connect -- the exact failure the rest of this
+        // function exists to prevent.
+        if let Some(encoded) = &credentials.naive_encoded
+            && let Some(owner) = self.credential_owner_naive(encoded)
+            && &*owner != id
+        {
+            return Err(EngineError::DuplicateCredential {
+                id: id.to_string(),
+                owner: owner.to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// Take the writer lock, recovering from a poisoned one.
+    ///
+    /// The mutex guards `()`, so there is no state a panicking writer could have left
+    /// half-updated for the next one to observe -- the maps are what carry the state,
+    /// and a poisoned lock says nothing about them. Refusing every later write would
+    /// turn one panic into a permanently unmanageable inbound.
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Note one more live user whose hash starts with this prefix.
@@ -770,6 +874,12 @@ impl MemoryUserRegistry {
     fn credential_owner_anytls(&self, hash: &[u8; 32]) -> Option<Arc<str>> {
         self.by_anytls_hash
             .get(hash)
+            .map(|e| e.context.id().clone())
+    }
+
+    fn credential_owner_naive(&self, encoded: &[u8]) -> Option<Arc<str>> {
+        self.by_naive_encoded
+            .get(encoded)
             .map(|e| e.context.id().clone())
     }
 
@@ -831,12 +941,21 @@ impl UserRegistry for MemoryUserRegistry {
             .find_map(|entry| entry.accept_vmess(auth_id))
     }
 
+    /// Who an identity header named, and the key their session derives from.
+    ///
+    /// Not `accept`, and no `note_auth`: the header is sealed under the *inbound's*
+    /// key rather than this user's, so it names them without showing the sender is
+    /// them. The handler counts it once the record layer opens a chunk. See the trait
+    /// method's docs.
     fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
         let entry = self.by_psk_hash.get(hash)?;
         let credential = entry.shadowsocks.as_ref()?;
-        let user = entry.accept(&credential.hash[..], &hash[..])?;
+        let expected = &credential.hash;
+        if expected.ct_eq(&hash[..]).unwrap_u8() == 0 || !entry.context.is_enabled() {
+            return None;
+        }
         Some(ShadowsocksIdentity {
-            user,
+            user: entry.context.clone(),
             psk: credential.psk.clone(),
         })
     }
@@ -892,6 +1011,18 @@ impl UserRegistry for MemoryUserRegistry {
     }
 }
 
+/// [`user_info`], but the byte counters are taken rather than read.
+fn taken_user_info(context: &UserContext) -> UserInfo {
+    let mut info = user_info(context);
+    // The swap, not the snapshot above, is what decides the reported figure: it is
+    // the only read that also closes the period, so anything counted between the two
+    // belongs to this one rather than being reported twice or not at all.
+    let (tx, rx) = context.take_traffic();
+    info.tx = tx;
+    info.rx = rx;
+    info
+}
+
 fn user_info(context: &UserContext) -> UserInfo {
     let stats = context.stats();
     UserInfo {
@@ -910,6 +1041,7 @@ mod tests {
 
     const UUID_A: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
     const UUID_B: &str = "11111111-1111-4111-8111-111111111111";
+    const UUID_C: &str = "22222222-2222-4222-8222-222222222222";
 
     fn uuid_bytes(s: &str) -> [u8; 16] {
         credential::parse_uuid(s).unwrap()
@@ -920,6 +1052,24 @@ mod tests {
             id: Some(id.to_string()),
             uuid: Some(uuid.to_string()),
             password: None,
+            enabled: true,
+        }
+    }
+
+    fn psk_spec(id: &str, psk: &[u8]) -> UserSpec {
+        UserSpec {
+            id: Some(id.to_string()),
+            uuid: None,
+            password: Some(credential::encode_shadowsocks_psk(psk)),
+            enabled: true,
+        }
+    }
+
+    fn naive_spec(id: &str, password: &str) -> UserSpec {
+        UserSpec {
+            id: Some(id.to_string()),
+            uuid: None,
+            password: Some(password.to_string()),
             enabled: true,
         }
     }
@@ -1288,7 +1438,11 @@ mod tests {
             "bob"
         );
         assert!(registry.find_shadowsocks_psk_hash(&[0u8; 16]).is_none());
-        assert_eq!(registry.get("alice").unwrap().total_conns, 1);
+        // Naming a user is not authenticating them here: an identity header is
+        // sealed under the *inbound's* key, which every client of the inbound knows,
+        // so it can be copied off the wire and replayed. The handler counts once the
+        // record layer opens a chunk under alice's own PSK.
+        assert_eq!(registry.get("alice").unwrap().total_conns, 0);
     }
 
     #[test]
@@ -1818,7 +1972,10 @@ mod tests {
 
         by_auth_id.add_rx(512);
         assert_eq!(registry.get("alice").unwrap().rx, 512);
-        assert_eq!(by_uuid.total_conns(), 2);
+        // One authentication, from the VLESS lookup. The VMess one names her without
+        // counting, because its auth id is replayable; her handler counts once the
+        // header AEAD opens.
+        assert_eq!(by_uuid.total_conns(), 1);
     }
 
     #[test]
@@ -1927,5 +2084,213 @@ mod tests {
             !json.contains(UUID_A),
             "credentials must not be echoed back"
         );
+    }
+
+    #[test]
+    fn a_colon_in_an_id_cannot_forge_another_user_s_basic_credential() {
+        // NaiveProxy's wire credential is base64("id:password"), so an id holding a
+        // colon makes the split ambiguous: these two users encode the same bytes.
+        // Without the duplicate check the second upsert silently takes over the
+        // first's index entry, leaving alice listed and unable to connect.
+        let registry = MemoryUserRegistry::new(CredentialKinds::NAIVE_BASIC);
+        registry
+            .upsert(naive_spec("alice", "b:c"))
+            .expect("the first user is unremarkable");
+
+        let clash = registry.upsert(naive_spec("alice:b", "c"));
+        assert!(
+            matches!(clash, Err(EngineError::DuplicateCredential { .. })),
+            "the colliding id must be refused, got {clash:?}"
+        );
+        assert_eq!(registry.len(), 1, "and must not be left in the table");
+
+        // The original credential still belongs to the original user.
+        let wire = credential::naive_basic_credential("alice", "b:c");
+        assert_eq!(
+            registry.find_naive_basic(&wire).map(|u| u.id().to_string()),
+            Some("alice".to_string())
+        );
+
+        // An id with a colon is fine on its own -- it is only a collision that is
+        // refused, and refusing every colon would be a rule nobody could predict.
+        assert!(registry.upsert(naive_spec("has:colon", "other")).is_ok());
+    }
+
+    #[test]
+    fn a_lookup_that_cannot_prove_possession_does_not_count() {
+        // Three credentials are matched on bytes an observer can copy off the wire,
+        // so a hit shows only that somebody held them once -- possibly the victim, on
+        // a connection the sender recorded. Counting there let a replayer inflate
+        // another user's connection count. Their handlers count instead, once the
+        // protocol produces something a copy could not.
+        let ss_registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(16));
+        ss_registry
+            .upsert(psk_spec("alice", &[7u8; 16]))
+            .expect("alice added");
+        let named = ss_registry
+            .find_shadowsocks_psk_hash(&credential::shadowsocks_psk_hash(&[7u8; 16]))
+            .expect("the header names alice");
+        assert_eq!(&**named.user.id(), "alice");
+        assert_eq!(
+            named.user.total_conns(),
+            0,
+            "an identity header is sealed under the inbound's key, not alice's"
+        );
+
+        let vmess_registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        vmess_registry
+            .upsert(uuid_spec("bob", UUID_A))
+            .expect("bob added");
+        let found = vmess_registry
+            .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+            .expect("the auth id names bob");
+        assert_eq!(&**found.user.id(), "bob");
+        assert_eq!(
+            found.user.total_conns(),
+            0,
+            "an auth id crosses the wire in the clear and can be replayed"
+        );
+
+        // The contrast: a credential the client had to *hold* to send is counted on
+        // the spot, because there is nothing further to wait for.
+        let trojan_registry = MemoryUserRegistry::new(CredentialKinds::TROJAN_PASSWORD);
+        trojan_registry
+            .upsert(trojan_spec("carol", "hunter2"))
+            .expect("carol added");
+        let carol = trojan_registry
+            .find_trojan_hash(&credential::trojan_password_hash("hunter2"))
+            .expect("carol authenticates");
+        assert_eq!(carol.total_conns(), 1);
+    }
+
+    #[test]
+    fn taking_traffic_reports_what_it_zeroed() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        registry.upsert(uuid_spec("bob", UUID_B)).unwrap();
+
+        // Stand in for a connection: authenticate, then move some bytes.
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        alice.open_conn();
+        alice.add_tx(400);
+        alice.add_rx(600);
+
+        let taken = registry.take_traffic("t", "alice").unwrap();
+        assert_eq!((taken.tx, taken.rx), (400, 600), "the period's bytes");
+        // Live and lifetime connection counts are not part of a period.
+        assert_eq!((taken.conns, taken.total_conns), (1, 1));
+
+        let after = registry.get("alice").unwrap();
+        assert_eq!((after.tx, after.rx), (0, 0), "the counters are zeroed");
+        assert_eq!((after.conns, after.total_conns), (1, 1));
+
+        // A second take with nothing in between reports zero rather than repeating
+        // the period that was already closed.
+        let again = registry.take_traffic("t", "alice").unwrap();
+        assert_eq!((again.tx, again.rx), (0, 0));
+
+        // Bytes counted after the take belong to the next period, and the connection
+        // is still bound to the same record.
+        alice.add_tx(7);
+        assert_eq!(registry.take_traffic("t", "alice").unwrap().tx, 7);
+
+        assert!(registry.take_traffic("t", "nobody").is_err());
+    }
+
+    #[test]
+    fn a_sweep_takes_every_user_and_leaves_the_table_alone() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        registry.upsert(uuid_spec("bob", UUID_B)).unwrap();
+        registry.find_uuid(&uuid_bytes(UUID_A)).unwrap().add_tx(10);
+        registry.find_uuid(&uuid_bytes(UUID_B)).unwrap().add_rx(20);
+
+        let swept = registry.take_all_traffic();
+        let reported: Vec<(&str, u64, u64)> =
+            swept.iter().map(|u| (u.id.as_str(), u.tx, u.rx)).collect();
+        assert_eq!(reported, vec![("alice", 10, 0), ("bob", 0, 20)]);
+
+        // A sweep closes a period; it does not remove anybody or disturb their
+        // credentials.
+        assert_eq!(registry.len(), 2);
+        assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_some());
+        assert!(
+            registry
+                .take_all_traffic()
+                .iter()
+                .all(|u| u.tx == 0 && u.rx == 0)
+        );
+    }
+
+    use std::sync::atomic;
+
+    // -- concurrent writers -------------------------------------------------
+    //
+    // Both of these check a property the single-threaded tests above already
+    // cover; what they add is that it survives two control-plane calls landing at
+    // once. Before the writer lock existed each of them failed on ~99% of rounds,
+    // so a low round count is enough -- this is not a rare interleaving.
+
+    /// Ten threads, one round each, released together.
+    fn race<F: Fn(usize) + Sync>(threads: usize, body: F) {
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for i in 0..threads {
+                let barrier = &barrier;
+                let body = &body;
+                scope.spawn(move || {
+                    barrier.wait();
+                    body(i);
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn two_writers_cannot_both_be_granted_one_uuid() {
+        for round in 0..200 {
+            let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+            let accepted = atomic::AtomicUsize::new(0);
+
+            race(2, |i| {
+                let id = if i == 0 { "alice" } else { "bob" };
+                if registry.upsert(uuid_spec(id, UUID_A)).is_ok() {
+                    accepted.fetch_add(1, atomic::Ordering::Relaxed);
+                }
+            });
+
+            assert_eq!(
+                accepted.load(atomic::Ordering::Relaxed),
+                1,
+                "round {round}: exactly one writer may claim a uuid; the loser must \
+                 be told so rather than listed as a user who can never connect"
+            );
+            assert_eq!(registry.len(), 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_concurrently_rotated_credential_stops_working() {
+        for round in 0..200 {
+            let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+            registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+
+            // Two rotations of the same user, landing together. Whichever wins, the
+            // other two uuids must be dead: a retired credential that still
+            // authenticates is a revocation that silently did not happen.
+            race(2, |i| {
+                let uuid = if i == 0 { UUID_B } else { UUID_C };
+                let _ = registry.upsert(uuid_spec("alice", uuid));
+            });
+
+            let live = [UUID_A, UUID_B, UUID_C]
+                .iter()
+                .filter(|uuid| registry.find_uuid(&uuid_bytes(uuid)).is_some())
+                .count();
+            assert_eq!(
+                live, 1,
+                "round {round}: only the current uuid may authenticate"
+            );
+        }
     }
 }
