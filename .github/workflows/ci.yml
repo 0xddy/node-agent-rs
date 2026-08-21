@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Upstream pins nothing: `shoes/Cargo.toml` uses `*` for every version and
+  # Cargo.lock at the workspace root is the single source of truth. Building with
+  # `--locked` is what makes CI test the versions that were actually reviewed.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    # Linux rather than Windows on purpose. Several code paths -- unix sockets,
+    # SO_REUSEPORT, the TUN device -- are `cfg`'d out on Windows, so a Windows-only
+    # run never compiles them. Developing on Windows and gating on Linux covers both.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # `--all-targets` matters: without it the ~6,000 lines of acceptance suite
+      # under crates/shoes-engine/tests/ are never linted.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      # The acceptance suites bind loopback ports and speak real protocols to
+      # themselves, so they need no network and no fixtures beyond the checked-in
+      # test certificate.
+      - name: Test
+        run: cargo test --workspace --locked
