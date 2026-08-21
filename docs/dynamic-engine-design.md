@@ -187,17 +187,37 @@ These are load-bearing. Breaking any of them is a security bug, not a style prob
    time; what that leaks is bucket occupancy, not credential bytes. Every
    implementation still finishes with a constant-time comparison of the stored
    credential.
-3. **The registry counts the authentication**, via `note_auth`, so a handler cannot
-   forget to. This works because for every credential *except TUIC's* the key is the
-   proof. TUIC is the documented exception.
+3. **Whoever can prove possession counts the authentication.** The registry calls
+   `note_auth` wherever the key *is* the proof — a password or hash a client could
+   not have sent without holding it. Three lookups are not in that position, because
+   the bytes they match on cross the wire in a form an observer can **copy**:
+   TUIC's cleartext uuid, VMess' auth id, and a Shadowsocks 2022 identity header
+   (sealed under the *inbound's* key, which every client of the inbound knows). Those
+   three hand back an identity without counting it, and their handler counts once the
+   protocol produces something a copy could not: a token keyed to this connection, or
+   an AEAD opened under the user's own key. Counting on the copyable half let anyone
+   who had recorded one of a user's connections inflate that user's connection count
+   and bill them for the garbage that followed.
 4. **A credential is never an identity.** `UserContext.id` is chosen by whoever
    registered the user; `UserInfo` has no credential field at all, and a test asserts
    the serialised form does not echo one. Where a uuid *is* the reported id, that is a
    deliberate call: it already crosses the wire in cleartext and operators already
-   refer to the user by it.
-5. **No lock on the connection path.** A lookup runs inline in connection setup,
-   before the handshake can proceed, so a lock held there stalls every concurrent
-   dial.
+   refer to the user by it. An id reaches logs — the AnyTLS handler debug-logs it on
+   every successful authentication — so a config user who declared no name is
+   reported by *position*, never by their password, which is what an earlier version
+   did.
+
+   One protocol is the exception in the other direction: on a NaiveProxy inbound the
+   id is the username half of an HTTP Basic credential, so it is part of the
+   credential by construction. That makes `id:password` ambiguous when an id contains
+   a colon — `("alice", "b:c")` and `("alice:b", "c")` encode identically — so the
+   duplicate-credential check covers this index too, rather than assuming distinct
+   ids imply distinct credentials.
+5. **Nothing on the connection path waits on the control plane.** A lookup runs
+   inline in connection setup, before the handshake can proceed, so anything that
+   blocks there stalls every concurrent dial. A lookup does take one `DashMap` shard
+   read guard, held for the length of a constant-time comparison; what it never takes
+   is the registry's writer lock or the engine's control lock.
 
 ### Two implementations, one trait object
 
@@ -347,6 +367,18 @@ thread at once.
 move, so a snapshot taken mid-transfer is a race. The test harness's `quiet()` helper
 exists for that.
 
+### Closing a billing period
+
+Reading the counters and then zeroing them are one operation, not two:
+`Engine::take_user_traffic` and `take_inbound_traffic` report what they took. Two calls
+would drop whatever moved in between, and the whole point of the meter is that every
+byte lands in exactly one period. A sweep takes each user individually rather than as
+one snapshot, so a user transferring while it runs has their bytes *split* between two
+periods rather than double-counted or lost — and `remove_user` already reports a
+departing user's final counters, which is where their last bytes are. `conns` and
+`total_conns` are untouched: one is live state, the other a lifetime total, and neither
+belongs to a period.
+
 ---
 
 ## 5. Reload: RCU without a grace period
@@ -383,13 +415,36 @@ live connections to finish before dropping the endpoint. The bounds nest deliber
 `InboundSlot::LISTENER_DRAIN_TIMEOUT` must exceed `quic_server::QUIC_DRAIN_TIMEOUT`, or
 the abort would cut exactly the connections the drain exists to protect.
 
+### The resolver travels with the handler
+
+A reload rebuilds the handler *and its resolver* — an inbound may declare its own
+`dns` section, so the two are not independent. That means the resolver cannot live in
+the accept loop, which reads it once at startup and would otherwise hand every new
+connection one generation's rules and another's DNS. It goes in the slot instead, so a
+`load` returns both halves of one generation and a connection is pinned to both.
+
 ### What reload does not cover
 
-- **QUIC certificates.** They live in the endpoint, not the handler, so they are fixed
-  until the listener is replaced.
+Everything here is **refused by name**, not ignored. A reload that reports success
+while quietly keeping the old value is worse than a refusal, and the worst case is the
+one an operator acts on: after rotating a certificate, the next thing they do is stop
+worrying about the old one.
+
+- **Anything the listener baked in**: `tcp_settings.no_delay`, read once before the
+  accept loop starts, and every field of `quic_settings` — the certificate, the key,
+  the ALPN list, client CAs and fingerprints, the endpoint count. These belong to the
+  socket and the endpoint, which a reload does not rebuild. `FixedListener` records
+  them at start and `check_reload` compares.
 - **The listen set and the transport.** Changing either is a different set of
-  listeners, which is not something to do silently; `check_reload` refuses both with a
-  message naming what it is serving.
+  listeners, which is not something to do silently. For a unix socket that means the
+  *path*, not merely "still a unix socket" — the path is the socket, so `/tmp/a` to
+  `/tmp/b` is a different listener and used to report success while serving `/tmp/a`.
+- **What a dynamic inbound authenticates with.** Its registry was built to answer one
+  set of questions and its users hold credentials of those shapes. Swapping VLESS for
+  Trojan strands every user; swapping it for a plain SOCKS proxy strands the *access
+  control*, leaving an open proxy on a live port while the API goes on reporting the
+  users it no longer consults. Both are refused by comparing `credential_kinds`
+  against the registry's own.
 - **Protocol settings on Hysteria2 and TUIC.** They never build a `TcpServerHandler`,
   so they register a [`SelectorSlot`](#5-reload-rcu-without-a-grace-period) instead,
   which reaches their rules and nothing else. `udp_enabled`, `zero_rtt_handshake` and
@@ -418,9 +473,52 @@ its own address registry as authoritative — two concurrent `add_inbound` calls
 never both pass the conflict check for the same port. Reads (`list_inbounds`,
 `get_user`) go through the `DashMap`s and never contend with an in-flight reload.
 
-User mutations are deliberately **outside** the control lock: `MemoryUserRegistry` is
-already concurrent, and the same `Arc` is inside the running handlers, so adding a user
-takes effect on the next handshake with no restart and no coordination.
+User mutations are deliberately **outside** the control lock: the same `Arc` is inside
+the running handlers, so adding a user takes effect on the next handshake with no
+restart and no coordination, and it never waits on a reload that is holding sockets.
+
+They are not, however, unserialised. `MemoryUserRegistry` carries a `Mutex` of its own,
+taken by `upsert` and `remove` and by nothing else. A *reader* concerns one user, which
+is why the table needs no RCU; a *writer* does not — one `upsert` reads the indexes to
+reject a credential someone else holds, reads the previous entry to decide which keys to
+retire, and then writes up to six maps. Each step is atomic and the sequence is not, so
+two writers interleaving produce exactly what the steps exist to prevent: two users both
+told they were granted one uuid, and a rotated-away credential left live in an index.
+Neither was a rare interleaving — both reproduced on ~99% of attempts before the lock
+existed, and both now have a regression test. No lookup takes that lock, so §3's
+invariant about the connection path is untouched.
+
+### What an address claim covers
+
+`bound` is keyed by *socket*, not by address. A TCP listener and a QUIC endpoint on
+`:443` are two different things and holding both is the ordinary way to serve HTTP/3
+beside HTTP/2 — keying on the `SocketAddr` alone refused the second as a conflict with
+the first. A unix socket has no address at all and so needs its own kind of key rather
+than being left out of the registry, which is what let two inbounds claim one path and
+the second silently delete the first one's socket file. The pre-flight bind follows the
+same rule: a QUIC inbound is probed with a UDP socket, because probing TCP tests a port
+nobody was going to open.
+
+### Cancelling a control-plane call
+
+`add_inbound` and `remove_inbound` are `async`, and an embedder's transport will cancel
+them — a gRPC client hangs up, a request times out. Dropping either future used to leak:
+`add_inbound` opens sockets before it registers the inbound, so a cancellation in
+between left listeners serving with no tag to name them and no way to stop them;
+`remove_inbound` takes the slot out of `inbounds` before it releases the addresses, so a
+cancellation left them claimed forever by a tag that no longer existed.
+
+Both are covered by drop guards now, and both are honest about what a guard can do.
+`Drop` cannot await, so they call the *synchronous* half — `CancellationToken::cancel`,
+which stops the accept loops without waiting for the drain. So a cancelled call still
+cleans up; what it gives up is the guarantee that the port is free the moment it
+returns. A caller that retries the same address immediately may race the listener it
+just cancelled, which is a reason to drive these futures to completion rather than a
+reason to distrust them.
+
+Dropping the last `Engine` handle stops accepting on every inbound, for the same
+reason: an engine is the only thing that can name its inbounds, so listeners outliving
+it are unreachable by anything.
 
 `Engine::bootstrap` starts with nothing — no config file, no inbounds, no users — and
 is fully operational in that state. Its one piece of eager work is recording the
@@ -446,7 +544,7 @@ nobody — which is the empty state the whole design exists to support.
 
 ### Fail closed on credentials
 
-Two refusals matter more than they look.
+Three refusals matter more than they look.
 
 **A `users` list on an inbound the registry cannot serve is an error, not a no-op.**
 `credential_kinds` walks the *expanded* config — seeing through TLS, Reality, ShadowTLS
@@ -458,6 +556,33 @@ fail-open, and invisible until someone connects with a credential nobody granted
 That match is **exhaustive on purpose, with no wildcard arm**. Adding registry support
 for a protocol is a deliberate decision, and so is absorbing a new protocol from
 upstream; both should stop the build there rather than silently classify as "no users".
+
+**A target the list does not govern refuses the whole inbound, even when its
+neighbours are governed.** "Does anything here authenticate through a registry" and
+"is the whole inbound governed by the list" are different questions, and a tree can
+answer yes to the first while one target answers no to the second. Two shapes end up
+there, and both are fail-open:
+
+- **A target that cannot act on a registry it is handed.** Shadowsocks is the only
+  protocol that can be in that position, because it is the only handler that
+  **branches** on whether a registry was injected — a 2022 *chacha20* target has no
+  identity header to name a user with, and that combination cannot even start.
+- **A target that authenticates nobody at all.** A plain HTTP, SOCKS or mixed target
+  with neither `username` nor `password`, or a port-forward, serves every client that
+  reaches its SNI. Sharing an inbound with VLESS does not change that, and it is
+  precisely the case where a `users` list reads as protection it is not.
+
+`unservable_registry_target` walks the same tree `credential_kinds` does and names the
+offending target. What it deliberately does *not* name is a target that authenticates
+on its own terms: legacy shadowsocks, Snell, or an HTTP target with a credential.
+Those keep what the operator actually wrote — nothing invented one for them, since
+only `PLACEHOLDER_FIELDS` protocols get a throwaway — so the inbound is not open, it
+is simply not per-user there.
+
+The check lives on **both** entry points. A reload rebuilds the handlers from the new
+config and hands them the registry the inbound already has, so `update_inbound` can
+introduce such a target exactly as `add_inbound` can — and it never goes through
+`build_user_registry`, so one copy of the check would not cover it.
 
 **A credential in the config of a dynamic inbound is an error, not something to
 overwrite.** Shoes' schema requires `user_id` on VLESS, `password` on Hysteria2, both
@@ -530,16 +655,21 @@ What a future `git subtree` merge of upstream has to survive, measured against
 
 | area | size |
 |---|---|
-| `shoes/src/dynamic/` (entirely new) | ~2,900 lines |
-| the rest of `shoes/` | 28 files, +2,156 / −733 |
-| `crates/` | ~10,200 lines, of which ~6,200 are tests |
+| `shoes/src/dynamic/` (entirely new) | ~3,200 lines |
+| the rest of `shoes/` | 28 files, +2,381 / −746 |
+| `crates/` | ~11,800 lines, of which ~6,800 are tests |
 
 Inside `shoes/`, outside the new module, the changes are of four kinds:
 
 1. **Visibility widenings** — `pub mod tcp;`, `pub mod socket_util;`,
    `pub mod dynamic;`, exporting `DnsRegistry`; plus the `arc-swap` dependency and
    `[profile.release]` moved to the workspace root, because Cargo ignores profiles in
-   a non-root member.
+   a non-root member. `shoes/Cargo.toml` also carries a package-scoped
+   `[lints.clippy]` allowing `absurd_extreme_comparisons`: three of upstream's VMess
+   tests assert `length_mask <= u16::MAX` on a value that is already a `u16`, which
+   clippy denies by default — that made `cargo clippy --workspace --all-targets` fail
+   to *compile*, so no test code in the workspace could be linted. A `Cargo.toml`
+   line beats editing upstream test bodies that every merge would then carry.
 2. **Registry injection at eight authentication sites** — VLESS, Trojan, VMess,
    Shadowsocks 2022, Hysteria2, TUIC, AnyTLS, NaiveProxy. Behaviour-preserving by
    construction, per §3. One deletion: NaiveProxy's `UserLookup` is gone, because the
@@ -548,10 +678,6 @@ Inside `shoes/`, outside the new module, the changes are of four kinds:
    flag through the handler factory and the accept loops; `HandlerSlot` / `ServerHandle`
    in place of a bare handler.
 4. **Two new wire-format modules** — `shadowsocks/eih.rs`, `vmess/auth.rs`, per §2.
-
-> **Known stale:** the "Invasiveness" table in `crates/shoes-engine/src/lib.rs` still
-> describes the phase-2a footprint — "two authentication sites (VLESS, Trojan)". The
-> numbers above supersede it.
 
 Every protocol shoes can tell users apart on is now registry-backed. Snell is the only
 one left out, and it is not a gap: it has no multi-user identity mechanism at all, so
@@ -565,14 +691,34 @@ For review checklists and for the next protocol conversion.
 
 1. A disabled user reports **absent**, never present-but-denied.
 2. A hash hit is a candidate, not proof; finish with a constant-time comparison.
-3. The registry calls `note_auth` — unless its lookup cannot authenticate, in which
-   case it says so and the handler calls it.
-4. No lock and no allocation on the connection path.
+3. The registry calls `note_auth` — unless the bytes it matched on are copyable off
+   the wire, in which case it says so and the handler counts once something
+   unforgeable arrives. TUIC, VMess and Shadowsocks 2022 are the three.
+4. No lock a control-plane call can hold on the connection path. A lookup does take
+   one `DashMap` shard read guard, for the length of a constant-time comparison; what
+   it must never wait on is a writer, a reload, or I/O. (One allocation survives:
+   `find_shadowsocks_psk_hash` clones the user's PSK, because the handler derives the
+   connection's session keys from it.)
 5. Credentials never appear in an id, a log line, or a report.
 6. With no registry injected, behaviour is bit-for-bit what upstream did.
 7. A reload changes what the *next* connection sees, never a live one.
 8. `shoes/src/dynamic/` adds no dependency an *application* would need — no
    transport, no serialisation format, no store. (`arc-swap` is the one crate it did
    add, and it is a concurrency primitive.)
-9. An inbound that cannot use a `users` list refuses one.
-10. Count bytes on the wire, once, on the client side only.
+9. An inbound that cannot use a `users` list refuses one — including one whose
+   *targets* disagree, whether because a target cannot act on a registry or because
+   it authenticates nobody at all.
+10. Count bytes on the wire, once, on the client side only. One connection belongs to
+    one user: a protocol that reads a credential more than once per connection
+    refuses a second, different one rather than billing them to the first.
+11. What a dynamic inbound authenticates with is fixed for its life. A reload may
+    change its rules, its protocol settings and its certificates-in-the-handler; it
+    may not change the credential shape its registered users hold, and it may not
+    change the protocol to one that consults no registry.
+12. A claim on an address is a claim on a *socket*: TCP `:443` and QUIC `:443` are two
+    of them, and a unix path is a third kind. Pre-flight binds test the socket the
+    listener will really open.
+13. Cancelling a control-plane call leaks nothing. Listeners started but never
+    registered are stopped; addresses held by an inbound being removed are released.
+    What cancellation gives up is *timing* — nothing is left to await the drain — not
+    cleanup.

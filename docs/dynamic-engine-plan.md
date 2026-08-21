@@ -352,7 +352,10 @@ The convention the last four commits established:
    process, covering: attribution across users, an unregistered credential, a miss
    billed to nobody, disabled users, rotation, removal leaving an established
    connection alone, and both classic and dynamic mode.
-5. `cargo fmt`, `cargo clippy`, `cargo test --workspace` all clean.
+5. All three gates clean: `cargo fmt --all --check`,
+   `cargo clippy --workspace --all-targets`, `cargo test --workspace`. The
+   `--all-targets` matters — without it the acceptance suites themselves are never
+   linted. See the [README](../README.md#building-and-checking).
 6. A commit message that explains the design decision and **names any pre-existing bug
    the new suite flushed out** — three of the four so far found at least one.
 
@@ -361,7 +364,7 @@ The convention the last four commits established:
 - **Snell** stays out. It has no multi-user identity mechanism at all, so
   `credential_kinds` should keep classifying it as "no registry credentials" and the
   engine should keep refusing it a `users` list.
-- **The "Invasiveness" table in `crates/shoes-engine/src/lib.rs`** still describes the
-  phase-2a footprint — two authentication sites out of the eight there are now.
-  Section 8 of [dynamic-engine-design.md](dynamic-engine-design.md) supersedes it and
-  says so, but the module doc itself has not been corrected.
+- **Nothing else.** The "Invasiveness" table in `crates/shoes-engine/src/lib.rs` was
+  the last known-stale item and was corrected in `e12de88`, which also fixed a claim
+  that was wrong rather than merely old: `shoes/src/dynamic/` was said to pull in no
+  new dependency, and it pulls in `arc-swap` for the reload slots.
