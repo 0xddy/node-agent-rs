@@ -12,8 +12,13 @@
 //! `shoes/` stays an **engine**. It gets extension points -- a trait to look a
 //! credential up, a per-user record to account against -- and nothing that decides
 //! policy, speaks a wire protocol to an operator, or manages a process. Concretely,
-//! nothing under `shoes/src/dynamic/` knows about HTTP, JSON, or a user database;
-//! that is why it pulls in no new dependency at all.
+//! nothing under `shoes/src/dynamic/` knows about HTTP, JSON, or a user database.
+//!
+//! The dependency list is the test, and it is easy to apply: `shoes/src/dynamic/`
+//! added exactly one crate, `arc-swap`, for the pointer swap a reload is built on.
+//! That is a concurrency primitive of the same kind as the `tokio` already there. If
+//! a change to this module would need a transport or a store, it belongs out here
+//! instead.
 //!
 //! Everything application-shaped lives out here:
 //!
@@ -42,22 +47,37 @@
 //! | start listeners | [`shoes::tcp::tcp_server::start_servers_with_users`] |
 //!
 //! The footprint inside `shoes/`, which is what every future merge of upstream has
-//! to survive, is:
+//! to survive, is roughly 2,900 new lines under `src/dynamic/` plus 28 touched files
+//! elsewhere. Those 28 are of four kinds:
 //!
-//! - three visibility widenings (`pub mod tcp;`, `pub mod socket_util;`, and
-//!   exporting `DnsRegistry`), plus `[profile.release]` moved to the workspace root
-//!   because Cargo ignores profiles in a non-root member
-//! - a new `shoes::dynamic` module: the [`shoes::dynamic::UserRegistry`] trait,
-//!   the per-user record it returns, wire-format credential derivation, and a
-//!   `StaticUserRegistry` for config-file users
-//! - an `Option<Arc<dyn UserRegistry>>` threaded through the handler factory, and
-//!   two authentication sites (VLESS, Trojan) changed from comparing against one
-//!   hardcoded credential to asking the registry
+//! - **Visibility widenings**: `pub mod tcp;`, `pub mod socket_util;`,
+//!   `pub mod dynamic;`, and exporting `DnsRegistry`. Plus one dependency,
+//!   `arc-swap`, and `[profile.release]` moved to the workspace root because Cargo
+//!   ignores profiles declared by a non-root member.
+//! - **The new `shoes::dynamic` module**: the [`shoes::dynamic::UserRegistry`] trait,
+//!   the per-user record it returns, the traffic meter, the reload slots, wire-format
+//!   credential derivation, and a `StaticUserRegistry` for config-file users.
+//! - **Registry injection at eight authentication sites**: VLESS, Trojan, VMess,
+//!   Shadowsocks 2022, Hysteria2, TUIC, AnyTLS and NaiveProxy now ask a registry
+//!   instead of comparing against a hardcoded credential. NaiveProxy's own
+//!   `UserLookup` was deleted, since the registry answers everything it answered.
+//! - **Metering and reload threading**: an `Option<Arc<dyn UserRegistry>>` and a
+//!   `metered` flag through the handler factory and the accept loops, and a
+//!   `HandlerSlot` (or, for the two QUIC-native protocols, a `SelectorSlot`) where a
+//!   bare handler or selector used to sit.
 //!
-//! That last point is the only upstream *behaviour* change, and it is behaviour
+//! Two of those sites brought new wire-format code with them --
+//! `shadowsocks/eih.rs` for 2022 identity headers, `vmess/auth.rs` for auth ids --
+//! which lives inside `shoes/` on purpose: it is protocol, and putting it out here
+//! would mean a second implementation of a wire format in the tree.
+//!
+//! The third point is the only upstream *behaviour* change, and it is behaviour
 //! preserving by construction: with no registry injected, each handler builds a
-//! `StaticUserRegistry` holding exactly the credential from its own config, so a
+//! `StaticUserRegistry` holding exactly the credentials from its own config, so a
 //! plain YAML config authenticates precisely as it did before.
+//!
+//! `docs/dynamic-engine-design.md` covers the design these hooks implement, and
+//! collects the invariants a new protocol conversion has to preserve.
 
 mod error;
 mod inbound;

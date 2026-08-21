@@ -31,10 +31,11 @@ So the governing rule is a seam, not a feature list:
 > **`shoes/` gets extension points. Everything that decides policy, speaks to an
 > operator, or stores a user lives outside it.**
 
-The test for "is this allowed inside `shoes/`" is dependency-shaped and easy to apply:
-`shoes/src/dynamic/` pulls in **no new crate**. Nothing in it knows about HTTP, JSON,
-gRPC, or a database. If a change would need one of those, it belongs in
-`crates/`.
+The test for "is this allowed inside `shoes/`" is dependency-shaped and easy to apply.
+`shoes/src/dynamic/` added exactly **one** crate: `arc-swap`, for the pointer swap a
+reload is built on — a concurrency primitive of the same kind as the `tokio` already
+there. Nothing in the module knows about HTTP, JSON, gRPC, or a database, and if a
+change would need one of those, it belongs in `crates/` instead.
 
 ---
 
@@ -535,9 +536,10 @@ What a future `git subtree` merge of upstream has to survive, measured against
 
 Inside `shoes/`, outside the new module, the changes are of four kinds:
 
-1. **Visibility widenings** — `pub mod tcp;`, `pub mod socket_util;`, exporting
-   `DnsRegistry`; plus `[profile.release]` moved to the workspace root, because Cargo
-   ignores profiles in a non-root member.
+1. **Visibility widenings** — `pub mod tcp;`, `pub mod socket_util;`,
+   `pub mod dynamic;`, exporting `DnsRegistry`; plus the `arc-swap` dependency and
+   `[profile.release]` moved to the workspace root, because Cargo ignores profiles in
+   a non-root member.
 2. **Registry injection at eight authentication sites** — VLESS, Trojan, VMess,
    Shadowsocks 2022, Hysteria2, TUIC, AnyTLS, NaiveProxy. Behaviour-preserving by
    construction, per §3. One deletion: NaiveProxy's `UserLookup` is gone, because the
@@ -569,6 +571,8 @@ For review checklists and for the next protocol conversion.
 5. Credentials never appear in an id, a log line, or a report.
 6. With no registry injected, behaviour is bit-for-bit what upstream did.
 7. A reload changes what the *next* connection sees, never a live one.
-8. `shoes/src/dynamic/` adds no dependency.
+8. `shoes/src/dynamic/` adds no dependency an *application* would need — no
+   transport, no serialisation format, no store. (`arc-swap` is the one crate it did
+   add, and it is a concurrency primitive.)
 9. An inbound that cannot use a `users` list refuses one.
 10. Count bytes on the wire, once, on the client side only.
