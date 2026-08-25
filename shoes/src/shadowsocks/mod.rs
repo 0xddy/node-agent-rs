@@ -8,7 +8,7 @@ mod shadowsocks_key;
 mod shadowsocks_stream;
 mod shadowsocks_stream_type;
 mod shadowsocks_tcp_handler;
-mod timed_salt_checker;
+mod shadowsocks_udp;
 
 pub use default_key::DefaultKey;
 pub use eih::{psk_hash, supports_identity_headers};

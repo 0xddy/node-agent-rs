@@ -4,7 +4,7 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,89 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
+
+    /// Resolve through one explicitly named upstream exposed by a composite
+    /// resolver. Ordinary resolvers deliberately reject a non-empty tag rather
+    /// than silently falling back to their default path.
+    ///
+    /// This is the narrow primitive needed by per-outbound dialers: routing
+    /// policy still uses [`Self::resolve_location`], while a proxy-server lookup
+    /// can select the exact DNS transport requested by its own configuration.
+    fn resolve_location_via(&self, upstream_tag: &str, location: &NetLocation) -> ResolveFuture {
+        if upstream_tag.is_empty() {
+            return self.resolve_location(location);
+        }
+        let upstream_tag = upstream_tag.to_string();
+        Box::pin(async move {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("resolver does not expose named upstream {upstream_tag:?}"),
+            ))
+        })
+    }
+}
+
+/// A resolver reference that can be connected after the graph containing it
+/// has been built.
+///
+/// DNS transports may themselves use a proxy chain, while a proxy hop in that
+/// chain can request one of the DNS policy's named upstreams. Building that
+/// graph requires a late back-reference to the finished policy resolver. The
+/// stored reference is deliberately weak so the finished resolver does not
+/// retain itself through `policy -> upstream -> client chain -> resolver`.
+#[derive(Default)]
+pub struct LateBoundResolver {
+    inner: OnceLock<Weak<dyn Resolver>>,
+}
+
+impl LateBoundResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Connect this handle exactly once to its finished resolver graph.
+    pub fn bind(&self, resolver: &Arc<dyn Resolver>) -> std::io::Result<()> {
+        self.inner.set(Arc::downgrade(resolver)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "late-bound resolver is already connected",
+            )
+        })
+    }
+
+    fn target(&self) -> std::io::Result<Arc<dyn Resolver>> {
+        self.inner.get().and_then(Weak::upgrade).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "late-bound resolver is not connected",
+            )
+        })
+    }
+}
+
+impl Debug for LateBoundResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LateBoundResolver")
+            .field("connected", &self.inner.get().is_some())
+            .finish()
+    }
+}
+
+impl Resolver for LateBoundResolver {
+    fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        match self.target() {
+            Ok(target) => target.resolve_location(location),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    fn resolve_location_via(&self, upstream_tag: &str, location: &NetLocation) -> ResolveFuture {
+        match self.target() {
+            Ok(target) => target.resolve_location_via(upstream_tag, location),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
 }
 
 /// Resolver wrapper that enforces a timeout on DNS resolution.
@@ -88,6 +171,32 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
                     ),
                 )),
             }
+        })
+    }
+
+    fn resolve_location_via(&self, upstream_tag: &str, location: &NetLocation) -> ResolveFuture {
+        if location.to_socket_addr_nonblocking().is_some() {
+            let location = location.clone();
+            return Box::pin(
+                async move { Ok(vec![location.to_socket_addr_nonblocking().unwrap()]) },
+            );
+        }
+
+        let inner_future = self.inner.resolve_location_via(upstream_tag, location);
+        let timeout_duration = self.timeout;
+        let location_string = location.to_string();
+        let upstream_tag = upstream_tag.to_string();
+        Box::pin(async move {
+            tokio::time::timeout(timeout_duration, inner_future)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "DNS resolution for {location_string} via {upstream_tag:?} timed out after {timeout_duration:?}"
+                        ),
+                    )
+                })?
         })
     }
 }
@@ -308,11 +417,23 @@ pub async fn resolve_addresses(
     resolver: &Arc<dyn Resolver>,
     location: &NetLocation,
 ) -> std::io::Result<Vec<SocketAddr>> {
+    resolve_addresses_via(resolver, None, location).await
+}
+
+/// Resolve all addresses through an optional exact named upstream.
+pub async fn resolve_addresses_via(
+    resolver: &Arc<dyn Resolver>,
+    upstream_tag: Option<&str>,
+    location: &NetLocation,
+) -> std::io::Result<Vec<SocketAddr>> {
     if let Some(socket_addr) = location.to_socket_addr_nonblocking() {
         return Ok(vec![socket_addr]);
     }
 
-    let addrs = resolver.resolve_location(location).await?;
+    let addrs = match upstream_tag {
+        Some(tag) => resolver.resolve_location_via(tag, location).await?,
+        None => resolver.resolve_location(location).await?,
+    };
     if addrs.is_empty() {
         return Err(std::io::Error::other(format!(
             "could not resolve location: {location}"
@@ -328,10 +449,25 @@ pub async fn resolve_location(
     location: &mut ResolvedLocation,
     resolver: &Arc<dyn Resolver>,
 ) -> std::io::Result<SocketAddr> {
+    resolve_location_via(location, resolver, None).await
+}
+
+/// Resolve and cache a location through an optional exact named upstream.
+pub async fn resolve_location_via(
+    location: &mut ResolvedLocation,
+    resolver: &Arc<dyn Resolver>,
+    upstream_tag: Option<&str>,
+) -> std::io::Result<SocketAddr> {
     if let Some(addr) = location.resolved_addr() {
         return Ok(addr);
     }
-    let addr = resolve_single_address(resolver, location.location()).await?;
+    let addrs = resolve_addresses_via(resolver, upstream_tag, location.location()).await?;
+    let addr = addrs.into_iter().next().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "could not resolve location: {}",
+            location.location()
+        ))
+    })?;
     location.set_resolved(addr);
     Ok(addr)
 }
@@ -670,6 +806,31 @@ mod tests {
 
     fn unique_location(index: usize) -> NetLocation {
         NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
+    }
+
+    #[tokio::test]
+    async fn late_bound_resolver_delegates_without_retaining_target() {
+        let handle = LateBoundResolver::new();
+        let error = handle.resolve_location(&test_location()).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+
+        let concrete = Arc::new(MockResolver::with_addrs(test_addrs()));
+        let target: Arc<dyn Resolver> = concrete.clone();
+        handle.bind(&target).unwrap();
+        assert_eq!(
+            handle.resolve_location(&test_location()).await.unwrap(),
+            test_addrs()
+        );
+        assert_eq!(concrete.count(), 1);
+        assert_eq!(
+            handle.bind(&target).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+
+        drop(target);
+        drop(concrete);
+        let error = handle.resolve_location(&test_location()).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
     }
 
     #[test]

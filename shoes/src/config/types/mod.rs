@@ -27,17 +27,25 @@ pub mod tun;
 // Re-export all public types for convenience
 #[allow(unused_imports)]
 pub use client::{
-    ClientConfig, ClientProxyConfig, H2MuxConfig, TlsClientConfig, WebsocketClientConfig,
+    ClientConfig, ClientProxyConfig, H2MuxConfig, Hysteria2ClientObfs, ShadowsocksUdpMode,
+    TlsClientConfig, VlessPacketEncoding, WebsocketClientConfig, parse_go_duration,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
-pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
+pub use dns::{
+    DnsConfig, DnsConfigGroup, DnsPolicyActionConfig, DnsPolicyRuleConfig, DnsServerSpec,
+    ExpandedDnsGroup, ExpandedDnsPolicyAction, ExpandedDnsPolicyRule, ExpandedDnsSpec,
+};
 pub use groups::{ClientConfigGroup, Config, NamedPem, PemSource};
-pub use rules::{ClientChain, ClientChainHop, RuleActionConfig, RuleConfig};
+#[allow(unused_imports)]
+pub use rules::{
+    ClientChain, ClientChainHop, ClientChainSelectionConfig, DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+    RouteMatchConfig, RouteNetwork, RouteRuleSetConfig, RuleActionConfig, RuleConfig,
+};
 pub use selection::ConfigSelection;
 pub use server::{
-    RealityServerConfig, ServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
-    ShadowTlsServerHandshakeConfig, TlsServerConfig, WebsocketPingType, WebsocketServerConfig,
-    direct_allow_rule,
+    Hysteria2MasqueradeConfig, Hysteria2ObfsConfig, RealityServerConfig, ServerConfig,
+    ServerProxyConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, TlsServerConfig,
+    WebsocketPingType, WebsocketServerConfig, direct_allow_rule,
 };
 pub use shadowsocks::ShadowsocksConfig;
 pub use transport::{BindLocation, ClientQuicConfig, ServerQuicConfig, TcpConfig, Transport};

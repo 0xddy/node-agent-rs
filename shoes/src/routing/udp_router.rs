@@ -1043,7 +1043,7 @@ impl<'a> UdpRouter<'a> {
             let resolved_addr = resolve_single_address(&resolver, &dest_for_future).await?;
             // Create ResolvedLocation with pre-resolved address
             let resolved_location = ResolvedLocation::with_resolved(dest_for_future, resolved_addr);
-            let decision = selector.judge(resolved_location, &resolver).await?;
+            let decision = selector.judge_udp(resolved_location, &resolver).await?;
 
             match decision {
                 ConnectDecision::Allow {

@@ -2,14 +2,15 @@
 //!
 //! This trait handles the socket-level connection at hop 0 of a chain.
 //! It is responsible for:
-//! - Creating TCP sockets with bind_interface
+//! - Creating TCP sockets with interface/source binding and Linux routing options
 //! - Creating and caching QUIC endpoints
 //! - UDP socket creation for direct connections
 //!
 //! ## Design
 //!
 //! Every `ClientConfig` implicitly defines a `SocketConnector` through its
-//! socket-related fields: `bind_interface`, `transport`, `tcp_settings`, `quic_settings`.
+//! socket-related fields: `bind_interface`, source addresses, routing mark, connect timeout,
+//! `bind_address_no_port`, `transport`, `tcp_settings`, and `quic_settings`.
 //!
 //! When a config is used:
 //! - **As hop 0**: The SocketConnector is used to create the connection
@@ -27,7 +28,7 @@ use crate::resolver::Resolver;
 /// Trait for creating socket connections at hop 0.
 ///
 /// Only used at the first hop of a chain. Handles TCP and QUIC transports
-/// with optional bind_interface.
+/// with optional dialer socket settings.
 #[async_trait]
 pub trait SocketConnector: Send + Sync + Debug {
     /// Create a TCP/QUIC connection to the given address.
@@ -56,5 +57,7 @@ pub trait SocketConnector: Send + Sync + Debug {
     ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
 
     /// Returns the bind interface configured for this socket connector, if any.
-    fn bind_interface(&self) -> Option<&str>;
+    fn bind_interface(&self) -> Option<&str> {
+        None
+    }
 }

@@ -71,6 +71,14 @@ impl ProxyConnector for ProxyConnectorImpl {
         self.client_handler.supports_udp_over_tcp()
     }
 
+    fn supports_native_udp(&self) -> bool {
+        self.client_handler.supports_native_udp()
+    }
+
+    fn needs_handshake_for_write(&self) -> bool {
+        self.client_handler.needs_handshake_for_write()
+    }
+
     async fn setup_tcp_stream(
         &self,
         stream: Box<dyn AsyncStream>,
@@ -96,6 +104,20 @@ impl ProxyConnector for ProxyConnectorImpl {
         );
         self.client_handler
             .setup_client_udp_bidirectional(stream, target)
+            .await
+    }
+
+    async fn setup_native_udp(
+        &self,
+        stream: Box<dyn AsyncMessageStream>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        debug!(
+            "[ProxyConnector] setup_native_udp: {} -> {}",
+            self.location, target
+        );
+        self.client_handler
+            .setup_client_native_udp(stream, target)
             .await
     }
 }

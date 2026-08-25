@@ -19,10 +19,11 @@
 //!
 //! ## Hot path cost
 //!
-//! Lookups happen once per connection, during the handshake, never per packet.
-//! Implementations are expected to be lock free; both of the ones shipped here are
-//! (an immutable map for static configs, a sharded concurrent map for dynamic
-//! ones), so authentication never contends with a config reload.
+//! Lookups happen once per connection, during the handshake, never per packet. The
+//! static registry is immutable and the dynamic registry uses sharded indexes. A
+//! successful dynamic authentication briefly enters only that user's lifecycle gate,
+//! so it can linearise against removal without contending with config reloads or
+//! unrelated users; metering itself remains atomic-only.
 //!
 //! ## Accounting
 //!
@@ -46,6 +47,7 @@
 
 pub mod credential;
 mod meter;
+mod rate;
 mod registry;
 mod reload;
 mod static_registry;
@@ -53,6 +55,7 @@ mod user;
 
 pub use meter::{
     ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
+    scope_connection_until_cancelled,
 };
 pub use registry::{ShadowsocksIdentity, TuicIdentity, UserRegistry, VmessIdentity};
 pub use reload::{HandlerSlot, SelectorSlot, ServerHandle};

@@ -231,17 +231,19 @@ async fn anytls_users_are_found_by_their_hashed_password() {
         FILLER + 2,
     );
 
-    // -- 9. removal is forward-looking only ------------------------------------
-    checks.section("9. removing a user leaves their open connection alone");
+    // -- 9. removal closes existing sessions -----------------------------------
+    checks.section("9. removing a user closes their open connection");
     let mut held = Socks::connect(rotated_leg, sink.address)
         .await
         .expect("bob should open a connection");
     held.write_all(b"wh").await.expect("send half a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("anytls", "bob")).await;
     checks.that(
-        "bob is removed",
-        engine.remove_user("anytls", "bob").is_ok(),
+        "bob is removed after his connection drains",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
     );
     checks.that(
         "a new bob connection is refused",
@@ -252,12 +254,11 @@ async fn anytls_users_are_found_by_their_hashed_password() {
         reach(alice_leg, sink.address).await.is_ok(),
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "bob's already-open connection still completes",
-        read_line(&mut held).await.ok(),
-        Some("sink".to_string()),
-    );
+    let closed = match held.write_all(b"o\n").await {
+        Err(_) => true,
+        Ok(()) => read_line(&mut held).await.is_err(),
+    };
+    checks.that("bob's already-open connection is actively closed", closed);
 
     checks.finish();
 }

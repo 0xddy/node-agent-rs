@@ -5,16 +5,21 @@ use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
-use crate::config::{DnsConfig, ExpandedDnsGroup, ExpandedDnsSpec};
+use crate::config::{
+    DnsConfig, ExpandedDnsGroup, ExpandedDnsPolicyAction, ExpandedDnsPolicyRule, ExpandedDnsSpec,
+};
 use crate::dns::composite_resolver::CompositeResolver;
 use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
 use crate::dns::parsed::{ParsedDnsServer, ParsedDnsServerEntry, ParsedDnsUrl};
+use crate::dns::policy::{PolicyAction, PolicyResolver, PolicyRuleSpec};
 use crate::option_util::NoneOrSome;
 use crate::resolver::{
-    CachingNativeResolver, NativeResolver, RefreshPolicy, RefreshingResolver, Resolver,
-    ResolverFactory, TimeoutResolver,
+    CachingNativeResolver, LateBoundResolver, NativeResolver, RefreshPolicy, RefreshingResolver,
+    Resolver, ResolverFactory, TimeoutResolver,
 };
-use crate::tcp::chain_builder::{build_client_chain_group, build_direct_chain_group};
+use crate::tcp::chain_builder::{
+    build_client_chain_group_with_selection, build_direct_chain_group,
+};
 
 /// Registry of resolved DNS groups with lazy default resolver.
 pub struct DnsRegistry {
@@ -300,6 +305,13 @@ fn build_hickory_from_server(
             bootstrap,
             options,
         )?),
+        ParsedDnsServer::Quic { addr, server_name } => Arc::new(HickoryResolver::quic(
+            addr,
+            server_name,
+            chain,
+            bootstrap,
+            options,
+        )?),
         ParsedDnsServer::Https {
             addr,
             server_name,
@@ -351,6 +363,11 @@ fn server_to_ns_config(
             cc.port = addr.port();
             Some((addr.ip(), cc))
         }
+        ParsedDnsServer::Quic { addr, server_name } => {
+            let mut cc = ConnectionConfig::quic(server_name.clone());
+            cc.port = addr.port();
+            Some((addr.ip(), cc))
+        }
         ParsedDnsServer::Https {
             addr,
             server_name,
@@ -398,6 +415,7 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
 
         let options = HickoryResolverOptions {
             ip_strategy: entry.ip_strategy,
+            use_native_roots: entry.use_native_roots,
             request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
             connect_timeout: Duration::from_secs(entry.connect_timeout_secs as u64),
             attempts: entry.attempts,
@@ -457,6 +475,7 @@ fn try_build_hickory_pool(
             || entry.connect_timeout_secs != first.connect_timeout_secs
             || entry.attempts != first.attempts
             || entry.ip_strategy != first.ip_strategy
+            || entry.use_native_roots != first.use_native_roots
         {
             return Ok(None);
         }
@@ -465,6 +484,7 @@ fn try_build_hickory_pool(
     let timeout_secs = first.timeout_secs;
     let options = HickoryResolverOptions {
         ip_strategy: first.ip_strategy,
+        use_native_roots: first.use_native_roots,
         request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
         connect_timeout: Duration::from_secs(first.connect_timeout_secs as u64),
         attempts: first.attempts,
@@ -495,11 +515,122 @@ pub async fn build_dns_registry(groups: Vec<ExpandedDnsGroup>) -> std::io::Resul
     let mut registry = DnsRegistry::new();
 
     for group in groups {
-        let resolver = build_resolver_from_specs(&group.specs, &registry, &group.name).await?;
+        let resolver = if group.final_server.is_some()
+            || !group.rules.is_empty()
+            || group.specs.iter().any(|spec| spec.tag.is_some())
+        {
+            build_policy_resolver(&group, &registry).await?
+        } else {
+            build_resolver_from_specs(&group.specs, &registry, &group.name).await?
+        };
         registry.register(group.name, resolver);
     }
 
     Ok(registry)
+}
+
+async fn build_policy_resolver(
+    group: &ExpandedDnsGroup,
+    registry: &DnsRegistry,
+) -> std::io::Result<Arc<dyn Resolver>> {
+    // A DNS upstream can use a proxy detour whose own server lookup names one
+    // of this policy's upstream tags. The policy does not exist until all of
+    // its upstream transports have been built, so give those chains a weak
+    // late-bound handle and connect it after constructing the policy.
+    let chain_resolver = Arc::new(LateBoundResolver::new());
+    let mut upstreams: FxHashMap<String, Arc<dyn Resolver>> = FxHashMap::default();
+    for spec in &group.specs {
+        let tag = spec.tag.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS policy group '{}' contains an untagged upstream",
+                    group.name
+                ),
+            )
+        })?;
+        let description = format!("{}/{}", group.name, tag);
+        let resolver = build_resolver_from_specs_with_chain_resolver(
+            std::slice::from_ref(spec),
+            registry,
+            &description,
+            Some(chain_resolver.clone()),
+        )
+        .await?;
+        if upstreams.insert(tag.to_string(), resolver).is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS policy group '{}' has duplicate upstream tag {tag:?}",
+                    group.name
+                ),
+            ));
+        }
+    }
+
+    let final_tag = group.final_server.as_deref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("DNS policy group '{}' has no final upstream", group.name),
+        )
+    })?;
+    let final_resolver = upstreams.get(final_tag).cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "DNS policy group '{}' final references unknown upstream tag {final_tag:?}",
+                group.name
+            ),
+        )
+    })?;
+
+    let rules = group
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| policy_rule_spec(group, &upstreams, index, rule))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let policy: Arc<dyn Resolver> = Arc::new(PolicyResolver::with_named_upstreams(
+        final_resolver,
+        rules,
+        upstreams,
+    )?);
+    chain_resolver.bind(&policy)?;
+    Ok(policy)
+}
+
+fn policy_rule_spec(
+    group: &ExpandedDnsGroup,
+    upstreams: &FxHashMap<String, Arc<dyn Resolver>>,
+    index: usize,
+    rule: &ExpandedDnsPolicyRule,
+) -> std::io::Result<PolicyRuleSpec> {
+    let action = match &rule.action {
+        ExpandedDnsPolicyAction::Route(tag) => {
+            let resolver = upstreams.get(tag).cloned().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "DNS policy group '{}' rules[{index}] references unknown upstream tag {tag:?}",
+                        group.name
+                    ),
+                )
+            })?;
+            PolicyAction::Route(resolver)
+        }
+        ExpandedDnsPolicyAction::Reject(method) => PolicyAction::Reject(*method),
+        ExpandedDnsPolicyAction::Predefined(response) => PolicyAction::Predefined(response.clone()),
+    };
+    Ok(PolicyRuleSpec {
+        exact: rule.exact.clone(),
+        suffix: rule.suffix.clone(),
+        keyword: rule.keyword.clone(),
+        regex: rule.regex.clone(),
+        rule_set: rule.rule_set.clone(),
+        timeout: (rule.timeout_millis != 0)
+            .then(|| std::time::Duration::from_millis(rule.timeout_millis)),
+        action,
+    })
 }
 
 /// Build a resolver from expanded DNS specs, wrapping hickory-backed groups
@@ -508,6 +639,15 @@ async fn build_resolver_from_specs(
     specs: &[ExpandedDnsSpec],
     registry: &DnsRegistry,
     group_name: &str,
+) -> std::io::Result<Arc<dyn Resolver>> {
+    build_resolver_from_specs_with_chain_resolver(specs, registry, group_name, None).await
+}
+
+async fn build_resolver_from_specs_with_chain_resolver(
+    specs: &[ExpandedDnsSpec],
+    registry: &DnsRegistry,
+    group_name: &str,
+    chain_resolver: Option<Arc<dyn Resolver>>,
 ) -> std::io::Result<Arc<dyn Resolver>> {
     if specs.is_empty() {
         return Err(std::io::Error::other("no DNS servers configured"));
@@ -518,7 +658,7 @@ async fn build_resolver_from_specs(
     let mut has_system = false;
 
     for spec in specs {
-        let (entry, plan) = build_entry_and_plan(spec, registry).await?;
+        let (entry, plan) = build_entry_and_plan(spec, registry, chain_resolver.as_ref()).await?;
         if matches!(entry.server, ParsedDnsServer::System) {
             has_system = true;
         }
@@ -555,14 +695,21 @@ async fn build_resolver_from_specs(
 async fn build_entry_and_plan(
     spec: &ExpandedDnsSpec,
     registry: &DnsRegistry,
+    chain_resolver: Option<&Arc<dyn Resolver>>,
 ) -> std::io::Result<(ParsedDnsServerEntry, Option<HickoryResolverPlan>)> {
     // Parse URL
     let parsed_url = ParsedDnsUrl::parse_with_server_name(&spec.url, spec.server_name.as_deref())
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Build client chain group
-    let chain_resolver = Arc::new(NativeResolver::new());
-    let chain_group = if spec.client_chains.is_empty() {
+    let chain_resolver: Arc<dyn Resolver> = chain_resolver
+        .cloned()
+        .unwrap_or_else(|| Arc::new(NativeResolver::new()));
+    let chain_group = if spec.client_chains.is_empty()
+        && matches!(
+            &spec.client_chain_selection,
+            crate::config::ClientChainSelectionConfig::RoundRobin
+        ) {
         Arc::new(build_direct_chain_group(chain_resolver))
     } else {
         let chains = if spec.client_chains.len() == 1 {
@@ -570,7 +717,11 @@ async fn build_entry_and_plan(
         } else {
             NoneOrSome::Some(spec.client_chains.clone())
         };
-        Arc::new(build_client_chain_group(chains, chain_resolver))
+        Arc::new(build_client_chain_group_with_selection(
+            chains,
+            spec.client_chain_selection.clone(),
+            chain_resolver,
+        ))
     };
 
     // Build or get bootstrap resolver
@@ -611,8 +762,10 @@ async fn build_entry_and_plan(
     };
 
     let timeout_secs = spec.timeout_secs;
+    let effective_use_native_roots = spec.use_native_roots && parsed_url.uses_tls();
     let options = HickoryResolverOptions {
         ip_strategy: spec.ip_strategy,
+        use_native_roots: effective_use_native_roots,
         request_timeout: (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs as u64)),
         connect_timeout: Duration::from_secs(spec.connect_timeout_secs as u64),
         attempts: spec.attempts,
@@ -624,9 +777,12 @@ async fn build_entry_and_plan(
             parsed_url: parsed_url.clone(),
             chain_group: chain_group.clone(),
             bootstrap_resolver: bootstrap_resolver.clone(),
-            chain_key: serde_yaml::to_string(&spec.client_chains).map_err(|e| {
-                std::io::Error::other(format!("failed to serialize client_chains: {e}"))
-            })?,
+            chain_key: serde_yaml::to_string(&(&spec.client_chains, &spec.client_chain_selection))
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "failed to serialize client_chains selection: {e}"
+                    ))
+                })?,
             bootstrap_key: spec.bootstrap_url.clone(),
             options,
             description: spec.url.clone(),
@@ -671,7 +827,8 @@ async fn build_entry_and_plan(
         spec.timeout_secs,
         spec.connect_timeout_secs,
         spec.attempts,
-    );
+    )
+    .with_native_roots(effective_use_native_roots);
 
     Ok((entry, plan))
 }
@@ -679,7 +836,11 @@ async fn build_entry_and_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ExpandedDnsSpec;
+    use crate::address::{Address, NetLocation};
+    use crate::config::{
+        DnsServerSpec, ExpandedDnsGroup, ExpandedDnsPolicyAction, ExpandedDnsPolicyRule,
+        ExpandedDnsSpec,
+    };
     use crate::dns::parsed::{IpStrategy, ParsedDnsServer};
     use crate::resolver::NativeResolver;
     use crate::tcp::chain_builder::build_direct_chain_group;
@@ -712,14 +873,69 @@ mod tests {
 
     fn make_spec(url: &str) -> ExpandedDnsSpec {
         ExpandedDnsSpec {
+            tag: None,
             url: url.to_string(),
             server_name: None,
+            use_native_roots: false,
             client_chains: vec![],
+            client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
             bootstrap_url: None,
             ip_strategy: IpStrategy::default(),
             timeout_secs: 5,
             connect_timeout_secs: 5,
             attempts: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_builder_preserves_urltest_client_chain_selection() {
+        let mut spec = make_spec("tcp://1.1.1.1");
+        spec.client_chains = vec![
+            crate::config::ClientChain::default(),
+            crate::config::ClientChain::default(),
+        ];
+        spec.client_chain_selection = crate::config::ClientChainSelectionConfig::UrlTest {
+            url: "http://127.0.0.1:9/generate_204".to_string(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 30_000,
+            tolerance_millis: 50,
+            idle_timeout_millis: 1_800_000,
+        };
+
+        let (_, plan) = build_entry_and_plan(&spec, &DnsRegistry::new(), None)
+            .await
+            .unwrap();
+        let plan = plan.unwrap();
+        assert!(format!("{:?}", plan.chain_group).contains("UrlTest"));
+        assert!(plan.chain_key.contains("urltest"));
+    }
+
+    #[tokio::test]
+    async fn native_roots_are_normalized_for_dns_entries_and_refresh_plans() {
+        for (url, expected) in [
+            ("system", false),
+            ("udp://1.1.1.1", false),
+            ("tcp://1.1.1.1", false),
+            ("tls://1.1.1.1", true),
+            ("quic://1.1.1.1", true),
+            ("https://1.1.1.1/dns-query", true),
+            ("h3://1.1.1.1/dns-query", true),
+        ] {
+            let mut spec = make_spec(url);
+            spec.use_native_roots = true;
+            let (entry, plan) = build_entry_and_plan(&spec, &DnsRegistry::new(), None)
+                .await
+                .unwrap();
+            assert_eq!(entry.use_native_roots, expected, "entry for {url}");
+            if let Some(plan) = plan {
+                assert_eq!(
+                    plan.options.use_native_roots, expected,
+                    "refresh plan for {url}"
+                );
+            } else {
+                assert_eq!(url, "system");
+            }
         }
     }
 
@@ -754,6 +970,86 @@ mod tests {
             !debug.contains("CompositeResolver"),
             "compatible entries should NOT produce CompositeResolver, got: {}",
             debug
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_returns_policy_resolver_for_server_group() {
+        let mut upstream = make_spec("system");
+        upstream.tag = Some("system-final".to_string());
+        let group = ExpandedDnsGroup {
+            name: "policy-dns".to_string(),
+            specs: vec![upstream],
+            final_server: Some("system-final".to_string()),
+            rules: vec![
+                ExpandedDnsPolicyRule {
+                    exact: vec!["static.example".to_string()],
+                    suffix: Vec::new(),
+                    keyword: Vec::new(),
+                    regex: Vec::new(),
+                    rule_set: Vec::new(),
+                    action: ExpandedDnsPolicyAction::Predefined(
+                        crate::dns::DnsPredefinedResponse::no_error(vec![
+                            "192.0.2.7".parse().unwrap(),
+                        ]),
+                    ),
+                    timeout_millis: 0,
+                },
+                ExpandedDnsPolicyRule {
+                    exact: vec!["empty.example".to_string()],
+                    suffix: Vec::new(),
+                    keyword: Vec::new(),
+                    regex: Vec::new(),
+                    rule_set: Vec::new(),
+                    action: ExpandedDnsPolicyAction::Predefined(
+                        crate::dns::DnsPredefinedResponse::no_error(Vec::new()),
+                    ),
+                    timeout_millis: 0,
+                },
+                ExpandedDnsPolicyRule {
+                    exact: Vec::new(),
+                    suffix: vec!["blocked.example".to_string()],
+                    keyword: Vec::new(),
+                    regex: Vec::new(),
+                    rule_set: Vec::new(),
+                    action: ExpandedDnsPolicyAction::Reject(crate::dns::DnsRejectMethod::Default),
+                    timeout_millis: 0,
+                },
+            ],
+        };
+        let mut registry = build_dns_registry(vec![group]).await.unwrap();
+        let config = DnsConfig {
+            servers: NoneOrSome::One(DnsServerSpec::Simple("policy-dns".to_string())),
+            final_server: None,
+            rules: Vec::new(),
+        };
+        let resolver = registry.get_for_server(Some(&config));
+
+        let static_location =
+            NetLocation::new(Address::Hostname("STATIC.EXAMPLE.".to_string()), 8443);
+        assert_eq!(
+            resolver.resolve_location(&static_location).await.unwrap(),
+            ["192.0.2.7:8443".parse().unwrap()]
+        );
+
+        let empty_location = NetLocation::new(Address::Hostname("empty.example".to_string()), 53);
+        assert!(
+            resolver
+                .resolve_location(&empty_location)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let blocked_location =
+            NetLocation::new(Address::Hostname("ads.blocked.example".to_string()), 53);
+        assert_eq!(
+            resolver
+                .resolve_location(&blocked_location)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
         );
     }
 
@@ -965,6 +1261,31 @@ mod tests {
     }
 
     #[test]
+    fn test_quic_server_builds_native_doq_with_custom_sni_and_port() {
+        use hickory_resolver::config::ProtocolConfig;
+
+        let server = ParsedDnsServer::Quic {
+            addr: "94.140.14.14:8853".parse().unwrap(),
+            server_name: Arc::from("dns.example.com"),
+        };
+        let (ip, connection) = server_to_ns_config(&server).unwrap();
+        assert_eq!(ip, "94.140.14.14".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(connection.port, 8853);
+        assert!(matches!(
+            connection.protocol,
+            ProtocolConfig::Quic { ref server_name } if &**server_name == "dns.example.com"
+        ));
+
+        let (chain, bootstrap) = shared_test_deps();
+        let resolver = build_resolver(vec![make_entry(server, &chain, &bootstrap)]).unwrap();
+        let debug = format!("{resolver:?}");
+        assert!(
+            debug.contains("quic://94.140.14.14:8853#dns.example.com"),
+            "expected native DoQ resolver description, got: {debug}"
+        );
+    }
+
+    #[test]
     fn test_three_compatible_servers_pooled() {
         let (chain, bootstrap) = shared_test_deps();
         let entries = vec![
@@ -1036,8 +1357,12 @@ mod tests {
         let spec_a = make_spec("udp://8.8.8.8");
         let spec_b = make_spec("udp://8.8.4.4");
 
-        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry).await.unwrap();
-        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry).await.unwrap();
+        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry, None)
+            .await
+            .unwrap();
+        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry, None)
+            .await
+            .unwrap();
         let plans = vec![plan_a.unwrap(), plan_b.unwrap()];
 
         let resolver = build_hickory_resolver_group(&plans).await.unwrap();
@@ -1061,8 +1386,12 @@ mod tests {
         let mut spec_b = make_spec("udp://8.8.4.4");
         spec_b.attempts = 3;
 
-        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry).await.unwrap();
-        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry).await.unwrap();
+        let (_, plan_a) = build_entry_and_plan(&spec_a, &registry, None)
+            .await
+            .unwrap();
+        let (_, plan_b) = build_entry_and_plan(&spec_b, &registry, None)
+            .await
+            .unwrap();
         let plans = vec![plan_a.unwrap(), plan_b.unwrap()];
 
         let resolver = build_hickory_resolver_group(&plans).await.unwrap();

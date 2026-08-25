@@ -199,7 +199,7 @@ async fn handle_tcp_connection(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let decision = proxy_selector.judge(target.into(), &resolver).await?;
+    let decision = proxy_selector.judge_tcp(target.into(), &resolver).await?;
 
     match decision {
         crate::client_proxy_selector::ConnectDecision::Allow {

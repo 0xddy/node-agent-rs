@@ -12,6 +12,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use super::handshake_gate::{
+    HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
+};
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use super::tcp_server_handler_factory::create_tcp_server_handler;
 
@@ -23,10 +26,12 @@ use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConf
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::dynamic::{
-    ConnContext, HandlerSlot, ServerHandle, TrafficMeterStream, UserRegistry, scope_connection,
+    ConnContext, HandlerSlot, ServerHandle, TrafficMeterStream, UserRegistry,
+    scope_connection_until_cancelled,
 };
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
+use crate::routing::protocol::{SniffedTcpMetadata, sniff_tcp};
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
@@ -44,6 +49,8 @@ async fn run_tcp_server(
     let TcpConfig { no_delay } = tcp_config;
 
     let listener = new_tcp_listener(bind_address, 4096, None)?;
+    // One budget per listener, so a flood against this bind cannot starve another.
+    let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
 
     loop {
         // Returning here drops the listener, which is what frees the port. The
@@ -65,6 +72,18 @@ async fn run_tcp_server(
             },
         };
 
+        // Taken before anything is spent on this connection, and released again the
+        // moment its handshake resolves. Dropping `stream` here is the refusal: the
+        // peer sees a closed connection and this listener spends nothing further on
+        // an address that is already holding as much of the budget as it may.
+        let Some(permit) = handshake_gate.enter(Some(addr.ip())) else {
+            debug!(
+                "refusing {}: the listener is at its pending-handshake limit",
+                addr.ip()
+            );
+            continue;
+        };
+
         if let Err(e) = set_tcp_keepalive(
             &stream,
             std::time::Duration::from_secs(300),
@@ -84,7 +103,8 @@ async fn run_tcp_server(
         let (cloned_handler, cloned_resolver) = handler_slot.load();
         tokio::spawn(async move {
             if let Err(e) =
-                process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
+                process_metered_stream(stream, metered, cloned_handler, cloned_resolver, permit)
+                    .await
             {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -110,6 +130,9 @@ async fn run_unix_server(
     }
 
     let listener = crate::socket_util::new_unix_listener(path_buf, 4096)?;
+    // See `run_tcp_server`. A unix peer has no address to hold a share of, so only
+    // the total applies here.
+    let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
 
     loop {
         // See `run_tcp_server`.
@@ -129,10 +152,17 @@ async fn run_unix_server(
         };
 
         // See `run_tcp_server`.
+        let Some(permit) = handshake_gate.enter(None) else {
+            debug!("refusing a unix peer: at the pending-handshake limit");
+            continue;
+        };
+
+        // See `run_tcp_server`.
         let (cloned_handler, cloned_resolver) = handler_slot.load();
         tokio::spawn(async move {
             if let Err(e) =
-                process_metered_stream(stream, metered, cloned_handler, cloned_resolver).await
+                process_metered_stream(stream, metered, cloned_handler, cloned_resolver, permit)
+                    .await
             {
                 error!("{addr:?} finished with error: {e:?}");
             } else {
@@ -154,17 +184,22 @@ async fn process_metered_stream<AS>(
     metered: bool,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
+    permit: HandshakePermit,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
 {
     if !metered {
-        return process_stream(stream, server_handler, resolver).await;
+        return process_stream(stream, server_handler, resolver, permit).await;
     }
 
     let conn = ConnContext::new();
     let stream = TrafficMeterStream::new(stream, Arc::clone(&conn));
-    scope_connection(conn, process_stream(stream, server_handler, resolver)).await
+    scope_connection_until_cancelled(
+        conn,
+        process_stream(stream, server_handler, resolver, permit),
+    )
+    .await
 }
 
 async fn setup_server_stream<AS>(
@@ -178,10 +213,17 @@ where
     server_handler.setup_server_stream(server_stream).await
 }
 
+/// Run one accepted connection to completion.
+///
+/// `permit` is this connection's place in the listener's pending-handshake budget.
+/// It is taken as a value rather than borrowed because the point is to release it
+/// early: it is dropped as soon as the handshake below resolves, not when the
+/// connection ends. See [`handshake_gate`](super::handshake_gate).
 pub async fn process_stream<AS>(
     stream: AS,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
+    permit: HandshakePermit,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -207,6 +249,14 @@ where
         }
     };
 
+    // The handshake is over, so the budget it was charged against is no longer the
+    // right one to hold: everything past this point is either an authenticated
+    // connection, bounded by its own user's ceiling, or a protocol that does not
+    // authenticate at all. Holding on would turn a bound on handshakes into a bound
+    // on connections, which is exactly the shape this gate exists to avoid. The
+    // early returns above release it too, by dropping it on the way out.
+    drop(permit);
+
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
@@ -216,13 +266,20 @@ where
             connection_success_response,
             initial_remote_data,
         } => {
+            let mut replay = initial_remote_data.map(Vec::from).unwrap_or_default();
+            let sniffed = if proxy_selector.needs_tcp_protocol_sniff() {
+                sniff_tcp(&mut server_stream, &mut replay).await?
+            } else {
+                None
+            };
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_tcp_stream(
+                setup_client_tcp_stream_with_metadata(
                     &mut server_stream,
                     proxy_selector,
                     resolver,
                     remote_location.clone(),
+                    sniffed,
                 ),
             );
 
@@ -255,12 +312,11 @@ where
                 // it's needed.
             }
 
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    write_all(&mut client_stream, &data).await?;
-                    true
-                }
-                None => false,
+            let client_need_initial_flush = if replay.is_empty() {
+                false
+            } else {
+                write_all(&mut client_stream, &replay).await?;
+                true
             };
 
             let copy_result = copy_bidirectional(
@@ -283,7 +339,7 @@ where
             proxy_selector,
         } => {
             let action = proxy_selector
-                .judge(remote_location.into(), &resolver)
+                .judge_udp(remote_location.into(), &resolver)
                 .await?;
             match action {
                 ConnectDecision::Allow {
@@ -350,9 +406,40 @@ pub async fn setup_client_tcp_stream(
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    let action = client_proxy_selector
-        .judge(remote_location.into(), &resolver)
-        .await?;
+    setup_client_tcp_stream_with_metadata(
+        server_stream,
+        client_proxy_selector,
+        resolver,
+        remote_location,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn setup_client_tcp_stream_with_metadata(
+    server_stream: &mut Box<dyn AsyncStream>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    remote_location: NetLocation,
+    metadata: Option<SniffedTcpMetadata>,
+) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
+    let action = match metadata {
+        Some(metadata) => {
+            client_proxy_selector
+                .judge_sniffed_tcp(
+                    remote_location.into(),
+                    &resolver,
+                    metadata.protocol,
+                    metadata.domain,
+                )
+                .await?
+        }
+        None => {
+            client_proxy_selector
+                .judge_tcp(remote_location.into(), &resolver)
+                .await?
+        }
+    };
 
     match action {
         ConnectDecision::Allow {
@@ -544,7 +631,7 @@ async fn start_tcp_servers(
                 }
             }
         }
-        BindLocation::Path(path_buf) => {
+        BindLocation::Path(_path_buf) => {
             #[cfg(target_family = "unix")]
             {
                 let handler_slot = handle.slot_for_path(
@@ -560,7 +647,7 @@ async fn start_tcp_servers(
                 debug!("TCP handler: {handler_slot:?}");
                 let cancel = handle.cancel_token();
                 let listener = tokio::spawn(async move {
-                    run_unix_server(path_buf, handler_slot, metered, cancel)
+                    run_unix_server(_path_buf, handler_slot, metered, cancel)
                         .await
                         .unwrap();
                 });
@@ -568,8 +655,7 @@ async fn start_tcp_servers(
             }
             #[cfg(not(target_family = "unix"))]
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "Unix sockets are not supported on this platform",
                 ));
             }

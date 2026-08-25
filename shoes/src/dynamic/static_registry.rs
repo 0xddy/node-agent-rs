@@ -44,7 +44,7 @@ struct Entry {
 impl Entry {
     fn new(id: &str, credential: impl Into<Box<[u8]>>) -> Self {
         Self {
-            context: UserContext::new(id),
+            context: UserContext::new_untracked(id),
             credential: credential.into(),
             vmess: None,
             tuic_password: None,
@@ -69,7 +69,6 @@ impl Entry {
         if self.credential.ct_eq(presented).unwrap_u8() == 0 || !self.context.is_enabled() {
             return None;
         }
-        self.context.note_auth();
         Some(self.context.clone())
     }
 
@@ -79,8 +78,9 @@ impl Entry {
     /// nothing is being compared against a stored secret. A valid checksum means the
     /// sixteen bytes were produced by somebody holding the uuid -- which is not the
     /// same as the *sender* holding it, since those bytes cross the wire in the
-    /// clear and can be copied. So this does not call `note_auth`; the handler does,
-    /// once the header AEAD proves it. See [`UserRegistry::find_vmess_auth_id`].
+    /// clear and can be copied. Like every registry lookup this only resolves a
+    /// candidate; the handler admits it once the header AEAD proves possession. See
+    /// [`UserRegistry::find_vmess_auth_id`].
     fn verify_vmess(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
         let key = self.vmess.as_ref()?;
         let timestamp = key.open(auth_id)?;
@@ -96,9 +96,8 @@ impl Entry {
 
     /// This entry's user and TUIC password, if the uuid is theirs.
     ///
-    /// Deliberately does not call `note_auth`, unlike every other method here: the
-    /// token that proves the client holds the password has not been checked yet, and
-    /// cannot be checked from in here. See
+    /// The token that proves the client holds the password has not been checked yet,
+    /// and cannot be checked from in here. See
     /// [`UserRegistry::find_tuic_uuid`](super::registry::UserRegistry::find_tuic_uuid).
     fn verify_tuic(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> {
         let password = self.tuic_password.clone()?;
@@ -326,7 +325,7 @@ mod tests {
 
         let found = registry.find_uuid(&uuid_bytes(UUID)).unwrap();
         assert_eq!(&**found.id(), UUID);
-        assert_eq!(found.total_conns(), 1);
+        assert_eq!(found.total_conns(), 0);
 
         assert!(
             registry
@@ -390,13 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn finds_a_cleartext_password_and_counts_the_hit() {
+    fn finds_a_cleartext_password_without_admitting_it() {
         let registry = StaticUserRegistry::single_password("hunter2");
         let found = registry
             .find_password("hunter2")
             .expect("the config's own password should authenticate");
         assert_eq!(&**found.id(), CONFIG_USER_ID);
-        assert_eq!(found.total_conns(), 1);
+        assert_eq!(found.total_conns(), 0);
 
         assert!(registry.find_password("hunter3").is_none());
         // A prefix must not match: the comparison is over the whole value.
@@ -417,7 +416,7 @@ mod tests {
         let user = registry.find_password("hunter2").unwrap();
         user.set_enabled(false);
         assert!(registry.find_password("hunter2").is_none());
-        assert_eq!(user.total_conns(), 1, "a denial is not a connection");
+        assert_eq!(user.total_conns(), 0, "a lookup is not a connection");
         user.set_enabled(true);
         assert!(registry.find_password("hunter2").is_some());
     }
@@ -479,11 +478,9 @@ mod tests {
             .user;
         assert!(Arc::ptr_eq(&by_uuid, &by_auth_id));
 
-        // One authentication, not two. VLESS' lookup counts, because a client that
-        // did not hold the uuid could not have sent it; VMess' does not, because its
-        // auth id can be copied off the wire and replayed, so the handler counts once
-        // the header AEAD proves the sender holds the key.
-        assert_eq!(by_uuid.total_conns(), 1);
+        // Neither lookup admits a connection. VLESS can admit immediately after its
+        // lookup; VMess waits until the header AEAD proves the sender holds the key.
+        assert_eq!(by_uuid.total_conns(), 0);
     }
 
     #[test]
@@ -498,9 +495,9 @@ mod tests {
         user.set_enabled(true);
         assert!(registry.find_vmess_auth_id(&auth_id).is_some());
 
-        // Not once, across all three lookups. This one names a user rather than
-        // authenticating them -- the handler counts, once the header AEAD opens --
-        // so nothing here is billable however many times it is asked.
+        // Not once, across all three lookups. The handler admits only after the
+        // header AEAD opens, so nothing here is billable however many times it is
+        // asked.
         assert_eq!(user.total_conns(), 0);
     }
 
@@ -571,7 +568,7 @@ mod tests {
             .find_password_sha256(&hash)
             .expect("the config's own password should authenticate");
         assert_eq!(&**found.id(), "alice");
-        assert_eq!(found.total_conns(), 1);
+        assert_eq!(found.total_conns(), 0);
 
         assert!(
             registry
@@ -626,7 +623,7 @@ mod tests {
             .find_naive_basic(&encoded)
             .expect("the config's own credential should authenticate");
         assert_eq!(&**found.id(), "alice");
-        assert_eq!(found.total_conns(), 1);
+        assert_eq!(found.total_conns(), 0);
 
         // The username alone is not the credential, nor is the password.
         assert!(
@@ -692,7 +689,7 @@ mod tests {
         let user = registry.find_naive_basic(&encoded).unwrap();
         user.set_enabled(false);
         assert!(registry.find_naive_basic(&encoded).is_none());
-        assert_eq!(user.total_conns(), 1, "a denial is not a connection");
+        assert_eq!(user.total_conns(), 0, "a lookup is not a connection");
         user.set_enabled(true);
         assert!(registry.find_naive_basic(&encoded).is_some());
     }

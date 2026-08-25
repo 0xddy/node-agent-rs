@@ -81,6 +81,8 @@
 //! `docs/dynamic-engine-design.md` covers the design these hooks implement, and
 //! collects the invariants a new protocol conversion has to preserve.
 
+pub const DATA_PLANE_VERSION: &str = shoes::VERSION;
+
 mod error;
 mod inbound;
 mod protocol;
@@ -208,7 +210,7 @@ impl Engine {
         bound_addresses.sort();
 
         EngineStatus {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: DATA_PLANE_VERSION.to_string(),
             inbounds: self.inner.inbounds.len(),
             bound_addresses,
         }
@@ -227,6 +229,55 @@ impl Engine {
 
     pub fn get_inbound(&self, tag: &str) -> Option<Arc<InboundSlot>> {
         self.inner.inbounds.get(tag).map(|e| e.value().clone())
+    }
+
+    /// Validates a complete inbound payload without opening sockets or changing
+    /// engine state.
+    ///
+    /// A control plane should call this before replacing a running inbound. It
+    /// checks the shoes schema and all dynamic-user credential constraints, so an
+    /// invalid candidate can be rejected while the healthy listener is still up.
+    /// Bind conflicts and operating-system failures are necessarily checked by
+    /// [`Self::add_inbound`] when the replacement is actually started.
+    pub async fn validate_inbound(&self, spec: &InboundSpec) -> EngineResult<()> {
+        let tag = spec.tag.trim();
+        if tag.is_empty() {
+            return Err(EngineError::InvalidConfig("tag must not be empty".into()));
+        }
+
+        let mut config = spec.config.clone();
+        if spec.users.is_some() {
+            protocol::install_placeholder_credentials(&mut config)?;
+        }
+
+        let ValidatedInbound {
+            configs: server_configs,
+            ..
+        } = validate_inbound_config(config).await?;
+
+        if let Some(users) = &spec.users {
+            Self::build_user_registry(&server_configs, users.clone())?;
+        }
+
+        // Resolve and de-duplicate the candidate's own listen set as well. Do not
+        // compare it with `inner.bound` here: the ordinary reason to preflight is
+        // replacing an inbound that already owns the same socket.
+        let mut claimed = Vec::new();
+        for server_config in &server_configs {
+            let targets =
+                resolve_bind_targets(&server_config.bind_location, &server_config.transport)?;
+            for key in targets.keys() {
+                if claimed.contains(&key) {
+                    return Err(EngineError::AddressInUse {
+                        address: key.to_string(),
+                        tag: tag.to_string(),
+                    });
+                }
+                claimed.push(key);
+            }
+        }
+
+        Ok(())
     }
 
     /// Validates, binds and starts one inbound, then registers it under `tag`.
@@ -513,7 +564,7 @@ impl Engine {
         if let Some(registry) = slot.users() {
             let kinds = Self::registry_kinds_for(&server_configs)?;
             if kinds != registry.kinds() {
-                return Err(EngineError::Unsupported(format!(
+                return Err(EngineError::ReloadRequired(format!(
                     "cannot change what this inbound authenticates with in place: its \
                      users hold {} and the new config asks for {}. Their credentials \
                      would have to be reissued, so do it as a remove plus an add",
@@ -529,7 +580,9 @@ impl Engine {
             paired.push((server_config, resolver));
         }
 
-        let revision = slot.reload(paired).map_err(EngineError::from_rejection)?;
+        let revision = slot
+            .reload(paired)
+            .map_err(EngineError::from_reload_rejection)?;
 
         let info = slot.describe();
         info!(
@@ -681,17 +734,34 @@ impl Engine {
     ///
     /// Updating an existing id keeps that user's counters and their established
     /// connections; only the credential and the enabled flag are replaced.
+    /// An id whose previous removal has not yet returned its final counters cannot
+    /// be reused; call [`Self::remove_user`] again to collect that result first.
     pub fn add_user(&self, tag: &str, user: UserSpec) -> EngineResult<UserInfo> {
         self.registry_for(tag)?.upsert(user)
     }
 
-    /// Removes one user from `tag`.
+    /// Removes one user from `tag` and actively closes every connection currently
+    /// authenticated as them.
     ///
-    /// Their established connections keep running and keep being accounted for --
-    /// each one holds its own `Arc<UserContext>`, taken at handshake time. Only
-    /// the lookup path forgets the credential, so no new session can use it.
-    pub fn remove_user(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
-        self.registry_for(tag)?.remove(tag, id)
+    /// The credential is revoked before this method waits, so no new session can
+    /// race into the drain. The returned [`UserInfo`] is produced only after every
+    /// registered connection has exited and therefore contains the user's final
+    /// traffic and connection counters. If this future is cancelled while draining,
+    /// calling `remove_user` again with the same id attaches to that removal and
+    /// returns the recoverable final snapshot. The id remains reserved until that
+    /// result is collected, so a re-add cannot silently discard the old counters.
+    pub async fn remove_user(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        self.registry_for(tag)?.remove(tag, id).await
+    }
+
+    /// Closes every connection currently authenticated as `id` while keeping the
+    /// user registered and eligible to reconnect.
+    ///
+    /// This is intentionally distinct from [`Self::remove_user`]. It is useful for
+    /// credential rotation and remote administrative disconnects, where the old
+    /// sessions must end but the current credential must remain authorized.
+    pub fn kick_user(&self, tag: &str, id: &str) -> EngineResult<u64> {
+        self.registry_for(tag)?.kick(tag, id)
     }
 
     pub fn list_users(&self, tag: &str) -> EngineResult<Vec<UserInfo>> {

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use log::debug;
@@ -7,13 +8,14 @@ use rand::{Rng, RngExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::salt_checker::SaltChecker;
-use super::timed_salt_checker::TimedSaltChecker;
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::dynamic::{UserContext, UserRegistry, bind_connection_user};
-use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+use crate::config::ShadowsocksUdpMode;
+use crate::dynamic::{UserContext, UserRegistry, bind_connection_user, current_connection};
+use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
+use crate::replay_filter::ReplayFilter;
 use crate::resolver::Resolver;
 use crate::socks_handler::{read_location, write_location_to_vec};
 use crate::stream_reader::StreamReader;
@@ -30,6 +32,7 @@ use super::shadowsocks_cipher::ShadowsocksCipher;
 use super::shadowsocks_key::ShadowsocksKey;
 use super::shadowsocks_stream::ShadowsocksStream;
 use super::shadowsocks_stream_type::ShadowsocksStreamType;
+use super::shadowsocks_udp::ShadowsocksUdpCodecConfig;
 
 /// What this handler does about identity headers, if anything.
 ///
@@ -72,7 +75,8 @@ pub struct ShadowsocksTcpHandler {
     key: Arc<Box<dyn ShadowsocksKey>>,
     aead2022: bool,
     salt_checker: Option<Arc<Mutex<dyn SaltChecker>>>,
-    udp_enabled: bool,
+    udp_mode: ShadowsocksUdpMode,
+    udp_codec_config: Option<ShadowsocksUdpCodecConfig>,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
     /// DNS resolver for h2mux sessions. None when used as client handler.
@@ -99,7 +103,12 @@ impl ShadowsocksTcpHandler {
             key,
             aead2022: false,
             salt_checker: None,
-            udp_enabled,
+            udp_mode: if udp_enabled {
+                ShadowsocksUdpMode::Uot
+            } else {
+                ShadowsocksUdpMode::Disabled
+            },
+            udp_codec_config: None,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
             identity: None,
@@ -107,17 +116,24 @@ impl ShadowsocksTcpHandler {
     }
 
     /// Create a new handler for client use (no proxy_selector needed)
-    pub fn new_client(cipher: ShadowsocksCipher, password: &str, udp_enabled: bool) -> Self {
+    pub fn new_client(
+        cipher: ShadowsocksCipher,
+        password: &str,
+        udp_mode: ShadowsocksUdpMode,
+    ) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(DefaultKey::new(
             password,
             cipher.algorithm().key_len(),
         )));
+        let udp_codec_config = (udp_mode == ShadowsocksUdpMode::Native)
+            .then(|| ShadowsocksUdpCodecConfig::legacy(cipher, key.clone()));
         Self {
             cipher,
             key,
             aead2022: false,
             salt_checker: None,
-            udp_enabled,
+            udp_mode,
+            udp_codec_config,
             proxy_selector: None,
             resolver: None,
             identity: None,
@@ -140,8 +156,13 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
-            udp_enabled,
+            salt_checker: Some(Arc::new(Mutex::new(ReplayFilter::new(SALT_WINDOW)))),
+            udp_mode: if udp_enabled {
+                ShadowsocksUdpMode::Uot
+            } else {
+                ShadowsocksUdpMode::Disabled
+            },
+            udp_codec_config: None,
             proxy_selector: Some(proxy_selector),
             resolver: Some(resolver),
             identity: None,
@@ -152,18 +173,30 @@ impl ShadowsocksTcpHandler {
     pub fn new_aead2022_client(
         cipher: ShadowsocksCipher,
         key_bytes: &[u8],
-        udp_enabled: bool,
+        udp_mode: ShadowsocksUdpMode,
     ) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
             key_bytes.to_vec().into_boxed_slice(),
             cipher.algorithm().key_len(),
         )));
+        let udp_codec_config = if udp_mode == ShadowsocksUdpMode::Native {
+            Some(
+                ShadowsocksUdpCodecConfig::aead2022(
+                    cipher,
+                    vec![key_bytes.to_vec().into_boxed_slice()].into_boxed_slice(),
+                )
+                .expect("validated Shadowsocks 2022 client key"),
+            )
+        } else {
+            None
+        };
         Self {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(TimedSaltChecker::new(60)))),
-            udp_enabled,
+            salt_checker: Some(Arc::new(Mutex::new(ReplayFilter::new(SALT_WINDOW)))),
+            udp_mode,
+            udp_codec_config,
             proxy_selector: None,
             resolver: None,
             identity: None,
@@ -221,14 +254,14 @@ impl ShadowsocksTcpHandler {
         cipher: ShadowsocksCipher,
         identity_keys: &[Box<[u8]>],
         key_bytes: &[u8],
-        udp_enabled: bool,
+        udp_mode: ShadowsocksUdpMode,
     ) -> std::io::Result<Self> {
         check_psk_len(&cipher, key_bytes.len())?;
         for key in identity_keys {
             check_psk_len(&cipher, key.len())?;
         }
 
-        let mut handler = Self::new_aead2022_client(cipher, key_bytes, udp_enabled);
+        let mut handler = Self::new_aead2022_client(cipher, key_bytes, udp_mode);
         if identity_keys.is_empty() {
             return Ok(handler);
         }
@@ -249,6 +282,10 @@ impl ShadowsocksTcpHandler {
             .chain(std::iter::once(key_bytes.to_vec().into_boxed_slice()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        if udp_mode == ShadowsocksUdpMode::Native {
+            handler.udp_codec_config =
+                Some(ShadowsocksUdpCodecConfig::aead2022(cipher, chain.clone())?);
+        }
         handler.identity = Some(IdentityRole::Client { chain });
         Ok(handler)
     }
@@ -353,6 +390,10 @@ fn check_psk_len(cipher: &ShadowsocksCipher, len: usize) -> std::io::Result<()> 
     Ok(())
 }
 
+/// How long a Shadowsocks AEAD salt is remembered, per SIP022: "salts only have to
+/// be stored for 60 seconds".
+const SALT_WINDOW: Duration = Duration::from_secs(60);
+
 #[async_trait]
 impl TcpServerHandler for ShadowsocksTcpHandler {
     async fn setup_server_stream(
@@ -408,10 +449,14 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
         // was a claim; from here it is a fact, so this is where the authentication is
         // counted and the connection starts being billed.
         if let Some(user) = named_user {
-            user.note_auth();
             // Everything read so far -- salt, header, the first chunk -- is already
             // counted against the inbound, and the meter hands it over.
-            bind_connection_user(&user);
+            if !bind_connection_user(&user) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "user could not be admitted: removed, suspended, or at their connection limit",
+                ));
+            }
         }
 
         if self.aead2022 {
@@ -440,17 +485,19 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
                 .clone()
                 .expect("proxy_selector required for server handler");
             let resolver = self.resolver.clone().expect("resolver required for h2mux");
-            let udp_enabled = self.udp_enabled;
+            let udp_enabled = self.udp_mode != ShadowsocksUdpMode::Disabled;
 
             let initial_data = stream_reader.unparsed_data_owned();
+            let meter = current_connection();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_h2mux_session(
+                if let Err(e) = handle_h2mux_session_with_meter(
                     server_stream,
                     initial_data,
                     udp_enabled,
                     proxy_selector,
                     resolver,
+                    meter,
                 )
                 .await
                 {
@@ -463,7 +510,9 @@ impl TcpServerHandler for ShadowsocksTcpHandler {
 
         // Checks for UDP-over-TCP (UoT) magic addresses
         if let Address::Hostname(host) = remote_location.address() {
-            if !self.udp_enabled && (host == UOT_V1_MAGIC_ADDRESS || host == UOT_V2_MAGIC_ADDRESS) {
+            if self.udp_mode == ShadowsocksUdpMode::Disabled
+                && (host == UOT_V1_MAGIC_ADDRESS || host == UOT_V2_MAGIC_ADDRESS)
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "UDP-over-TCP is disabled for this Shadowsocks server",
@@ -595,7 +644,11 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
     }
 
     fn supports_udp_over_tcp(&self) -> bool {
-        self.udp_enabled
+        self.udp_mode == ShadowsocksUdpMode::Uot
+    }
+
+    fn supports_native_udp(&self) -> bool {
+        self.udp_mode == ShadowsocksUdpMode::Native
     }
 
     async fn setup_client_udp_bidirectional(
@@ -636,5 +689,22 @@ impl TcpClientHandler for ShadowsocksTcpHandler {
         let message_stream = UotV2Stream::new(client_stream);
 
         Ok(Box::new(message_stream))
+    }
+
+    async fn setup_client_native_udp(
+        &self,
+        client_stream: Box<dyn AsyncMessageStream>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        if self.udp_mode != ShadowsocksUdpMode::Native {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Shadowsocks native UDP is not enabled",
+            ));
+        }
+        self.udp_codec_config
+            .as_ref()
+            .expect("native UDP client has codec key material")
+            .wrap(client_stream, target.into_location())
     }
 }

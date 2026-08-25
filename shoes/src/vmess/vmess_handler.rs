@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use aws_lc_rs::aead::{
@@ -10,6 +10,7 @@ use aws_lc_rs::cipher::{
     AES_128, EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
 };
 use bytes::BytesMut;
+use parking_lot::Mutex;
 use rand::{Rng, RngExt};
 use shake::Shake128;
 use shake::digest::{ExtendableOutput, Update};
@@ -22,8 +23,9 @@ use super::vmess_stream::{ReadHeaderInfo, VmessStream};
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::dynamic::{UserRegistry, bind_connection_user};
-use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+use crate::dynamic::{UserRegistry, bind_connection_user, current_connection};
+use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
+use crate::replay_filter::ReplayFilter;
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
@@ -62,12 +64,54 @@ impl From<&str> for DataCipher {
     }
 }
 
+/// How far a VMess auth id's sealed timestamp may be from this server's clock.
+/// 120 seconds either way, which is what the protocol's other implementations allow
+/// and what this crate's own client assumes when it picks a timestamp.
+const AUTH_ID_CLOCK_SKEW: Duration = Duration::from_secs(120);
+
+/// How long an admitted auth id has to be remembered for the replay check to have no
+/// gap.
+///
+/// Twice the skew, not once, and the difference is the whole point. An auth id
+/// carrying timestamp `T` is admissible for as long as `T` is within the skew of the
+/// clock -- that is, across the whole interval `[T - skew, T + skew]`, which is two
+/// skews wide. An attacker who copies one presented at the start of that interval can
+/// present it again at the end. Remembering for only one skew would forget it exactly
+/// halfway through the period the timestamp check still admits it, which is a replay
+/// window rather than a replay filter.
+///
+/// The cost of the wider window is small and bounded, because what lands in the
+/// filter is one entry per *admitted* connection rather than one per packet off the
+/// wire.
+const AUTH_ID_WINDOW: Duration = AUTH_ID_CLOCK_SKEW.saturating_mul(2);
+
+const _: () = assert!(
+    AUTH_ID_WINDOW.as_secs() == 2 * AUTH_ID_CLOCK_SKEW.as_secs(),
+    "an auth id stays admissible for two skews, so it must be remembered for two"
+);
+
 pub struct VmessTcpServerHandler {
     data_cipher: DataCipher,
     users: Arc<dyn UserRegistry>,
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    /// Auth ids seen inside [`AUTH_ID_WINDOW`], so a recorded one cannot be used
+    /// twice.
+    ///
+    /// Shared by every connection to this inbound, because that is the scope a
+    /// replay crosses: an attacker records one client's handshake and opens their
+    /// own connection with it.
+    ///
+    /// # Why this is not a memory hazard
+    ///
+    /// It is fed only *after* `find_vmess_auth_id` has recognised the value and the
+    /// timestamp inside it has been found fresh. Those sixteen bytes are a user's
+    /// key applied to a timestamp and a checksum, so a value that gets this far was
+    /// either produced by someone holding the uuid or copied from someone who did.
+    /// Random bytes fail the checksum and never reach the filter, which is what
+    /// separates this from a filter fed by anything off the wire.
+    auth_ids: Mutex<ReplayFilter>,
 }
 
 impl std::fmt::Debug for VmessTcpServerHandler {
@@ -93,6 +137,7 @@ impl VmessTcpServerHandler {
             udp_enabled,
             proxy_selector,
             resolver,
+            auth_ids: Mutex::new(ReplayFilter::new(AUTH_ID_WINDOW)),
         }
     }
 }
@@ -128,10 +173,20 @@ impl TcpServerHandler for VmessTcpServerHandler {
         let time_secs = identity.timestamp;
         let current_time_secs = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs();
         let time_delta = time_secs.abs_diff(current_time_secs);
-        if time_delta > 120 {
+        if time_delta > AUTH_ID_CLOCK_SKEW.as_secs() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Hash timestamp is too old ({time_secs} is {time_delta} seconds old)"),
+            ));
+        }
+
+        // Ordered after the timestamp check on purpose. A stale auth id is refused
+        // without being remembered, so a client with a wrong clock cannot fill the
+        // filter, and nothing is held that the timestamp check would reject anyway.
+        if !self.auth_ids.lock().check_and_insert(&cert_hash) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "auth id has already been used",
             ));
         }
 
@@ -179,14 +234,17 @@ impl TcpServerHandler for VmessTcpServerHandler {
         // their connection count and their traffic by replaying the prefix.
         //
         // This is the first thing on the connection an attacker cannot produce
-        // without the uuid. What it does *not* stop is a replay of the whole recorded
-        // prefix, auth id and header together, which is by construction openable --
-        // that needs an auth-id replay cache, which is a feature of its own with its
-        // own memory and lifetime questions. See `UserRegistry::find_vmess_auth_id`.
-        identity.user.note_auth();
+        // without the uuid. A replay of the whole recorded prefix -- auth id and
+        // header together -- is by construction openable and would get past it, which
+        // is why `auth_ids` above rejected that case before this point.
         // Everything read so far is already counted against the inbound; the meter
         // hands it over.
-        bind_connection_user(&identity.user);
+        if !bind_connection_user(&identity.user) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "user could not be admitted: removed, suspended, or at their connection limit",
+            ));
+        }
 
         let payload_length = u16::from_be_bytes(encrypted_payload_length[0..2].try_into().unwrap());
 
@@ -242,13 +300,13 @@ impl TcpServerHandler for VmessTcpServerHandler {
 
         let command = fixed_header[37];
 
-        log::info!("VMess command: {}", command);
+        log::trace!("VMess command: {}", command);
 
         // For MUX/XUDP command (0x03), there is NO destination in the VMess header
         // Destinations come in XUDP frames themselves
         let remote_location = if command == COMMAND_MUX {
             // Use a placeholder address for XUDP - actual destinations come from XUDP frames
-            log::info!(
+            log::trace!(
                 "VMess MUX/XUDP: No destination in VMess header (destinations come in XUDP frames)"
             );
             NetLocation::new(Address::Ipv4(Ipv4Addr::new(0, 0, 0, 0)), 0)
@@ -329,21 +387,21 @@ impl TcpServerHandler for VmessTcpServerHandler {
         };
 
         let margin_len: u8 = fixed_header[35] >> 4;
-        log::info!("VMess margin_len: {}, command: {}", margin_len, command);
+        log::trace!("VMess margin_len: {}, command: {}", margin_len, command);
         if margin_len > 0 {
             let mut margin_bytes = allocate_vec(margin_len as usize).into_boxed_slice();
             header_reader.read_slice_into(&mut margin_bytes)?;
-            log::info!("VMess margin_bytes: {:?}", &margin_bytes[..]);
+            log::trace!("VMess margin_bytes: {:?}", &margin_bytes[..]);
             fnv_hasher.write(&margin_bytes);
         }
 
         let mut check_bytes = [0u8; 4];
         header_reader.read_slice_into(&mut check_bytes)?;
-        log::info!("VMess check_bytes: {:?}", &check_bytes);
+        log::trace!("VMess check_bytes: {:?}", &check_bytes);
 
         let expected_check_value = u32::from_be_bytes(check_bytes[0..4].try_into().unwrap());
         let actual_check_value = fnv_hasher.finish();
-        log::info!(
+        log::trace!(
             "VMess FNV1a: expected={}, actual={}",
             expected_check_value,
             actual_check_value
@@ -558,14 +616,16 @@ impl TcpServerHandler for VmessTcpServerHandler {
                     let proxy_selector = self.proxy_selector.clone();
                     let resolver = self.resolver.clone();
                     let udp_enabled = self.udp_enabled;
+                    let meter = current_connection();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_h2mux_session(
+                        if let Err(e) = handle_h2mux_session_with_meter(
                             Box::new(vmess_stream),
                             None, // initial data already fed to vmess_stream
                             udp_enabled,
                             proxy_selector,
                             resolver,
+                            meter,
                         )
                         .await
                         {

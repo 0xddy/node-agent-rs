@@ -1,8 +1,8 @@
 //! Phase 2 acceptance: in-memory, lock-free, per-inbound users.
 //!
 //! The property the phase exists for: **one VLESS inbound, users added at runtime,
-//! each authenticated independently, and removing one does not disturb a connection
-//! the other -- or the removed user themselves -- already has open.**
+//! each authenticated independently, and removing one closes that user's existing
+//! connections without disturbing anyone else.**
 
 mod common;
 
@@ -124,21 +124,28 @@ async fn dynamic_users_authenticate_independently() {
         reach(bob_leg, sink.address).await.is_ok(),
     );
 
-    // -- 6. removal is forward-looking only ------------------------------------
-    //
-    // This is the acceptance criterion. A connection bob already holds must run to
-    // completion: it was authorised when it started, and the registry lookup that
-    // authorised it does not happen again.
-    checks.section("6. removing a user leaves their open connection alone");
+    // -- 6. removal actively closes the user's existing connections -------------
+    checks.section("6. removing a user closes their open connections");
     let mut held = Socks::connect(bob_leg, sink.address)
         .await
         .expect("bob should be able to open a connection");
     held.write_all(b"wh").await.expect("send half a request");
-    // Give the request's first half time to traverse the chain, so the connection is
-    // genuinely established upstream rather than merely accepted locally.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    checks.that(
+        "bob's held connection is registered before removal",
+        wait_for("bob's held connection to authenticate", || {
+            engine
+                .get_user("vless", "bob")
+                .is_ok_and(|user| user.conns == 1)
+        })
+        .await,
+    );
 
-    checks.that("bob is removed", engine.remove_user("vless", "bob").is_ok());
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("vless", "bob")).await;
+    checks.that(
+        "bob is removed only after his connection closes",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
+    );
     checks.that(
         "a new bob connection is refused",
         denied(bob_leg, sink.address).await,
@@ -148,13 +155,26 @@ async fn dynamic_users_authenticate_independently() {
         reach(alice_leg, sink.address).await.is_ok(),
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "bob's already-open connection still completes",
-        read_line(&mut held).await.ok(),
-        Some("sink".to_string()),
+    let bob_closed = tokio::time::timeout(Duration::from_secs(2), async {
+        match held.write_all(b"o\n").await {
+            Err(_) => true,
+            Ok(()) => read_line(&mut held).await.is_err(),
+        }
+    })
+    .await;
+    checks.that(
+        "bob's already-open connection is actively closed",
+        matches!(bob_closed, Ok(true)),
     );
     drop(held);
+
+    engine
+        .add_user("vless", user("bob", BOB))
+        .expect("the same id can be added with a fresh connection lifecycle");
+    checks.that(
+        "a re-added bob receives a fresh usable connection token",
+        reach(bob_leg, sink.address).await.is_ok(),
+    );
 
     // -- 7. bad users are refused whole, never half-applied --------------------
     checks.section("7. rejected users");
@@ -174,6 +194,9 @@ async fn dynamic_users_authenticate_independently() {
                 uuid: None,
                 password: Some("hunter2".into()),
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             },
         ),
         "does not authenticate by password",
@@ -187,6 +210,9 @@ async fn dynamic_users_authenticate_independently() {
                 uuid: None,
                 password: None,
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             },
         ),
         "needs a credential",
@@ -203,7 +229,7 @@ async fn dynamic_users_authenticate_independently() {
     );
     checks.refused(
         "removing an unknown user is refused",
-        engine.remove_user("vless", "mallory"),
+        engine.remove_user("vless", "mallory").await,
         "no such user",
     );
 
@@ -245,6 +271,185 @@ async fn dynamic_users_authenticate_independently() {
         after.conns == 0,
     );
     checks.that("alice's connections were tallied", after.total_conns > 0);
+
+    checks.finish();
+}
+
+/// A user's connection ceiling is the only bound on what one valid credential can
+/// cost the host, so it is worth proving end to end rather than at the registry.
+/// Every protocol's per-connection state -- UDP sessions, multiplexed tunnels,
+/// buffers -- is a multiplier on this number.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_ceiling_bounds_one_credential() {
+    let mut checks = Checks::new("connection ceiling");
+
+    let engine = engine().await;
+    let sink = Sink::start("sink").await;
+
+    let vless = free_addr();
+    engine
+        .add_inbound(dynamic("vless", vless_inbound(vless, true)))
+        .await
+        .expect("a vless inbound should start");
+    let alice_leg = start_leg(&engine, "leg-alice", vless_chain(vless, ALICE)).await;
+
+    let mut capped = user("alice", ALICE);
+    capped.max_conns = Some(1);
+    engine
+        .add_user("vless", capped)
+        .expect("a capped user should be accepted");
+
+    checks.section("1. the ceiling is reported");
+    checks.eq(
+        "alice's ceiling is visible in her status",
+        engine.get_user("vless", "alice").map(|u| u.max_conns).ok(),
+        Some(1),
+    );
+
+    checks.section("2. the first connection is admitted");
+    // Half a request, so the connection authenticates and then stays open rather
+    // than completing and releasing its slot.
+    let mut held = Socks::connect(alice_leg, sink.address)
+        .await
+        .expect("alice's first connection should open");
+    held.write_all(b"wh").await.expect("send half a request");
+    checks.that(
+        "alice's held connection is registered",
+        wait_for("alice's held connection to authenticate", || {
+            engine
+                .get_user("vless", "alice")
+                .is_ok_and(|user| user.conns == 1)
+        })
+        .await,
+    );
+
+    checks.section("3. the second is refused while the first is open");
+    checks.that(
+        "a second connection on the same credential is refused",
+        denied(alice_leg, sink.address).await,
+    );
+    checks.eq(
+        "the refusal did not raise the live count",
+        engine.get_user("vless", "alice").map(|u| u.conns).ok(),
+        Some(1),
+    );
+    let after_refusal = engine
+        .get_user("vless", "alice")
+        .expect("alice is still registered");
+    checks.eq(
+        "a refused connection is not counted as an authentication",
+        after_refusal.total_conns,
+        1,
+    );
+
+    checks.section("4. the held connection still works");
+    // The point of refusing rather than evicting: the connection already carrying
+    // traffic is the one that survives.
+    held.write_all(
+        b"o
+",
+    )
+    .await
+    .expect("finish the request");
+    checks.eq(
+        "the first connection still reaches the sink",
+        read_line(&mut held).await.ok(),
+        Some("sink".to_string()),
+    );
+
+    checks.section("5. closing it frees the slot");
+    drop(held);
+    checks.that(
+        "the live count returns to zero",
+        wait_for("alice's held connection to close", || {
+            engine
+                .get_user("vless", "alice")
+                .is_ok_and(|user| user.conns == 0)
+        })
+        .await,
+    );
+    checks.eq(
+        "a new connection is admitted again",
+        reach(alice_leg, sink.address).await.ok(),
+        Some("sink".to_string()),
+    );
+
+    checks.section("6. raising the ceiling admits more at once");
+    let mut raised = user("alice", ALICE);
+    raised.max_conns = Some(3);
+    engine
+        .add_user("vless", raised)
+        .expect("raising the ceiling should be accepted");
+
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        let mut stream = Socks::connect(alice_leg, sink.address)
+            .await
+            .expect("a connection under the raised ceiling should open");
+        stream.write_all(b"wh").await.expect("send half a request");
+        open.push(stream);
+    }
+    checks.that(
+        "three connections are held at once",
+        wait_for("three of alice's connections to authenticate", || {
+            engine
+                .get_user("vless", "alice")
+                .is_ok_and(|user| user.conns == 3)
+        })
+        .await,
+    );
+    checks.that(
+        "the fourth is refused",
+        denied(alice_leg, sink.address).await,
+    );
+    drop(open);
+
+    checks.finish();
+}
+
+/// The pending-handshake gate must hand its permits back.
+///
+/// A permit that outlives its handshake is far worse than no gate at all: the
+/// listener would wedge after `MAX_PENDING_PER_SOURCE` connections from one address
+/// and refuse everything after that, forever, with no error to explain it. Every
+/// connection here completes and closes, so a listener that stops answering partway
+/// through is a leaked permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn handshake_permits_are_returned_after_the_handshake() {
+    use shoes::tcp::handshake_gate::MAX_PENDING_PER_SOURCE;
+
+    let mut checks = Checks::new("handshake permits");
+
+    let engine = engine().await;
+    let sink = Sink::start("sink").await;
+
+    let vless = free_addr();
+    engine
+        .add_inbound(dynamic("vless", vless_inbound(vless, true)))
+        .await
+        .expect("a vless inbound should start");
+    engine
+        .add_user("vless", user("alice", ALICE))
+        .expect("alice should be accepted");
+    let alice_leg = start_leg(&engine, "leg-alice", vless_chain(vless, ALICE)).await;
+
+    // Comfortably past the per-source share, all from 127.0.0.1 -- which is the one
+    // address every one of these connections has.
+    let rounds = MAX_PENDING_PER_SOURCE * 3;
+    let mut reached = 0usize;
+    for _ in 0..rounds {
+        if matches!(reach(alice_leg, sink.address).await, Ok(ref name) if name == "sink") {
+            reached += 1;
+        } else {
+            break;
+        }
+    }
+
+    checks.eq(
+        "every sequential connection past the per-source share still connects",
+        reached,
+        rounds,
+    );
 
     checks.finish();
 }

@@ -1,4 +1,5 @@
 /target/
+/crates/node-agent/runtime/
 **/*.rs.bk
 *.pdb
 

@@ -49,7 +49,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{
-    BindLocation, ConfigSelection, ServerConfig, ServerProxyConfig, TcpConfig, Transport,
+    BindLocation, ConfigSelection, Hysteria2MasqueradeConfig, Hysteria2ObfsConfig, ServerConfig,
+    ServerProxyConfig, TcpConfig, Transport,
 };
 use crate::dynamic::UserRegistry;
 use crate::resolver::Resolver;
@@ -225,6 +226,20 @@ enum QuicNativeSettings {
     Hysteria2 {
         password: Option<String>,
         udp_enabled: bool,
+        /// Used by the per-endpoint controller factory and auth exchange. The
+        /// selector slot cannot reach either after the listener has started.
+        up_mbps: u64,
+        down_mbps: u64,
+        /// Compared in full, password included, unlike the credential above.
+        ///
+        /// A registry can take over *authentication*, but nothing can take over
+        /// obfuscation: it is applied beneath QUIC by the accept loop's socket,
+        /// so changing it means rebuilding the listener. Hiding it the way
+        /// `password` is hidden would let a reload silently keep the old one.
+        obfs: Option<Hysteria2ObfsConfig>,
+        /// The accept loop hands this to each new H3 connection, outside the rule
+        /// slot, so it is fixed for the listener's lifetime too.
+        masquerade: Option<Hysteria2MasqueradeConfig>,
     },
     Tuic {
         uuid: Option<String>,
@@ -263,9 +278,17 @@ impl QuicNativeSettings {
             ServerProxyConfig::Hysteria2 {
                 password,
                 udp_enabled,
+                up_mbps,
+                down_mbps,
+                obfs,
+                masquerade,
             } => Some(Self::Hysteria2 {
                 password: hide(password),
                 udp_enabled: *udp_enabled,
+                up_mbps: *up_mbps,
+                down_mbps: *down_mbps,
+                obfs: obfs.clone(),
+                masquerade: masquerade.clone(),
             }),
             ServerProxyConfig::TuicV5 {
                 uuid,
@@ -287,16 +310,32 @@ impl QuicNativeSettings {
                 Self::Hysteria2 {
                     password,
                     udp_enabled,
+                    up_mbps,
+                    down_mbps,
+                    obfs,
+                    masquerade,
                 },
                 Self::Hysteria2 {
                     password: new_password,
                     udp_enabled: new_udp,
+                    up_mbps: new_up_mbps,
+                    down_mbps: new_down_mbps,
+                    obfs: new_obfs,
+                    masquerade: new_masquerade,
                 },
             ) => {
                 if password != new_password {
                     Some("password")
                 } else if udp_enabled != new_udp {
                     Some("udp_enabled")
+                } else if up_mbps != new_up_mbps {
+                    Some("up_mbps")
+                } else if down_mbps != new_down_mbps {
+                    Some("down_mbps")
+                } else if obfs != new_obfs {
+                    Some("obfs")
+                } else if masquerade != new_masquerade {
+                    Some("masquerade")
                 } else {
                     None
                 }

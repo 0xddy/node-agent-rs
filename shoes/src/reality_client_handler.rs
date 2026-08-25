@@ -8,6 +8,7 @@ use async_trait::async_trait;
 
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncStream;
+use crate::config::VlessPacketEncoding;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
 use crate::reality::{CipherSuite, RealityClientConfig, RealityClientConnection};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
@@ -28,7 +29,11 @@ pub struct RealityClientHandler {
 #[derive(Debug)]
 pub enum RealityInnerClientHandler {
     Default(Box<dyn TcpClientHandler>),
-    VisionVless { uuid: Box<[u8]>, udp_enabled: bool },
+    VisionVless {
+        uuid: Box<[u8]>,
+        udp_enabled: bool,
+        packet_encoding: Option<VlessPacketEncoding>,
+    },
 }
 
 impl RealityClientHandler {
@@ -54,6 +59,7 @@ impl RealityClientHandler {
         cipher_suites: Vec<CipherSuite>,
         user_id: Box<[u8]>,
         udp_enabled: bool,
+        packet_encoding: Option<VlessPacketEncoding>,
     ) -> Self {
         Self {
             public_key,
@@ -63,6 +69,7 @@ impl RealityClientHandler {
             handler: RealityInnerClientHandler::VisionVless {
                 uuid: user_id,
                 udp_enabled,
+                packet_encoding,
             },
         }
     }
@@ -133,6 +140,13 @@ impl TcpClientHandler for RealityClientHandler {
         }
     }
 
+    fn needs_handshake_for_write(&self) -> bool {
+        match &self.handler {
+            RealityInnerClientHandler::Default(handler) => handler.needs_handshake_for_write(),
+            RealityInnerClientHandler::VisionVless { .. } => true,
+        }
+    }
+
     fn supports_udp_over_tcp(&self) -> bool {
         match &self.handler {
             RealityInnerClientHandler::Default(handler) => handler.supports_udp_over_tcp(),
@@ -153,11 +167,16 @@ impl TcpClientHandler for RealityClientHandler {
                     .setup_client_udp_bidirectional(Box::new(tls_stream), target)
                     .await
             }
-            RealityInnerClientHandler::VisionVless { uuid, .. } => {
+            RealityInnerClientHandler::VisionVless {
+                uuid,
+                packet_encoding,
+                ..
+            } => {
                 crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
                     tls_stream,
                     uuid,
-                    target.into_location(),
+                    target,
+                    *packet_encoding,
                 )
                 .await
             }

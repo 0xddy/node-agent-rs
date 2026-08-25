@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 #[cfg(unix)]
 use std::mem::ManuallyDrop;
@@ -9,6 +9,147 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::Path;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+/// Socket-level options shared by direct TCP and UDP outbound dials.
+///
+/// QUIC intentionally continues to use its existing endpoint setup. Configuration
+/// validation rejects these options for QUIC transports until that path can provide
+/// identical behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboundSocketOptions {
+    pub bind_interface: Option<String>,
+    pub inet4_bind_address: Option<Ipv4Addr>,
+    pub inet6_bind_address: Option<Ipv6Addr>,
+    pub routing_mark: u32,
+    pub bind_address_no_port: bool,
+}
+
+impl OutboundSocketOptions {
+    fn bind_address(&self, is_ipv6: bool) -> Option<SocketAddr> {
+        if is_ipv6 {
+            self.inet6_bind_address
+                .map(|address| SocketAddr::new(IpAddr::V6(address), 0))
+        } else {
+            self.inet4_bind_address
+                .map(|address| SocketAddr::new(IpAddr::V4(address), 0))
+        }
+    }
+}
+
+fn validate_platform_options(options: &OutboundSocketOptions) -> std::io::Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if options.routing_mark != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "routing_mark is only supported on Linux",
+            ));
+        }
+        if options.bind_address_no_port {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bind_address_no_port is only supported on Linux",
+            ));
+        }
+    }
+    let _ = options;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_routing_mark(socket: &Socket, routing_mark: u32) -> std::io::Result<()> {
+    if routing_mark != 0 {
+        socket.set_mark(routing_mark)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_routing_mark(_socket: &Socket, _routing_mark: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_bind_address_no_port(socket: &Socket) -> std::io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_IP,
+            libc::IP_BIND_ADDRESS_NO_PORT,
+            std::ptr::from_ref(&enabled).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // Match sing-box: old kernels and address families that do not expose the
+    // option fall back to ordinary source-port reservation.
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOPROTOOPT) | Some(libc::EINVAL)
+    ) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Create an outbound TCP socket, applying source-address and Linux dial options
+/// before the source bind and connect.
+pub fn new_outbound_tcp_socket(
+    is_ipv6: bool,
+    options: &OutboundSocketOptions,
+) -> std::io::Result<tokio::net::TcpSocket> {
+    validate_platform_options(options)?;
+
+    let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+
+    if let Some(ref _interface) = options.bind_interface {
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        socket.bind_device(Some(_interface.as_bytes()))?;
+
+        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bind_interface is only available on Android, Fuchsia, or Linux",
+        ));
+    }
+
+    apply_routing_mark(&socket, options.routing_mark)?;
+    #[cfg(target_os = "linux")]
+    if options.bind_address_no_port {
+        // Linux only applies IP_BIND_ADDRESS_NO_PORT to TCP dial sockets;
+        // unconnected UDP listener sockets intentionally retain normal binding.
+        set_bind_address_no_port(&socket)?;
+    }
+    if let Some(bind_address) = options.bind_address(is_ipv6) {
+        socket.bind(&SockAddr::from(bind_address))?;
+    }
+
+    let stream: std::net::TcpStream = socket.into();
+    Ok(tokio::net::TcpSocket::from_std_stream(stream))
+}
+
+/// Create a direct outbound UDP socket bound to the configured source address
+/// for the destination address family.
+pub fn new_outbound_udp_socket(
+    is_ipv6: bool,
+    options: &OutboundSocketOptions,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    validate_platform_options(options)?;
+    let socket = new_socket2_udp_socket(is_ipv6, options.bind_interface.clone(), None, false)?;
+    apply_routing_mark(&socket, options.routing_mark)?;
+    let bind_address = options
+        .bind_address(is_ipv6)
+        .unwrap_or_else(|| get_unspecified_socket_addr(is_ipv6));
+    socket.bind(&SockAddr::from(bind_address))?;
+    into_tokio_udp_socket(socket)
+}
 
 pub fn new_udp_socket(
     is_ipv6: bool,
@@ -83,9 +224,9 @@ pub fn new_socket2_udp_socket_with_buffer_size(
         panic!("Cannot support reuse sockets");
     }
 
-    if let Some(ref interface) = bind_interface {
+    if let Some(ref _interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
+        socket.bind_device(Some(_interface.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -117,22 +258,13 @@ pub fn new_tcp_socket(
     bind_interface: Option<String>,
     is_ipv6: bool,
 ) -> std::io::Result<tokio::net::TcpSocket> {
-    let tcp_socket = if is_ipv6 {
-        tokio::net::TcpSocket::new_v6()?
-    } else {
-        tokio::net::TcpSocket::new_v4()?
-    };
-
-    if let Some(_b) = bind_interface {
-        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        tcp_socket.bind_device(Some(_b.as_bytes()))?;
-
-        // This should be handled during config validation.
-        #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
-        panic!("Could not bind to device, unsupported platform.")
-    }
-
-    Ok(tcp_socket)
+    new_outbound_tcp_socket(
+        is_ipv6,
+        &OutboundSocketOptions {
+            bind_interface,
+            ..Default::default()
+        },
+    )
 }
 
 pub fn set_tcp_keepalive(
@@ -179,9 +311,9 @@ pub fn new_tcp_listener(
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
 
-    if let Some(ref interface) = bind_interface {
+    if let Some(ref _interface) = bind_interface {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-        socket.bind_device(Some(interface.as_bytes()))?;
+        socket.bind_device(Some(_interface.as_bytes()))?;
 
         // This should be handled during config validation.
         #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
@@ -215,4 +347,89 @@ pub fn new_unix_listener<P: AsRef<Path>>(
 
     let std_listener: std::os::unix::net::UnixListener = socket.into();
     tokio::net::UnixListener::from_std(std_listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_source_address_follows_target_family() {
+        let options = OutboundSocketOptions {
+            inet4_bind_address: Some(Ipv4Addr::new(192, 0, 2, 10)),
+            inet6_bind_address: Some("2001:db8::10".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            options.bind_address(false).unwrap().ip(),
+            "192.0.2.10".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            options.bind_address(true).unwrap().ip(),
+            "2001:db8::10".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_tcp_and_udp_bind_configured_ipv4_source() {
+        let options = OutboundSocketOptions {
+            inet4_bind_address: Some(Ipv4Addr::LOCALHOST),
+            ..Default::default()
+        };
+        let tcp = new_outbound_tcp_socket(false, &options).unwrap();
+        assert_eq!(
+            tcp.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_ne!(tcp.local_addr().unwrap().port(), 0);
+
+        let udp = new_outbound_udp_socket(false, &options).unwrap();
+        assert_eq!(
+            udp.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_ne!(udp.local_addr().unwrap().port(), 0);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn linux_only_outbound_options_fail_in_socket_layer() {
+        for options in [
+            OutboundSocketOptions {
+                routing_mark: 1,
+                ..Default::default()
+            },
+            OutboundSocketOptions {
+                bind_address_no_port: true,
+                ..Default::default()
+            },
+        ] {
+            let error = new_outbound_tcp_socket(false, &options).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tcp_sets_bind_address_no_port_before_source_bind() {
+        let options = OutboundSocketOptions {
+            inet4_bind_address: Some(Ipv4Addr::LOCALHOST),
+            bind_address_no_port: true,
+            ..Default::default()
+        };
+        let socket = new_outbound_tcp_socket(false, &options).unwrap();
+        let mut enabled: libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&enabled) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_IP,
+                libc::IP_BIND_ADDRESS_NO_PORT,
+                std::ptr::from_mut(&mut enabled).cast(),
+                &mut length,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(enabled, 1);
+    }
 }

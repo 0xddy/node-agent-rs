@@ -14,9 +14,10 @@
 //! * the TCP request frame (`0x401`, address, padding) and its status reply,
 //! * unfragmented UDP over QUIC datagrams.
 //!
-//! Fragmentation, congestion control, `Hysteria-CC-RX`, port hopping and the
-//! masquerade site are all left out; none of them affect who a connection is billed
-//! to. The wire formats are those in `shoes/src/hysteria2_server.rs` -- the frame
+//! Fragmentation, congestion control, `Hysteria-CC-RX` and port hopping are left
+//! out; none of them affect who a connection is billed to. The small HTTP probe
+//! helper at the bottom does exercise the masquerade site. The wire formats are
+//! those in `shoes/src/hysteria2_server.rs` -- the frame
 //! constant at `:840`, the status reply built at `:877`, and the datagram header
 //! described at `:422`.
 
@@ -26,6 +27,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use bytes::{Buf as _, Bytes, BytesMut};
 
 use super::IO_TIMEOUT;
 
@@ -121,6 +124,10 @@ pub struct Hysteria2Client {
     connection: quinn::Connection,
     /// Whether the server said it would carry UDP, from `Hysteria-UDP`.
     pub udp_enabled: bool,
+    /// Server receive rate from `Hysteria-CC-RX`, in bytes per second.
+    pub advertised_receive_bps: u64,
+    /// Whether the response asked the client to keep bandwidth detection (BBR).
+    pub advertised_receive_auto: bool,
     /// The HTTP/3 driver. Held for the client's whole life on purpose: h3 closes the
     /// QUIC connection underneath it when the driver is dropped, which would take the
     /// proxied streams with it. The server keeps its own half alive for the same
@@ -142,8 +149,61 @@ impl Hysteria2Client {
     /// rejection arrives here as a status that is not 233, promptly, which is what
     /// makes [`denied`] fast.
     pub async fn connect(server: SocketAddr, password: &str) -> io::Result<Self> {
-        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+        Self::connect_with_receive_bps(server, password, 0).await
+    }
 
+    /// Connects while declaring the fixed rate this client can receive.
+    ///
+    /// Hysteria2 expresses this header in bytes per second, not Mbps. A zero value
+    /// asks the server to retain its fallback congestion controller.
+    pub async fn connect_with_receive_bps(
+        server: SocketAddr,
+        password: &str,
+        receive_bps: u64,
+    ) -> io::Result<Self> {
+        Self::connect_over(
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?,
+            server,
+            password,
+            receive_bps,
+        )
+        .await
+    }
+
+    /// Connects through a Salamander-obfuscated socket.
+    ///
+    /// Built the same way the server builds its own -- quinn's socket wrapped in
+    /// `ObfuscatedUdpSocket` -- so a test that passes here is evidence the two
+    /// sides agree on the wire format, not evidence that one implementation is
+    /// self-consistent.
+    pub async fn connect_obfuscated(
+        server: SocketAddr,
+        password: &str,
+        obfs_password: &str,
+    ) -> io::Result<Self> {
+        use quinn::Runtime as _;
+
+        let runtime = Arc::new(quinn::TokioRuntime);
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let inner = runtime.wrap_udp_socket(socket)?;
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            Arc::new(shoes::hysteria2_obfs::ObfuscatedUdpSocket::new(
+                inner,
+                shoes::hysteria2_obfs::Salamander::new(obfs_password),
+            )),
+            runtime,
+        )?;
+        Self::connect_over(endpoint, server, password, 0).await
+    }
+
+    async fn connect_over(
+        endpoint: quinn::Endpoint,
+        server: SocketAddr,
+        password: &str,
+        receive_bps: u64,
+    ) -> io::Result<Self> {
         let connecting = endpoint
             .connect_with(client_config(), server, "e2e.test")
             .map_err(|e| io::Error::other(format!("quic connect rejected: {e}")))?;
@@ -168,6 +228,7 @@ impl Hysteria2Client {
 
         let request = http::Request::post("https://hysteria/auth")
             .header("hysteria-auth", password)
+            .header("Hysteria-CC-RX", receive_bps)
             .body(())
             .expect("the auth request should be well formed");
 
@@ -200,10 +261,20 @@ impl Hysteria2Client {
             .get("Hysteria-UDP")
             .and_then(|value| value.to_str().ok())
             == Some("true");
+        let advertised_receive_header = response
+            .headers()
+            .get("Hysteria-CC-RX")
+            .and_then(|value| value.to_str().ok());
+        let advertised_receive_auto = advertised_receive_header == Some("auto");
+        let advertised_receive_bps = advertised_receive_header
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
 
         Ok(Self {
             connection,
             udp_enabled,
+            advertised_receive_bps,
+            advertised_receive_auto,
             driver,
             endpoint,
             requests,
@@ -413,6 +484,66 @@ fn stream_err(error: impl std::fmt::Display) -> io::Error {
 }
 
 // --------------------------------------------------------------------------- probes
+
+/// Sends one ordinary HTTP/3 request without authenticating.
+///
+/// A camouflage site is only visible during the three-second authentication
+/// window, so this owns a fresh QUIC connection and drives the complete request
+/// before returning the response body.
+pub async fn request(
+    server: SocketAddr,
+    request: http::Request<Bytes>,
+) -> io::Result<http::Response<Bytes>> {
+    let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+    let connection = deadline(
+        endpoint
+            .connect_with(client_config(), server, "e2e.test")
+            .map_err(|e| io::Error::other(format!("quic connect rejected: {e}")))?,
+    )
+    .await?
+    .map_err(|e| io::Error::other(format!("quic handshake failed: {e}")))?;
+    let (mut driver, mut requests) = deadline(h3::client::new(h3_quinn::Connection::new(
+        connection.clone(),
+    )))
+    .await?
+    .map_err(|e| io::Error::other(format!("h3 setup failed: {e}")))?;
+    let driver = tokio::spawn(async move {
+        let _ = driver.wait_idle().await;
+        std::future::pending::<()>().await;
+    });
+
+    let (parts, body) = request.into_parts();
+    let mut stream = deadline(requests.send_request(http::Request::from_parts(parts, ())))
+        .await?
+        .map_err(|e| io::Error::other(format!("could not send probe request: {e}")))?;
+    if !body.is_empty() {
+        deadline(stream.send_data(body))
+            .await?
+            .map_err(|e| io::Error::other(format!("could not send probe body: {e}")))?;
+    }
+    deadline(stream.finish())
+        .await?
+        .map_err(|e| io::Error::other(format!("could not finish probe request: {e}")))?;
+
+    let response = deadline(stream.recv_response())
+        .await?
+        .map_err(|e| io::Error::other(format!("no probe response: {e}")))?;
+    let (parts, ()) = response.into_parts();
+    let mut body = BytesMut::new();
+    while let Some(mut data) = deadline(stream.recv_data())
+        .await?
+        .map_err(|e| io::Error::other(format!("could not read probe response: {e}")))?
+    {
+        let remaining = data.remaining();
+        body.extend_from_slice(&data.copy_to_bytes(remaining));
+    }
+
+    connection.close(0x100u32.into(), b"probe complete");
+    driver.abort();
+    drop(requests);
+    drop(endpoint);
+    Ok(http::Response::from_parts(parts, body.freeze()))
+}
 
 /// Asks `dest` who it is through a fresh Hysteria2 connection.
 pub async fn reach(server: SocketAddr, password: &str, dest: SocketAddr) -> io::Result<String> {

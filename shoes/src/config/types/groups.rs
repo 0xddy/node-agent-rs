@@ -270,6 +270,12 @@ mod tests {
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
             bind_interface: crate::option_util::NoneOrOne::One("eth0".to_string()),
+            inet4_bind_address: None,
+            inet6_bind_address: None,
+            routing_mark: 0,
+            connect_timeout: None,
+            bind_address_no_port: false,
+            dns_resolver: None,
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {
                 username: Some("client_user".to_string()),
@@ -287,6 +293,7 @@ mod tests {
                 NetLocationMask::from("192.168.0.0/16:80").unwrap(),
                 NetLocationMask::from("10.0.0.0/8:443").unwrap(),
             ]),
+            match_config: None,
             action: RuleActionConfig::Allow {
                 override_address: Some(NetLocation::from_ip_addr(
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -297,6 +304,7 @@ mod tests {
                         "test-proxy-group".to_string(),
                     ))),
                 }),
+                client_chain_selection: super::super::rules::ClientChainSelectionConfig::default(),
             },
         }
     }
@@ -309,6 +317,12 @@ mod tests {
                 ConfigSelection::Config(create_test_client_config()),
                 ConfigSelection::Config(ClientConfig {
                     bind_interface: crate::option_util::NoneOrOne::None,
+                    inet4_bind_address: None,
+                    inet6_bind_address: None,
+                    routing_mark: 0,
+                    connect_timeout: None,
+                    bind_address_no_port: false,
+                    dns_resolver: None,
                     address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
                     protocol: ClientProxyConfig::Http {
                         username: None,
@@ -380,6 +394,7 @@ client_proxies:
                 create_test_rule_config(),
                 RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
+                    match_config: None,
                     action: RuleActionConfig::Block,
                 },
             ]),

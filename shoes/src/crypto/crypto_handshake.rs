@@ -323,9 +323,17 @@ mod tests {
         use std::sync::Arc;
 
         let config = Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
+            // The workspace intentionally enables both rustls providers: shoes
+            // uses AWS-LC while the ACP transport can pull ring through tonic.
+            // A compile-surface test must therefore choose explicitly instead
+            // of relying on rustls' single-feature process default.
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
         );
 
         let server_name = rustls::pki_types::ServerName::try_from("example.com")

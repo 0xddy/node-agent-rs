@@ -20,6 +20,8 @@ pub enum IpStrategy {
     Ipv6Only,
     /// Query A and AAAA in parallel.
     Ipv4AndIpv6,
+    /// Query A and AAAA in parallel, returning IPv6 answers first.
+    Ipv6AndIpv4,
     /// Query A first, fall back to AAAA (default).
     #[default]
     Ipv4ThenIpv6,
@@ -33,7 +35,7 @@ impl IpStrategy {
         match self {
             Self::Ipv4Only => LookupIpStrategy::Ipv4Only,
             Self::Ipv6Only => LookupIpStrategy::Ipv6Only,
-            Self::Ipv4AndIpv6 => LookupIpStrategy::Ipv4AndIpv6,
+            Self::Ipv4AndIpv6 | Self::Ipv6AndIpv4 => LookupIpStrategy::Ipv4AndIpv6,
             Self::Ipv4ThenIpv6 => LookupIpStrategy::Ipv4thenIpv6,
             Self::Ipv6ThenIpv4 => LookupIpStrategy::Ipv6thenIpv4,
         }
@@ -50,6 +52,8 @@ pub struct ParsedDnsServerEntry {
     pub bootstrap_resolver: Arc<dyn Resolver>,
     /// IP lookup strategy (IPv4/IPv6 selection).
     pub ip_strategy: IpStrategy,
+    /// Whether encrypted DNS transports use the operating-system trust policy.
+    pub use_native_roots: bool,
     /// Timeout for DNS resolution in seconds. 0 means no timeout.
     pub timeout_secs: u32,
     /// Timeout for establishing connections to DNS upstreams in seconds.
@@ -73,10 +77,16 @@ impl ParsedDnsServerEntry {
             client_chain: chain,
             bootstrap_resolver: bootstrap,
             ip_strategy,
+            use_native_roots: false,
             timeout_secs,
             connect_timeout_secs,
             attempts,
         }
+    }
+
+    pub fn with_native_roots(mut self, use_native_roots: bool) -> Self {
+        self.use_native_roots = use_native_roots && self.server.uses_tls();
+        self
     }
 }
 
@@ -99,6 +109,12 @@ pub enum ParsedDnsServer {
         server_name: Arc<str>,
     },
 
+    /// DNS-over-QUIC (RFC 9250).
+    Quic {
+        addr: SocketAddr,
+        server_name: Arc<str>,
+    },
+
     /// DNS-over-HTTPS.
     Https {
         addr: SocketAddr,
@@ -112,6 +128,15 @@ pub enum ParsedDnsServer {
         server_name: Arc<str>,
         path: Arc<str>,
     },
+}
+
+impl ParsedDnsServer {
+    fn uses_tls(&self) -> bool {
+        matches!(
+            self,
+            Self::Tls { .. } | Self::Quic { .. } | Self::Https { .. } | Self::H3 { .. }
+        )
+    }
 }
 
 /// Host parsed from a DNS URL - can be IP or hostname.
@@ -150,6 +175,13 @@ pub enum ParsedDnsUrl {
         server_name: String,
     },
 
+    /// DNS-over-QUIC (RFC 9250).
+    Quic {
+        host: DnsHost,
+        port: u16,
+        server_name: String,
+    },
+
     /// DNS-over-HTTPS.
     Https {
         host: DnsHost,
@@ -168,6 +200,13 @@ pub enum ParsedDnsUrl {
 }
 
 impl ParsedDnsUrl {
+    pub(crate) fn uses_tls(&self) -> bool {
+        matches!(
+            self,
+            Self::Tls { .. } | Self::Quic { .. } | Self::Https { .. } | Self::H3 { .. }
+        )
+    }
+
     /// Parse a DNS server URL string. Host can be IP or hostname.
     pub fn parse(url_str: &str) -> Result<Self, DnsConfigError> {
         Self::parse_with_server_name(url_str, None)
@@ -218,6 +257,14 @@ impl ParsedDnsUrl {
                     server_name,
                 })
             }
+            "quic" => {
+                let port = url.port().unwrap_or(853);
+                Ok(Self::Quic {
+                    host,
+                    port,
+                    server_name,
+                })
+            }
             "https" => {
                 let port = url.port().unwrap_or(443);
                 let path = url.path().to_string();
@@ -254,6 +301,7 @@ impl ParsedDnsUrl {
             Self::Udp { host, .. }
             | Self::Tcp { host, .. }
             | Self::Tls { host, .. }
+            | Self::Quic { host, .. }
             | Self::Https { host, .. }
             | Self::H3 { host, .. } => host.as_hostname(),
         }
@@ -285,6 +333,17 @@ impl ParsedDnsUrl {
             } => {
                 let ip = Self::get_ip(host, resolved_ip)?;
                 Ok(ParsedDnsServer::Tls {
+                    addr: SocketAddr::new(ip, *port),
+                    server_name: Arc::from(server_name.as_str()),
+                })
+            }
+            Self::Quic {
+                host,
+                port,
+                server_name,
+            } => {
+                let ip = Self::get_ip(host, resolved_ip)?;
+                Ok(ParsedDnsServer::Quic {
                     addr: SocketAddr::new(ip, *port),
                     server_name: Arc::from(server_name.as_str()),
                 })
@@ -355,6 +414,46 @@ impl std::error::Error for DnsConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_roots_only_apply_to_encrypted_dns_transports() {
+        let addr = "127.0.0.1:53".parse().unwrap();
+        assert!(!ParsedDnsServer::System.uses_tls());
+        assert!(!ParsedDnsServer::Udp { addr }.uses_tls());
+        assert!(!ParsedDnsServer::Tcp { addr }.uses_tls());
+
+        let server_name: Arc<str> = Arc::from("dns.example");
+        assert!(
+            ParsedDnsServer::Tls {
+                addr,
+                server_name: server_name.clone(),
+            }
+            .uses_tls()
+        );
+        assert!(
+            ParsedDnsServer::Quic {
+                addr,
+                server_name: server_name.clone(),
+            }
+            .uses_tls()
+        );
+        assert!(
+            ParsedDnsServer::Https {
+                addr,
+                server_name: server_name.clone(),
+                path: Arc::from("/dns-query"),
+            }
+            .uses_tls()
+        );
+        assert!(
+            ParsedDnsServer::H3 {
+                addr,
+                server_name,
+                path: Arc::from("/dns-query"),
+            }
+            .uses_tls()
+        );
+    }
 
     #[test]
     fn test_parse_system() {
@@ -539,13 +638,46 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_invalid_scheme() {
-        let result = ParsedDnsUrl::parse("quic://8.8.8.8");
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DnsConfigError::UnsupportedScheme(_)
-        ));
+    fn test_parse_quic_defaults_and_override() {
+        let url = ParsedDnsUrl::parse("quic://8.8.8.8").unwrap();
+        let server = url.to_parsed_server(None).unwrap();
+        match server {
+            ParsedDnsServer::Quic { addr, server_name } => {
+                assert_eq!(addr, "8.8.8.8:853".parse().unwrap());
+                assert_eq!(&*server_name, "8.8.8.8");
+            }
+            _ => panic!("expected Quic"),
+        }
+
+        let url =
+            ParsedDnsUrl::parse_with_server_name("quic://1.2.3.4:8853", Some("dns.example.com"))
+                .unwrap();
+        let server = url.to_parsed_server(None).unwrap();
+        match server {
+            ParsedDnsServer::Quic { addr, server_name } => {
+                assert_eq!(addr, "1.2.3.4:8853".parse().unwrap());
+                assert_eq!(&*server_name, "dns.example.com");
+            }
+            _ => panic!("expected Quic"),
+        }
+    }
+
+    #[test]
+    fn test_parse_quic_hostname_requires_bootstrap_resolution() {
+        let url = ParsedDnsUrl::parse("quic://dns.adguard-dns.com").unwrap();
+        assert_eq!(url.hostname(), Some("dns.adguard-dns.com"));
+        assert!(url.to_parsed_server(None).is_err());
+
+        let server = url
+            .to_parsed_server(Some("94.140.14.14".parse().unwrap()))
+            .unwrap();
+        match server {
+            ParsedDnsServer::Quic { addr, server_name } => {
+                assert_eq!(addr, "94.140.14.14:853".parse().unwrap());
+                assert_eq!(&*server_name, "dns.adguard-dns.com");
+            }
+            _ => panic!("expected Quic"),
+        }
     }
 
     #[test]
@@ -562,6 +694,10 @@ mod tests {
         assert_eq!(
             serde_yaml::from_str::<IpStrategy>("ipv4_and_ipv6").unwrap(),
             IpStrategy::Ipv4AndIpv6
+        );
+        assert_eq!(
+            serde_yaml::from_str::<IpStrategy>("ipv6_and_ipv4").unwrap(),
+            IpStrategy::Ipv6AndIpv4
         );
         assert_eq!(
             serde_yaml::from_str::<IpStrategy>("ipv4_then_ipv6").unwrap(),
@@ -596,6 +732,10 @@ mod tests {
         ));
         assert!(matches!(
             IpStrategy::Ipv4AndIpv6.to_hickory(),
+            LookupIpStrategy::Ipv4AndIpv6
+        ));
+        assert!(matches!(
+            IpStrategy::Ipv6AndIpv4.to_hickory(),
             LookupIpStrategy::Ipv4AndIpv6
         ));
         assert!(matches!(

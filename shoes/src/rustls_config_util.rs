@@ -11,6 +11,7 @@ pub fn create_client_config(
     enable_sni: bool,
     client_key_and_cert: Option<(Vec<u8>, Vec<u8>)>,
     tls13_only: bool,
+    use_native_roots: bool,
 ) -> rustls::ClientConfig {
     let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider());
     let builder = if tls13_only {
@@ -22,22 +23,19 @@ pub fn create_client_config(
     };
 
     let builder = if verify_webpki {
-        let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            get_root_cert_store(),
-            get_crypto_provider(),
-        )
-        .build()
-        .unwrap();
+        let certificate_verifier = get_certificate_verifier(use_native_roots);
         if !server_fingerprints.is_empty() {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                     supported_algs: get_supported_algorithms(),
                     server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
-                    webpki_verifier: Some(Arc::into_inner(webpki_verifier).unwrap()),
+                    certificate_verifier: Some(certificate_verifier),
                 }))
         } else {
-            builder.with_webpki_verifier(webpki_verifier)
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(certificate_verifier)
         }
     } else if !server_fingerprints.is_empty() {
         builder
@@ -45,7 +43,7 @@ pub fn create_client_config(
             .with_custom_certificate_verifier(Arc::new(ServerFingerprintVerifier {
                 supported_algs: get_supported_algorithms(),
                 server_fingerprints: process_fingerprints(&server_fingerprints).unwrap(),
-                webpki_verifier: None,
+                certificate_verifier: None,
             }))
     } else {
         builder
@@ -81,7 +79,7 @@ pub fn create_client_config(
 pub struct ServerFingerprintVerifier {
     supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
     server_fingerprints: BTreeSet<Vec<u8>>,
-    webpki_verifier: Option<rustls::client::WebPkiServerVerifier>,
+    certificate_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
@@ -93,8 +91,8 @@ impl rustls::client::danger::ServerCertVerifier for ServerFingerprintVerifier {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if let Some(ref webpki_verifier) = self.webpki_verifier {
-            let _ = webpki_verifier.verify_server_cert(
+        if let Some(ref certificate_verifier) = self.certificate_verifier {
+            let _ = certificate_verifier.verify_server_cert(
                 end_entity,
                 intermediates,
                 server_name,
@@ -219,14 +217,109 @@ fn get_root_cert_store() -> Arc<rustls::RootCertStore> {
         .clone()
 }
 
+fn get_certificate_verifier(
+    use_native_roots: bool,
+) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+    if use_native_roots {
+        get_native_certificate_verifier()
+    } else {
+        get_bundled_certificate_verifier()
+    }
+}
+
+fn get_native_certificate_verifier() -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+    static INSTANCE: OnceLock<Arc<dyn rustls::client::danger::ServerCertVerifier>> =
+        OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            match rustls_platform_verifier::Verifier::new(get_crypto_provider()) {
+                Ok(verifier) => Arc::new(verifier),
+                Err(error) => Arc::new(InitializationFailedVerifier {
+                    supported_algs: get_supported_algorithms(),
+                    message: format!(
+                        "could not initialize the operating-system TLS certificate verifier: {error}"
+                    ),
+                }),
+            }
+        })
+        .clone()
+}
+
+fn get_bundled_certificate_verifier() -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+    static INSTANCE: OnceLock<Arc<dyn rustls::client::danger::ServerCertVerifier>> =
+        OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                get_root_cert_store(),
+                get_crypto_provider(),
+            )
+            .build()
+            .expect("bundled WebPKI roots must contain at least one trust anchor")
+        })
+        .clone()
+}
+
+/// Keeps configuration construction non-panicking when a platform has no usable
+/// trust store. Any handshake using this verifier still fails closed with the
+/// original initialization error; it never falls back to the bundled roots.
+#[derive(Debug)]
+struct InitializationFailedVerifier {
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    message: String,
+}
+
+impl rustls::client::danger::ServerCertVerifier for InitializationFailedVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::General(self.message.clone()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+}
+
 /// Creates a simple TLS ClientConfig with root CA verification.
 /// Used by hickory-resolver for DoT/DoH connections.
-pub fn create_dns_client_config() -> rustls::ClientConfig {
-    rustls::ClientConfig::builder_with_provider(get_crypto_provider())
+pub fn create_dns_client_config(use_native_roots: bool) -> rustls::ClientConfig {
+    let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
         .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates((*get_root_cert_store()).clone())
-        .with_no_client_auth()
+        .unwrap();
+    if use_native_roots {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(get_certificate_verifier(true))
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates((*get_root_cert_store()).clone())
+            .with_no_client_auth()
+    }
 }
 
 pub fn create_server_config(
@@ -401,5 +494,36 @@ impl rustls::server::danger::ClientCertVerifier for ClientFingerprintVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.supported_algs.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_client_config, create_dns_client_config, get_certificate_verifier};
+
+    #[test]
+    fn bundled_and_operating_system_root_modes_both_build() {
+        for use_native_roots in [false, true] {
+            let client = create_client_config(
+                true,
+                Vec::new(),
+                Vec::new(),
+                true,
+                None,
+                false,
+                use_native_roots,
+            );
+            assert!(client.enable_sni);
+            let _ = create_dns_client_config(use_native_roots);
+        }
+    }
+
+    #[test]
+    fn certificate_verifiers_are_cached_per_trust_policy() {
+        for use_native_roots in [false, true] {
+            let first = get_certificate_verifier(use_native_roots);
+            let second = get_certificate_verifier(use_native_roots);
+            assert!(std::sync::Arc::ptr_eq(&first, &second));
+        }
     }
 }

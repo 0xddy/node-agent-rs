@@ -244,6 +244,10 @@ impl TcpClientHandler for WebsocketTcpClientHandler {
             .await
     }
 
+    fn needs_handshake_for_write(&self) -> bool {
+        self.handler.needs_handshake_for_write()
+    }
+
     fn supports_udp_over_tcp(&self) -> bool {
         self.handler.supports_udp_over_tcp()
     }

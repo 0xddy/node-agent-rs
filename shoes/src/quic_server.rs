@@ -17,7 +17,7 @@ use crate::config::{
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::dynamic::{
     ConnContext, HandlerSlot, ServerHandle, StaticUserRegistry, TrafficMeterStream, UserRegistry,
-    scope_connection,
+    scope_connection_until_cancelled,
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
@@ -194,7 +194,7 @@ async fn process_streams(
 
     let conn = ConnContext::new();
     let quic_stream = TrafficMeterStream::new(quic_stream, Arc::clone(&conn));
-    scope_connection(
+    scope_connection_until_cancelled(
         conn,
         serve_stream(resolver, server_handler, Box::new(quic_stream)),
     )
@@ -303,7 +303,7 @@ async fn serve_stream(
             proxy_selector,
         } => {
             let action = proxy_selector
-                .judge(remote_location.into(), &resolver)
+                .judge_udp(remote_location.into(), &resolver)
                 .await?;
             match action {
                 ConnectDecision::Allow {
@@ -454,7 +454,16 @@ pub async fn start_quic_servers(
         ServerProxyConfig::Hysteria2 {
             password,
             udp_enabled,
+            up_mbps,
+            down_mbps,
+            obfs,
+            masquerade,
         } => {
+            let obfs = obfs.map(|obfs| match obfs {
+                crate::config::Hysteria2ObfsConfig::Salamander { password } => {
+                    crate::hysteria2_obfs::Salamander::new(&password)
+                }
+            });
             // Hysteria2 sends its password in cleartext in a header, so the whole of
             // authentication is one registry lookup. An injected registry takes it
             // over; without one, the config's own password becomes a one-user
@@ -463,6 +472,9 @@ pub async fn start_quic_servers(
                 Some(users) => users.clone(),
                 None => StaticUserRegistry::single_password(&password),
             };
+            let masquerade = Arc::new(crate::hysteria2_masquerade::Hysteria2Masquerade::new(
+                masquerade.as_ref(),
+            )?);
 
             for bind_address in bind_addresses.into_iter() {
                 // A rule slot rather than a handler slot: hysteria2 authenticates in
@@ -482,6 +494,10 @@ pub async fn start_quic_servers(
                     selector_slot,
                     num_endpoints,
                     udp_enabled,
+                    up_mbps,
+                    down_mbps,
+                    obfs.clone(),
+                    masquerade.clone(),
                     cancel.clone(),
                 )
                 .await?;

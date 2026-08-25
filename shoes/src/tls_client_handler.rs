@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
+use crate::config::VlessPacketEncoding;
 use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
@@ -19,7 +20,11 @@ pub struct TlsClientHandler {
 #[derive(Debug)]
 pub enum TlsInnerClientHandler {
     Default(Box<dyn TcpClientHandler>),
-    VisionVless { uuid: Box<[u8]>, udp_enabled: bool },
+    VisionVless {
+        uuid: Box<[u8]>,
+        udp_enabled: bool,
+        packet_encoding: Option<VlessPacketEncoding>,
+    },
 }
 
 impl TlsClientHandler {
@@ -43,12 +48,17 @@ impl TlsClientHandler {
         server_name: rustls::pki_types::ServerName<'static>,
         uuid: Box<[u8]>,
         udp_enabled: bool,
+        packet_encoding: Option<VlessPacketEncoding>,
     ) -> Self {
         Self {
             client_config,
             tls_buffer_size,
             server_name,
-            handler: TlsInnerClientHandler::VisionVless { uuid, udp_enabled },
+            handler: TlsInnerClientHandler::VisionVless {
+                uuid,
+                udp_enabled,
+                packet_encoding,
+            },
         }
     }
 }
@@ -94,6 +104,13 @@ impl TcpClientHandler for TlsClientHandler {
         }
     }
 
+    fn needs_handshake_for_write(&self) -> bool {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => handler.needs_handshake_for_write(),
+            TlsInnerClientHandler::VisionVless { .. } => true,
+        }
+    }
+
     fn supports_udp_over_tcp(&self) -> bool {
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => handler.supports_udp_over_tcp(),
@@ -129,11 +146,16 @@ impl TcpClientHandler for TlsClientHandler {
                     .setup_client_udp_bidirectional(Box::new(tls_stream), target)
                     .await
             }
-            TlsInnerClientHandler::VisionVless { uuid, .. } => {
+            TlsInnerClientHandler::VisionVless {
+                uuid,
+                packet_encoding,
+                ..
+            } => {
                 crate::vless::vless_client_handler::setup_vless_udp_bidirectional(
                     tls_stream,
                     uuid,
-                    target.into_location(),
+                    target,
+                    *packet_encoding,
                 )
                 .await
             }

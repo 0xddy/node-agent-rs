@@ -1,13 +1,16 @@
 //! SocketConnectorImpl - Implementation of SocketConnector trait.
 //!
-//! Handles TCP and QUIC transports with bind_interface support.
+//! Handles TCP and QUIC transports. Rich dialer socket options are isolated to
+//! TCP/direct-UDP; configuration validation rejects them for QUIC.
 //! Created from the socket-related fields of any ClientConfig.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use log::{debug, error};
@@ -18,9 +21,12 @@ use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::config::{ClientConfig, ClientQuicConfig, Transport};
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, resolve_addresses, resolve_location};
+use crate::resolver::{Resolver, resolve_addresses_via, resolve_location_via};
 use crate::rustls_config_util::create_client_config;
-use crate::socket_util::{new_tcp_socket, new_udp_socket, set_tcp_keepalive};
+use crate::socket_util::{
+    OutboundSocketOptions, new_outbound_tcp_socket, new_outbound_udp_socket, new_udp_socket,
+    set_tcp_keepalive,
+};
 use crate::thread_util::get_num_threads;
 
 use super::socket_connector::SocketConnector;
@@ -43,13 +49,46 @@ enum TransportConfig {
 ///
 /// Created from the socket-related fields of any ClientConfig:
 /// - `bind_interface`
+/// - `inet4_bind_address` / `inet6_bind_address`
+/// - `routing_mark` / `bind_address_no_port`
+/// - `connect_timeout`
 /// - `transport`
 /// - `tcp_settings`
 /// - `quic_settings`
 #[derive(Debug)]
 pub struct SocketConnectorImpl {
-    bind_interface: Option<String>,
+    socket_options: OutboundSocketOptions,
+    connect_timeout: Option<Duration>,
+    dns_resolver: Option<String>,
     transport: TransportConfig,
+}
+
+async fn with_connect_timeout<F, T>(
+    future: F,
+    connect_timeout: Option<Duration>,
+    target: SocketAddr,
+) -> std::io::Result<T>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    let Some(connect_timeout) = connect_timeout else {
+        return future.await;
+    };
+    // sing-box treats an explicitly configured zero duration as its standard
+    // dial timeout. Absence remains None so legacy shoes behavior is unchanged.
+    let connect_timeout = if connect_timeout.is_zero() {
+        Duration::from_secs(5)
+    } else {
+        connect_timeout
+    };
+    tokio::time::timeout(connect_timeout, future)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("TCP connect to {target} timed out after {connect_timeout:?}"),
+            )
+        })?
 }
 
 impl SocketConnectorImpl {
@@ -66,7 +105,13 @@ impl SocketConnectorImpl {
         config: &ClientConfig,
         target_address: Option<&NetLocation>,
     ) -> Option<Self> {
-        let bind_interface = config.bind_interface.clone().into_option();
+        let socket_options = OutboundSocketOptions {
+            bind_interface: config.bind_interface.clone().into_option(),
+            inet4_bind_address: config.inet4_bind_address,
+            inet6_bind_address: config.inet6_bind_address,
+            routing_mark: config.routing_mark,
+            bind_address_no_port: config.bind_address_no_port,
+        };
 
         let default_sni_hostname =
             target_address.and_then(|addr| addr.address().hostname().map(ToString::to_string));
@@ -95,6 +140,7 @@ impl SocketConnectorImpl {
 
                 let ClientQuicConfig {
                     verify,
+                    use_native_roots,
                     server_fingerprints,
                     alpn_protocols,
                     sni_hostname,
@@ -135,6 +181,7 @@ impl SocketConnectorImpl {
                     sni_hostname.is_some(),
                     key_and_cert_bytes,
                     false, // tls13_only - QUIC enforces TLS 1.3 anyway
+                    use_native_roots,
                 );
 
                 let quic_client_config = quinn::crypto::rustls::QuicClientConfig::with_initial(
@@ -161,7 +208,7 @@ impl SocketConnectorImpl {
                 for _ in 0..endpoints_len {
                     let udp_socket = match new_udp_socket(
                         target_address.address().is_ipv6(),
-                        bind_interface.clone(),
+                        socket_options.bind_interface.clone(),
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -191,7 +238,9 @@ impl SocketConnectorImpl {
         };
 
         Some(Self {
-            bind_interface,
+            socket_options,
+            connect_timeout: config.connect_timeout,
+            dns_resolver: config.dns_resolver.clone(),
             transport,
         })
     }
@@ -202,7 +251,12 @@ impl SocketConnectorImpl {
     #[cfg(test)]
     pub fn new_tcp(bind_interface: Option<String>, no_delay: bool) -> Self {
         Self {
-            bind_interface,
+            socket_options: OutboundSocketOptions {
+                bind_interface,
+                ..Default::default()
+            },
+            connect_timeout: None,
+            dns_resolver: None,
             transport: TransportConfig::Tcp { no_delay },
         }
     }
@@ -217,7 +271,10 @@ impl SocketConnector for SocketConnectorImpl {
     ) -> std::io::Result<Box<dyn AsyncStream>> {
         let target_addrs = match address.resolved_addr() {
             Some(r) => vec![r],
-            None => resolve_addresses(resolver, address.location()).await?,
+            None => {
+                resolve_addresses_via(resolver, self.dns_resolver.as_deref(), address.location())
+                    .await?
+            }
         };
 
         match &self.transport {
@@ -225,8 +282,14 @@ impl SocketConnector for SocketConnectorImpl {
                 let mut last_err = None;
                 for (i, target_addr) in target_addrs.iter().enumerate() {
                     let tcp_socket =
-                        new_tcp_socket(self.bind_interface.clone(), target_addr.is_ipv6())?;
-                    match tcp_socket.connect(*target_addr).await {
+                        new_outbound_tcp_socket(target_addr.is_ipv6(), &self.socket_options)?;
+                    match with_connect_timeout(
+                        tcp_socket.connect(*target_addr),
+                        self.connect_timeout,
+                        *target_addr,
+                    )
+                    .await
+                    {
                         Ok(stream) => {
                             if i > 0 {
                                 debug!(
@@ -324,8 +387,9 @@ impl SocketConnector for SocketConnectorImpl {
             target.location()
         );
 
-        let remote_addr = resolve_location(&mut target, resolver).await?;
-        let client_socket = new_udp_socket(remote_addr.is_ipv6(), self.bind_interface.clone())?;
+        let remote_addr =
+            resolve_location_via(&mut target, resolver, self.dns_resolver.as_deref()).await?;
+        let client_socket = new_outbound_udp_socket(remote_addr.is_ipv6(), &self.socket_options)?;
 
         // Don't use connect() - wrap in UnconnectedUdpSocket instead.
         // A connected UDP socket filters incoming packets by source address,
@@ -338,7 +402,7 @@ impl SocketConnector for SocketConnectorImpl {
     }
 
     fn bind_interface(&self) -> Option<&str> {
-        self.bind_interface.as_deref()
+        self.socket_options.bind_interface.as_deref()
     }
 }
 
@@ -435,7 +499,10 @@ mod tests {
             connector.transport,
             TransportConfig::Tcp { no_delay: true }
         ));
-        assert_eq!(connector.bind_interface, Some("eth0".to_string()));
+        assert_eq!(
+            connector.socket_options.bind_interface,
+            Some("eth0".to_string())
+        );
     }
 
     #[test]
@@ -447,5 +514,45 @@ mod tests {
             connector.unwrap().transport,
             TransportConfig::Tcp { .. }
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_connect_timeout_wraps_tcp_connect() {
+        let target = "192.0.2.1:443".parse().unwrap();
+        let error = with_connect_timeout(
+            std::future::pending::<std::io::Result<()>>(),
+            Some(Duration::from_secs(2)),
+            target,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("192.0.2.1:443"));
+    }
+
+    #[test]
+    fn test_from_config_copies_dialer_socket_options() {
+        let config = ClientConfig {
+            inet4_bind_address: Some("192.0.2.10".parse().unwrap()),
+            inet6_bind_address: Some("2001:db8::10".parse().unwrap()),
+            routing_mark: 100,
+            connect_timeout: Some(Duration::from_secs(8)),
+            bind_address_no_port: true,
+            dns_resolver: Some("proxy-dns-v6".to_string()),
+            ..Default::default()
+        };
+        let connector = SocketConnectorImpl::from_config(&config, None).unwrap();
+        assert_eq!(
+            connector.socket_options.inet4_bind_address,
+            config.inet4_bind_address
+        );
+        assert_eq!(
+            connector.socket_options.inet6_bind_address,
+            config.inet6_bind_address
+        );
+        assert_eq!(connector.socket_options.routing_mark, 100);
+        assert_eq!(connector.connect_timeout, Some(Duration::from_secs(8)));
+        assert_eq!(connector.dns_resolver.as_deref(), Some("proxy-dns-v6"));
+        assert!(connector.socket_options.bind_address_no_port);
     }
 }

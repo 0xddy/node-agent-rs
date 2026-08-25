@@ -18,7 +18,7 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
-use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry};
+use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserRegistry};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
 use crate::stream_reader::StreamReader;
@@ -47,6 +47,18 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum number of concurrent UDP sessions one connection may hold open.
+///
+/// A session owns a client-side UDP socket, a spawned task, and that task's 64 KiB
+/// receive buffer. TUIC's association id is a `u16`, so the map is inherently capped
+/// at 65536 -- which is not a limit worth relying on: it is around 4 GiB of buffers
+/// and 65536 descriptors for a *single* authenticated connection, enough to take a
+/// shared inbound down for everybody on it.
+///
+/// The same 512 as hysteria2's, for the same reason: far above what a real client
+/// reaches, and roughly 32 MiB and 512 descriptors per connection at the ceiling.
+const MAX_UDP_SESSIONS: usize = 512;
 
 /// Heartbeat interval - server sends heartbeat datagrams to client at this interval.
 /// Default is 10 seconds per sing-box reference implementation.
@@ -131,8 +143,13 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    let user = match timeout(AUTH_TIMEOUT, auth_connection(&connection, users.as_ref())).await {
-        Ok(Ok(user)) => user,
+    let meter = match timeout(
+        AUTH_TIMEOUT,
+        auth_connection(&connection, users.as_ref(), metered),
+    )
+    .await
+    {
+        Ok(Ok(meter)) => meter,
         Ok(Err(e)) => {
             connection.close(0u32.into(), b"auth failed");
             return Err(e);
@@ -151,15 +168,15 @@ async fn process_connection(
     // whose connection this is, so there is no user to bill it to at the time, and it
     // is 50 bytes once per connection -- the same argument that already applies to the
     // QUIC handshake that carried it.
-    let meter: Meter = metered.then(|| {
-        let context = ConnContext::new();
-        context.bind(user);
-        context
-    });
+    let removal_meter = meter.clone();
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
     let cancel_token = CancellationToken::new();
+    // `CancellationToken` does not cancel when its last handle is merely dropped.
+    // Keep a guard on this stack so a panic (for example while decoding an
+    // authenticated datagram) cannot strand child UDP tasks and their user meter.
+    let _cancel_on_exit = cancel_token.drop_guard_ref();
 
     // this allows for:
     // 1. multiple threads can read different sessions concurrently
@@ -220,7 +237,25 @@ async fn process_connection(
         datagram_cancel_token,
     );
 
-    let result = tokio::try_join!(heartbeat_loop, bi_loop, uni_loop, datagram_loop);
+    let user_removed = async move {
+        match removal_meter {
+            Some(context) => context.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+
+    let result = tokio::select! {
+        biased;
+        () = user_removed => {
+            cancel_token.cancel();
+            connection.close(0u32.into(), b"user removed");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "connection closed because its user was removed",
+            ))
+        }
+        result = async { tokio::try_join!(heartbeat_loop, bi_loop, uni_loop, datagram_loop) } => result,
+    };
 
     // Cancel all remaining tasks (UDP session loops, cleanup task, heartbeat)
     cancel_token.cancel();
@@ -267,7 +302,7 @@ async fn run_heartbeat_loop(
                 // it looks at what kind it is. One rule for both directions is easier
                 // to state, and to test, than an exemption for keepalives.
                 if let Some(meter) = &meter {
-                    meter.count_datagram_tx(heartbeat_len);
+                    meter.count_datagram_tx(heartbeat_len).await;
                 }
             }
         }
@@ -286,7 +321,8 @@ async fn run_heartbeat_loop(
 async fn auth_connection(
     connection: &quinn::Connection,
     users: &dyn UserRegistry,
-) -> std::io::Result<Arc<UserContext>> {
+    metered: bool,
+) -> std::io::Result<Meter> {
     // Loop until we receive an AUTH command.
     // Other commands (like DISSOCIATE) may arrive on uni streams before AUTH.
     // We discard non-AUTH streams and wait for the next one.
@@ -357,9 +393,25 @@ async fn auth_connection(
         }
 
         // The lookup deliberately left this to us: only now is the client shown to
-        // hold the password the token was keyed with. See `UserRegistry::find_tuic_uuid`.
-        identity.user.note_auth();
-        return Ok(identity.user);
+        // hold the password the token was keyed with. Admission and registration use
+        // the same user lifecycle gate, so removal cannot slip between them.
+        if metered {
+            let context = ConnContext::new();
+            if !context.bind_authenticated(identity.user) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "user could not be admitted: removed, suspended, or at their connection limit",
+                ));
+            }
+            return Ok(Some(context));
+        }
+        if !identity.user.admit_unmetered() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "user could not be admitted: removed, suspended, or at their connection limit",
+            ));
+        }
+        return Ok(None);
     }
 }
 
@@ -392,16 +444,28 @@ async fn run_bidirectional_loop(
         // cover all of them at once and the live-connection count follows the QUIC
         // connection rather than the streams multiplexed over it.
         let meter = meter.clone();
+        let removal_meter = meter.clone();
         tokio::spawn(async move {
-            match process_tcp_stream(
+            let work = process_tcp_stream(
                 client_proxy_selector,
                 resolver,
                 meter,
                 send_stream,
                 recv_stream,
-            )
-            .await
-            {
+            );
+            let result = if let Some(meter) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = meter.cancelled() => Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "user removed",
+                    )),
+                    result = work => result,
+                }
+            } else {
+                work.await
+            };
+            match result {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     // Per official TUIC reference (handle_stream.rs:127-135),
@@ -623,12 +687,55 @@ struct UdpSession {
     cancel_token: CancellationToken,
 }
 
+impl Drop for UdpSession {
+    /// Stop the remote-to-local task this session started.
+    ///
+    /// A `CancellationToken` does not fire when its last handle is dropped -- only
+    /// an explicit `cancel` or a `DropGuard` does that, as the connection token at
+    /// the top of `process_connection` already notes -- and the spawned loop holds
+    /// its own clone of this one along with the client socket and a 64 KiB receive
+    /// buffer.
+    ///
+    /// Two paths discard a session without going through the reaper, and both leaked
+    /// before this: the `remove` after a failed forward, and the loser of the insert
+    /// race in `process_udp_packet`, where an already-started session is dropped
+    /// because a concurrent packet for the same association id got there first. The
+    /// race loser is the worse of the two, because it is not in the map for the
+    /// reaper to ever find, so its socket and task lived until the whole connection
+    /// ended.
+    ///
+    /// Cancelling here rather than at each call site makes the release a property of
+    /// the session's lifetime. The reaper's explicit `cancel` is left in place and is
+    /// simply idempotent.
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
 struct FragmentedPacket {
     fragment_count: u8,
     fragment_received: u8,
     packet_len: usize,
     received: Vec<Option<Bytes>>,
     remote_location: Option<NetLocation>,
+}
+
+/// Record the destination carried by fragment zero, even when a continuation
+/// fragment created the reassembly entry first. Returns false when fragment zero
+/// itself omits the required address.
+fn capture_first_fragment_location(
+    cached: &mut Option<NetLocation>,
+    fragment_id: u8,
+    presented: Option<NetLocation>,
+) -> bool {
+    if fragment_id != 0 || cached.is_some() {
+        return true;
+    }
+    let Some(presented) = presented else {
+        return false;
+    };
+    *cached = Some(presented);
+    true
 }
 
 impl UdpSession {
@@ -641,6 +748,7 @@ impl UdpSession {
         initial_socket_addr: SocketAddr,
         override_local_write_location: Option<NetLocation>,
         override_remote_write_address: Option<SocketAddr>,
+        meter: Meter,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
@@ -655,18 +763,25 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
-        // No meter parameter here: the stream this loop writes to is already wrapped,
-        // so its bytes are counted where they cross.
+        let removal_meter = meter;
         tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_stream_loop(
+            let work = run_udp_remote_to_local_stream_loop(
                 assoc_id,
                 send_stream,
                 client_socket,
                 override_local_write_location,
                 session_cancel_token,
-            )
-            .await
-            {
+            );
+            let result = if let Some(meter) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = meter.cancelled() => Ok(()),
+                    result = work => result,
+                }
+            } else {
+                work.await
+            };
+            if let Err(e) = result {
                 error!("UDP remote-to-local write loop ended with error: {e}");
             }
         });
@@ -698,17 +813,26 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
+        let removal_meter = meter.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_datagram_loop(
+            let work = run_udp_remote_to_local_datagram_loop(
                 assoc_id,
                 connection,
                 client_socket,
                 override_local_write_location,
                 meter,
                 session_cancel_token,
-            )
-            .await
-            {
+            );
+            let result = if let Some(meter) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = meter.cancelled() => Ok(()),
+                    result = work => result,
+                }
+            } else {
+                work.await
+            };
+            if let Err(e) = result {
                 error!("UDP remote-to-local write loop ended with error: {e}");
             }
         });
@@ -730,7 +854,7 @@ impl UdpSession {
                     (self.last_socket_addr, false)
                 } else {
                     let action = client_proxy_selector
-                        .judge(location.clone().into(), resolver)
+                        .judge_udp(location.clone().into(), resolver)
                         .await?;
 
                     let updated_location = match action {
@@ -916,6 +1040,19 @@ async fn run_udp_remote_to_local_datagram_loop(
         // + payload_size (2 bytes) + address_bytes
         let header_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + address_bytes_len;
 
+        // TUIC's own wire format length-prefixes a hostname with one byte, so a
+        // client cannot name a destination whose echoed form outgrows a datagram --
+        // 269 bytes at the very most, against a floor of `min_mtu`. The `else` branch
+        // below still subtracts this from `max_datagram_size`, though, and an
+        // unreachable underflow is one refactor away from a reachable one. Checked
+        // here so the arithmetic below is guarded by something other than a comment.
+        if max_datagram_size <= header_overhead {
+            return Err(std::io::Error::other(format!(
+                "the requested destination needs {header_overhead} header bytes, which does not \
+                 fit a {max_datagram_size} byte datagram"
+            )));
+        }
+
         if header_overhead + payload_len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
             datagram.put_u8(5); // tuic version
@@ -937,7 +1074,7 @@ async fn run_udp_remote_to_local_datagram_loop(
                 .send_datagram(datagram)
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
             if let Some(meter) = &meter {
-                meter.count_datagram_tx(datagram_len);
+                meter.count_datagram_tx(datagram_len).await;
             }
         } else {
             // Calculate header sizes for first fragment and subsequent fragments.
@@ -980,7 +1117,7 @@ async fn run_udp_remote_to_local_datagram_loop(
                     ))
                 })?;
                 if let Some(meter) = &meter {
-                    meter.count_datagram_tx(datagram_len);
+                    meter.count_datagram_tx(datagram_len).await;
                 }
                 offset += fragment_payload_len;
             }
@@ -1042,11 +1179,12 @@ async fn run_unidirectional_loop(
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
+        let task_cancel_token = cancel_token.clone();
         let meter = meter.clone();
         tokio::spawn(async move {
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
-            match process_uni_stream(
+            let work = process_uni_stream(
                 &connection,
                 client_proxy_selector,
                 resolver,
@@ -1054,9 +1192,13 @@ async fn run_unidirectional_loop(
                 udp_session_map,
                 meter,
                 cancel_token,
-            )
-            .await
-            {
+            );
+            let result = tokio::select! {
+                biased;
+                () = task_cancel_token.cancelled() => return,
+                result = work => result,
+            };
+            match result {
                 Ok(()) => {}
                 Err(e) => {
                     // Per official TUIC reference (handle_stream.rs:70-78),
@@ -1199,10 +1341,22 @@ async fn process_udp_packet(
                     ));
                 }
 
+                // Checked here rather than inside the `entry` below, because that
+                // holds one shard's write lock and `DashMap::len` wants a read lock
+                // on every shard. So concurrent creators can each pass this and
+                // overshoot by however many of them are in flight -- bounded, and
+                // the losers of the insert race are cancelled on drop -- whereas
+                // reading the length under the entry lock risks deadlocking.
+                if udp_session_map.len() >= MAX_UDP_SESSIONS {
+                    return Err(std::io::Error::other(format!(
+                        "Refusing new UDP session {assoc_id}: at the {MAX_UDP_SESSIONS} session limit"
+                    )));
+                }
+
                 let remote_location = remote_location.clone().unwrap();
 
                 let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), resolver)
+                    .judge_udp(remote_location.clone().into(), resolver)
                     .await;
 
                 let (_chain_group, updated_location) = match action {
@@ -1262,6 +1416,7 @@ async fn process_udp_packet(
                         resolved_address,
                         override_local_write_location,
                         override_remote_write_address,
+                        meter.clone(),
                         cancel_token,
                     )
                 } else {
@@ -1351,14 +1506,18 @@ async fn process_udp_packet(
             }
         };
 
-        if is_new && frag_id == 0 && packet.remote_location.is_none() {
-            if remote_location.is_none() {
-                fragments.pop(&packet_id);
-                return Err(std::io::Error::other(format!(
-                    "Ignoring packet with empty first fragment address for session {assoc_id}"
-                )));
-            }
-            packet.remote_location = remote_location.clone();
+        // Continuation fragments may arrive before fragment zero. Fill the cached
+        // destination whenever fragment zero eventually arrives, not only when it
+        // happened to create the cache entry.
+        if !capture_first_fragment_location(
+            &mut packet.remote_location,
+            frag_id,
+            remote_location.clone(),
+        ) {
+            fragments.pop(&packet_id);
+            return Err(std::io::Error::other(format!(
+                "Ignoring packet with empty first fragment address for session {assoc_id}"
+            )));
         }
 
         if packet.fragment_count != frag_total {
@@ -1388,9 +1547,15 @@ async fn process_udp_packet(
             received,
             packet_len,
             ..
-        } = fragments.pop(&packet_id).unwrap();
+        } = fragments
+            .pop(&packet_id)
+            .ok_or_else(|| std::io::Error::other("Fragment cache entry disappeared"))?;
 
-        let remote_location = remote_location.unwrap();
+        let remote_location = remote_location.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "Missing first fragment address for session {assoc_id} packet {packet_id}"
+            ))
+        })?;
 
         let (socket_addr, is_updated) = session
             .resolve_address(&remote_location, client_proxy_selector, resolver)
@@ -1427,6 +1592,22 @@ async fn process_udp_packet(
     }
 
     Ok(())
+}
+
+fn checked_payload_end(
+    data_len: usize,
+    offset: usize,
+    payload_size: usize,
+) -> std::io::Result<usize> {
+    let end = offset
+        .checked_add(payload_size)
+        .ok_or_else(|| std::io::Error::other("decode UDP message: payload length overflow"))?;
+    if end > data_len {
+        return Err(std::io::Error::other(
+            "decode UDP message: truncated payload",
+        ));
+    }
+    Ok(end)
 }
 
 async fn run_datagram_loop(
@@ -1468,7 +1649,7 @@ async fn run_datagram_loop(
         // has already received. Billing only the well-formed ones would let a client
         // move bytes for free by malforming them.
         if let Some(meter) = &meter {
-            meter.count_datagram_rx(data.len());
+            meter.count_datagram_rx(data.len()).await;
         }
 
         // Per official TUIC reference (handle_stream.rs:172-180), protocol errors close the connection
@@ -1514,12 +1695,18 @@ async fn run_datagram_loop(
                     ));
                 }
                 let address_len = data[11] as usize;
-                if data_len < 12 + address_len + 2 + payload_size {
+                let address_end = 12usize.checked_add(address_len).ok_or_else(|| {
+                    std::io::Error::other("decode UDP message: hostname length overflow")
+                })?;
+                let offset = address_end.checked_add(2).ok_or_else(|| {
+                    std::io::Error::other("decode UDP message: hostname length overflow")
+                })?;
+                if offset > data_len {
                     return Err(std::io::Error::other(
                         "decode UDP message: truncated hostname",
                     ));
                 }
-                let address_bytes = &data[12..12 + address_len];
+                let address_bytes = &data[12..address_end];
                 let address_str = str::from_utf8(address_bytes).map_err(|e| {
                     std::io::Error::other(format!("decode UDP message: invalid UTF-8: {e}"))
                 })?;
@@ -1529,11 +1716,11 @@ async fn run_datagram_loop(
                 let address = Address::from(address_str).map_err(|e| {
                     std::io::Error::other(format!("decode UDP message: invalid address: {e}"))
                 })?;
-                let port = u16::from_be_bytes([data[12 + address_len], data[12 + address_len + 1]]);
-                (Some(NetLocation::new(address, port)), 12 + address_len + 2)
+                let port = u16::from_be_bytes([data[address_end], data[address_end + 1]]);
+                (Some(NetLocation::new(address, port)), offset)
             }
             0x01 => {
-                if data_len < 17 + payload_size {
+                if data_len < 17 {
                     return Err(std::io::Error::other("decode UDP message: IPv4 too short"));
                 }
                 let ipv4_addr = Ipv4Addr::new(data[11], data[12], data[13], data[14]);
@@ -1541,7 +1728,7 @@ async fn run_datagram_loop(
                 (Some(NetLocation::new(Address::Ipv4(ipv4_addr), port)), 17)
             }
             0x02 => {
-                if data_len < 29 + payload_size {
+                if data_len < 29 {
                     return Err(std::io::Error::other("decode UDP message: IPv6 too short"));
                 }
                 let ipv6_bytes: [u8; 16] = data[11..27].try_into().unwrap();
@@ -1556,7 +1743,11 @@ async fn run_datagram_loop(
             }
         };
 
-        let payload_fragment = &data[offset..offset + payload_size];
+        // One checked calculation covers every address variant, including 0xff
+        // (address omitted on a continuation fragment). Previously that branch
+        // could index past the datagram and unwind the whole connection task.
+        let payload_end = checked_payload_end(data_len, offset, payload_size)?;
+        let payload_fragment = &data[offset..payload_end];
 
         if let Err(e) = process_udp_packet(
             &connection,
@@ -1689,4 +1880,87 @@ pub async fn start_tuic_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UdpSession, capture_first_fragment_location, checked_payload_end};
+    use crate::address::{Address, NetLocation};
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Dropping a session must stop the task it started.
+    ///
+    /// This is what the insert-race loser and the failed-forward `remove` both rely
+    /// on. Constructed by hand rather than through `start_*`, because the point is
+    /// the struct's own lifetime, not the loop it spawns -- and a spawned loop would
+    /// need a real QUIC connection to build.
+    #[tokio::test]
+    async fn dropping_a_session_cancels_its_background_task() {
+        let parent = CancellationToken::new();
+        let token = parent.child_token();
+
+        let session = UdpSession {
+            send_socket: Arc::new(
+                tokio::net::UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback socket"),
+            ),
+            last_location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
+            last_socket_addr: "127.0.0.1:1".parse().unwrap(),
+            override_remote_write_address: None,
+            last_activity: std::time::Instant::now(),
+            cancel_token: token.clone(),
+        };
+
+        assert!(!token.is_cancelled(), "a live session is not cancelled");
+        drop(session);
+        assert!(
+            token.is_cancelled(),
+            "the spawned loop holds its own clone of this token and would otherwise              keep its socket and buffer alive until the connection ended"
+        );
+        assert!(
+            !parent.is_cancelled(),
+            "one session ending must not take the whole connection with it"
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_payload_after_omitted_address() {
+        // A TUIC continuation fragment with address type 0xff has an 11-byte
+        // header. Its declared payload must still fit in the received datagram.
+        let error = checked_payload_end(11, 11, 1).expect_err("payload is absent");
+        assert!(error.to_string().contains("truncated payload"));
+    }
+
+    #[test]
+    fn accepts_payload_that_exactly_fills_datagram() {
+        assert_eq!(checked_payload_end(18, 11, 7).unwrap(), 18);
+    }
+
+    #[test]
+    fn rejects_payload_offset_overflow() {
+        let error = checked_payload_end(usize::MAX, usize::MAX, 1)
+            .expect_err("offset addition must be checked");
+        assert!(error.to_string().contains("length overflow"));
+    }
+
+    #[test]
+    fn fragment_zero_supplies_the_address_after_a_continuation_arrives_first() {
+        let mut cached = None;
+        assert!(capture_first_fragment_location(&mut cached, 1, None));
+        assert!(cached.is_none());
+
+        let location = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53);
+        assert!(capture_first_fragment_location(
+            &mut cached,
+            0,
+            Some(location.clone()),
+        ));
+        assert_eq!(cached, Some(location));
+
+        let mut missing = None;
+        assert!(!capture_first_fragment_location(&mut missing, 0, None));
+    }
 }

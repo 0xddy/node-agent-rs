@@ -307,13 +307,8 @@ async fn tuic_users_are_found_by_their_uuid_and_password() {
             .is_ok(),
     );
 
-    // -- 9. removal is forward-looking only ------------------------------------
-    //
-    // TUIC resolves a user once, at auth, and the connection holds the context it
-    // found. Removing the user takes their uuid out of the index; it does not reach
-    // into a live connection, which is the smooth-handover property the whole design
-    // rests on.
-    checks.section("9. removing a user leaves their open connection alone");
+    // -- 9. removal closes the authenticated QUIC connection --------------------
+    checks.section("9. removing a user closes their QUIC connection");
     let held_client = tu::TuicClient::connect(tuic, BOB_UUID, BOB_PASSWORD)
         .await
         .expect("bob should be able to authenticate");
@@ -324,7 +319,12 @@ async fn tuic_users_are_found_by_their_uuid_and_password() {
     held.write_all(b"wh").await.expect("send half a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    checks.that("bob is removed", engine.remove_user("tuic", "bob").is_ok());
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("tuic", "bob")).await;
+    checks.that(
+        "bob is removed after his QUIC connection drains",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
+    );
     checks.that(
         "a new bob connection is refused",
         tu::denied(tuic, BOB_UUID, BOB_PASSWORD, sink.address).await,
@@ -336,11 +336,14 @@ async fn tuic_users_are_found_by_their_uuid_and_password() {
             .is_ok(),
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "bob's already-open stream still completes",
-        held.read_line().await.ok(),
-        Some("sink".to_string()),
+    let closed = match held.write_all(b"o\n").await {
+        Err(_) => true,
+        Ok(()) => held.read_line().await.is_err(),
+    };
+    checks.that("bob's already-open stream is actively closed", closed);
+    checks.that(
+        "the removed user's old QUIC connection cannot open another stream",
+        held_client.open_tcp(sink.address).await.is_err(),
     );
     drop(held);
     drop(held_client);
@@ -540,6 +543,9 @@ async fn a_dynamic_tuic_inbound_needs_both_halves() {
                 uuid: None,
                 password: None,
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             },
         ),
         "needs a credential",

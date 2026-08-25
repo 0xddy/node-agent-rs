@@ -42,7 +42,10 @@
 //! **Shape B -- explicit parameter.** Task locals do not cross [`tokio::spawn`], so
 //! Shape A works only where authentication is inline. Three protocols authenticate
 //! somewhere else and must carry the context themselves, as
-//! `type Meter = Option<Arc<ConnContext>>`, obtained from [`current_connection`]:
+//! `type Meter = Option<Arc<ConnContext>>`. QUIC protocols construct it when the
+//! connection authenticates; a protocol that crosses a spawn first captures it with
+//! [`current_connection`]. They admit through [`ConnContext::bind_authenticated`] or,
+//! for repeated request authentication, [`ConnContext::bind_or_matches`]:
 //!
 //! - **Hysteria2** authenticates once and then fans out into three loops, each its
 //!   own task;
@@ -50,9 +53,10 @@
 //! - **NaiveProxy** hands the task to hyper at `serve_connection`, and the
 //!   credential is not read until a request arrives on it.
 //!
-//! Getting this wrong fails silently -- TCP still adds up perfectly and the user's
-//! counters simply sit at zero -- so every acceptance suite has a section that moves
-//! traffic on the path that crosses the spawn.
+//! Tracked dynamic users fail closed when this context is missing, so getting the
+//! propagation wrong rejects authentication rather than silently creating a session
+//! removal cannot cancel. Every acceptance suite still moves traffic on the path that
+//! crosses the spawn, proving the explicit hand-off is present.
 //!
 //! # Hot path cost
 //!
@@ -61,13 +65,16 @@
 //! atomic load to find that user. No locks, no allocation, and nothing that a
 //! config reload or a user being added can contend with.
 
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{Instant, Sleep};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::async_stream::{AsyncPing, AsyncStream};
 
@@ -90,7 +97,12 @@ pub struct ConnContext {
     /// [`bind`]: ConnContext::bind
     pending_tx: AtomicU64,
     pending_rx: AtomicU64,
+    /// Serialises the one-time bind and NaiveProxy's concurrent H2 requests. It is
+    /// touched only during authentication, never by the byte-counting path.
+    binding: Mutex<()>,
     user: OnceLock<Arc<UserContext>>,
+    registration: OnceLock<u64>,
+    cancellation: CancellationToken,
 }
 
 impl std::fmt::Debug for ConnContext {
@@ -107,7 +119,10 @@ impl ConnContext {
         Arc::new(Self {
             pending_tx: AtomicU64::new(0),
             pending_rx: AtomicU64::new(0),
+            binding: Mutex::new(()),
             user: OnceLock::new(),
+            registration: OnceLock::new(),
+            cancellation: CancellationToken::new(),
         })
     }
 
@@ -134,15 +149,53 @@ impl ConnContext {
     /// paths and never through both. It is still ordered rather than atomic: this
     /// is called from the handshake, on the same task that is doing the reads, so
     /// there is no concurrent metering to race with.
-    pub fn bind(&self, user: Arc<UserContext>) -> bool {
+    #[cfg(test)]
+    pub(crate) fn bind(&self, user: Arc<UserContext>) -> bool {
+        let _binding = self.lock_binding();
+        self.bind_locked(user, false)
+    }
+
+    /// Atomically count a proved authentication and bind its physical connection.
+    /// The user's removal gate is held across both operations.
+    ///
+    /// Use this instead of [`bind_connection_user`] when a protocol carries its
+    /// `ConnContext` explicitly across a task boundary. Returns `false` when removal
+    /// or suspension won the admission race, or when this context was already bound.
+    ///
+    /// [`bind_connection_user`]: crate::dynamic::bind_connection_user
+    pub fn bind_authenticated(&self, user: Arc<UserContext>) -> bool {
+        let _binding = self.lock_binding();
+        self.bind_locked(user, true)
+    }
+
+    fn bind_locked(&self, user: Arc<UserContext>, authenticated: bool) -> bool {
         if self.user.set(user).is_err() {
             return false;
         }
         let user = self.user.get().expect("just set");
-        user.open_conn();
+        let id = if authenticated {
+            user.register_authenticated_connection(self.cancellation.clone())
+        } else {
+            user.register_connection(self.cancellation.clone())
+        };
+        let Some(id) = id else {
+            // Removal won the race after authentication returned this record but
+            // before the connection could bind it. The local token is already
+            // cancelled, so every wrapper around the connection will stop it.
+            return false;
+        };
+        self.registration
+            .set(id)
+            .expect("a connection is registered only by its first bind");
         user.add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
         user.add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
         true
+    }
+
+    fn lock_binding(&self) -> MutexGuard<'_, ()> {
+        self.binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Bind this connection to `user`, or confirm it already belongs to them.
@@ -153,19 +206,24 @@ impl ConnContext {
     /// `proxy-authorization`, so the same user re-presenting their credential is
     /// ordinary and must not be treated as a failure.
     ///
-    /// Returns `false` only when the connection is already bound to somebody *else*,
-    /// which a caller must refuse. There is one meter per connection and it cannot
-    /// separate two users' bytes after the fact, so letting the second one through
-    /// would bill everything they move to the first. One connection, one user.
+    /// Returns `false` when the connection is already bound to somebody *else*, or
+    /// when this user is no longer eligible for a new authentication because they
+    /// were suspended or revoked. A caller must refuse either case. There is one
+    /// meter per connection and it cannot separate two users' bytes after the fact,
+    /// so letting a second user through would bill everything they move to the first.
+    /// One connection, one user.
     ///
     /// The comparison is `Arc` identity rather than id equality: exactly one
     /// [`UserContext`] exists per user, so two records for one user cannot exist to
     /// be confused, and two users can never share one.
     pub fn bind_or_matches(&self, user: &Arc<UserContext>) -> bool {
-        if self.bind(Arc::clone(user)) {
-            return true;
+        let _binding = self.lock_binding();
+        if let Some(bound) = self.user() {
+            return self.registration.get().is_some()
+                && Arc::ptr_eq(bound, user)
+                && user.note_auth();
         }
-        self.user().is_some_and(|bound| Arc::ptr_eq(bound, user))
+        self.bind_locked(Arc::clone(user), true)
     }
 
     /// Count a datagram sent to the client, for a protocol whose datagrams never
@@ -179,17 +237,54 @@ impl ConnContext {
     /// The figure is the datagram's own length, header and address included, but not
     /// the QUIC framing and AEAD tag quinn adds around it -- the same caveat every
     /// QUIC inbound's accounting carries.
-    #[inline]
-    pub fn count_datagram_tx(&self, len: usize) {
+    /// The datagram is already gone by the time this is called -- quinn owns the
+    /// buffer and the send is not undoable -- so a bandwidth limit cannot hold
+    /// this one back. Awaiting here paces the *next* datagram instead, which
+    /// yields the right average rate over any window longer than one datagram.
+    pub async fn count_datagram_tx(&self, len: usize) {
         self.add_tx(len as u64);
+        sleep_for(self.reserve_tx(len as u64)).await;
     }
 
     /// Count a datagram received from the client. See [`count_datagram_tx`].
     ///
     /// [`count_datagram_tx`]: ConnContext::count_datagram_tx
-    #[inline]
-    pub fn count_datagram_rx(&self, len: usize) {
+    pub async fn count_datagram_rx(&self, len: usize) {
         self.add_rx(len as u64);
+        sleep_for(self.reserve_rx(len as u64)).await;
+    }
+
+    /// Claims download allowance for `n` bytes, reporting how long to wait.
+    ///
+    /// An unbound connection has no user and therefore no limit: bytes before
+    /// authentication are handshake overhead, they are not billed to anybody,
+    /// and throttling them would only slow down connection setup.
+    #[inline]
+    fn reserve_tx(&self, n: u64) -> Duration {
+        match self.user.get() {
+            Some(user) => user.reserve_tx(n),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Claims upload allowance for `n` bytes. See [`reserve_tx`](Self::reserve_tx).
+    #[inline]
+    fn reserve_rx(&self, n: u64) -> Duration {
+        match self.user.get() {
+            Some(user) => user.reserve_rx(n),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Resolves when the user this connection authenticated as is removed.
+    /// Before authentication the token remains pending; binding registers it with
+    /// the user's revocation set, and a bind racing with removal cancels it at once.
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     #[inline]
@@ -197,11 +292,17 @@ impl ConnContext {
         if n == 0 {
             return;
         }
-        match self.user.get() {
-            Some(user) => user.add_tx(n),
-            None => {
-                self.pending_tx.fetch_add(n, Ordering::Relaxed);
-            }
+        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
+            user.add_tx(n);
+            return;
+        }
+
+        self.pending_tx.fetch_add(n, Ordering::Relaxed);
+        // Authentication can publish the registration between the check and the
+        // fetch_add above. Rechecking and draining closes that handover race; swaps
+        // performed concurrently are harmless because exactly one observes bytes.
+        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
+            user.add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
         }
     }
 
@@ -210,21 +311,24 @@ impl ConnContext {
         if n == 0 {
             return;
         }
-        match self.user.get() {
-            Some(user) => user.add_rx(n),
-            None => {
-                self.pending_rx.fetch_add(n, Ordering::Relaxed);
-            }
+        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
+            user.add_rx(n);
+            return;
+        }
+
+        self.pending_rx.fetch_add(n, Ordering::Relaxed);
+        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
+            user.add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
         }
     }
 }
 
 impl Drop for ConnContext {
     fn drop(&mut self) {
-        // Mirrors the `open_conn` in `bind`, which is the only place it happens, so
-        // a connection that never authenticated is not counted down.
-        if let Some(user) = self.user.get() {
-            user.close_conn();
+        // Mirrors the live-count increment performed during registration, so a
+        // connection that never authenticated is not counted down.
+        if let (Some(user), Some(id)) = (self.user.get(), self.registration.get()) {
+            user.unregister_connection(*id);
         }
     }
 }
@@ -237,15 +341,42 @@ pub fn scope_connection<F: std::future::Future>(
     METERED_CONNECTION.scope(conn, future)
 }
 
-/// Attribute the connection being metered on this task to `user`.
+/// Run one ordinary connection until it finishes or its authenticated user is
+/// removed. Unlike checking only the stream, this also interrupts time spent in
+/// DNS resolution, outbound connect, or protocol setup where no client I/O is
+/// currently being polled.
+pub async fn scope_connection_until_cancelled<F>(
+    conn: Arc<ConnContext>,
+    future: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    let cancellation = Arc::clone(&conn);
+    scope_connection(conn, async move {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(connection_removed_error()),
+            result = future => result,
+        }
+    })
+    .await
+}
+
+/// Admit an authenticated user and, when this task is metered, bind its connection.
 ///
-/// Called from a protocol handler the instant it authenticates. Returns false when
-/// the inbound is not metered, which is the normal case for a config-file inbound,
-/// so handlers can ignore the result.
+/// Registry lookups only resolve credentials; they deliberately do not mutate
+/// accounting. A protocol handler must call this exactly once after it has all of
+/// the proof its protocol requires. On a metered connection, counting the
+/// authentication and registering the connection happen under the same per-user
+/// lifecycle lock, so removal either drains this connection or rejects it here. A
+/// classic, unmetered config-file inbound has no connection to register and records
+/// only the authentication. A dynamic context outside the task-local scope is
+/// rejected rather than silently admitted without a revocation token.
 pub fn bind_connection_user(user: &Arc<UserContext>) -> bool {
     METERED_CONNECTION
-        .try_with(|conn| conn.bind(Arc::clone(user)))
-        .unwrap_or(false)
+        .try_with(|conn| conn.bind_authenticated(Arc::clone(user)))
+        .unwrap_or_else(|_| user.admit_unmetered())
 }
 
 /// The connection being metered on this task, for code that has to carry the
@@ -263,20 +394,82 @@ pub fn current_connection() -> Option<Arc<ConnContext>> {
 pub struct TrafficMeterStream<T> {
     inner: T,
     conn: Arc<ConnContext>,
+    cancellation: Pin<Box<WaitForCancellationFutureOwned>>,
+    /// Bandwidth debt owed before the next read may be issued, if any.
+    ///
+    /// One slot per direction, and per *stream* rather than per user: the bucket
+    /// is shared, but each stream needs somewhere to register its own waker.
+    /// Allocated lazily, so an unlimited user never pays for a timer.
+    read_delay: Option<Pin<Box<Sleep>>>,
+    /// Bandwidth debt owed before the next write may be issued, if any.
+    write_delay: Option<Pin<Box<Sleep>>>,
 }
 
 impl<T> TrafficMeterStream<T> {
     pub fn new(inner: T, conn: Arc<ConnContext>) -> Self {
-        Self { inner, conn }
+        let cancellation = Box::pin(conn.cancellation_token().cancelled_owned());
+        Self {
+            inner,
+            conn,
+            cancellation,
+            read_delay: None,
+            write_delay: None,
+        }
     }
 
     pub fn conn(&self) -> &Arc<ConnContext> {
         &self.conn
     }
 
-    pub fn into_inner(self) -> T {
-        self.inner
+    fn poll_cancelled(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
+        if self.cancellation.as_mut().poll(cx).is_ready() {
+            Err(connection_removed_error())
+        } else {
+            Ok(())
+        }
     }
+}
+
+/// Waits out a reservation. A zero delay does not touch the timer wheel.
+async fn sleep_for(delay: Duration) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Polls an armed delay, clearing it once it fires.
+///
+/// `Ready` means the direction is clear to proceed.
+fn poll_delay(slot: &mut Option<Pin<Box<Sleep>>>, cx: &mut Context<'_>) -> Poll<()> {
+    let Some(sleep) = slot.as_mut() else {
+        return Poll::Ready(());
+    };
+    match sleep.as_mut().poll(cx) {
+        Poll::Ready(()) => {
+            *slot = None;
+            Poll::Ready(())
+        }
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Arms a delay, reusing the existing timer rather than allocating a new one.
+fn arm_delay(slot: &mut Option<Pin<Box<Sleep>>>, delay: Duration) {
+    if delay.is_zero() {
+        return;
+    }
+    let deadline = Instant::now() + delay;
+    match slot.as_mut() {
+        Some(sleep) => sleep.as_mut().reset(deadline),
+        None => *slot = Some(Box::pin(tokio::time::sleep_until(deadline))),
+    }
+}
+
+fn connection_removed_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "connection closed because its user was removed",
+    )
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for TrafficMeterStream<T> {
@@ -295,12 +488,24 @@ impl<T: AsyncRead + Unpin> AsyncRead for TrafficMeterStream<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        if let Err(error) = this.poll_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
+        // Debt from the previous read is paid before another one is issued. The
+        // bytes already handed to the caller cannot be taken back, so the pause
+        // lands here instead -- which also lets TCP flow control do the actual
+        // work of slowing the peer down, rather than buffering on our side.
+        if poll_delay(&mut this.read_delay, cx).is_pending() {
+            return Poll::Pending;
+        }
         // `poll_read` reports success by having grown the filled region, so the
         // delta is the only way to learn how much arrived.
         let before = buf.filled().len();
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
         if result.is_ready() {
-            this.conn.add_rx((buf.filled().len() - before) as u64);
+            let read = (buf.filled().len() - before) as u64;
+            this.conn.add_rx(read);
+            arm_delay(&mut this.read_delay, this.conn.reserve_rx(read));
         }
         result
     }
@@ -313,19 +518,34 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TrafficMeterStream<T> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if let Err(error) = this.poll_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
+        if poll_delay(&mut this.write_delay, cx).is_pending() {
+            return Poll::Pending;
+        }
         let result = Pin::new(&mut this.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = result {
             this.conn.add_tx(n as u64);
+            arm_delay(&mut this.write_delay, this.conn.reserve_tx(n as u64));
         }
         result
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 
     // Forwarded rather than left to the default implementation, which would fall
@@ -337,9 +557,16 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TrafficMeterStream<T> {
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if let Err(error) = this.poll_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
+        if poll_delay(&mut this.write_delay, cx).is_pending() {
+            return Poll::Pending;
+        }
         let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
         if let Poll::Ready(Ok(n)) = result {
             this.conn.add_tx(n as u64);
+            arm_delay(&mut this.write_delay, this.conn.reserve_tx(n as u64));
         }
         result
     }
@@ -357,7 +584,11 @@ impl<T: AsyncPing + Unpin> AsyncPing for TrafficMeterStream<T> {
     fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
         // Deliberately not counted. A ping is written by the stream underneath this
         // one, which meters it on the way out.
-        Pin::new(&mut self.get_mut().inner).poll_write_ping(cx)
+        let this = self.get_mut();
+        if let Err(error) = this.poll_cancelled(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.inner).poll_write_ping(cx)
     }
 }
 
@@ -482,8 +713,112 @@ mod tests {
         assert_eq!(
             user.total_conns(),
             0,
-            "counting an auth is the registry's job"
+            "plain bind registers an already-accounted/internal connection"
         );
+    }
+
+    #[tokio::test]
+    async fn revoking_a_user_wakes_and_aborts_a_pending_stream() {
+        let user = UserContext::new("alice");
+        let conn = ConnContext::new();
+        assert!(conn.bind(Arc::clone(&user)));
+
+        let (_peer, mut stream) = metered(&conn);
+        drop(conn);
+        let read = tokio::spawn(async move {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).await
+        });
+        tokio::task::yield_now().await;
+
+        user.revoke_connections();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+            .await
+            .expect("revocation must wake a pending read")
+            .expect("the read task must not panic")
+            .expect_err("the removed user's stream must be aborted");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+
+        user.wait_for_connections_closed().await;
+        assert_eq!(user.conns(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bind_that_loses_the_removal_race_fails_closed() {
+        let user = UserContext::new("alice");
+        user.revoke_connections();
+
+        let conn = ConnContext::new();
+        assert!(!conn.bind_authenticated(Arc::clone(&user)));
+        assert_eq!(user.conns(), 0);
+        assert_eq!(user.total_conns(), 0);
+
+        let (_peer, mut stream) = metered(&conn);
+        let error = stream
+            .write_all(b"must not leave")
+            .await
+            .expect_err("a late bind inherits the already-cancelled state");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn concurrent_naive_requests_share_the_first_bind_without_a_false_rejection() {
+        let user = UserContext::new("alice");
+        let conn = ConnContext::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let mut requests = Vec::new();
+        for _ in 0..2 {
+            let conn = Arc::clone(&conn);
+            let user = Arc::clone(&user);
+            let barrier = Arc::clone(&barrier);
+            requests.push(tokio::spawn(async move {
+                barrier.wait().await;
+                conn.bind_or_matches(&user)
+            }));
+        }
+        barrier.wait().await;
+
+        for request in requests {
+            assert!(request.await.unwrap());
+        }
+        assert_eq!(user.conns(), 1);
+        assert_eq!(user.total_conns(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_bind_and_removal_have_one_linearized_winner() {
+        for _ in 0..100 {
+            let user = UserContext::new("alice");
+            let conn = ConnContext::new();
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+            let binder = {
+                let user = Arc::clone(&user);
+                let conn = Arc::clone(&conn);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    conn.bind_authenticated(user)
+                })
+            };
+            let remover = {
+                let user = Arc::clone(&user);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    user.revoke_connections();
+                })
+            };
+            barrier.wait().await;
+
+            let admitted = binder.await.unwrap();
+            remover.await.unwrap();
+            assert_eq!(user.total_conns(), u64::from(admitted));
+            assert_eq!(user.conns(), u64::from(admitted));
+            drop(conn);
+            user.wait_for_connections_closed().await;
+        }
     }
 
     #[tokio::test]
@@ -518,13 +853,24 @@ mod tests {
         assert!(bound);
         assert_eq!(&**conn.user().unwrap().id(), "alice");
         assert_eq!(user.conns(), 1);
+        assert_eq!(user.total_conns(), 1);
     }
 
     #[tokio::test]
-    async fn binding_outside_a_metered_inbound_is_a_no_op() {
+    async fn admission_outside_a_metered_inbound_still_counts_authentication() {
+        let user = UserContext::new_untracked("alice");
+        assert!(current_connection().is_none());
+        assert!(bind_connection_user(&user));
+        assert_eq!(user.conns(), 0);
+        assert_eq!(user.total_conns(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tracked_user_outside_its_connection_scope_fails_closed() {
         let user = UserContext::new("alice");
         assert!(current_connection().is_none());
         assert!(!bind_connection_user(&user));
         assert_eq!(user.conns(), 0);
+        assert_eq!(user.total_conns(), 0);
     }
 }

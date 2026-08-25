@@ -215,19 +215,20 @@ async fn vmess_users_are_found_by_trial_decryption() {
         reach(bob_leg, sink.address).await.is_ok(),
     );
 
-    // -- 8. removal is forward-looking only ------------------------------------
-    //
-    // The same RCU property the VLESS suite pins down, restated for the trial: the
-    // snapshot the search walks is republished on every mutation, and a connection
-    // that already passed the search never consults it again.
-    checks.section("8. removing a user leaves their open connection alone");
+    // -- 8. removal closes existing sessions -----------------------------------
+    checks.section("8. removing a user closes their open connection");
     let mut held = Socks::connect(bob_leg, sink.address)
         .await
         .expect("bob should be able to open a connection");
     held.write_all(b"wh").await.expect("send half a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    checks.that("bob is removed", engine.remove_user("vmess", "bob").is_ok());
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("vmess", "bob")).await;
+    checks.that(
+        "bob is removed after his connection drains",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
+    );
     checks.that(
         "a new bob connection is refused",
         denied(bob_leg, sink.address).await,
@@ -237,12 +238,11 @@ async fn vmess_users_are_found_by_trial_decryption() {
         reach(alice_leg, sink.address).await.is_ok(),
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "bob's already-open connection still completes",
-        read_line(&mut held).await.ok(),
-        Some("sink".to_string()),
-    );
+    let closed = match held.write_all(b"o\n").await {
+        Err(_) => true,
+        Ok(()) => read_line(&mut held).await.is_err(),
+    };
+    checks.that("bob's already-open connection is actively closed", closed);
     drop(held);
 
     checks.finish();
@@ -296,6 +296,114 @@ async fn a_config_declared_vmess_user_still_works() {
     checks.that(
         "any other uuid is refused",
         denied(stranger_leg, sink.address).await,
+    );
+
+    checks.finish();
+}
+
+/// A recorded VMess handshake prefix must not open a second connection.
+///
+/// The auth id is the first sixteen bytes on the wire and it is, by construction,
+/// openable by anyone who copies it -- it carries a timestamp and a checksum sealed
+/// with the user's key, and nothing that proves the sender holds that key. So the
+/// only thing standing between a passive observer and a connection billed to
+/// somebody else is the server remembering the ids it has already admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_auth_id_cannot_be_used_twice() {
+    use std::net::SocketAddr;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+
+    /// Sits in front of the inbound and keeps a copy of each client's first sixteen
+    /// bytes, which is exactly the auth id, before passing everything through.
+    async fn record_auth_ids(upstream: SocketAddr) -> (SocketAddr, mpsc::Receiver<[u8; 16]>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+        let address = listener.local_addr().expect("relay address");
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut server = TcpStream::connect(upstream).await?;
+                    let mut auth_id = [0u8; 16];
+                    client.read_exact(&mut auth_id).await?;
+                    let _ = tx.send(auth_id).await;
+                    server.write_all(&auth_id).await?;
+                    tokio::io::copy_bidirectional(&mut client, &mut server).await?;
+                    Ok::<_, std::io::Error>(())
+                });
+            }
+        });
+        (address, rx)
+    }
+
+    let mut checks = Checks::new("vmess auth id replay");
+
+    let engine = engine().await;
+    let sink = Sink::start("sink").await;
+
+    let vmess = free_addr();
+    engine
+        .add_inbound(dynamic("vmess", vmess_inbound(vmess, true)))
+        .await
+        .expect("a vmess inbound should start");
+    engine
+        .add_user("vmess", user("alice", ALICE))
+        .expect("alice should be accepted");
+
+    let (relay, mut auth_ids) = record_auth_ids(vmess).await;
+    let alice_leg = start_leg(
+        &engine,
+        "leg-alice",
+        vmess_chain(relay, ALICE, "aes-128-gcm"),
+    )
+    .await;
+
+    checks.section("1. the genuine connection works and is observed");
+    checks.eq(
+        "alice reaches the sink through the recorder",
+        reach(alice_leg, sink.address).await.ok(),
+        Some("sink".to_string()),
+    );
+    let recorded = tokio::time::timeout(Duration::from_secs(5), auth_ids.recv())
+        .await
+        .ok()
+        .flatten()
+        .expect("the recorder should have captured alice's auth id");
+
+    checks.section("2. replaying it is refused");
+    let mut replay = TcpStream::connect(vmess)
+        .await
+        .expect("the inbound should accept the TCP connection");
+    replay
+        .write_all(&recorded)
+        .await
+        .expect("the recorded auth id should be writable");
+
+    // Refusal shows up as the server hanging up. Without the filter it would instead
+    // sit waiting for the rest of the header until the 60 second setup deadline, so a
+    // timeout here is the failure -- not a slow pass.
+    let mut discard = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(10), replay.read(&mut discard)).await;
+    checks.that(
+        "the server hangs up on a replayed auth id",
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+    );
+
+    checks.section("3. the user is unharmed");
+    checks.eq(
+        "alice can still connect afterwards",
+        reach(alice_leg, sink.address).await.ok(),
+        Some("sink".to_string()),
+    );
+    let alice = engine
+        .get_user("vmess", "alice")
+        .expect("alice is registered");
+    checks.eq(
+        "the refused replay was not counted as one of her connections",
+        alice.total_conns,
+        2,
     );
 
     checks.finish();

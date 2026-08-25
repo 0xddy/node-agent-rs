@@ -72,13 +72,15 @@ impl NaiveClientSession {
         // H2 settings tuned for reasonable throughput without excessive memory
         // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
         const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
-        const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+        // See the server side in `naive_hyper_service`: this is the largest frame the
+        // *server* may send this client, so it sizes what this side has to buffer.
+        const MAX_FRAME_SIZE: u32 = 64 * 1024; // 64 KiB
 
         let (send_request, connection) = h2::client::Builder::new()
             .initial_window_size(WINDOW_SIZE)
             .initial_connection_window_size(WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
-            .max_concurrent_streams(1024)
+            .max_concurrent_streams(256)
             .handshake(stream)
             .await
             .map_err(|e| io::Error::other(format!("H2 client handshake failed: {}", e)))?;

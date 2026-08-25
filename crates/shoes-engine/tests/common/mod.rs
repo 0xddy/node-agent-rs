@@ -122,6 +122,27 @@ impl Checks {
         self.record(label, ok, format!("{value}, expected {low}..{high}"));
     }
 
+    /// Asserts a lower bound.
+    ///
+    /// For timing assertions this is the half worth trusting: a rate limiter
+    /// cannot deliver faster than its rate however fast the machine is, whereas
+    /// an upper bound is only as reliable as the runner's scheduling.
+    pub fn at_least<T: PartialOrd + Debug>(&mut self, label: &str, value: T, floor: T) {
+        let ok = value >= floor;
+        self.record(label, ok, format!("{value:?}, expected at least {floor:?}"));
+    }
+
+    /// Asserts an upper bound. Use only where the margin is wide enough that a
+    /// slow runner cannot turn a pass into a failure.
+    pub fn at_most<T: PartialOrd + Debug>(&mut self, label: &str, value: T, ceiling: T) {
+        let ok = value <= ceiling;
+        self.record(
+            label,
+            ok,
+            format!("{value:?}, expected at most {ceiling:?}"),
+        );
+    }
+
     /// Asserts an operation was refused, and that the reason mentions `needle`.
     ///
     /// The message matters as much as the rejection: a refusal a caller cannot act
@@ -418,6 +439,30 @@ pub fn hysteria2_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
     })
 }
 
+/// As [`hysteria2_inbound`], with independently negotiated Brutal bandwidths.
+pub fn hysteria2_inbound_with_bandwidth(
+    address: SocketAddr,
+    up_mbps: u64,
+    down_mbps: u64,
+    udp_enabled: bool,
+) -> Value {
+    let mut config = hysteria2_inbound(address, udp_enabled);
+    config["protocol"]["up_mbps"] = json!(up_mbps);
+    config["protocol"]["down_mbps"] = json!(down_mbps);
+    config
+}
+
+/// As [`hysteria2_inbound`], but with Salamander obfuscation switched on.
+pub fn hysteria2_inbound_obfuscated(
+    address: SocketAddr,
+    obfs_password: &str,
+    udp_enabled: bool,
+) -> Value {
+    let mut config = hysteria2_inbound(address, udp_enabled);
+    config["protocol"]["obfs"] = json!({"type": "salamander", "password": obfs_password});
+    config
+}
+
 /// As [`hysteria2_inbound`], but declaring the password a classic-mode inbound
 /// authenticates against.
 pub fn hysteria2_inbound_with_password(
@@ -649,6 +694,9 @@ pub fn user(id: &str, uuid: &str) -> UserSpec {
         uuid: Some(uuid.to_string()),
         password: None,
         enabled: true,
+        max_conns: None,
+        upload_limit_bps: None,
+        download_limit_bps: None,
     }
 }
 
@@ -666,6 +714,9 @@ pub fn psk_user(id: &str, psk: &str) -> UserSpec {
         uuid: None,
         password: Some(psk.to_string()),
         enabled: true,
+        max_conns: None,
+        upload_limit_bps: None,
+        download_limit_bps: None,
     }
 }
 
@@ -680,6 +731,9 @@ pub fn password_user(id: &str, password: &str) -> UserSpec {
         uuid: None,
         password: Some(password.to_string()),
         enabled: true,
+        max_conns: None,
+        upload_limit_bps: None,
+        download_limit_bps: None,
     }
 }
 
@@ -701,6 +755,9 @@ pub fn tuic_user(id: &str, uuid: &str, password: &str) -> UserSpec {
         uuid: Some(uuid.to_string()),
         password: Some(password.to_string()),
         enabled: true,
+        max_conns: None,
+        upload_limit_bps: None,
+        download_limit_bps: None,
     }
 }
 

@@ -42,7 +42,9 @@ mod socks_addr;
 pub mod uot_common;
 mod uot_v1_server_stream;
 
-pub use uot_v1_server_stream::{SocksPacketAddrStream, UotV1ServerStream};
+pub use uot_v1_server_stream::{
+    SocksPacketAddrStream, UotV1ServerStream, VlessPacketAddrClientStream,
+};
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream (length-prefixed u16be + data)
 pub type UotV2Stream<S> = crate::vless::VlessMessageStream<S>;

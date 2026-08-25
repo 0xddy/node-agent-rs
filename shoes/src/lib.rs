@@ -16,6 +16,9 @@
 //! - **Proxy chaining**: Connect through multiple proxies
 //! - **Flexible routing**: Rule-based traffic routing
 //!
+//! The embedding node-agent reports this value in ACP's historical
+//! `sing_box_version` field.
+//!
 //! # Mobile Integration
 //!
 //! For Android, use the FFI module:
@@ -53,6 +56,8 @@
 //! - Android (arm64-v8a, armeabi-v7a, x86_64)
 //! - iOS (arm64)
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // Modules are declared here (mirroring main.rs) so the library crate can
 // expose them for FFI/mobile integration.
 mod address;
@@ -68,6 +73,15 @@ pub mod dns;
 pub mod dynamic;
 mod h2mux;
 mod http_handler;
+pub mod hysteria2;
+mod hysteria2_client;
+mod hysteria2_masquerade;
+/// Salamander, Hysteria2's UDP obfuscation.
+///
+/// Public for the same reason [`dynamic::credential`] is: it is a wire format,
+/// and anything speaking to or standing in for a Hysteria2 peer -- a client, a
+/// test harness -- has to derive exactly the same bytes.
+pub mod hysteria2_obfs;
 mod hysteria2_server;
 mod mixed_handler;
 mod naiveproxy;
@@ -77,8 +91,22 @@ mod quic_server;
 mod quic_stream;
 mod reality;
 mod reality_client_handler;
+mod replay_filter;
 pub mod resolver;
 mod routing;
+
+/// Validate a sing-box route rule-set with the exact parser and support policy
+/// used by shoes selectors. Control-plane adapters use this before publishing
+/// remotely downloaded bytes as a durable last-good resource.
+pub fn validate_route_rule_set(format: &str, bytes: &[u8]) -> Result<(), String> {
+    let parsed =
+        routing::srs::parse_bytes_named(format, bytes).map_err(|error| error.to_string())?;
+    if parsed.is_fully_supported() {
+        Ok(())
+    } else {
+        Err("rule-set contains predicates shoes cannot evaluate without widening it".into())
+    }
+}
 mod rustls_config_util;
 mod rustls_connection_util;
 mod shadow_tls;

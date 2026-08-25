@@ -28,6 +28,14 @@ pub enum EngineError {
     /// The requested feature exists upstream but is not reachable through the
     /// dynamic API yet.
     Unsupported(String),
+    /// The candidate is valid, but one or more settings are owned by the running
+    /// listener and therefore cannot be swapped in place.
+    ///
+    /// Callers may handle this by explicitly removing and re-adding the inbound.
+    /// Keeping this distinct from [`InvalidConfig`](Self::InvalidConfig) prevents a
+    /// control plane from tearing down a healthy listener merely because a malformed
+    /// candidate happened to produce a similar error message.
+    ReloadRequired(String),
 }
 
 pub type EngineResult<T> = Result<T, EngineError>;
@@ -51,6 +59,7 @@ impl fmt::Display for EngineError {
             }
             Self::Io(e) => write!(f, "{e}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Self::ReloadRequired(msg) => write!(f, "inbound must be replaced: {msg}"),
         }
     }
 }
@@ -80,10 +89,14 @@ impl EngineError {
     /// reporting it as an I/O failure would invite a retry that can never succeed.
     /// The two kinds shoes uses deliberately are mapped through; anything else is a
     /// genuine I/O failure and stays one.
-    pub(crate) fn from_rejection(e: std::io::Error) -> Self {
+    pub(crate) fn from_reload_rejection(e: std::io::Error) -> Self {
         match e.kind() {
-            std::io::ErrorKind::InvalidInput => Self::InvalidConfig(e.to_string()),
-            std::io::ErrorKind::Unsupported => Self::Unsupported(e.to_string()),
+            // `InboundSlot::reload` validates every candidate before it swaps a
+            // slot, and its InvalidInput/Unsupported paths all describe a running
+            // listener that cannot represent the requested change in place.
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported => {
+                Self::ReloadRequired(e.to_string())
+            }
             _ => Self::Io(e),
         }
     }

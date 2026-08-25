@@ -33,6 +33,21 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// Prevents memory leaks from hung streams (slow DNS, stuck connections, etc.)
 const STREAM_HANDLER_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Maximum number of streams one session may have open at once.
+///
+/// A stream is not cheap: it is a spawned task, an mpsc channel, two entries in the
+/// session's maps, and -- once its destination arrives -- a DNS lookup, an outbound
+/// socket and a pair of copy buffers. The stream id is a client-chosen `u32` and a
+/// SYN frame is a few bytes, so without a ceiling one authenticated session can open
+/// as many as it can send frames for, each holding an outbound descriptor for up to
+/// [`STREAM_HANDLER_TIMEOUT`]. That exhausts descriptors on the host and makes this
+/// proxy the source of the outbound flood.
+///
+/// The multiplexed protocols on either side of this one settle around the same
+/// figure -- h2mux and NaiveProxy both cap their HTTP/2 streams -- and a client
+/// tunnelling a browser stays far below it.
+const MAX_CONCURRENT_STREAMS: usize = 256;
+
 /// AnyTLS Session manages multiplexed streams over a connection
 pub struct AnyTlsSession {
     /// Underlying connection (split into reader/writer)
@@ -196,29 +211,29 @@ impl AnyTlsSession {
 
     /// Close the session
     pub async fn close(&self) {
-        if self
-            .is_closed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
+        // Cleanup is deliberately idempotent and every caller completes it. Setting
+        // a one-shot flag before the awaits made this function cancellation-unsafe:
+        // if that first caller was dropped, later callers skipped the unfinished
+        // task/stream cleanup forever.
+        self.is_closed.store(true, Ordering::SeqCst);
+
+        // Abort all active stream handler tasks first
+        // This prevents memory leaks from hung tasks holding Arc<Self>
         {
-            // Abort all active stream handler tasks first
-            // This prevents memory leaks from hung tasks holding Arc<Self>
-            {
-                let mut tasks = self.stream_tasks.lock().await;
-                for (stream_id, handle) in tasks.drain() {
-                    log::trace!("Aborting stream task {}", stream_id);
-                    handle.abort();
-                }
+            let mut tasks = self.stream_tasks.lock().await;
+            for (stream_id, handle) in tasks.drain() {
+                log::trace!("Aborting stream task {}", stream_id);
+                handle.abort();
             }
+        }
 
-            // Clear all streams (drops senders, signals EOF to any remaining receivers)
-            let mut streams = self.streams.write().await;
-            streams.clear();
+        // Clear all streams (drops senders, signals EOF to any remaining receivers)
+        let mut streams = self.streams.write().await;
+        streams.clear();
 
-            // Try to shutdown writer gracefully
-            if let Ok(mut writer) = self.writer.try_lock() {
-                let _ = writer.shutdown().await;
-            }
+        // Try to shutdown writer gracefully
+        if let Ok(mut writer) = self.writer.try_lock() {
+            let _ = writer.shutdown().await;
         }
     }
 
@@ -231,23 +246,23 @@ impl AnyTlsSession {
     ///
     /// This starts the receive loop and processes frames until the connection closes.
     /// New streams are handled internally using the configured resolver and proxy_provider.
+    #[cfg(test)]
     pub async fn run(self: &Arc<Self>) -> io::Result<()> {
-        let session = Arc::clone(self);
-
-        // Start the outgoing data processor
-        let session_clone = Arc::clone(&session);
-        let outgoing_task = tokio::spawn(async move {
-            session_clone.process_outgoing().await;
-        });
-
-        // Run the receive loop
-        let result = session.recv_loop().await;
-
-        // Cleanup
-        session.close().await;
-        outgoing_task.abort();
-
+        let result = self.run_core().await;
+        self.close().await;
         result
+    }
+
+    /// Drive both session halves without cleanup. The server handler uses this so
+    /// user cancellation and normal completion converge on one full `close` call.
+    pub(crate) async fn run_core(self: &Arc<Self>) -> io::Result<()> {
+        // Keep both halves inside this future. In particular, do not detach the
+        // outgoing processor: dropping `run_core` during user revocation must release
+        // every Arc that owns the metered transport.
+        tokio::select! {
+            result = self.recv_loop() => result,
+            () = self.process_outgoing() => Ok(()),
+        }
     }
 
     /// Process outgoing data from streams
@@ -370,28 +385,52 @@ impl AnyTlsSession {
 
                 // Check if stream already exists and register atomically
                 // This prevents race conditions with duplicate SYNs
+                let mut refused_at_limit = false;
                 let stream_opt = {
                     let mut streams = self.streams.write().await;
                     use std::collections::hash_map::Entry;
-                    match streams.entry(stream_id) {
-                        Entry::Occupied(_) => {
-                            log::warn!("Duplicate SYN for stream {}", stream_id);
-                            None
-                        }
-                        Entry::Vacant(entry) => {
-                            // Create new stream with bounded channel for backpressure
-                            let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
-                            let stream = AnyTlsStream::new(
-                                stream_id,
-                                data_rx,
-                                self.outgoing_tx.clone(),
-                                Arc::clone(&self.is_closed),
-                            );
-                            entry.insert(data_tx);
-                            Some(stream)
+                    if streams.len() >= MAX_CONCURRENT_STREAMS {
+                        // Counted under the same write lock that inserts, so this is
+                        // the exact live count and two concurrent SYNs cannot both
+                        // pass it.
+                        log::debug!(
+                            "Refusing AnyTLS stream {stream_id}: at the {MAX_CONCURRENT_STREAMS} \
+                             stream limit"
+                        );
+                        refused_at_limit = true;
+                        None
+                    } else {
+                        match streams.entry(stream_id) {
+                            Entry::Occupied(_) => {
+                                log::warn!("Duplicate SYN for stream {}", stream_id);
+                                None
+                            }
+                            Entry::Vacant(entry) => {
+                                // Create new stream with bounded channel for backpressure
+                                let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+                                let stream = AnyTlsStream::new(
+                                    stream_id,
+                                    data_rx,
+                                    self.outgoing_tx.clone(),
+                                    Arc::clone(&self.is_closed),
+                                );
+                                entry.insert(data_tx);
+                                Some(stream)
+                            }
                         }
                     }
                 };
+
+                if refused_at_limit {
+                    // Tell the client rather than leaving it waiting on a stream that
+                    // will never answer. `try_send` because this runs on the receive
+                    // loop: blocking on a full outgoing queue here would stall every
+                    // other stream on the session, which is the opposite of what a
+                    // limit is for. A dropped FIN costs the client one stalled stream
+                    // until its own timeout, and only when the session is already
+                    // saturated.
+                    let _ = self.outgoing_tx.try_send((stream_id, Bytes::new()));
+                }
 
                 // Handle the new stream internally with timeout and task tracking
                 if let Some(stream) = stream_opt {
@@ -399,39 +438,52 @@ impl AnyTlsSession {
                     let stream_id_for_cleanup = stream_id;
                     let session_for_cleanup = Arc::clone(self);
 
-                    let handle = tokio::spawn(async move {
-                        // Apply timeout to entire stream handler lifetime
-                        // This prevents memory leaks from hung streams
-                        let result = tokio::time::timeout(
-                            STREAM_HANDLER_TIMEOUT,
-                            session.handle_new_stream(stream),
-                        )
-                        .await;
-
-                        match result {
-                            Ok(Ok(())) => {
-                                log::trace!("AnyTLS stream {} completed", stream_id_for_cleanup);
-                            }
-                            Ok(Err(e)) => {
-                                log::debug!("AnyTLS stream {} error: {}", stream_id_for_cleanup, e);
-                            }
-                            Err(_) => {
-                                log::warn!(
-                                    "AnyTLS stream {} timed out after {:?}",
-                                    stream_id_for_cleanup,
-                                    STREAM_HANDLER_TIMEOUT
-                                );
-                            }
-                        }
-
-                        // Remove self from stream_tasks on completion
-                        let mut tasks = session_for_cleanup.stream_tasks.lock().await;
-                        tasks.remove(&stream_id_for_cleanup);
-                    });
-
-                    // Track the task for cancellation on session close
+                    // Acquire the tracking lock before spawning. `close` takes the
+                    // same lock, so it either sees this handle or sets `is_closed`
+                    // first and prevents the task from starting at all.
                     let mut tasks = self.stream_tasks.lock().await;
-                    tasks.insert(stream_id, handle);
+                    if self.is_closed() {
+                        drop(tasks);
+                        self.streams.write().await.remove(&stream_id);
+                    } else {
+                        let handle = tokio::spawn(async move {
+                            // Apply timeout to entire stream handler lifetime
+                            // This prevents memory leaks from hung streams
+                            let result = tokio::time::timeout(
+                                STREAM_HANDLER_TIMEOUT,
+                                session.handle_new_stream(stream),
+                            )
+                            .await;
+
+                            match result {
+                                Ok(Ok(())) => {
+                                    log::trace!(
+                                        "AnyTLS stream {} completed",
+                                        stream_id_for_cleanup
+                                    );
+                                }
+                                Ok(Err(e)) => {
+                                    log::debug!(
+                                        "AnyTLS stream {} error: {}",
+                                        stream_id_for_cleanup,
+                                        e
+                                    );
+                                }
+                                Err(_) => {
+                                    log::warn!(
+                                        "AnyTLS stream {} timed out after {:?}",
+                                        stream_id_for_cleanup,
+                                        STREAM_HANDLER_TIMEOUT
+                                    );
+                                }
+                            }
+
+                            // Remove self from stream_tasks on completion
+                            let mut tasks = session_for_cleanup.stream_tasks.lock().await;
+                            tasks.remove(&stream_id_for_cleanup);
+                        });
+                        tasks.insert(stream_id, handle);
+                    }
                 }
             }
 
@@ -760,7 +812,7 @@ impl AnyTlsSession {
 
         let action = self
             .proxy_provider
-            .judge(destination.clone().into(), &self.resolver)
+            .judge_tcp(destination.clone().into(), &self.resolver)
             .await?;
 
         match action {
@@ -898,7 +950,7 @@ impl AnyTlsSession {
         // Use ClientProxySelector for routing
         let action = self
             .proxy_provider
-            .judge(destination.clone().into(), &self.resolver)
+            .judge_udp(destination.clone().into(), &self.resolver)
             .await?;
 
         match action {
@@ -1199,6 +1251,61 @@ mod tests {
         assert_eq!(decoded.cmd, Command::Waste);
         assert_eq!(decoded.stream_id, 0);
         assert_eq!(decoded.data.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_session_stops_registering_streams_at_the_limit() {
+        // Without a ceiling this loop registers every id it is given: a stream is a
+        // task, a channel, and eventually an outbound socket, and the stream id is a
+        // client-chosen u32.
+        let (client, mut server) = duplex(1 << 20);
+        let padding = PaddingFactory::default_factory();
+        let session = AnyTlsSession::new_server_test(client, padding);
+
+        let session_clone = Arc::clone(&session);
+        let run_task = tokio::spawn(async move {
+            let _ = session_clone.run().await;
+        });
+
+        let mut settings = StringMap::new();
+        settings.insert("v", "2");
+        settings.insert("padding-md5", PaddingFactory::default_factory().md5());
+        let settings_frame =
+            Frame::with_data(Command::Settings, 0, Bytes::from(settings.to_bytes()));
+        server.write_all(&settings_frame.encode()).await.unwrap();
+
+        // Every stream here stalls in `read_location_direct` waiting for a
+        // destination that never arrives, which is precisely the shape that made an
+        // unbounded map expensive: cheap for the client, held open by the server.
+        let overshoot = 64u32;
+        for stream_id in 1..=(MAX_CONCURRENT_STREAMS as u32 + overshoot) {
+            let syn = Frame::control(Command::Syn, stream_id);
+            server.write_all(&syn.encode()).await.unwrap();
+        }
+
+        // Wait for the receive loop to work through the frames, then confirm it
+        // settled at the ceiling rather than above it.
+        let settled = timeout(Duration::from_secs(5), async {
+            loop {
+                if session.streams.read().await.len() >= MAX_CONCURRENT_STREAMS {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "the session never reached its ceiling");
+
+        // Give the surplus SYNs a chance to be wrongly admitted before measuring.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let live = session.streams.read().await.len();
+        assert_eq!(
+            live, MAX_CONCURRENT_STREAMS,
+            "{overshoot} SYNs past the ceiling must not register"
+        );
+
+        session.close().await;
+        run_task.abort();
     }
 
     #[tokio::test]

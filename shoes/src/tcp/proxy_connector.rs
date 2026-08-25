@@ -18,6 +18,8 @@
 use async_trait::async_trait;
 use std::fmt::Debug;
 
+use tokio::time::Instant;
+
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::tcp::tcp_handler::TcpClientSetupResult;
@@ -42,6 +44,18 @@ pub trait ProxyConnector: Send + Sync + Debug {
     /// Check if this connector supports UDP-over-TCP tunneling.
     fn supports_udp_over_tcp(&self) -> bool;
 
+    /// Check if this connector supports protocol-native UDP datagrams.
+    fn supports_native_udp(&self) -> bool {
+        false
+    }
+
+    /// Whether the final protocol has a write-triggered handshake in the Go
+    /// implementation.  Composite handlers propagate this from their inner
+    /// Trojan/VLESS handler.
+    fn needs_handshake_for_write(&self) -> bool {
+        false
+    }
+
     /// Setup protocol on existing stream.
     ///
     /// # Arguments
@@ -54,6 +68,24 @@ pub trait ProxyConnector: Send + Sync + Debug {
         stream: Box<dyn AsyncStream>,
         target: &ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
+
+    /// Setup a final hop and return the equivalent sing-box
+    /// `NeedHandshakeForWrite` timing boundary, when the protocol has one.
+    ///
+    /// Ordinary connections continue to use [`Self::setup_tcp_stream`].
+    async fn setup_tcp_stream_with_write_handshake_boundary(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<(TcpClientSetupResult, Option<Instant>)> {
+        if !self.needs_handshake_for_write() {
+            return Ok((self.setup_tcp_stream(stream, target).await?, None));
+        }
+
+        let (result, started_at) =
+            crate::tcp::write_handshake::observe(self.setup_tcp_stream(stream, target)).await;
+        result.map(|setup| (setup, started_at))
+    }
 
     /// Setup bidirectional UDP-over-TCP on existing stream.
     ///
@@ -69,4 +101,16 @@ pub trait ProxyConnector: Send + Sync + Debug {
         stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>>;
+
+    /// Wrap a native UDP socket connected to this proxy server.
+    async fn setup_native_udp(
+        &self,
+        _stream: Box<dyn AsyncMessageStream>,
+        _target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "connector does not support native UDP",
+        ))
+    }
 }

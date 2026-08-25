@@ -39,20 +39,28 @@ arc-swap = "*"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
+# BLAKE2b-256 keys Hysteria2's Salamander obfuscation. Pinned to the 0.10
+# line, which is a generation behind the md-5/digest 0.11 crates above and
+# so brings its own `digest 0.10` along: a build-time cost, taken instead of
+# putting a release candidate in a deployed proxy. Revisit when blake2 0.11
+# ships stable.
+blake2 = "0.10"
 blake3 = "*"
 bytes = "*"
 chrono = "*"
+chacha20poly1305 = "0.10"
 dashmap = "*"
 digest = "*"
 etherparse = "*"
+flate2 = { version = "*", default-features = false, features = ["rust_backend"] }
 futures = "*"
 h2 = "*"
 h3 = "*"
 h3-quinn = "*"
-hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
+hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs", "quic-aws-lc-rs"] }
 http = "*"
 http-body-util = "*"
-hyper = { version = "*", features = ["server", "http1", "http2"] }
+hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
 libc = "*"
@@ -64,18 +72,25 @@ mime_guess = "*"
 notify = "*"
 parking_lot = "*"
 percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-aws-lc-rs"] }
+# Quinn re-exports the congestion traits but not the `RttEstimator` appearing in
+# `Controller::on_ack`; a direct dependency is required to implement the trait.
+# Cargo unifies this with Quinn's own quinn-proto version.
+quinn-proto = "0.11"
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+regex = "*"
 rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"
+rustls-platform-verifier = "*"
 serde = { version = "*", features = ["derive", "std"] }
+serde_json = "*"
 serde_yaml = "*"
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
-socket2 = "*"
+socket2 = { version = "*", features = ["all"] }
 subtle = "*"
 tokio = { version = "*", features = [
     "fs",
@@ -94,8 +109,10 @@ x509-parser = { version = "*", default-features = false, features = ["verify-aws
 
 [dev-dependencies]
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+# `test-util` gives tests a pausable clock. Rate-limit tests assert on elapsed
+# time, and against the real clock those are both slow and flaky.
+tokio = { version = "*", features = ["test-util"] }
 rustls-pemfile = "*"
-serde_json = "*"
 tempfile = "*"
 tokio-rustls = "*"
 

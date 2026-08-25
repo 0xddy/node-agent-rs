@@ -4,7 +4,7 @@
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::ready;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,8 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::{
-    AsyncFlushMessage, AsyncPing, AsyncReadSessionMessage, AsyncSessionMessageStream,
-    AsyncShutdownMessage, AsyncStream, AsyncWriteSessionMessage,
+    AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadSessionMessage,
+    AsyncSessionMessageStream, AsyncShutdownMessage, AsyncStream, AsyncWriteMessage,
+    AsyncWriteSessionMessage,
 };
 use crate::resolver::{NativeResolver, ResolverCache};
 
@@ -46,6 +47,11 @@ pub struct XudpMessageStream {
     /// This preserves hostnames for encoding in response frames
     session_to_original_destination: HashMap<u16, NetLocation>,
 
+    /// Sessions for which the peer has already seen a New frame.  This is
+    /// deliberately independent of the address maps: an outbound client must
+    /// pre-register session 0 while still sending New on its first packet.
+    peer_opened_sessions: HashSet<u16>,
+
     /// Resolver cache for hostname resolution
     /// Resolves hostnames to IPs before storing in session maps
     resolver_cache: ResolverCache,
@@ -71,6 +77,7 @@ impl XudpMessageStream {
             destination_to_session: HashMap::new(),
             session_to_destination: HashMap::new(),
             session_to_original_destination: HashMap::new(),
+            peer_opened_sessions: HashSet::new(),
             resolver_cache: ResolverCache::new(resolver),
             incoming_message: None,
             is_eof: false,
@@ -123,6 +130,19 @@ impl XudpMessageStream {
                 resolved_destination
             );
             (session_id, false) // Existing session
+        } else if let Some((&session_id, _)) = self
+            .session_to_original_destination
+            .iter()
+            .find(|(_, destination)| *destination == original_destination)
+        {
+            // Preserve the peer-provided session ID after a New frame is
+            // decoded.  Resolution happens after frame parsing, so the
+            // resolved reverse mapping can only be installed here.
+            self.destination_to_session
+                .insert(resolved_destination.clone(), session_id);
+            self.session_to_destination
+                .insert(session_id, resolved_destination.clone());
+            (session_id, false)
         } else {
             let session_id = self.allocate_session_id();
             log::debug!(
@@ -200,6 +220,7 @@ impl XudpMessageStream {
             // We have enough data to decode this frame - proceed with actual decode
             let metadata = FrameMetadata::decode(&mut self.read_buffer)?
                 .expect("metadata decode should succeed after length check");
+            self.peer_opened_sessions.insert(metadata.session_id);
 
             log::debug!(
                 "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
@@ -230,6 +251,7 @@ impl XudpMessageStream {
                 }
                 self.session_to_original_destination
                     .remove(&metadata.session_id);
+                self.peer_opened_sessions.remove(&metadata.session_id);
                 return self.try_decode_one_frame();
             }
 
@@ -263,6 +285,7 @@ impl XudpMessageStream {
         // Now we know we have a complete frame - consume it all
         let metadata = FrameMetadata::decode(&mut self.read_buffer)?
             .expect("metadata decode should succeed after length check");
+        self.peer_opened_sessions.insert(metadata.session_id);
 
         log::debug!(
             "[XUDP READ] Decoded frame: session_id={}, status={:?}, has_data={}, target={:?}, network={:?}",
@@ -560,8 +583,8 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         buf: &[u8],
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
-        // This is the reverse direction: UDP response from internet → XUDP client
-        // Use original destination (may be hostname) in response frame, NOT resolved IP
+        // Use the original destination (possibly a hostname) on the wire, not
+        // merely the resolved socket address supplied by the UDP side.
 
         log::debug!(
             "[XUDP SESSION WRITE] Writing {} bytes for session {} from source {}",
@@ -570,6 +593,13 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             target
         );
 
+        if buf.len() > u16::MAX as usize {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XUDP datagram exceeds the 65535-byte wire limit",
+            )));
+        }
+
         // Flush any pending write buffer first
         if !self.write_buffer.is_empty() {
             ready!(self.as_mut().poll_flush_message(cx))?;
@@ -577,9 +607,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
 
         // Check if this is a new session BEFORE looking up or creating entries.
         // XUDP protocol requires first frame for a session to be StatusNew.
-        let is_new_session = !self
-            .session_to_original_destination
-            .contains_key(&session_id);
+        let is_new_session = self.peer_opened_sessions.insert(session_id);
 
         // Use original destination (hostname) instead of resolved IP
         // Look up the original destination that the client requested.
@@ -664,3 +692,105 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
 }
 
 impl AsyncSessionMessageStream for XudpMessageStream {}
+
+/// Single-destination client view of an XUDP session.
+///
+/// VLESS XUDP assigns session ID 0 to the packet connection.  Keeping this
+/// adapter here lets VLESS reuse the generic XUDP codec without teaching the
+/// rest of the outbound stack about session identifiers.
+pub struct XudpClientMessageStream {
+    inner: XudpMessageStream,
+    target: SocketAddr,
+}
+
+impl XudpClientMessageStream {
+    pub fn new(
+        inner_stream: Box<dyn AsyncStream>,
+        original_target: NetLocation,
+        resolved_target: SocketAddr,
+    ) -> Self {
+        let resolved_location = match resolved_target {
+            SocketAddr::V4(address) => {
+                NetLocation::new(Address::Ipv4(*address.ip()), address.port())
+            }
+            SocketAddr::V6(address) => {
+                NetLocation::new(Address::Ipv6(*address.ip()), address.port())
+            }
+        };
+
+        let mut inner = XudpMessageStream::new(inner_stream);
+        inner
+            .destination_to_session
+            .insert(resolved_location.clone(), 0);
+        inner.session_to_destination.insert(0, resolved_location);
+        inner
+            .session_to_original_destination
+            .insert(0, original_target);
+
+        Self {
+            inner,
+            target: resolved_target,
+        }
+    }
+}
+
+impl AsyncReadMessage for XudpClientMessageStream {
+    fn poll_read_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let (session_id, _) = ready!(Pin::new(&mut self.inner).poll_read_session_message(cx, buf))?;
+        if session_id != 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unexpected XUDP session ID {session_id}, expected 0"),
+            )));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWriteMessage for XudpClientMessageStream {
+    fn poll_write_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<()>> {
+        let target = self.target;
+        Pin::new(&mut self.inner).poll_write_session_message(cx, 0, buf, &target)
+    }
+}
+
+impl AsyncFlushMessage for XudpClientMessageStream {
+    fn poll_flush_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush_message(cx)
+    }
+}
+
+impl AsyncShutdownMessage for XudpClientMessageStream {
+    fn poll_shutdown_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown_message(cx)
+    }
+}
+
+impl AsyncPing for XudpClientMessageStream {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.inner).poll_write_ping(cx)
+    }
+}
+
+impl AsyncMessageStream for XudpClientMessageStream {}

@@ -4,13 +4,54 @@ use serde::{Deserialize, Serialize};
 
 use crate::address::{NetLocation, NetLocationMask};
 use crate::option_util::{NoneOrSome, OneOrSome};
+pub use crate::routing::predicate::{RouteMatchConfig, RouteNetwork, RouteRuleSetConfig};
 
 use super::client::ClientConfig;
+use super::common::is_false;
 use super::selection::ConfigSelection;
+
+pub const DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS: u64 = 30 * 60 * 1_000;
+
+fn default_urltest_idle_timeout_millis() -> u64 {
+    DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS
+}
+
+/// How a rule selects between its `client_chains`.
+///
+/// Round-robin is the historical/default behaviour. URL test periodically sends
+/// an HTTP HEAD request through every complete chain and keeps the fastest
+/// healthy chain selected, with `tolerance_millis` providing switch hysteresis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientChainSelectionConfig {
+    #[default]
+    RoundRobin,
+    #[serde(rename = "urltest", alias = "url_test")]
+    UrlTest {
+        #[serde(default)]
+        url: String,
+        /// Use the operating system's TLS trust policy for HTTPS probes.
+        /// Omitted/false preserves historical shoes configurations.
+        #[serde(default, skip_serializing_if = "is_false")]
+        use_native_roots: bool,
+        /// Immediately select another URLTest member after a live connection
+        /// failure. Disabled by default to preserve sing-box/Go semantics,
+        /// which only invalidate the failed member's delay history.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reselect_on_connection_failure: bool,
+        interval_millis: u64,
+        #[serde(default)]
+        tolerance_millis: u64,
+        #[serde(default = "default_urltest_idle_timeout_millis")]
+        idle_timeout_millis: u64,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct RuleConfig {
     pub masks: OneOrSome<NetLocationMask>,
+    /// Optional second-stage matcher. It is ANDed with the legacy `masks` match.
+    pub match_config: Option<RouteMatchConfig>,
     pub action: RuleActionConfig,
 }
 
@@ -18,9 +59,11 @@ impl Default for RuleConfig {
     fn default() -> Self {
         Self {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            match_config: None,
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
+                client_chain_selection: ClientChainSelectionConfig::default(),
             },
         }
     }
@@ -185,6 +228,8 @@ impl<'de> Deserialize<'de> for RuleConfig {
         struct RuleConfigTemp {
             #[serde(alias = "mask")]
             masks: Option<OneOrSome<NetLocationMask>>,
+            #[serde(rename = "match", default)]
+            match_config: Option<RouteMatchConfig>,
             // Action fields (from RuleActionConfig)
             #[serde(default)]
             action: Option<String>,
@@ -197,6 +242,8 @@ impl<'de> Deserialize<'de> for RuleConfig {
             /// Alias: client_chain (singular) for backward compatibility
             #[serde(alias = "client_chain", default)]
             client_chains: NoneOrSome<ClientChain>,
+            #[serde(default)]
+            client_chain_selection: ClientChainSelectionConfig,
         }
 
         let temp = RuleConfigTemp::deserialize(deserializer)?;
@@ -260,6 +307,7 @@ impl<'de> Deserialize<'de> for RuleConfig {
                 RuleActionConfig::Allow {
                     override_address,
                     client_chains,
+                    client_chain_selection: temp.client_chain_selection,
                 }
             }
             other => {
@@ -270,7 +318,11 @@ impl<'de> Deserialize<'de> for RuleConfig {
             }
         };
 
-        Ok(RuleConfig { masks, action })
+        Ok(RuleConfig {
+            masks,
+            match_config: temp.match_config,
+            action,
+        })
     }
 }
 
@@ -287,6 +339,7 @@ impl Serialize for RuleConfig {
             RuleActionConfig::Allow {
                 override_address,
                 client_chains,
+                client_chain_selection,
             } => {
                 let mut count = 1; // action
                 if override_address.is_some() {
@@ -295,14 +348,25 @@ impl Serialize for RuleConfig {
                 if !client_chains.is_empty() {
                     count += 1;
                 }
+                if !matches!(
+                    client_chain_selection,
+                    ClientChainSelectionConfig::RoundRobin
+                ) {
+                    count += 1;
+                }
                 count
             }
         };
 
-        let mut map = serializer.serialize_map(Some(1 + action_field_count))?;
+        let mut map = serializer.serialize_map(Some(
+            1 + usize::from(self.match_config.is_some()) + action_field_count,
+        ))?;
 
         // Serialize masks
         map.serialize_entry("masks", &self.masks)?;
+        if let Some(match_config) = &self.match_config {
+            map.serialize_entry("match", match_config)?;
+        }
 
         // Serialize action fields (flattened)
         match &self.action {
@@ -312,6 +376,7 @@ impl Serialize for RuleConfig {
             RuleActionConfig::Allow {
                 override_address,
                 client_chains,
+                client_chain_selection,
             } => {
                 map.serialize_entry("action", "allow")?;
                 if let Some(addr) = override_address {
@@ -319,6 +384,12 @@ impl Serialize for RuleConfig {
                 }
                 if !client_chains.is_empty() {
                     map.serialize_entry("client_chains", client_chains)?;
+                }
+                if !matches!(
+                    client_chain_selection,
+                    ClientChainSelectionConfig::RoundRobin
+                ) {
+                    map.serialize_entry("client_chain_selection", client_chain_selection)?;
                 }
             }
         }
@@ -463,6 +534,8 @@ pub enum RuleActionConfig {
         /// - `NoneOrSome::One(chain)` → Single chain
         /// - `NoneOrSome::Some(chains)` → Multiple chains for round-robin
         client_chains: NoneOrSome<ClientChain>,
+        /// Selection policy for `client_chains`. Omitted means round-robin.
+        client_chain_selection: ClientChainSelectionConfig,
     },
     Block,
 }
@@ -489,6 +562,8 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
             /// Alias: client_chain (singular) for backward compatibility
             #[serde(alias = "client_chain", default)]
             client_chains: NoneOrSome<ClientChain>,
+            #[serde(default)]
+            client_chain_selection: ClientChainSelectionConfig,
         }
 
         let temp = RuleActionTemp::deserialize(deserializer)?;
@@ -549,6 +624,7 @@ impl<'de> Deserialize<'de> for RuleActionConfig {
                 Ok(RuleActionConfig::Allow {
                     override_address,
                     client_chains,
+                    client_chain_selection: temp.client_chain_selection,
                 })
             }
             other => Err(D::Error::custom(format!(
@@ -575,12 +651,19 @@ impl Serialize for RuleActionConfig {
             RuleActionConfig::Allow {
                 override_address,
                 client_chains,
+                client_chain_selection,
             } => {
                 let mut count = 1; // action
                 if override_address.is_some() {
                     count += 1;
                 }
                 if !client_chains.is_empty() {
+                    count += 1;
+                }
+                if !matches!(
+                    client_chain_selection,
+                    ClientChainSelectionConfig::RoundRobin
+                ) {
                     count += 1;
                 }
 
@@ -591,6 +674,12 @@ impl Serialize for RuleActionConfig {
                 }
                 if !client_chains.is_empty() {
                     map.serialize_entry("client_chains", client_chains)?;
+                }
+                if !matches!(
+                    client_chain_selection,
+                    ClientChainSelectionConfig::RoundRobin
+                ) {
+                    map.serialize_entry("client_chain_selection", client_chain_selection)?;
                 }
                 map.end()
             }
@@ -609,6 +698,7 @@ mod tests {
                 NetLocationMask::from("192.168.0.0/16:80").unwrap(),
                 NetLocationMask::from("10.0.0.0/8:443").unwrap(),
             ]),
+            match_config: None,
             action: RuleActionConfig::Allow {
                 override_address: Some(NetLocation::from_ip_addr(
                     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
@@ -619,6 +709,7 @@ mod tests {
                         "test-proxy-group".to_string(),
                     ))),
                 }),
+                client_chain_selection: ClientChainSelectionConfig::default(),
             },
         }
     }
@@ -628,6 +719,10 @@ mod tests {
         let original = create_test_rule_config();
         let yaml_str = serde_yaml::to_string(&original).expect("Failed to serialize");
         println!("Rule config YAML:\n{yaml_str}");
+        assert!(
+            !yaml_str.contains("match:"),
+            "legacy rules must not gain a serialized match field"
+        );
         let deserialized: RuleConfig =
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize");
         assert!(matches!(
@@ -645,6 +740,38 @@ action: block
         let result: Result<RuleConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap().action, RuleActionConfig::Block));
+    }
+
+    #[test]
+    fn test_rule_config_optional_match_roundtrip() {
+        let yaml = r#"
+masks: 0.0.0.0/0
+match:
+  domain: [example.com, api.example.com]
+  network: tcp
+  port_range: 8000:9000
+action: block
+"#;
+        let rule: RuleConfig = serde_yaml::from_str(yaml).unwrap();
+        let match_config = rule.match_config.as_ref().unwrap();
+        assert_eq!(match_config.domain.len(), 2);
+        assert_eq!(match_config.port_range, vec!["8000:9000"]);
+
+        let encoded = serde_yaml::to_string(&rule).unwrap();
+        assert!(encoded.contains("match:"));
+        let decoded: RuleConfig = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.match_config, rule.match_config);
+    }
+
+    #[test]
+    fn test_rule_config_still_requires_masks_with_match() {
+        let yaml = r#"
+match:
+  domain_suffix: example.com
+action: block
+"#;
+        let error = serde_yaml::from_str::<RuleConfig>(yaml).unwrap_err();
+        assert!(error.to_string().contains("masks"));
     }
 
     #[test]
@@ -1222,5 +1349,102 @@ client_chains:
         } else {
             panic!("Expected Allow action");
         }
+    }
+
+    #[test]
+    fn test_urltest_client_chain_selection_roundtrip() {
+        let yaml = r#"
+masks: 0.0.0.0/0
+action: allow
+client_chains:
+  - chain: [direct]
+client_chain_selection:
+  type: urltest
+  url: https://www.gstatic.com/generate_204
+  interval_millis: 30000
+  tolerance_millis: 50
+  idle_timeout_millis: 1800000
+"#;
+        let rule: RuleConfig = serde_yaml::from_str(yaml).unwrap();
+        let RuleActionConfig::Allow {
+            client_chain_selection,
+            ..
+        } = &rule.action
+        else {
+            panic!("expected allow rule");
+        };
+        assert_eq!(
+            client_chain_selection,
+            &ClientChainSelectionConfig::UrlTest {
+                url: "https://www.gstatic.com/generate_204".to_string(),
+                use_native_roots: false,
+                reselect_on_connection_failure: false,
+                interval_millis: 30_000,
+                tolerance_millis: 50,
+                idle_timeout_millis: DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+            }
+        );
+
+        let serialized = serde_yaml::to_string(&rule).unwrap();
+        assert!(serialized.contains("client_chain_selection:"));
+        assert!(serialized.contains("type: urltest"));
+        assert!(!serialized.contains("use_native_roots"));
+        assert!(!serialized.contains("reselect_on_connection_failure"));
+        let roundtrip: RuleConfig = serde_yaml::from_str(&serialized).unwrap();
+        assert!(matches!(
+            roundtrip.action,
+            RuleActionConfig::Allow {
+                client_chain_selection: ClientChainSelectionConfig::UrlTest { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn urltest_connection_failure_reselection_is_explicit_opt_in() {
+        let yaml = r#"
+masks: 0.0.0.0/0
+action: allow
+client_chains: [direct]
+client_chain_selection:
+  type: urltest
+  reselect_on_connection_failure: true
+  interval_millis: 30000
+"#;
+        let rule: RuleConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            &rule.action,
+            RuleActionConfig::Allow {
+                client_chain_selection: ClientChainSelectionConfig::UrlTest {
+                    reselect_on_connection_failure: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            serde_yaml::to_string(&rule)
+                .unwrap()
+                .contains("reselect_on_connection_failure: true")
+        );
+    }
+
+    #[test]
+    fn test_round_robin_selection_is_default_and_omitted() {
+        let rule: RuleConfig =
+            serde_yaml::from_str("masks: 0.0.0.0/0\naction: allow\nclient_chains: [direct]\n")
+                .unwrap();
+        assert!(matches!(
+            rule.action,
+            RuleActionConfig::Allow {
+                client_chain_selection: ClientChainSelectionConfig::RoundRobin,
+                ..
+            }
+        ));
+        assert!(
+            !serde_yaml::to_string(&rule)
+                .unwrap()
+                .contains("client_chain_selection")
+        );
     }
 }

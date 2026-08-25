@@ -103,8 +103,24 @@ pub trait TcpClientHandler: Send + Sync + Debug {
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult>;
 
+    /// Whether this handler returns a connection whose protocol request is
+    /// conceptually performed by the first application write in sing-box.
+    ///
+    /// Shoes performs these handshakes eagerly.  The marker lets URLTest place
+    /// its latency boundary at the equivalent point without delaying ordinary
+    /// connection setup.
+    fn needs_handshake_for_write(&self) -> bool {
+        false
+    }
+
     /// Returns true if this handler supports UDP-over-TCP tunneling.
     fn supports_udp_over_tcp(&self) -> bool {
+        false
+    }
+
+    /// Returns true when this protocol carries UDP as native datagrams to the
+    /// proxy server instead of tunnelling messages over a byte stream.
+    fn supports_native_udp(&self) -> bool {
         false
     }
 
@@ -126,6 +142,22 @@ pub trait TcpClientHandler: Send + Sync + Debug {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "UDP-over-TCP not supported by this protocol",
+        ))
+    }
+
+    /// Wrap a native UDP socket connected to the proxy server.
+    ///
+    /// Protocols such as Shadowsocks SIP003 encrypt each datagram independently,
+    /// so forcing them through `setup_client_udp_bidirectional` would incorrectly
+    /// turn native UDP into UDP-over-TCP.
+    async fn setup_client_native_udp(
+        &self,
+        _client_stream: Box<dyn AsyncMessageStream>,
+        _target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native UDP not supported by this protocol",
         ))
     }
 }

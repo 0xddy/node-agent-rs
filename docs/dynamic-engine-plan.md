@@ -278,8 +278,9 @@ first thing an operator would do.
 
 And authentication happens at `naive_hyper_service.rs:257`, **inside** the hyper
 `serve_connection` task spawned at `:145` / `:172`. Task locals do not cross
-`tokio::spawn`, so `bind_connection_user` would find nothing there and every
-NaiveProxy user's counters would sit at zero.
+`tokio::spawn`, so `bind_connection_user` would find nothing there. Tracked dynamic
+users now fail closed in that state; the explicit context below is what lets the
+request authenticate and makes the connection revocable.
 
 ### The fix for the second one
 
@@ -346,17 +347,20 @@ The convention the last four commits established:
    config's own credential becomes a one-user `StaticUserRegistry` — behaviour
    identical to what it replaced.
 2. A disabled user is reported **absent**, never present-but-denied.
-3. Metering: task local where authentication is inline, explicit `Arc<ConnContext>`
+3. Registry lookup only resolves a candidate; after sufficient protocol proof, admit
+   it exactly once so authentication counting and revocable connection registration
+   share one lifecycle operation.
+4. Metering: task local where authentication is inline, explicit `Arc<ConnContext>`
    where it crosses a `tokio::spawn`.
-4. An end-to-end suite under `crates/shoes-engine/tests/`, driving `Engine` in
+5. An end-to-end suite under `crates/shoes-engine/tests/`, driving `Engine` in
    process, covering: attribution across users, an unregistered credential, a miss
-   billed to nobody, disabled users, rotation, removal leaving an established
-   connection alone, and both classic and dynamic mode.
-5. All three gates clean: `cargo fmt --all --check`,
+   billed to nobody, disabled users, rotation, removal actively closing an established
+   connection, and both classic and dynamic mode.
+6. All three gates clean: `cargo fmt --all --check`,
    `cargo clippy --workspace --all-targets`, `cargo test --workspace`. The
    `--all-targets` matters — without it the acceptance suites themselves are never
    linted. See the [README](../README.md#building-and-checking).
-6. A commit message that explains the design decision and **names any pre-existing bug
+7. A commit message that explains the design decision and **names any pre-existing bug
    the new suite flushed out** — three of the four so far found at least one.
 
 ## Still open

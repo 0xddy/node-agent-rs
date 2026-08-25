@@ -216,13 +216,8 @@ async fn hysteria2_users_are_found_by_their_password() {
         hy2::reach(hy, BOB, sink.address).await.is_ok(),
     );
 
-    // -- 8. removal is forward-looking only ------------------------------------
-    //
-    // Hysteria2 resolves a user once, at auth, and the connection holds the context
-    // it found. Removing the user takes their password out of the index; it does not
-    // reach into a live connection, which is the smooth-handover property the whole
-    // design rests on.
-    checks.section("8. removing a user leaves their open connection alone");
+    // -- 8. removal closes the authenticated QUIC connection --------------------
+    checks.section("8. removing a user closes their QUIC connection");
     let held_client = hy2::Hysteria2Client::connect(hy, BOB)
         .await
         .expect("bob should be able to authenticate");
@@ -233,7 +228,12 @@ async fn hysteria2_users_are_found_by_their_password() {
     held.write_all(b"wh").await.expect("send half a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    checks.that("bob is removed", engine.remove_user("hy2", "bob").is_ok());
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("hy2", "bob")).await;
+    checks.that(
+        "bob is removed after his QUIC connection drains",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
+    );
     checks.that(
         "a new bob connection is refused",
         hy2::denied(hy, BOB, sink.address).await,
@@ -243,11 +243,14 @@ async fn hysteria2_users_are_found_by_their_password() {
         hy2::reach(hy, ALICE, sink.address).await.is_ok(),
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "bob's already-open stream still completes",
-        held.read_line().await.ok(),
-        Some("sink".to_string()),
+    let closed = match held.write_all(b"o\n").await {
+        Err(_) => true,
+        Ok(()) => held.read_line().await.is_err(),
+    };
+    checks.that("bob's already-open stream is actively closed", closed);
+    checks.that(
+        "the removed user's old QUIC connection cannot open another stream",
+        held_client.open_tcp(sink.address).await.is_err(),
     );
     drop(held);
     drop(held_client);
@@ -452,6 +455,9 @@ async fn a_dynamic_hysteria2_inbound_takes_only_passwords() {
                 uuid: None,
                 password: None,
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             },
         ),
         "needs a credential",

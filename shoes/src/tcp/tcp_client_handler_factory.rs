@@ -12,6 +12,7 @@ use crate::config::{
 };
 use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
+use crate::hysteria2_client::Hysteria2TcpClientHandler;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
 use crate::resolver::Resolver;
@@ -20,7 +21,6 @@ use crate::shadow_tls::ShadowTlsClientHandler;
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellClientHandler;
 use crate::socks_handler::SocksTcpClientHandler;
-use crate::tcp::chain_builder::build_client_chain_group;
 use crate::tcp::tcp_handler::TcpClientHandler;
 use crate::tls_client_handler::TlsClientHandler;
 use crate::trojan_handler::TrojanTcpHandler;
@@ -66,12 +66,9 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
             create_auth_credentials(username, password),
         )),
-        ClientProxyConfig::Shadowsocks {
-            config,
-            udp_enabled,
-        } => match config {
+        ClientProxyConfig::Shadowsocks { config, udp_mode } => match config {
             ShadowsocksConfig::Legacy { cipher, password } => Box::new(
-                ShadowsocksTcpHandler::new_client(cipher, &password, udp_enabled),
+                ShadowsocksTcpHandler::new_client(cipher, &password, udp_mode),
             ),
             ShadowsocksConfig::Aead2022 {
                 cipher,
@@ -82,7 +79,7 @@ pub fn create_tcp_client_handler(
                     cipher,
                     &identity_keys,
                     &key_bytes,
-                    udp_enabled,
+                    udp_mode,
                 )
                 .expect("Invalid shadowsocks 2022 client keys"),
             ),
@@ -102,10 +99,14 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Vless {
             user_id,
             udp_enabled,
+            packet_encoding,
             h2mux,
         } => {
-            let handler: Box<dyn TcpClientHandler> =
-                Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled));
+            let handler: Box<dyn TcpClientHandler> = Box::new(VlessTcpClientHandler::new(
+                &user_id,
+                udp_enabled,
+                packet_encoding,
+            ));
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),
@@ -118,10 +119,12 @@ pub fn create_tcp_client_handler(
         ClientProxyConfig::Trojan {
             password,
             shadowsocks,
+            udp_enabled,
             h2mux,
         } => {
-            let handler: Box<dyn TcpClientHandler> =
-                Box::new(TrojanTcpHandler::new_client(&password, &shadowsocks));
+            let handler: Box<dyn TcpClientHandler> = Box::new(
+                TrojanTcpHandler::new_client_with_udp(&password, &shadowsocks, udp_enabled),
+            );
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),
@@ -131,9 +134,13 @@ pub fn create_tcp_client_handler(
                 handler
             }
         }
+        ClientProxyConfig::Hysteria2 { udp_enabled, .. } => {
+            Box::new(Hysteria2TcpClientHandler::new(udp_enabled))
+        }
         ClientProxyConfig::Tls(tls_client_config) => {
             let TlsClientConfig {
                 verify,
+                use_native_roots,
                 server_fingerprints,
                 sni_hostname,
                 alpn_protocols,
@@ -171,6 +178,7 @@ pub fn create_tcp_client_handler(
                 sni_hostname.is_some(),
                 key_and_cert_bytes,
                 false, // tls13_only
+                use_native_roots,
             ));
 
             let server_name = match sni_hostname {
@@ -184,6 +192,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
+                    packet_encoding,
                     h2mux: _, // h2mux not supported with vision
                 } = protocol.as_ref()
                 else {
@@ -199,6 +208,7 @@ pub fn create_tcp_client_handler(
                     server_name,
                     user_id_bytes,
                     *udp_enabled,
+                    *packet_encoding,
                 ))
             } else {
                 let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
@@ -244,6 +254,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
+                    packet_encoding,
                     h2mux: _, // h2mux not supported with vision
                 } = protocol.as_ref()
                 else {
@@ -260,6 +271,7 @@ pub fn create_tcp_client_handler(
                         cipher_suites,
                         user_id_bytes,
                         *udp_enabled,
+                        *packet_encoding,
                     ),
                 )
             } else {
@@ -298,6 +310,7 @@ pub fn create_tcp_client_handler(
                 enable_sni, // Enable SNI if hostname provided
                 None,       // No client cert
                 true,       // tls13_only - required for ShadowTLS v3
+                false,      // ShadowTLS deliberately skips PKI verification
             ));
 
             let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
@@ -378,18 +391,36 @@ pub fn create_tcp_client_proxy_selector(
     let rules = rules
         .into_iter()
         .map(|rule_config| {
-            let RuleConfig { masks, action } = rule_config;
+            let RuleConfig {
+                masks,
+                match_config,
+                action,
+            } = rule_config;
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,
                     client_chains,
+                    client_chain_selection,
                 } => {
-                    let chain_group = build_client_chain_group(client_chains, resolver.clone());
+                    let chain_group =
+                        crate::tcp::chain_builder::build_client_chain_group_with_selection(
+                            client_chains,
+                            client_chain_selection,
+                            resolver.clone(),
+                        );
                     ConnectAction::new_allow(override_address, chain_group)
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
-            ConnectRule::new(masks.into_vec(), connect_action)
+            match match_config {
+                Some(match_config) => ConnectRule::try_with_match_config(
+                    masks.into_vec(),
+                    match_config,
+                    connect_action,
+                )
+                .expect("route match config was validated while loading configuration"),
+                None => ConnectRule::new(masks.into_vec(), connect_action),
+            }
         })
         .collect::<Vec<_>>();
     ClientProxySelector::new(rules)

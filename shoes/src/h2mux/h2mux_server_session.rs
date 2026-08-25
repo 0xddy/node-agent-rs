@@ -16,6 +16,7 @@ use tokio::time::interval;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
+use crate::dynamic::{ConnContext, current_connection};
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::tcp::tcp_server::run_udp_copy;
@@ -34,7 +35,13 @@ use super::prepend_stream::PrependStream;
 /// HTTP/2 window and frame size configuration
 const STREAM_WINDOW_SIZE: u32 = 256 * 1024; // 256 KB per stream
 const CONNECTION_WINDOW_SIZE: u32 = 1 << 20; // 1 MB (matches Go's http2 default)
-const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+/// Advertised *to the peer*: the largest single frame they may send, and therefore
+/// what this side must be prepared to buffer before any of it can be forwarded. The
+/// old value was the protocol maximum, which is not a throughput setting so much as
+/// an absence of one -- the framing overhead it saves over 64 KiB is 9 bytes in
+/// 65536, and the streams here feed a 16 KiB copy loop anyway. sing-mux, which is
+/// the implementation this protocol interoperates with, advertises 32 KiB.
+const MAX_FRAME_SIZE: u32 = 64 * 1024; // 64 KiB
 
 /// Channel buffer size for inbound streams
 const INBOUND_BUFFER: usize = 128;
@@ -121,7 +128,10 @@ impl H2MuxServerSession {
             .initial_window_size(STREAM_WINDOW_SIZE)
             .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
-            .max_concurrent_streams(1024)
+            // Each stream is a spawned task and a proxied connection of its own. 1024
+            // was well past what any client opens: sing-mux leaves this to the Go
+            // library's default of 250, and NaiveProxy here settles on the same 256.
+            .max_concurrent_streams(256)
             .handshake(conn)
             .await
             .map_err(|e| io::Error::other(format!("H2 server handshake failed: {}", e)))?;
@@ -338,6 +348,31 @@ pub async fn handle_h2mux_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let meter = current_connection();
+    handle_h2mux_session_with_meter(
+        stream,
+        initial_data,
+        udp_enabled,
+        proxy_selector,
+        resolver,
+        meter,
+    )
+    .await
+}
+
+/// The spawn-safe form of [`handle_h2mux_session`]. Protocol handlers capture the
+/// task-local connection before spawning the long-lived session and pass it here.
+pub async fn handle_h2mux_session_with_meter<S>(
+    stream: S,
+    initial_data: Option<Box<[u8]>>,
+    udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    meter: Option<Arc<ConnContext>>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!("H2MUX: Starting server session");
 
     // Wrap with PrependStream if there's initial data from protocol parsing
@@ -353,11 +388,24 @@ where
     while let Some(inbound) = session.accept().await {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let removal_meter = meter.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver).await
-            {
+            let work = handle_h2mux_stream(inbound, udp_enabled, proxy_selector, resolver);
+            let result = if let Some(meter) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = meter.cancelled() => Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "user removed",
+                    )),
+                    result = work => result,
+                }
+            } else {
+                work.await
+            };
+
+            if let Err(e) = result {
                 debug!("H2MUX stream error: {}", e);
             }
         });
@@ -422,7 +470,7 @@ async fn handle_h2mux_tcp(
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
     let action = proxy_selector
-        .judge(destination.clone().into(), &resolver)
+        .judge_tcp(destination.clone().into(), &resolver)
         .await?;
 
     match action {
@@ -466,7 +514,9 @@ async fn handle_h2mux_udp(
 ) -> io::Result<()> {
     debug!("H2MUX UDP fixed: {}", destination);
 
-    let action = proxy_selector.judge(destination.into(), &resolver).await?;
+    let action = proxy_selector
+        .judge_udp(destination.into(), &resolver)
+        .await?;
 
     match action {
         ConnectDecision::Allow {

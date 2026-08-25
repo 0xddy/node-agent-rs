@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
 use crate::config::ConfigSelection;
-use crate::config::{ClientChainHop, ClientConfig};
+use crate::config::{ClientChainHop, ClientChainSelectionConfig, ClientConfig};
+use crate::hysteria2_client::Hysteria2SocketConnector;
 use crate::resolver::Resolver;
 use crate::tcp::proxy_connector::ProxyConnector;
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
@@ -61,9 +62,16 @@ pub fn build_client_proxy_chain(
             // Find the first proxy address for QUIC socket configuration
             let target_address = find_first_proxy_address(&hops, config);
 
-            let socket = SocketConnectorImpl::from_config(config, target_address)
-                .map(|s| Box::new(s) as Box<dyn SocketConnector>)
-                .expect("Failed to create SocketConnector");
+            let socket: Box<dyn SocketConnector> = if config.protocol.is_hysteria2() {
+                Box::new(
+                    Hysteria2SocketConnector::from_client_config(config)
+                        .expect("Hysteria2 client config was validated before chain construction"),
+                )
+            } else {
+                SocketConnectorImpl::from_config(config, target_address)
+                    .map(|s| Box::new(s) as Box<dyn SocketConnector>)
+                    .expect("Failed to create SocketConnector")
+            };
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
@@ -94,6 +102,12 @@ pub fn build_client_proxy_chain(
                             "protocol: direct is only valid at hop 0. Found direct at hop {} with address {}",
                             hop_index,
                             config.address
+                        );
+                    }
+                    if config.protocol.is_hysteria2() {
+                        panic!(
+                            "protocol: hysteria2 is only valid at hop 0 because it creates its own QUIC transport. Found hysteria2 at hop {} with address {}",
+                            hop_index, config.address
                         );
                     }
 
@@ -141,12 +155,25 @@ pub fn build_client_chain_group(
     client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientChainGroup {
+    build_client_chain_group_with_selection(
+        client_chains,
+        ClientChainSelectionConfig::RoundRobin,
+        resolver,
+    )
+}
+
+/// Build a ClientChainGroup with an explicit cross-chain selection policy.
+pub fn build_client_chain_group_with_selection(
+    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    selection: ClientChainSelectionConfig,
+    resolver: Arc<dyn Resolver>,
+) -> ClientChainGroup {
     let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
         vec![build_client_proxy_chain(
             crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                 ClientConfig::default(),
             ))),
-            resolver,
+            resolver.clone(),
         )]
     } else {
         client_chains
@@ -156,7 +183,7 @@ pub fn build_client_chain_group(
             .collect()
     };
 
-    ClientChainGroup::new(chains)
+    ClientChainGroup::new_with_selection(chains, selection, resolver)
 }
 
 #[cfg(test)]

@@ -10,6 +10,9 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::address::{AddressMask, NetLocationMask};
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::{Resolver, resolve_location};
+use crate::routing::predicate::{
+    RouteContext, RouteMatchConfig, RoutePredicate, RoutePredicateError, RouteProtocol,
+};
 
 /// Cache key for routing decisions.
 /// We cache based on the destination address and port.
@@ -113,12 +116,51 @@ impl RoutingCache {
 #[derive(Debug)]
 pub struct ConnectRule {
     pub masks: Vec<NetLocationMask>,
+    /// Optional second-stage matcher, ANDed with the legacy destination masks.
+    pub predicate: Option<RoutePredicate>,
     pub action: ConnectAction,
 }
 
 impl ConnectRule {
     pub fn new(masks: Vec<NetLocationMask>, action: ConnectAction) -> Self {
-        Self { masks, action }
+        Self {
+            masks,
+            predicate: None,
+            action,
+        }
+    }
+
+    pub fn with_predicate(
+        masks: Vec<NetLocationMask>,
+        predicate: RoutePredicate,
+        action: ConnectAction,
+    ) -> Self {
+        Self {
+            masks,
+            predicate: Some(predicate),
+            action,
+        }
+    }
+
+    pub fn try_with_match_config(
+        masks: Vec<NetLocationMask>,
+        match_config: RouteMatchConfig,
+        action: ConnectAction,
+    ) -> Result<Self, RoutePredicateError> {
+        if RoutePredicate::has_rule_set(&match_config)
+            && masks
+                .iter()
+                .any(|mask| mask.port != 0 || mask.address_mask.netmask != 0)
+        {
+            return Err(RoutePredicateError::new(
+                "rule_set match requires an unconditional legacy mask (for example 0.0.0.0/0)",
+            ));
+        }
+        Ok(Self::with_predicate(
+            masks,
+            RoutePredicate::compile(&match_config)?,
+            action,
+        ))
     }
 }
 
@@ -214,7 +256,14 @@ pub enum ConnectDecision<'a> {
 
 impl ClientProxySelector {
     pub fn new(rules: Vec<ConnectRule>) -> Self {
-        Self::with_options(rules, false)
+        // Rich predicates that contain destination IP ranges must be able to evaluate a
+        // hostname. Legacy masks retain the historical no-resolution default.
+        let resolve_rule_hostnames = rules.iter().any(|rule| {
+            rule.predicate
+                .as_ref()
+                .is_some_and(RoutePredicate::requires_ip)
+        });
+        Self::with_options(rules, resolve_rule_hostnames)
     }
 
     /// Create a new ClientProxySelector with configurable hostname resolution behavior.
@@ -242,9 +291,9 @@ impl ClientProxySelector {
     /// * `cache_capacity` - Maximum number of routing decisions to cache. Set to 0 to disable caching.
     ///
     /// # Caching behavior
-    /// Caching is automatically enabled when:
-    /// - `resolve_rule_hostnames` is true (DNS lookups are expensive), OR
-    /// - Rule count exceeds `CACHE_RULE_THRESHOLD` (16)
+    /// Caching is automatically enabled when the selector is independent of resolved IPs and:
+    /// - `resolve_rule_hostnames` is true, OR
+    /// - Rule count exceeds `CACHE_RULE_THRESHOLD` (16).
     ///
     /// For simple configurations with few rules and no DNS resolution, caching is disabled
     /// as the overhead of cache key construction exceeds the cost of linear rule matching.
@@ -253,10 +302,30 @@ impl ClientProxySelector {
         resolve_rule_hostnames: bool,
         cache_capacity: usize,
     ) -> Self {
-        // Enable caching if:
-        // 1. DNS resolution is enabled (expensive operation), OR
-        // 2. Many rules (linear scan becomes expensive)
-        let cache = if resolve_rule_hostnames || rules.len() > CACHE_RULE_THRESHOLD {
+        // Enable caching for context-free, resolution-independent selectors when
+        // explicitly requested or when linear rule scans become expensive.
+        // Network is intentionally not part of the legacy cache key. Context-sensitive
+        // selectors bypass caching, preventing a TCP decision from being reused for UDP.
+        let uses_context = rules.iter().any(|rule| {
+            rule.predicate
+                .as_ref()
+                .is_some_and(RoutePredicate::uses_context)
+        });
+        // A hostname decision that depends on its resolved IP cannot be cached by
+        // hostname and port alone. DNS may legitimately change between requests;
+        // reusing a previous allow rule would let a public-to-private DNS rebind
+        // bypass an IP-CIDR block rule while the connector resolves the hostname
+        // again. Keep these selectors uncached until the cache key can include a
+        // resolution with well-defined lifetime semantics.
+        let uses_resolved_ip = rules.iter().any(|rule| {
+            rule.predicate
+                .as_ref()
+                .is_some_and(RoutePredicate::requires_ip)
+        });
+        let cache = if !uses_context
+            && !uses_resolved_ip
+            && (resolve_rule_hostnames || rules.len() > CACHE_RULE_THRESHOLD)
+        {
             Some(RoutingCache::new(cache_capacity.max(1)))
         } else {
             None
@@ -277,13 +346,75 @@ impl ClientProxySelector {
     ///
     /// The returned `ConnectDecision` contains the (possibly resolved/modified) location.
     ///
-    /// Note: Caching is only enabled when `resolve_rule_hostnames` is true or there are
-    /// more than 16 rules. For simple configurations, direct rule matching is faster.
+    /// IP-dependent and context-dependent selectors are deliberately uncached. Otherwise,
+    /// caching is enabled when `resolve_rule_hostnames` is true or there are more than 16 rules.
+    #[allow(dead_code)] // Kept as the context-free compatibility API.
     #[inline]
     pub async fn judge<'a>(
         &'a self,
         location: ResolvedLocation,
         resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_with_context(location, resolver, &RouteContext::default())
+            .await
+    }
+
+    /// Judge a TCP destination. Built-in stream handlers use this convenience wrapper.
+    #[inline]
+    pub async fn judge_tcp<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_with_context(location, resolver, &RouteContext::tcp())
+            .await
+    }
+
+    /// Judge a TCP destination after bounded application-protocol sniffing.
+    #[inline]
+    pub async fn judge_sniffed_tcp<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        protocol: RouteProtocol,
+        domain: Option<String>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_with_context(
+            location,
+            resolver,
+            &RouteContext::sniffed_tcp(protocol, domain),
+        )
+        .await
+    }
+
+    /// Whether any rule needs application protocol metadata. Callers use this to
+    /// avoid touching application bytes for selectors that do not contain such rules.
+    pub fn needs_tcp_protocol_sniff(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.predicate
+                .as_ref()
+                .is_some_and(RoutePredicate::uses_protocol)
+        })
+    }
+
+    /// Judge a UDP destination. Built-in datagram handlers use this convenience wrapper.
+    #[inline]
+    pub async fn judge_udp<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_with_context(location, resolver, &RouteContext::udp())
+            .await
+    }
+
+    /// Judge a connection with metadata that is not encoded in its destination.
+    #[inline]
+    pub async fn judge_with_context<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolver: &Arc<dyn Resolver>,
+        context: &RouteContext,
     ) -> std::io::Result<ConnectDecision<'a>> {
         // Derive resolved_ip from any pre-resolved address
         let resolved_ip = location.resolved_addr().map(|addr| ip_to_u128(addr.ip()));
@@ -292,7 +423,9 @@ impl ClientProxySelector {
         let cache = match &self.cache {
             Some(c) => c,
             None => {
-                return self.judge_uncached(location, resolved_ip, resolver).await;
+                return self
+                    .judge_uncached_with_context(location, resolved_ip, resolver, context)
+                    .await;
             }
         };
 
@@ -310,6 +443,7 @@ impl ClientProxySelector {
             resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
+            context,
         )
         .await?
         {
@@ -327,12 +461,26 @@ impl ClientProxySelector {
     }
 
     /// Judge without using the cache. Useful for testing or when cache bypass is needed.
+    #[allow(dead_code)] // Kept as the context-free compatibility API.
     #[inline]
     pub async fn judge_uncached<'a>(
         &'a self,
         location: ResolvedLocation,
         resolved_ip: Option<u128>,
         resolver: &Arc<dyn Resolver>,
+    ) -> std::io::Result<ConnectDecision<'a>> {
+        self.judge_uncached_with_context(location, resolved_ip, resolver, &RouteContext::default())
+            .await
+    }
+
+    /// Judge without caching while supplying route metadata.
+    #[inline]
+    pub async fn judge_uncached_with_context<'a>(
+        &'a self,
+        location: ResolvedLocation,
+        resolved_ip: Option<u128>,
+        resolver: &Arc<dyn Resolver>,
+        context: &RouteContext,
     ) -> std::io::Result<ConnectDecision<'a>> {
         let mut location = location;
         match match_rule(
@@ -341,6 +489,7 @@ impl ClientProxySelector {
             resolved_ip,
             resolver,
             self.resolve_rule_hostnames,
+            context,
         )
         .await?
         {
@@ -425,8 +574,10 @@ async fn match_rule(
     mut resolved_ip: Option<u128>,
     resolver: &Arc<dyn Resolver>,
     resolve_rule_hostnames: bool,
+    context: &RouteContext,
 ) -> std::io::Result<Option<usize>> {
     for (rule_index, rule) in rules.iter().enumerate() {
+        let mut masks_match = false;
         for mask in rule.masks.iter() {
             match match_mask(
                 mask,
@@ -443,7 +594,8 @@ async fn match_rule(
                             "Found matching mask for {} -> {mask:?}",
                             location.location()
                         );
-                        return Ok(Some(rule_index));
+                        masks_match = true;
+                        break;
                     }
                 }
                 Err(MatchMaskError::Fatal(e)) => {
@@ -460,6 +612,29 @@ async fn match_rule(
                 }
             }
         }
+
+        if !masks_match {
+            continue;
+        }
+
+        if let Some(predicate) = &rule.predicate {
+            // Preserve the selector's existing hostname-resolution policy. If enabled,
+            // resolve only when an IP-dependent OR branch is still undecidable.
+            let mut predicate_ip = location.resolved_addr().map(|address| address.ip());
+            if predicate.needs_resolved_ip(location.location(), predicate_ip, context)
+                && matches!(location.location().address(), Address::Hostname(_))
+                && resolve_rule_hostnames
+            {
+                let socket_addr = resolve_location(location, resolver).await?;
+                resolved_ip = Some(ip_to_u128(socket_addr.ip()));
+                predicate_ip = Some(socket_addr.ip());
+            }
+            if !predicate.matches(location.location(), predicate_ip, context) {
+                continue;
+            }
+        }
+
+        return Ok(Some(rule_index));
     }
     Ok(None)
 }
@@ -567,6 +742,7 @@ mod tests {
     use std::future::Future;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A mock resolver for testing that returns predefined results
     #[derive(Debug)]
@@ -607,6 +783,43 @@ mod tests {
                     )
                 })
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RebindingResolver {
+        first: IpAddr,
+        subsequent: IpAddr,
+        calls: AtomicUsize,
+    }
+
+    impl RebindingResolver {
+        fn new(first: IpAddr, subsequent: IpAddr) -> Self {
+            Self {
+                first,
+                subsequent,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Resolver for RebindingResolver {
+        fn resolve_location(
+            &self,
+            location: &NetLocation,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = if call == 0 {
+                self.first
+            } else {
+                self.subsequent
+            };
+            let port = location.port();
+            Box::pin(async move { Ok(vec![SocketAddr::new(address, port)]) })
         }
     }
 
@@ -2043,6 +2256,242 @@ mod tests {
         match decision {
             ConnectDecision::Allow { .. } => {}
             _ => panic!("Expected subnet"),
+        }
+    }
+
+    #[tokio::test]
+    async fn predicate_is_anded_with_legacy_masks() {
+        let predicate_rule = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::from("example.com").unwrap()],
+            RouteMatchConfig {
+                port: vec![443],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::new(vec![
+            predicate_rule,
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ]);
+        let resolver = mock_resolver();
+
+        let blocked = NetLocation::new(Address::Hostname("api.example.com".into()), 443);
+        assert!(matches!(
+            selector.judge_tcp(blocked.into(), &resolver).await.unwrap(),
+            ConnectDecision::Block
+        ));
+
+        let wrong_port = NetLocation::new(Address::Hostname("api.example.com".into()), 80);
+        assert!(matches!(
+            selector
+                .judge_tcp(wrong_port.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+
+        let wrong_mask = NetLocation::new(Address::Hostname("other.test".into()), 443);
+        assert!(matches!(
+            selector
+                .judge_tcp(wrong_mask.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn protocol_sniff_is_demand_driven_by_the_selector() {
+        let destination_only = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                domain_suffix: vec!["example.com".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        assert!(!ClientProxySelector::new(vec![destination_only]).needs_tcp_protocol_sniff());
+
+        let protocol = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                protocol: vec![RouteProtocol::Tls],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        assert!(ClientProxySelector::new(vec![protocol]).needs_tcp_protocol_sniff());
+    }
+
+    #[tokio::test]
+    async fn network_context_selects_transport_and_disables_cache() {
+        let udp_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                network: vec![crate::routing::predicate::RouteNetwork::Udp],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::with_options(
+            vec![udp_block, allow_rule(vec!["0.0.0.0/0"], "default")],
+            true,
+        );
+        assert!(!selector.is_cache_enabled());
+        let resolver = mock_resolver();
+        let destination = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53);
+
+        assert!(matches!(
+            selector
+                .judge_tcp(destination.clone().into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            selector
+                .judge_udp(destination.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+    }
+
+    #[tokio::test]
+    async fn ip_predicate_uses_existing_lazy_hostname_resolution_policy() {
+        let private_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::new(vec![
+            private_block,
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ]);
+        let resolver: Arc<dyn Resolver> = Arc::new(MockResolver::new().with_mapping(
+            "private.example",
+            443,
+            vec![IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))],
+        ));
+        let destination = NetLocation::new(Address::Hostname("private.example".into()), 443);
+
+        assert!(matches!(
+            selector
+                .judge_tcp(destination.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+    }
+
+    #[tokio::test]
+    async fn ip_predicate_rechecks_hostname_after_public_to_private_dns_rebind() {
+        let private_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::new(vec![
+            private_block,
+            allow_rule(vec!["0.0.0.0/0"], "default"),
+        ]);
+        let rebinding = Arc::new(RebindingResolver::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+        ));
+        let resolver: Arc<dyn Resolver> = rebinding.clone();
+        let destination = || NetLocation::new(Address::Hostname("rebind.example".into()), 443);
+
+        assert!(
+            !selector.is_cache_enabled(),
+            "IP-dependent selectors must not cache hostname-only decisions"
+        );
+        let first = selector
+            .judge_tcp(destination().into(), &resolver)
+            .await
+            .unwrap();
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = first
+        else {
+            panic!("the initial public address should be allowed");
+        };
+        assert_eq!(
+            remote_location.resolved_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))
+        );
+
+        assert!(matches!(
+            selector
+                .judge_tcp(destination().into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+        assert_eq!(rebinding.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn matching_domain_arm_does_not_resolve_cidr_arm_in_same_group() {
+        let block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                domain: vec!["known.example".into()],
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector =
+            ClientProxySelector::new(vec![block, allow_rule(vec!["0.0.0.0/0"], "default")]);
+        // The empty resolver would error if the CIDR arm were evaluated eagerly.
+        let resolver = mock_resolver();
+        let destination = NetLocation::new(Address::Hostname("known.example".into()), 443);
+        assert!(matches!(
+            selector
+                .judge_tcp(destination.into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+    }
+
+    #[test]
+    fn rule_set_rejects_restrictive_legacy_masks() {
+        let rule_set = RouteMatchConfig {
+            rule_set: vec![crate::routing::predicate::RouteRuleSetConfig {
+                format: "source".into(),
+                path: "this-file-is-not-read.json".into(),
+            }],
+            ..Default::default()
+        };
+        for match_config in [
+            rule_set.clone(),
+            RouteMatchConfig {
+                any: vec![rule_set],
+                ..Default::default()
+            },
+        ] {
+            let error = ConnectRule::try_with_match_config(
+                vec![NetLocationMask::from("example.com").unwrap()],
+                match_config,
+                ConnectAction::new_block(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unconditional legacy mask"));
         }
     }
 

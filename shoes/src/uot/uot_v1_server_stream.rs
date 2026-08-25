@@ -19,10 +19,11 @@ use tokio::io::ReadBuf;
 
 use super::socks_addr::{parse_socks_packet_address, write_socks_packet_address};
 use super::uot_common::{parse_uot_address, write_uot_address};
-use crate::address::NetLocation;
+use crate::address::{Address, NetLocation};
 use crate::async_stream::{
-    AsyncFlushMessage, AsyncPing, AsyncReadTargetedMessage, AsyncShutdownMessage, AsyncStream,
-    AsyncTargetedMessageStream, AsyncWriteSourcedMessage,
+    AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncReadTargetedMessage,
+    AsyncShutdownMessage, AsyncStream, AsyncTargetedMessageStream, AsyncWriteMessage,
+    AsyncWriteSourcedMessage,
 };
 use crate::slide_buffer::SlideBuffer;
 use crate::util::allocate_vec;
@@ -46,6 +47,60 @@ const SOCKS_ADDR_CODEC: AddressCodec = AddressCodec {
     parse: parse_socks_packet_address,
     write: write_socks_packet_address,
 };
+
+const VLESS_PACKET_ADDR_CODEC: AddressCodec = AddressCodec {
+    parse: parse_vless_packet_address,
+    write: write_vless_packet_address,
+};
+
+fn parse_vless_packet_address(data: &[u8]) -> std::io::Result<Option<(NetLocation, usize)>> {
+    let Some(&address_type) = data.first() else {
+        return Ok(None);
+    };
+    match address_type {
+        1 => {
+            if data.len() < 7 {
+                return Ok(None);
+            }
+            let address = std::net::Ipv4Addr::new(data[1], data[2], data[3], data[4]);
+            let port = u16::from_be_bytes([data[5], data[6]]);
+            Ok(Some((NetLocation::new(Address::Ipv4(address), port), 7)))
+        }
+        2 => {
+            if data.len() < 19 {
+                return Ok(None);
+            }
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(&data[1..17]);
+            let port = u16::from_be_bytes([data[17], data[18]]);
+            Ok(Some((
+                NetLocation::new(Address::Ipv6(std::net::Ipv6Addr::from(octets)), port),
+                19,
+            )))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported VLESS packetaddr address type {address_type}"),
+        )),
+    }
+}
+
+fn write_vless_packet_address(data: &mut [u8], address: &SocketAddr) -> usize {
+    match address {
+        SocketAddr::V4(address) => {
+            data[0] = 1;
+            data[1..5].copy_from_slice(&address.ip().octets());
+            data[5..7].copy_from_slice(&address.port().to_be_bytes());
+            7
+        }
+        SocketAddr::V6(address) => {
+            data[0] = 2;
+            data[1..17].copy_from_slice(&address.ip().octets());
+            data[17..19].copy_from_slice(&address.port().to_be_bytes());
+            19
+        }
+    }
+}
 
 /// Packet-address stream for multi-destination UDP transports.
 pub struct PacketAddrStream<S> {
@@ -84,6 +139,11 @@ impl<S: AsyncStream> PacketAddrStream<S> {
     /// Create a stream that uses sing-mux SOCKS packet addresses.
     pub fn new_socks(stream: S) -> Self {
         Self::new_with_codec(stream, &SOCKS_ADDR_CODEC)
+    }
+
+    /// Create a stream using v2fly VLESS packetaddr's IP-only encoding.
+    pub fn new_vless_packet_addr(stream: S) -> Self {
+        Self::new_with_codec(stream, &VLESS_PACKET_ADDR_CODEC)
     }
 
     /// Feed initial data that was read before the stream was created.
@@ -317,10 +377,81 @@ impl<S: AsyncStream> AsyncTargetedMessageStream for PacketAddrStream<S> {}
 pub type UotV1ServerStream<S> = PacketAddrStream<S>;
 pub type SocksPacketAddrStream<S> = PacketAddrStream<S>;
 
+/// Bind the multi-destination packetaddr primitive to the single destination
+/// represented by shoes' outbound UDP interface.
+pub struct VlessPacketAddrClientStream {
+    inner: PacketAddrStream<Box<dyn AsyncStream>>,
+    target: SocketAddr,
+}
+
+impl VlessPacketAddrClientStream {
+    pub fn new(stream: Box<dyn AsyncStream>, target: SocketAddr) -> Self {
+        Self {
+            inner: PacketAddrStream::new_vless_packet_addr(stream),
+            target,
+        }
+    }
+}
+
+impl AsyncReadMessage for VlessPacketAddrClientStream {
+    fn poll_read_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        ready!(Pin::new(&mut self.inner).poll_read_targeted_message(cx, buf))?;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWriteMessage for VlessPacketAddrClientStream {
+    fn poll_write_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<()>> {
+        let target = self.target;
+        Pin::new(&mut self.inner).poll_write_sourced_message(cx, buf, &target)
+    }
+}
+
+impl AsyncFlushMessage for VlessPacketAddrClientStream {
+    fn poll_flush_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush_message(cx)
+    }
+}
+
+impl AsyncShutdownMessage for VlessPacketAddrClientStream {
+    fn poll_shutdown_message(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown_message(cx)
+    }
+}
+
+impl AsyncPing for VlessPacketAddrClientStream {
+    fn supports_ping(&self) -> bool {
+        self.inner.supports_ping()
+    }
+
+    fn poll_write_ping(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<bool>> {
+        Pin::new(&mut self.inner).poll_write_ping(cx)
+    }
+}
+
+impl AsyncMessageStream for VlessPacketAddrClientStream {}
+
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::pin::Pin;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
@@ -369,6 +500,23 @@ mod tests {
         frame[addr_len + 2..addr_len + 2 + payload.len()].copy_from_slice(payload);
         frame.truncate(addr_len + 2 + payload.len());
         frame
+    }
+
+    #[test]
+    fn vless_packetaddr_codec_matches_v2fly_ip_wire() {
+        let ipv4 = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 5353));
+        let ipv4_wire = encode_packet(write_vless_packet_address, &ipv4, b"v4");
+        assert_eq!(ipv4_wire, [1, 192, 0, 2, 1, 0x14, 0xe9, 0, 2, b'v', b'4']);
+        let (ipv4_location, ipv4_len) = parse_vless_packet_address(&ipv4_wire).unwrap().unwrap();
+        assert_eq!(ipv4_location.to_socket_addr_nonblocking(), Some(ipv4));
+        assert_eq!(ipv4_len, 7);
+
+        let ipv6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        let ipv6_wire = encode_packet(write_vless_packet_address, &ipv6, b"v6");
+        assert_eq!(ipv6_wire[0], 2);
+        let (ipv6_location, ipv6_len) = parse_vless_packet_address(&ipv6_wire).unwrap().unwrap();
+        assert_eq!(ipv6_location.to_socket_addr_nonblocking(), Some(ipv6));
+        assert_eq!(ipv6_len, 19);
     }
 
     #[tokio::test]

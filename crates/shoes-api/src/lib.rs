@@ -79,6 +79,39 @@ pub struct UserSpec {
     /// cannot authenticate again.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Most connections this user may have open at once. `0`, and the absent
+    /// default, mean no ceiling.
+    ///
+    /// This is the only bound on what one valid credential can cost the host.
+    /// Every protocol's per-connection state is a multiplier on it -- a hysteria2 or
+    /// TUIC connection may hold hundreds of UDP sessions, a NaiveProxy one hundreds
+    /// of multiplexed tunnels -- so on a shared inbound this is what stops one user
+    /// exhausting sockets or memory for all the others. An inbound serving users who
+    /// do not need many parallel connections is worth capping.
+    ///
+    /// Lowering it, or setting it on a user who is already over it, does not
+    /// disconnect anybody: it governs new connections, and the live count drains to
+    /// the new ceiling as existing ones end. Removing the user is what disconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_conns: Option<u64>,
+    /// Ceiling on how fast this user may *send*, in bits per second. `None` and
+    /// `0` both mean unlimited.
+    ///
+    /// Directions are named from the client's point of view, the way a control
+    /// plane states them: `upload` is the client sending to the proxy. Getting
+    /// the pair the wrong way round is a quiet failure -- traffic still flows,
+    /// just capped in the direction nobody complained about -- so the two fields
+    /// say whose upload and whose download they mean.
+    ///
+    /// The bucket belongs to the user, not to a connection, so opening a second
+    /// connection does not buy a second allowance. Like `max_conns`, changing
+    /// this governs what happens next and disconnects nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_limit_bps: Option<u64>,
+    /// Ceiling on how fast this user may *receive*, in bits per second. `None`
+    /// and `0` both mean unlimited. See [`upload_limit_bps`](Self::upload_limit_bps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_limit_bps: Option<u64>,
 }
 
 impl UserSpec {
@@ -100,10 +133,29 @@ pub struct UserInfo {
     pub tx: u64,
     /// Bytes received from this user, as they came off the wire.
     pub rx: u64,
+    /// Unix milliseconds of the most recent non-zero byte observation.
+    ///
+    /// This belongs to the byte counters rather than to a later control-plane
+    /// snapshot.  Consumers that periodically take the counters can therefore
+    /// retain the minute in which the traffic actually flowed. `0` means that
+    /// this accounting generation has not observed any bytes yet.
+    #[serde(default)]
+    pub last_traffic_observed_at_unix_millis: u64,
     /// Connections currently open.
     pub conns: u64,
-    /// Successful authentications since the user was added.
+    /// Successful authentications since the user was added. A connection refused
+    /// for exceeding `max_conns` is not counted here: the credential was good but
+    /// no connection came of it.
     pub total_conns: u64,
+    /// The ceiling `conns` is admitted against, or `0` for no ceiling.
+    #[serde(default)]
+    pub max_conns: u64,
+    /// Client-upload ceiling in bits per second, or `0` for none.
+    #[serde(default)]
+    pub upload_limit_bps: u64,
+    /// Client-download ceiling in bits per second, or `0` for none.
+    #[serde(default)]
+    pub download_limit_bps: u64,
 }
 
 /// Argument to [`Engine::add_inbound`] and [`Engine::update_inbound`].

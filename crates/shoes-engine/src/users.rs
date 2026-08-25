@@ -17,8 +17,10 @@
 //!
 //! A lookup is one hash, one shard read lock, one 16 or 56 byte constant-time
 //! comparison, and an `Arc` clone. It happens once per connection, during the
-//! handshake, never per packet. The read guard is held only for the comparison, so
-//! a concurrent `upsert` on the same shard waits nanoseconds, not for I/O.
+//! handshake, never per packet. Once the protocol has proved the credential,
+//! admission briefly enters only that user's lifecycle gate; that is what makes it
+//! linearise against removal. Neither lock is held across I/O, and unrelated users
+//! never share the lifecycle gate.
 //!
 //! # Writers, unlike readers, are serialised
 //!
@@ -45,7 +47,7 @@
 //! It is the same records either way: the snapshot holds the same `Arc<Entry>`s the
 //! maps do, so there is no second copy of anyone's state that could drift.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -299,6 +301,72 @@ struct Entry {
     vmess: Option<VmessAuthKey>,
 }
 
+/// One removed accounting generation, including its recoverable final snapshot.
+struct DrainingUser {
+    entry: Arc<Entry>,
+    result: OnceLock<UserInfo>,
+    completed: tokio::sync::Notify,
+}
+
+impl DrainingUser {
+    fn new(entry: Arc<Entry>) -> Arc<Self> {
+        Arc::new(Self {
+            entry,
+            result: OnceLock::new(),
+            completed: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn complete(&self) -> UserInfo {
+        debug_assert_eq!(self.entry.context.conns(), 0);
+        let info = self
+            .result
+            .get_or_init(|| user_info(&self.entry.context))
+            .clone();
+        self.completed.notify_waiters();
+        info
+    }
+
+    async fn completed_result(&self) -> UserInfo {
+        loop {
+            // Register before checking the value, so completion between the check
+            // and await cannot be missed.
+            let notified = self.completed.notified();
+            if let Some(info) = self.result.get() {
+                return info.clone();
+            }
+            notified.await;
+        }
+    }
+
+    async fn finish(&self) -> UserInfo {
+        if let Some(info) = self.result.get() {
+            return info.clone();
+        }
+
+        // Several retried remove calls may attach at once. UserContext wakes one
+        // zero waiter; that winner stores the result and wakes every other caller.
+        tokio::select! {
+            info = self.completed_result() => info,
+            () = self.entry.context.wait_for_connections_closed() => self.complete(),
+        }
+    }
+}
+
+/// Clear only the tombstone owned by this exact accounting generation.
+///
+/// A completed old finalizer can race with re-adding and then removing the same id.
+/// Key-only removal would let that stale finalizer erase the newer generation's
+/// tombstone and permit two live generations to overlap.
+fn clear_draining_generation(
+    draining: &DashMap<Arc<str>, Arc<DrainingUser>>,
+    generation: &Arc<DrainingUser>,
+) {
+    draining.remove_if(generation.entry.context.id().as_ref(), |_, current| {
+        Arc::ptr_eq(current, generation)
+    });
+}
+
 impl Entry {
     /// Confirms a candidate hit and, on success, hands out the shared record.
     ///
@@ -309,21 +377,20 @@ impl Entry {
         if expected.ct_eq(presented).unwrap_u8() == 0 || !self.context.is_enabled() {
             return None;
         }
-        self.context.note_auth();
         Some(self.context.clone())
     }
 
     /// Whether this user sealed `auth_id`, and what the handshake needs next.
     ///
     /// No constant-time comparison here, unlike `accept`, and none is called for:
-    /// nothing is being compared against a stored secret. A valid checksum is itself
-    /// proof that the sender held the uuid, so there is no credential to leak a byte
-    /// at a time.
+    /// nothing is being compared against a stored secret. A valid checksum shows
+    /// somebody held the uuid, but the auth id itself can be replayed, so there is no
+    /// stored credential for a timing probe to walk a byte at a time.
     ///
-    /// A disabled user reports absent, same as `accept`. Unlike `accept` this does
-    /// **not** count the authentication: an auth id names a user without proving
-    /// anything an observer could not have copied, so the handler counts it once the
-    /// header AEAD opens. See [`UserRegistry::find_vmess_auth_id`].
+    /// A disabled user reports absent, same as `accept`. The auth id names a user
+    /// without proving anything an observer could not have copied, so the handler
+    /// waits to admit it until the header AEAD opens. See
+    /// [`UserRegistry::find_vmess_auth_id`].
     fn accept_vmess(&self, auth_id: &[u8; 16]) -> Option<VmessIdentity> {
         let key = self.vmess.as_ref()?;
         let timestamp = key.open(auth_id)?;
@@ -364,6 +431,14 @@ pub struct MemoryUserRegistry {
     /// id -> user. Authoritative: `list` and `remove` work from this map, and it is
     /// the only place a user without a usable credential could be observed.
     users: DashMap<Arc<str>, Arc<Entry>>,
+    /// Removed users whose existing connections are still shutting down. Keeping a
+    /// tombstone prevents the same public id from acquiring a second accounting
+    /// generation before the first one has produced its final counters.
+    ///
+    /// The state stores the final snapshot. A detached finalizer can complete after
+    /// the first `remove_user` future is cancelled, and a repeated call attaches to
+    /// this same generation instead of losing its last billing result.
+    draining: Arc<DashMap<Arc<str>, Arc<DrainingUser>>>,
     /// wire uuid -> user. The index `find_uuid` hits.
     by_uuid: DashMap<[u8; 16], Arc<Entry>>,
     /// wire hash -> user. The index `find_trojan_hash` hits.
@@ -393,6 +468,7 @@ impl std::fmt::Debug for MemoryUserRegistry {
         f.debug_struct("MemoryUserRegistry")
             .field("kinds", &self.kinds)
             .field("num_users", &self.users.len())
+            .field("num_draining", &self.draining.len())
             .finish()
     }
 }
@@ -402,6 +478,7 @@ impl MemoryUserRegistry {
         Arc::new(Self {
             kinds,
             users: DashMap::new(),
+            draining: Arc::new(DashMap::new()),
             by_uuid: DashMap::new(),
             by_trojan_hash: DashMap::new(),
             by_password: DashMap::new(),
@@ -452,6 +529,17 @@ impl MemoryUserRegistry {
             }
         };
 
+        if let Some(draining) = self.draining.get(id.as_ref()) {
+            let state = if draining.entry.context.conns() == 0 {
+                "has completed removal, but its final counters have not been collected"
+            } else {
+                "is still disconnecting after removal"
+            };
+            return Err(EngineError::InvalidUser(format!(
+                "user {id} {state}; call remove_user again to collect that removal before re-adding the id"
+            )));
+        }
+
         let credentials = self.parse_credentials(&id, &spec)?;
         self.check_credentials_unclaimed(&id, &credentials)?;
 
@@ -463,6 +551,15 @@ impl MemoryUserRegistry {
             None => UserContext::new(id.clone()),
         };
         context.set_enabled(spec.enabled);
+        // Applied on every upsert, so an update that omits the field clears a
+        // previously set ceiling rather than silently keeping it. `UserSpec` is a
+        // whole-record description, not a patch: the same reason an omitted
+        // credential is rotated away above rather than preserved.
+        context.set_max_conns(spec.max_conns.unwrap_or(0));
+        context.set_speed_limits(
+            spec.upload_limit_bps.unwrap_or(0),
+            spec.download_limit_bps.unwrap_or(0),
+        );
 
         let entry = Arc::new(Entry {
             context,
@@ -546,53 +643,122 @@ impl MemoryUserRegistry {
         Ok(user_info(&entry.context))
     }
 
-    /// Removes a user so no new connection can authenticate as them.
+    /// Removes a user, closes every connection authenticated as them, and returns
+    /// only after their counters are final.
     ///
-    /// Established connections are deliberately untouched. They hold their own
-    /// `Arc<UserContext>`, taken at handshake time, so they keep running and keep
-    /// accounting; only the lookup path forgets the credential. Cutting them off
-    /// would need a per-user cancellation token, which is a different feature from
-    /// revoking a credential.
-    pub fn remove(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
-        // Same lock as `upsert`: removing a user reads their entry to learn which
-        // index keys are theirs, and a concurrent upsert of the same id would make
-        // that answer stale between the read and the removals.
-        let _writer = self.lock_writer();
+    /// Revocation and index retirement happen under the writer lock, but the async
+    /// drain does not: unrelated user mutations remain fast while sockets close.
+    /// On the normal Tokio engine runtime a detached finalizer owns the wait, so
+    /// cancelling this control-plane future does not cancel disconnection. Its final
+    /// snapshot stays on the drain tombstone and a repeated remove returns it. The
+    /// tombstone also prevents a second generation of the same id from overlapping;
+    /// it remains reserved until a repeated remove collects the result, including
+    /// when the original Tokio runtime shut down while the finalizer was pending.
+    pub async fn remove(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
+        let (generation, newly_removed) = {
+            // Same lock as `upsert`: removing a user reads their entry to learn which
+            // index keys are theirs, and a concurrent upsert of the same id would make
+            // that answer stale between the read and the removals.
+            let _writer = self.lock_writer();
 
-        let (_, entry) = self
-            .users
-            .remove(id)
-            .ok_or_else(|| EngineError::UnknownUser {
-                tag: tag.to_string(),
-                id: id.to_string(),
-            })?;
+            match self.users.get(id).map(|entry| entry.value().clone()) {
+                Some(entry) => {
+                    // This is the removal linearization point. Old map/ArcSwap
+                    // readers may still hold the Entry, but admission and connection
+                    // registration now fail closed and all registered connections
+                    // are signalled.
+                    entry.context.revoke_connections();
+                    self.users.remove(id);
+                    let generation = DrainingUser::new(entry.clone());
+                    self.draining
+                        .insert(entry.context.id().clone(), generation.clone());
 
-        if let Some(uuid) = entry.uuid {
-            self.by_uuid.remove(&uuid);
-        }
-        if let Some(hash) = &entry.trojan_hash {
-            self.by_trojan_hash.remove(hash);
-        }
-        if let Some(password) = &entry.password {
-            self.by_password.remove(password);
-        }
-        if let Some(shadowsocks) = &entry.shadowsocks {
-            self.by_psk_hash.remove(&shadowsocks.hash);
-        }
-        if let Some(hash) = entry.anytls_hash {
-            self.by_anytls_hash.remove(&hash);
-            self.release_anytls_prefix(&hash);
-        }
-        if let Some(encoded) = &entry.naive_encoded {
-            self.by_naive_encoded.remove(encoded);
-        }
-        self.republish_vmess();
+                    if let Some(uuid) = entry.uuid {
+                        self.by_uuid.remove(&uuid);
+                    }
+                    if let Some(hash) = &entry.trojan_hash {
+                        self.by_trojan_hash.remove(hash);
+                    }
+                    if let Some(password) = &entry.password {
+                        self.by_password.remove(password);
+                    }
+                    if let Some(shadowsocks) = &entry.shadowsocks {
+                        self.by_psk_hash.remove(&shadowsocks.hash);
+                    }
+                    if let Some(hash) = entry.anytls_hash {
+                        self.by_anytls_hash.remove(&hash);
+                        self.release_anytls_prefix(&hash);
+                    }
+                    if let Some(encoded) = &entry.naive_encoded {
+                        self.by_naive_encoded.remove(encoded);
+                    }
+                    self.republish_vmess();
+                    (generation, true)
+                }
+                None => {
+                    let generation = self
+                        .draining
+                        .get(id)
+                        .map(|entry| entry.value().clone())
+                        .ok_or_else(|| EngineError::UnknownUser {
+                            tag: tag.to_string(),
+                            id: id.to_string(),
+                        })?;
+                    (generation, false)
+                }
+            }
+        };
 
-        Ok(user_info(&entry.context))
+        if !newly_removed {
+            let info = generation.finish().await;
+            clear_draining_generation(&self.draining, &generation);
+            return Ok(info);
+        }
+
+        let finalizer_generation = generation.clone();
+        let finalizer = async move { finalizer_generation.finish().await };
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            match runtime.spawn(finalizer).await {
+                Ok(info) => {
+                    clear_draining_generation(&self.draining, &generation);
+                    Ok(info)
+                }
+                Err(error) => {
+                    // Leave the generation recoverable for a repeated remove. If
+                    // every connection did close before task cancellation, publish
+                    // its snapshot now so the retry completes immediately.
+                    if generation.entry.context.conns() == 0 {
+                        generation.complete();
+                    }
+                    Err(EngineError::Io(std::io::Error::other(format!(
+                        "user removal finalizer failed: {error}"
+                    ))))
+                }
+            }
+        } else {
+            // Engine operations normally run on Tokio. Polling this future from a
+            // different executor is still safe: wait inline rather than panicking at
+            // tokio::spawn. A cancelled caller leaves a generation that a repeated
+            // remove can finish and collect after its connections close.
+            let info = finalizer.await;
+            clear_draining_generation(&self.draining, &generation);
+            Ok(info)
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<UserInfo> {
         self.users.get(id).map(|entry| user_info(&entry.context))
+    }
+
+    /// Cancels the user's currently open connections without removing or
+    /// disabling the user. New authentications are allowed immediately.
+    pub fn kick(&self, tag: &str, id: &str) -> EngineResult<u64> {
+        let entry = self.users.get(id).ok_or_else(|| EngineError::UnknownUser {
+            tag: tag.to_string(),
+            id: id.to_string(),
+        })?;
+        Ok(entry.context.kick_connections())
     }
 
     /// Reports one user's traffic and zeroes it, in a single step.
@@ -888,14 +1054,14 @@ impl MemoryUserRegistry {
     /// Rebuilt whole rather than patched, so it cannot drift from the map it is
     /// derived from. The cost is one allocation and one pass over the users, on a
     /// control-plane path that already holds the engine's write lock -- and it buys a
-    /// connection path that takes no lock at all.
+    /// candidate lookup that takes no index lock at all. The handler still enters the
+    /// winning user's lifecycle gate after decrypting the header.
     ///
-    /// The snapshot lags the maps by the few instructions between the two writes. What
-    /// a connection landing in that window sees is the *older* set, so a just-added
-    /// user is briefly unknown and a just-removed one briefly still works. Both fail
-    /// in the direction the rest of the design already accepts: `remove_user` is
-    /// documented not to disturb what is already connected, and a user added
-    /// microseconds ago has no client waiting on them.
+    /// The snapshot lags the maps by the few instructions between the two writes. A
+    /// connection landing in that window can see the *older* set, so a just-added user
+    /// is briefly unknown. A removed candidate cannot get back in through the stale
+    /// snapshot: after opening the header the handler atomically admits and binds the
+    /// connection, and revocation makes that operation fail closed.
     fn republish_vmess(&self) {
         let candidates: Vec<Arc<Entry>> = self
             .users
@@ -943,10 +1109,9 @@ impl UserRegistry for MemoryUserRegistry {
 
     /// Who an identity header named, and the key their session derives from.
     ///
-    /// Not `accept`, and no `note_auth`: the header is sealed under the *inbound's*
-    /// key rather than this user's, so it names them without showing the sender is
-    /// them. The handler counts it once the record layer opens a chunk. See the trait
-    /// method's docs.
+    /// The header is sealed under the *inbound's* key rather than this user's, so it
+    /// names them without showing the sender is them. The handler admits it once the
+    /// record layer opens a chunk. See the trait method's docs.
     fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
         let entry = self.by_psk_hash.get(hash)?;
         let credential = entry.shadowsocks.as_ref()?;
@@ -962,10 +1127,9 @@ impl UserRegistry for MemoryUserRegistry {
 
     /// The uuid half of a TUIC credential, plus the password its token is keyed with.
     ///
-    /// Not `accept`, and no `note_auth`: the token that proves the client holds that
-    /// password has not been checked yet and cannot be checked from here, so there is
-    /// nothing yet to count. The handler counts it once the token matches. See the
-    /// trait method's docs.
+    /// The token that proves the client holds that password has not been checked yet
+    /// and cannot be checked from here, so there is nothing yet to admit. The handler
+    /// admits it once the token matches. See the trait method's docs.
     ///
     /// A user registered without a TUIC password -- which this inbound's
     /// `parse_credentials` refuses, but a registry built for another protocol would
@@ -1013,11 +1177,13 @@ impl UserRegistry for MemoryUserRegistry {
 
 /// [`user_info`], but the byte counters are taken rather than read.
 fn taken_user_info(context: &UserContext) -> UserInfo {
-    let mut info = user_info(context);
-    // The swap, not the snapshot above, is what decides the reported figure: it is
-    // the only read that also closes the period, so anything counted between the two
-    // belongs to this one rather than being reported twice or not at all.
+    // The swaps decide the reported figure: they are the only reads that also
+    // close the period, so each increment belongs to exactly one drain.
     let (tx, rx) = context.take_traffic();
+    // Byte increments publish their observation time before incrementing the
+    // counter. Read it after both swaps so every byte included above has also made
+    // its timestamp visible to this snapshot.
+    let mut info = user_info(context);
     info.tx = tx;
     info.rx = rx;
     info
@@ -1030,14 +1196,19 @@ fn user_info(context: &UserContext) -> UserInfo {
         enabled: stats.enabled,
         tx: stats.tx,
         rx: stats.rx,
+        last_traffic_observed_at_unix_millis: stats.last_traffic_observed_at_unix_millis,
         conns: stats.conns,
         total_conns: stats.total_conns,
+        max_conns: stats.max_conns,
+        upload_limit_bps: stats.upload_limit_bps,
+        download_limit_bps: stats.download_limit_bps,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shoes::dynamic::ConnContext;
 
     const UUID_A: &str = "b85798ef-e9dc-46a4-9a87-8da4499d36d0";
     const UUID_B: &str = "11111111-1111-4111-8111-111111111111";
@@ -1053,6 +1224,9 @@ mod tests {
             uuid: Some(uuid.to_string()),
             password: None,
             enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
         }
     }
 
@@ -1062,6 +1236,9 @@ mod tests {
             uuid: None,
             password: Some(credential::encode_shadowsocks_psk(psk)),
             enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
         }
     }
 
@@ -1071,6 +1248,9 @@ mod tests {
             uuid: None,
             password: Some(password.to_string()),
             enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
         }
     }
 
@@ -1080,6 +1260,9 @@ mod tests {
             uuid: None,
             password: Some(password.to_string()),
             enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
         }
     }
 
@@ -1091,6 +1274,9 @@ mod tests {
             uuid: Some(uuid.to_string()),
             password: Some(password.to_string()),
             enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
         }
     }
 
@@ -1100,6 +1286,9 @@ mod tests {
             uuid: None,
             password: Some(credential::encode_shadowsocks_psk(&ss_psk(id, len))),
             enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
         }
     }
 
@@ -1119,8 +1308,8 @@ mod tests {
         assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_none());
     }
 
-    #[test]
-    fn authenticates_two_users_independently() {
+    #[tokio::test]
+    async fn authenticates_two_users_independently() {
         // The phase 2 acceptance case: two users on one inbound, each with their own
         // record, and removing one leaves the other untouched.
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
@@ -1137,12 +1326,115 @@ mod tests {
         bob.add_tx(7);
         assert_eq!((alice.tx(), bob.tx()), (100, 7));
 
-        registry.remove("in", "alice").unwrap();
+        registry.remove("in", "alice").await.unwrap();
         assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_none());
         assert!(registry.find_uuid(&uuid_bytes(UUID_B)).is_some());
-        // Alice's live connections still hold their record and still account to it.
-        alice.add_tx(1);
-        assert_eq!(alice.tx(), 101);
+        assert!(alice.is_revoked());
+        assert!(!bob.is_revoked());
+
+        // Re-adding the public id creates a fresh lifecycle; the permanently
+        // cancelled record can never poison its replacement.
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        let replacement = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        assert!(!Arc::ptr_eq(&alice, &replacement));
+        assert!(!replacement.is_revoked());
+    }
+
+    #[tokio::test]
+    async fn kick_ends_current_sessions_without_revoking_the_user() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+
+        let current = ConnContext::new();
+        assert!(current.bind_authenticated(Arc::clone(&alice)));
+        assert_eq!(registry.kick("in", "alice").unwrap(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), current.cancelled())
+            .await
+            .expect("the current connection must be signalled");
+
+        assert!(!alice.is_revoked());
+        assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_some());
+        let replacement = ConnContext::new();
+        assert!(replacement.bind_authenticated(alice));
+    }
+
+    #[tokio::test]
+    async fn cancelling_remove_keeps_its_final_snapshot_recoverable_by_retry() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        let connection = ConnContext::new();
+        assert!(connection.bind_authenticated(Arc::clone(&alice)));
+        alice.add_rx(123);
+
+        let remover_registry = Arc::clone(&registry);
+        let remover = tokio::spawn(async move { remover_registry.remove("in", "alice").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !alice.is_revoked() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("removal must linearise");
+
+        remover.abort();
+        let _ = remover.await;
+        assert!(registry.get("alice").is_none());
+        assert!(
+            registry.upsert(uuid_spec("alice", UUID_A)).is_err(),
+            "the old accounting generation is still draining"
+        );
+
+        drop(connection);
+        assert!(
+            registry.upsert(uuid_spec("alice", UUID_A)).is_err(),
+            "a completed removal keeps the id reserved until its result is collected"
+        );
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            registry.remove("in", "alice"),
+        )
+        .await
+        .expect("a repeated remove must attach to the detached finalizer")
+        .expect("the final snapshot remains recoverable");
+        assert_eq!(recovered.rx, 123);
+        assert_eq!(recovered.conns, 0);
+        assert!(registry.draining.is_empty());
+
+        registry
+            .upsert(uuid_spec("alice", UUID_A))
+            .expect("the id can be reused after all old connections close");
+    }
+
+    #[test]
+    fn a_stale_finalizer_cannot_clear_a_new_generation_tombstone() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        let old = registry.users.get("alice").unwrap().value().clone();
+
+        let replacement_registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        replacement_registry
+            .upsert(uuid_spec("alice", UUID_B))
+            .unwrap();
+        let replacement = replacement_registry
+            .users
+            .get("alice")
+            .unwrap()
+            .value()
+            .clone();
+
+        let old_generation = DrainingUser::new(old);
+        let replacement_generation = DrainingUser::new(replacement);
+
+        registry.draining.insert(
+            replacement_generation.entry.context.id().clone(),
+            replacement_generation.clone(),
+        );
+        clear_draining_generation(&registry.draining, &old_generation);
+
+        let current = registry.draining.get("alice").unwrap();
+        assert!(Arc::ptr_eq(current.value(), &replacement_generation));
     }
 
     #[test]
@@ -1152,7 +1444,11 @@ mod tests {
         let first = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
         let second = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.total_conns(), 2);
+        assert_eq!(
+            first.total_conns(),
+            0,
+            "a revocable registry defers admission until the meter can register the connection"
+        );
     }
 
     #[test]
@@ -1170,6 +1466,47 @@ mod tests {
         let after = registry.find_uuid(&uuid_bytes(UUID_B)).unwrap();
         assert!(Arc::ptr_eq(&before, &after));
         assert_eq!(after.rx(), 4096);
+    }
+
+    #[test]
+    fn the_connection_ceiling_survives_an_upsert_and_is_reported() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        let mut spec = uuid_spec("alice", UUID_A);
+        spec.max_conns = Some(3);
+        registry.upsert(spec).unwrap();
+
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        assert_eq!(alice.max_conns(), 3);
+        assert_eq!(registry.get("alice").unwrap().max_conns, 3);
+
+        // Raising it keeps the same record, so the counters are not reset with it.
+        alice.add_tx(64);
+        let mut spec = uuid_spec("alice", UUID_A);
+        spec.max_conns = Some(9);
+        registry.upsert(spec).unwrap();
+        assert_eq!(alice.max_conns(), 9);
+        assert_eq!(registry.get("alice").unwrap().tx, 64);
+    }
+
+    #[test]
+    fn an_upsert_without_a_ceiling_clears_the_previous_one() {
+        // `UserSpec` describes a whole record rather than a patch, which is already
+        // how a rotated-away credential behaves. A ceiling that silently outlived the
+        // spec that stopped asking for it would be the one field that does not.
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        let mut spec = uuid_spec("alice", UUID_A);
+        spec.max_conns = Some(3);
+        registry.upsert(spec).unwrap();
+        assert_eq!(
+            registry.find_uuid(&uuid_bytes(UUID_A)).unwrap().max_conns(),
+            3
+        );
+
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        assert_eq!(
+            registry.find_uuid(&uuid_bytes(UUID_A)).unwrap().max_conns(),
+            0
+        );
     }
 
     #[test]
@@ -1226,6 +1563,9 @@ mod tests {
                 uuid: None,
                 password: None,
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             })
             .unwrap_err();
         assert!(matches!(err, EngineError::InvalidUser(_)));
@@ -1241,6 +1581,9 @@ mod tests {
                 uuid: Some(UUID_A.to_string()),
                 password: None,
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             })
             .unwrap();
         assert_eq!(info.id, UUID_A);
@@ -1287,6 +1630,9 @@ mod tests {
                 uuid: Some(UUID_B.to_string()),
                 password: Some("s3cret".into()),
                 enabled: true,
+                max_conns: None,
+                upload_limit_bps: None,
+                download_limit_bps: None,
             })
             .unwrap();
 
@@ -1304,10 +1650,10 @@ mod tests {
         assert!(Arc::ptr_eq(&by_uuid, &by_password));
     }
 
-    #[test]
-    fn remove_reports_an_unknown_id() {
+    #[tokio::test]
+    async fn remove_reports_an_unknown_id() {
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
-        let err = registry.remove("in", "nobody").unwrap_err();
+        let err = registry.remove("in", "nobody").await.unwrap_err();
         assert!(matches!(err, EngineError::UnknownUser { .. }));
     }
 
@@ -1321,7 +1667,7 @@ mod tests {
 
         assert_eq!(&**registry.find_password("hunter2").unwrap().id(), "alice");
         assert_eq!(&**registry.find_password("hunter3").unwrap().id(), "bob");
-        assert_eq!(registry.get("alice").unwrap().total_conns, 1);
+        assert_eq!(registry.get("alice").unwrap().total_conns, 0);
 
         // A prefix is not a match: the comparison covers the whole value.
         assert!(registry.find_password("hunter").is_none());
@@ -1363,8 +1709,8 @@ mod tests {
         assert!(Arc::ptr_eq(&by_plain, &by_hash));
     }
 
-    #[test]
-    fn rotating_a_password_retires_the_old_one() {
+    #[tokio::test]
+    async fn rotating_a_password_retires_the_old_one() {
         let registry = MemoryUserRegistry::new(CredentialKinds::PLAIN_PASSWORD);
         registry.upsert(trojan_spec("alice", "hunter2")).unwrap();
         let before = registry.find_password("hunter2").unwrap();
@@ -1377,7 +1723,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
         assert_eq!(after.rx(), 128);
 
-        registry.remove("in", "alice").unwrap();
+        registry.remove("in", "alice").await.unwrap();
         assert!(registry.find_password("hunter3").is_none());
     }
 
@@ -1445,8 +1791,8 @@ mod tests {
         assert_eq!(registry.get("alice").unwrap().total_conns, 0);
     }
 
-    #[test]
-    fn rotating_a_psk_retires_the_old_name() {
+    #[tokio::test]
+    async fn rotating_a_psk_retires_the_old_name() {
         let registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(32));
         registry.upsert(ss_spec("alice", 32)).unwrap();
         let before = registry
@@ -1470,7 +1816,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after.user));
         assert_eq!(after.user.tx(), 64);
 
-        registry.remove("in", "alice").unwrap();
+        registry.remove("in", "alice").await.unwrap();
         assert!(
             registry
                 .find_shadowsocks_psk_hash(&ss_name("rotated", 32))
@@ -1699,7 +2045,7 @@ mod tests {
         let hash = credential::password_sha256("hunter2");
         let found = registry.find_password_sha256(&hash).unwrap();
         assert_eq!(&**found.id(), "alice");
-        assert_eq!(found.total_conns(), 1);
+        assert_eq!(found.total_conns(), 0);
 
         assert!(
             registry
@@ -1730,8 +2076,8 @@ mod tests {
         assert!(!registry.has_password_sha256_prefix(&[0u8; 8]));
     }
 
-    #[test]
-    fn the_anytls_prefix_index_is_counted_rather_than_a_set() {
+    #[tokio::test]
+    async fn the_anytls_prefix_index_is_counted_rather_than_a_set() {
         // Two users can share an 8-byte prefix, so removing one must not blind the
         // probe to the other. A set would.
         let registry = MemoryUserRegistry::new(CredentialKinds::ANYTLS_PASSWORD);
@@ -1748,7 +2094,7 @@ mod tests {
         registry.claim_anytls_prefix(&alice_hash);
         assert!(registry.has_password_sha256_prefix(&prefix));
 
-        registry.remove("anytls", "alice").unwrap();
+        registry.remove("anytls", "alice").await.unwrap();
         assert!(
             registry.has_password_sha256_prefix(&prefix),
             "the second claim on this prefix is still live"
@@ -1800,7 +2146,7 @@ mod tests {
         let encoded = credential::naive_basic_credential("alice", "hunter2");
         let found = registry.find_naive_basic(&encoded).unwrap();
         assert_eq!(&**found.id(), "alice");
-        assert_eq!(found.total_conns(), 1);
+        assert_eq!(found.total_conns(), 0);
 
         // Neither half stands alone, and garbage off a header must not match.
         assert!(
@@ -1817,8 +2163,8 @@ mod tests {
         assert!(registry.find_naive_basic(&[0xff, 0xfe]).is_none());
     }
 
-    #[test]
-    fn renaming_a_naive_user_rotates_their_credential() {
+    #[tokio::test]
+    async fn renaming_a_naive_user_rotates_their_credential() {
         // The consequence of the id being the username half. Worth pinning, because
         // it is the one place in this crate where an id is not merely a label.
         let registry = MemoryUserRegistry::new(CredentialKinds::NAIVE_BASIC);
@@ -1839,7 +2185,7 @@ mod tests {
         );
         assert_eq!(registry.user_count(), 2);
 
-        registry.remove("naive", "alice").unwrap();
+        registry.remove("naive", "alice").await.unwrap();
         assert!(
             registry
                 .find_naive_basic(&credential::naive_basic_credential("alice", "hunter2"))
@@ -1875,7 +2221,7 @@ mod tests {
         let user = registry.find_naive_basic(&encoded).unwrap();
         user.set_enabled(false);
         assert!(registry.find_naive_basic(&encoded).is_none());
-        assert_eq!(user.total_conns(), 1, "a denial is not a connection");
+        assert_eq!(user.total_conns(), 0, "a denial is not a connection");
         user.set_enabled(true);
         assert!(registry.find_naive_basic(&encoded).is_some());
     }
@@ -1972,14 +2318,13 @@ mod tests {
 
         by_auth_id.add_rx(512);
         assert_eq!(registry.get("alice").unwrap().rx, 512);
-        // One authentication, from the VLESS lookup. The VMess one names her without
-        // counting, because its auth id is replayable; her handler counts once the
-        // header AEAD opens.
-        assert_eq!(by_uuid.total_conns(), 1);
+        // Both lookups only identify a candidate. The protocol handler atomically
+        // counts and registers the connection once it admits it to the data path.
+        assert_eq!(by_uuid.total_conns(), 0);
     }
 
-    #[test]
-    fn the_trial_snapshot_tracks_every_mutation() {
+    #[tokio::test]
+    async fn the_trial_snapshot_tracks_every_mutation() {
         // The snapshot is a second structure derived from the same entries, so the
         // risk it introduces is drift. Each mutation is checked through it.
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
@@ -2034,7 +2379,7 @@ mod tests {
         );
 
         // remove
-        registry.remove("in", "alice").unwrap();
+        registry.remove("in", "alice").await.unwrap();
         assert!(
             registry
                 .find_vmess_auth_id(&vmess_auth_id(UUID_B))
@@ -2117,12 +2462,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_that_cannot_prove_possession_does_not_count() {
-        // Three credentials are matched on bytes an observer can copy off the wire,
-        // so a hit shows only that somebody held them once -- possibly the victim, on
-        // a connection the sender recorded. Counting there let a replayer inflate
-        // another user's connection count. Their handlers count instead, once the
-        // protocol produces something a copy could not.
+    fn lookups_resolve_candidates_without_admitting_them() {
+        // Every registry implementation has one contract: lookup resolves an enabled
+        // candidate, while the handler admits only after its protocol has enough
+        // proof. For these first two protocols that proof comes later than lookup.
         let ss_registry = MemoryUserRegistry::new(CredentialKinds::shadowsocks_psk(16));
         ss_registry
             .upsert(psk_spec("alice", &[7u8; 16]))
@@ -2151,8 +2494,9 @@ mod tests {
             "an auth id crosses the wire in the clear and can be replayed"
         );
 
-        // The contrast: a credential the client had to *hold* to send is counted on
-        // the spot, because there is nothing further to wait for.
+        // Even a credential the client had to hold is only a candidate at lookup.
+        // Admission is deferred until the meter can count and register it as one
+        // operation against concurrent removal.
         let trojan_registry = MemoryUserRegistry::new(CredentialKinds::TROJAN_PASSWORD);
         trojan_registry
             .upsert(trojan_spec("carol", "hunter2"))
@@ -2160,7 +2504,7 @@ mod tests {
         let carol = trojan_registry
             .find_trojan_hash(&credential::trojan_password_hash("hunter2"))
             .expect("carol authenticates");
-        assert_eq!(carol.total_conns(), 1);
+        assert_eq!(carol.total_conns(), 0);
     }
 
     #[test]
@@ -2171,12 +2515,16 @@ mod tests {
 
         // Stand in for a connection: authenticate, then move some bytes.
         let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
-        alice.open_conn();
+        let connection = ConnContext::new();
+        assert!(connection.bind_authenticated(Arc::clone(&alice)));
         alice.add_tx(400);
         alice.add_rx(600);
+        let observed_at = alice.last_traffic_observed_at_unix_millis();
+        assert_ne!(observed_at, 0);
 
         let taken = registry.take_traffic("t", "alice").unwrap();
         assert_eq!((taken.tx, taken.rx), (400, 600), "the period's bytes");
+        assert_eq!(taken.last_traffic_observed_at_unix_millis, observed_at);
         // Live and lifetime connection counts are not part of a period.
         assert_eq!((taken.conns, taken.total_conns), (1, 1));
 

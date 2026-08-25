@@ -194,7 +194,7 @@ async fn naive_users_are_found_by_their_basic_credential() {
     );
     checks.that(
         "removing the old id revokes it",
-        engine.remove_user("naive", "bob").is_ok(),
+        engine.remove_user("naive", "bob").await.is_ok(),
     );
     checks.that(
         "the old credential no longer authenticates",
@@ -247,29 +247,30 @@ async fn naive_users_are_found_by_their_basic_credential() {
         reach(alice_leg, sink.address).await.is_ok(),
     );
 
-    // -- 9. removal is forward-looking only ------------------------------------
-    checks.section("9. removing a user leaves their open connection alone");
+    // -- 9. removal closes the owning HTTP/2 connection -------------------------
+    checks.section("9. removing a user closes their open connection");
     let mut held = Socks::connect(alice_leg, sink.address)
         .await
         .expect("alice should open a connection");
     held.write_all(b"wh").await.expect("send half a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("naive", "alice")).await;
     checks.that(
-        "alice is removed",
-        engine.remove_user("naive", "alice").is_ok(),
+        "alice is removed after her connection drains",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
     );
     checks.that(
         "a new alice connection is refused",
         denied(alice_leg, sink.address).await,
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "alice's already-open connection still completes",
-        read_line(&mut held).await.ok(),
-        Some("sink".to_string()),
-    );
+    let closed = match held.write_all(b"o\n").await {
+        Err(_) => true,
+        Ok(()) => read_line(&mut held).await.is_err(),
+    };
+    checks.that("alice's already-open connection is actively closed", closed);
 
     checks.finish();
 }

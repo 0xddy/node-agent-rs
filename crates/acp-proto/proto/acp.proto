@@ -1,0 +1,645 @@
+syntax = "proto3";
+
+package acp.v1;
+
+option go_package = "github.com/acp/node-agent/api/acp/v1;acpv1";
+
+service AuthService {
+  rpc Hello(HelloRequest) returns (Session);
+}
+
+service ControlService {
+  rpc ControlStream(stream ControlAck) returns (stream ControlCommand);
+}
+
+service TrafficService {
+  rpc TrafficStream(stream TrafficReport) returns (StreamClosed);
+}
+
+service TelemetryService {
+  rpc TelemetryStream(stream TelemetrySnapshot) returns (StreamClosed);
+}
+
+service LogService {
+  rpc LogStream(stream NodeLogBatch) returns (stream NodeLogCommand);
+}
+
+service RemoteControlService {
+  rpc RemoteControlStream(stream RemoteControlResponse) returns (stream RemoteControlRequest);
+}
+
+service ConfigService {
+  rpc GetMachineConfig(GetMachineConfigRequest) returns (MachineConfig);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+}
+
+message HelloRequest {
+  string machine_id = 1;
+  string agent_version = 2;
+  string sing_box_version = 3;
+  int64 timestamp_unix = 4;
+  string nonce = 5;
+  string signature = 6;
+  uint64 topology_revision = 7;
+  string node_id = 8;
+}
+
+message Session {
+  string session_id = 1;
+  uint64 topology_revision = 3;
+}
+
+message ControlCommand {
+  reserved 14;
+  reserved "device_kick";
+
+  string command_id = 1;
+  string machine_id = 2;
+  string node_id = 3;
+  uint64 revision = 4;
+  string idempotency_key = 5;
+  ControlCommandType type = 6;
+  bytes legacy_payload = 7;
+  string operation_id = 8;
+  // Revision of the topology that the sender used as the base for a partial
+  // topology command. Full snapshots do not use this field.
+  uint64 base_revision = 9;
+
+  oneof payload {
+    TopologySnapshot topology_snapshot = 10;
+    TopologyDelta topology_delta = 11;
+    UserMutation user_mutation = 12;
+    MaintenanceCommand maintenance = 13;
+    DiagnosticsCommand diagnostics = 15;
+    UpgradeCommand upgrade = 16;
+    TopologyRoutePatch topology_route_patch = 17;
+  }
+}
+
+enum ControlCommandType {
+  reserved 3, 4;
+  reserved "CONTROL_COMMAND_TYPE_USER_BAN", "CONTROL_COMMAND_TYPE_DEVICE_KICK";
+
+  CONTROL_COMMAND_TYPE_UNSPECIFIED = 0;
+  CONTROL_COMMAND_TYPE_TOPOLOGY_SNAPSHOT = 1;
+  CONTROL_COMMAND_TYPE_TOPOLOGY_DELTA = 2;
+  CONTROL_COMMAND_TYPE_MAINTENANCE = 5;
+  CONTROL_COMMAND_TYPE_DIAGNOSTICS = 6;
+  CONTROL_COMMAND_TYPE_UPGRADE = 7;
+  CONTROL_COMMAND_TYPE_USER_MUTATION = 8;
+  CONTROL_COMMAND_TYPE_ROUTE_PATCH = 9;
+  CONTROL_COMMAND_TYPE_USER_REFRESH = 10;
+}
+
+message ControlAck {
+  string command_id = 1;
+  string machine_id = 2;
+  string node_id = 3;
+  uint64 revision = 4;
+  string idempotency_key = 5;
+  ControlAckStatus status = 6;
+  string message = 7;
+  string operation_id = 8;
+}
+
+enum ControlAckStatus {
+  CONTROL_ACK_STATUS_UNSPECIFIED = 0;
+  CONTROL_ACK_STATUS_ACCEPTED = 1;
+  CONTROL_ACK_STATUS_APPLIED = 2;
+  CONTROL_ACK_STATUS_FAILED = 3;
+  CONTROL_ACK_STATUS_ROLLED_BACK = 4;
+}
+
+message TrafficReport {
+  string machine_id = 1;
+  string node_id = 2;
+  string user_id = 3;
+  string protocol = 4;
+  uint64 uplink_bytes = 5;
+  uint64 downlink_bytes = 6;
+  // UTC Unix timestamp of the minute bucket in which the traffic was observed.
+  int64 observed_at_unix = 7;
+}
+
+message TelemetrySnapshot {
+  string machine_id = 1;
+  int64 timestamp_unix = 2;
+  double cpu_percent = 3;
+  string cpu_brand = 10;
+  uint32 cpu_cores = 11;
+  uint32 cpu_threads = 12;
+  uint64 memory_used_bytes = 4;
+  uint64 memory_total_bytes = 5;
+  uint64 active_connections = 6;
+  uint64 online_users = 7;
+  string sing_box_state = 8;
+  repeated NetworkInterfaceTelemetry network_interfaces = 9;
+  repeated DiskUsageTelemetry disk_usages = 13;
+}
+
+message NetworkInterfaceTelemetry {
+  string name = 1;
+  string hardware_addr = 2;
+  repeated string addresses = 3;
+  uint64 rx_bytes = 4;
+  uint64 tx_bytes = 5;
+  uint64 rx_packets = 6;
+  uint64 tx_packets = 7;
+  bool is_up = 8;
+}
+
+message DiskUsageTelemetry {
+  string path = 1;
+  string fstype = 2;
+  uint64 used_bytes = 3;
+  uint64 total_bytes = 4;
+}
+
+message StreamClosed {
+  string message = 1;
+}
+
+message NodeLogCommand {
+  string subscription_id = 1;
+  NodeLogCommandType type = 2;
+}
+
+enum NodeLogCommandType {
+  NODE_LOG_COMMAND_TYPE_UNSPECIFIED = 0;
+  NODE_LOG_COMMAND_TYPE_START = 1;
+  NODE_LOG_COMMAND_TYPE_STOP = 2;
+}
+
+message NodeLogBatch {
+  string subscription_id = 1;
+  string source_id = 2;
+  repeated NodeLogLine lines = 3;
+  uint64 dropped_line_count = 4;
+}
+
+message NodeLogLine {
+  uint64 sequence = 1;
+  int64 captured_at_unix_milli = 2;
+  string text = 3;
+}
+
+message RemoteControlRequest {
+  string request_id = 1;
+
+  oneof command {
+    RemoteControlStatusRequest status = 10;
+    ReloadSingBoxRequest reload_sing_box = 11;
+    LoadedUsersRequest loaded_users = 12;
+    SingBoxConfigRequest sing_box_config = 13;
+    PeriodicUserPullRequest periodic_user_pull = 14;
+    SyncUsersRequest sync_users = 15;
+  }
+}
+
+message RemoteControlStatusRequest {}
+
+message ReloadSingBoxRequest {}
+
+message LoadedUsersRequest {
+  uint32 page = 1;
+  uint32 page_size = 2;
+}
+
+message SingBoxConfigRequest {}
+
+message PeriodicUserPullRequest {
+  bool enabled = 1;
+  uint32 interval_minutes = 2;
+}
+
+message SyncUsersRequest {}
+
+message RemoteControlResponse {
+  string request_id = 1;
+  RemoteControlResponseStatus status = 2;
+  string stage = 3;
+  string message = 4;
+
+  oneof payload {
+    RemoteControlState control_state = 10;
+    ReloadSingBoxResult reload_result = 11;
+    LoadedUsersPage loaded_users = 12;
+    SingBoxConfigChunk sing_box_config = 13;
+    SyncUsersResult sync_users_result = 14;
+  }
+}
+
+enum RemoteControlResponseStatus {
+  REMOTE_CONTROL_RESPONSE_STATUS_UNSPECIFIED = 0;
+  REMOTE_CONTROL_RESPONSE_STATUS_PROGRESS = 1;
+  REMOTE_CONTROL_RESPONSE_STATUS_COMPLETED = 2;
+  REMOTE_CONTROL_RESPONSE_STATUS_FAILED = 3;
+}
+
+message RemoteControlState {
+  bool reload_in_progress = 1;
+  string reload_operation_id = 2;
+  string reload_stage = 3;
+  ReloadSingBoxResult last_reload = 4;
+  bool periodic_user_pull_enabled = 5;
+  uint32 periodic_user_pull_interval_minutes = 6;
+  int64 periodic_user_pull_last_attempt_at_unix_milli = 7;
+  int64 periodic_user_pull_last_success_at_unix_milli = 8;
+  int64 periodic_user_pull_next_attempt_at_unix_milli = 9;
+  string periodic_user_pull_last_error = 10;
+}
+
+message ReloadSingBoxResult {
+  string operation_id = 1;
+  ReloadSingBoxOutcome outcome = 2;
+  string stage = 3;
+  string message = 4;
+  uint64 topology_revision = 5;
+  string config_sha256 = 6;
+  uint32 loaded_user_count = 7;
+  int64 duration_millis = 8;
+  int64 completed_at_unix_milli = 9;
+}
+
+enum ReloadSingBoxOutcome {
+  RELOAD_SING_BOX_OUTCOME_UNSPECIFIED = 0;
+  RELOAD_SING_BOX_OUTCOME_SUCCEEDED = 1;
+  RELOAD_SING_BOX_OUTCOME_FAILED_UNCHANGED = 2;
+  RELOAD_SING_BOX_OUTCOME_FAILED_ROLLED_BACK = 3;
+  RELOAD_SING_BOX_OUTCOME_FAILED_STOPPED = 4;
+  RELOAD_SING_BOX_OUTCOME_REJECTED_BUSY = 5;
+}
+
+message LoadedUsersPage {
+  repeated UserCredential users = 1;
+  uint32 page = 2;
+  uint32 page_size = 3;
+  uint32 total_size = 4;
+}
+
+message SyncUsersResult {
+  uint32 added_count = 1;
+  uint32 updated_count = 2;
+  uint32 deleted_count = 3;
+  bool applied = 4;
+  uint32 loaded_user_count = 5;
+  int64 completed_at_unix_milli = 6;
+}
+
+message SingBoxConfigChunk {
+  uint32 sequence = 1;
+  bytes data = 2;
+  bool eof = 3;
+  uint64 total_bytes = 4;
+  string sha256 = 5;
+}
+
+message GetMachineConfigRequest {
+  string machine_id = 1;
+  string session_id = 2;
+}
+
+message MachineConfig {
+  string machine_id = 1;
+  uint64 revision = 2;
+  repeated NodeConfig nodes = 3;
+  repeated OutboundConfig outbounds = 4;
+  RouteConfig route = 5;
+  DNSConfig dns = 6;
+}
+
+message NodeConfig {
+  string node_id = 1;
+  string provider_id = 2;
+  uint32 provider_config_version = 3;
+  bytes provider_config_json = 4;
+}
+
+message TopologySnapshot {
+  string machine_id = 1;
+  uint64 revision = 2;
+  repeated NodeTopology nodes = 3;
+  repeated OutboundConfig outbounds = 4;
+  RouteConfig route = 5;
+  DNSConfig dns = 6;
+}
+
+message OutboundConfig {
+  string type = 1;
+  string tag = 2;
+  reserved 3 to 34;
+  bytes options_json = 100;
+}
+
+message DialerOptions {
+  string detour = 1;
+  string bind_interface = 2;
+  string inet4_bind_address = 3;
+  string inet6_bind_address = 4;
+  uint32 routing_mark = 5;
+  bool reuse_addr = 6;
+  string connect_timeout = 7;
+  bool tcp_fast_open = 8;
+  bool tcp_multi_path = 9;
+  bool udp_fragment = 10;
+  string udp_timeout = 11;
+  string domain_strategy = 12;
+  bool bind_address_no_port = 13;
+  string protect_path = 14;
+  string netns = 15;
+  bool disable_tcp_keep_alive = 16;
+  string tcp_keep_alive = 17;
+  string tcp_keep_alive_interval = 18;
+  DomainResolveOptions domain_resolver = 19;
+  NetworkStrategy network_strategy = 20;
+  repeated string network_type = 21;
+  repeated string fallback_network_type = 22;
+  string fallback_delay = 23;
+}
+
+message DomainResolveOptions {
+  string server = 1;
+  string strategy = 2;
+  bool disable_cache = 3;
+  optional uint32 rewrite_ttl = 4;
+  string client_subnet = 5;
+}
+
+message NetworkStrategy {
+  repeated string type = 1;
+  repeated string fallback_type = 2;
+  string fallback_delay = 3;
+}
+
+message RouteConfig {
+  repeated RouteRule rules = 1;
+  repeated RouteRuleSet rule_sets = 2;
+  string final = 3;
+  bool auto_detect_interface = 4;
+  string default_interface = 5;
+  uint32 default_mark = 6;
+  bool find_process = 7;
+  GeoIPOptions geoip = 8;
+  GeositeOptions geosite = 9;
+  bool override_android_vpn = 10;
+  DomainResolveOptions default_domain_resolver = 11;
+  NetworkStrategy default_network_strategy = 12;
+  repeated string default_network_type = 13;
+  repeated string default_fallback_network_type = 14;
+  string default_fallback_delay = 15;
+}
+
+message DNSConfig {
+  repeated DNSRule rules = 1;
+  repeated DNSServer servers = 2;
+  string final = 3;
+}
+
+message DNSServer {
+  string type = 1;
+  string tag = 2;
+  string server = 3;
+  string detour = 4;
+}
+
+message DNSRule {
+  repeated string inbound = 1;
+  repeated string domain = 2;
+  repeated string domain_suffix = 3;
+  repeated string domain_keyword = 4;
+  repeated string domain_regex = 5;
+  repeated string rule_set = 6;
+  string action = 7;
+  string rcode = 8;
+  string server = 9;
+  string method = 10;
+  bool no_drop = 11;
+  repeated string answer = 12;
+  repeated string ns = 13;
+  repeated string extra = 14;
+  bool disable_cache = 15;
+  string rewrite_ttl = 16;
+  string timeout = 17;
+  string client_subnet = 18;
+}
+
+message GeoIPOptions {
+  string path = 1;
+  string download_url = 2;
+  string download_detour = 3;
+}
+
+message GeositeOptions {
+  string path = 1;
+  string download_url = 2;
+  string download_detour = 3;
+}
+
+message RouteRule {
+  string type = 1;
+  repeated string inbound = 2;
+  repeated string network = 3;
+  uint32 ip_version = 4;
+  repeated string domain = 5;
+  repeated string domain_suffix = 6;
+  repeated string domain_keyword = 7;
+  repeated string domain_regex = 8;
+  repeated string source_ip_cidr = 9;
+  repeated string ip_cidr = 10;
+  optional bool source_ip_is_private = 11;
+  optional bool ip_is_private = 12;
+  repeated uint32 port = 13;
+  repeated string port_range = 14;
+  repeated string source_port_range = 15;
+  repeated string protocol = 16;
+  repeated string rule_set = 17;
+  bool invert = 18;
+  string action = 19;
+  string outbound = 20;
+  string method = 21;
+  bool no_drop = 22;
+  string mode = 23;
+  repeated RouteRule rules = 24;
+  repeated string auth_user = 25;
+  repeated string client = 26;
+  repeated string geosite = 27;
+  repeated string source_geoip = 28;
+  repeated string geoip = 29;
+  repeated uint32 source_port = 30;
+  repeated string process_name = 31;
+  repeated string process_path = 32;
+  repeated string process_path_regex = 33;
+  repeated string package_name = 34;
+  repeated string user = 35;
+  repeated int32 user_id = 36;
+  string clash_mode = 37;
+  repeated string network_type = 38;
+  optional bool network_is_expensive = 39;
+  optional bool network_is_constrained = 40;
+  repeated string wifi_ssid = 41;
+  repeated string wifi_bssid = 42;
+  repeated string default_interface_address = 43;
+  repeated string preferred_by = 44;
+  bool rule_set_ip_cidr_match_source = 45;
+  RouteActionOptions route_options = 46;
+  DialerOptions direct_options = 47;
+  SniffActionOptions sniff_options = 48;
+  ResolveActionOptions resolve_options = 49;
+}
+
+message RouteRuleSet {
+  string type = 1;
+  string tag = 2;
+  string format = 3;
+  string path = 4;
+  string url = 5;
+  string download_detour = 6;
+  string update_interval = 7;
+  repeated HeadlessRule rules = 8;
+}
+
+message RouteActionOptions {
+  string override_address = 1;
+  uint32 override_port = 2;
+  NetworkStrategy network_strategy = 3;
+  uint32 fallback_delay = 4;
+  bool udp_disable_domain_unmapping = 5;
+  bool udp_connect = 6;
+  string udp_timeout = 7;
+  bool tls_fragment = 8;
+  string tls_fragment_fallback_delay = 9;
+  bool tls_record_fragment = 10;
+}
+
+message SniffActionOptions {
+  repeated string sniffer = 1;
+  string timeout = 2;
+}
+
+message ResolveActionOptions {
+  string server = 1;
+  string strategy = 2;
+  bool disable_cache = 3;
+  optional uint32 rewrite_ttl = 4;
+  string client_subnet = 5;
+}
+
+message HeadlessRule {
+  string type = 1;
+  repeated string network = 2;
+  repeated string domain = 3;
+  repeated string domain_suffix = 4;
+  repeated string domain_keyword = 5;
+  repeated string domain_regex = 6;
+  repeated string source_ip_cidr = 7;
+  repeated string ip_cidr = 8;
+  repeated uint32 source_port = 9;
+  repeated string source_port_range = 10;
+  repeated uint32 port = 11;
+  repeated string port_range = 12;
+  repeated string process_name = 13;
+  repeated string process_path = 14;
+  repeated string process_path_regex = 15;
+  repeated string package_name = 16;
+  repeated string network_type = 17;
+  optional bool network_is_expensive = 18;
+  optional bool network_is_constrained = 19;
+  repeated string wifi_ssid = 20;
+  repeated string wifi_bssid = 21;
+  repeated string default_interface_address = 22;
+  bool invert = 23;
+  string mode = 24;
+  repeated HeadlessRule rules = 25;
+}
+
+message TopologyDelta {
+  uint64 base_revision = 1;
+  uint64 target_revision = 2;
+  repeated NodeMutation node_mutations = 3;
+  repeated UserMutation user_mutations = 4;
+}
+
+message TopologyRoutePatch {
+  string machine_id = 1;
+  uint64 revision = 2;
+  repeated OutboundConfig outbounds = 3;
+  RouteConfig route = 4;
+  DNSConfig dns = 5;
+}
+
+message NodeMutation {
+  MutationOperation operation = 1;
+  NodeTopology node = 2;
+  string node_id = 3;
+}
+
+message NodeTopology {
+  string node_id = 1;
+  string provider_id = 2;
+  uint32 provider_config_version = 3;
+  bytes provider_config_json = 4;
+  repeated UserCredential users = 5;
+}
+
+message UserMutation {
+  MutationOperation operation = 1;
+  string machine_id = 2;
+  string node_id = 3;
+  UserCredential user = 4;
+  uint64 revision = 5;
+  bool kick_existing_connections = 6;
+}
+
+enum MutationOperation {
+  MUTATION_OPERATION_UNSPECIFIED = 0;
+  MUTATION_OPERATION_UPSERT = 1;
+  MUTATION_OPERATION_DISABLE = 2;
+  MUTATION_OPERATION_DELETE = 3;
+}
+
+message MaintenanceCommand {
+  bool enabled = 1;
+  bool reject_new_connections = 2;
+  string message = 3;
+}
+
+message DiagnosticsCommand {
+  string action = 1;
+  repeated string include = 2;
+}
+
+message UpgradeCommand {
+  string target_version = 1;
+  string package_url = 2;
+  string sha256 = 3;
+}
+
+message ListUsersRequest {
+  string machine_id = 1;
+  string session_id = 2;
+  string node_id = 3;
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListUsersResponse {
+  repeated UserCredential users = 1;
+  string next_page_token = 2;
+  uint32 total_size = 3;
+  bool has_next = 4;
+}
+
+message UserCredential {
+  string user_id = 1;
+  string name = 2;
+  string credential = 3;
+  UserStatus status = 4;
+  uint64 upload_speed_limit_bps = 5;
+  uint64 download_speed_limit_bps = 6;
+}
+
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_DISABLED = 2;
+}

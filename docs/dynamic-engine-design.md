@@ -138,7 +138,7 @@ The return types are not uniform, and the differences are the design:
 
 | shape | protocols | returns | why |
 |---|---|---|---|
-| **indexable** | VLESS, Trojan, Hysteria2, AnyTLS, NaiveProxy | `Arc<UserContext>` | the client names itself; a hit is the whole answer |
+| **indexable** | VLESS, Trojan, Hysteria2, AnyTLS, NaiveProxy | `Arc<UserContext>` | the client names itself; a confirmed hit supplies all proof needed for immediate admission |
 | **derived** | Shadowsocks 2022, VMess | identity + key material | naming the user is not enough — the rest of the handshake derives from their key |
 | **paired** | TUIC | identity + password, **unauthenticated** | half the credential is public; only the caller can check the other half |
 | **incomplete** | AnyTLS | `bool` | asked *before* the credential has fully arrived, so it can only be a plausibility test |
@@ -153,12 +153,24 @@ VMess is the one that cannot be indexed at all: its auth id carries no identifie
 recognising a user is linear in the user count. Every implementation of the protocol
 has this cost; it is well under a microsecond per user, once per connection.
 
-TUIC is the one that breaks the "a lookup authenticates" rule. Its uuid crosses the
-wire in cleartext, and the 32-byte token beside it is keyed with the user's password
-**and** the QUIC connection's exported keying material — which the registry has never
-seen. So `find_tuic_uuid` hands back a password rather than a verdict, deliberately
-does **not** call `note_auth`, and says so in its own documentation. The handler counts
-the authentication once the token matches.
+Registry lookup and admission are deliberately separate for every protocol. A lookup
+only resolves an enabled candidate and never changes counters. Once the protocol has
+enough proof, the handler performs one connection-aware admission. Inline handlers
+call `bind_connection_user`; protocols carrying an explicit `ConnContext` call
+`bind_authenticated`, or `bind_or_matches` when each request on one transport repeats
+authentication. On a metered connection this counts the authentication and registers
+its cancellation token under one per-user lifecycle lock; on a classic unmetered
+inbound it records only the authentication. This single contract applies to both
+`StaticUserRegistry` and `MemoryUserRegistry`, so a custom handler has the same public
+atomic admission APIs as the built-in protocols. Dynamic registries create tracked
+`UserContext`s, which reject admission if a handler loses its connection context;
+only immutable config registries opt into explicitly untracked records.
+
+TUIC is the clearest reason for the split. Its uuid crosses the wire in cleartext, and
+the 32-byte token beside it is keyed with the user's password **and** the QUIC
+connection's exported keying material — which the registry has never seen. So
+`find_tuic_uuid` hands back a password and the handler waits to admit the candidate
+until the token matches.
 
 AnyTLS breaks a different one. It peeks at the first 8 bytes of a connection and, on a
 miss, diverts it to a fallback destination without waiting for the remaining 24 —
@@ -187,17 +199,13 @@ These are load-bearing. Breaking any of them is a security bug, not a style prob
    time; what that leaks is bucket occupancy, not credential bytes. Every
    implementation still finishes with a constant-time comparison of the stored
    credential.
-3. **Whoever can prove possession counts the authentication.** The registry calls
-   `note_auth` wherever the key *is* the proof — a password or hash a client could
-   not have sent without holding it. Three lookups are not in that position, because
-   the bytes they match on cross the wire in a form an observer can **copy**:
-   TUIC's cleartext uuid, VMess' auth id, and a Shadowsocks 2022 identity header
-   (sealed under the *inbound's* key, which every client of the inbound knows). Those
-   three hand back an identity without counting it, and their handler counts once the
-   protocol produces something a copy could not: a token keyed to this connection, or
-   an AEAD opened under the user's own key. Counting on the copyable half let anyone
-   who had recorded one of a user's connections inflate that user's connection count
-   and bill them for the garbage that followed.
+3. **Lookup resolves; proof admits.** No registry lookup changes accounting. The
+   handler admits a resolved user only when its protocol proves possession. For
+   VLESS, Trojan, Hysteria2, AnyTLS and NaiveProxy that is immediately after the
+   constant-time credential comparison. TUIC's cleartext uuid, VMess' auth id, and a
+   Shadowsocks 2022 identity header can be copied off the wire, so those handlers wait
+   for a connection-bound token or an AEAD opened under the user's own key. Admitting
+   on the copyable half would let a recording inflate another user's counters.
 4. **A credential is never an identity.** `UserContext.id` is chosen by whoever
    registered the user; `UserInfo` has no credential field at all, and a test asserts
    the serialised form does not echo one. Where a uuid *is* the reported id, that is a
@@ -278,15 +286,16 @@ partway into the handshake, and for TLS-wrapped protocols it arrives after a han
 the meter is already counting.
 
 So a connection starts anonymous. Bytes accumulate in the `ConnContext` itself, and the
-moment a handler authenticates, `bind` hands over what has accumulated:
+moment a handler authenticates, `bind_authenticated` performs one atomic admission and
+hands over what has accumulated. Conceptually, the operation is:
 
 ```rust
-pub fn bind(&self, user: Arc<UserContext>) -> bool {
-    if self.user.set(user).is_err() { return false; }
-    let user = self.user.get().expect("just set");
-    user.open_conn();
-    user.add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
-    user.add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
+pub fn bind_authenticated(&self, user: &Arc<UserContext>) -> bool {
+    let _binding = self.binding.lock();
+    let Some(registration) = user.register_authenticated_connection(self.cancel.clone())
+    else { return false; };
+    self.publish_binding(user.clone(), registration);
+    self.handover_pending_bytes();
     true
 }
 ```
@@ -309,7 +318,9 @@ costs one thread-local read per connection and leaves those signatures untouched
 **Shape B — explicit parameter.** Task locals do not cross `tokio::spawn`. Shape A
 therefore works only where authentication happens *inline on the task that accepted the
 connection*. Where it does not, the context is passed as
-`type Meter = Option<Arc<ConnContext>>`.
+`type Meter = Option<Arc<ConnContext>>`; single-auth transports use
+`ConnContext::bind_authenticated`, while request-authenticated multiplexing uses
+`ConnContext::bind_or_matches`.
 
 | protocol | shape | why |
 |---|---|---|
@@ -319,9 +330,10 @@ connection*. Where it does not, the context is passed as
 | TUIC | B | same, four loops |
 | NaiveProxy | B | hyper owns the task from `serve_connection` on, and the credential is not read until a request arrives |
 
-The failure mode when this is got wrong is silent: TCP still adds up perfectly and the
-user's counters simply sit at zero. Every suite therefore has a section that moves
-traffic on the path that crosses the spawn.
+Tracked dynamic users now fail closed when this propagation is missing: authentication
+is rejected rather than creating an unmetered, non-revocable session. Every suite still
+has a section that moves traffic on the path that crosses the spawn, proving the
+explicit hand-off is actually present.
 
 ### Datagrams that do not ride the stream
 
@@ -354,10 +366,11 @@ thread at once.
   stores, so each user's hot counters land on their own cache line and two users
   metered concurrently on different cores never invalidate each other's line. A test
   asserts the alignment rather than trusting the comment.
-- **`Relaxed` everywhere.** There is nothing to synchronise: values are only
-  incremented by `fetch_add` and read for reporting, so the only guarantee needed is
-  that no increment is lost. Anything stronger would put a memory barrier on the
-  per-buffer I/O path for no benefit.
+- **Relaxed bytes, release/acquire completion.** Byte and lifetime-authentication
+  counters are relaxed, so the per-buffer I/O path has no memory barrier. The live
+  connection counter's final decrement is a release and observing zero is an acquire;
+  therefore removal sees that connection's last byte increments before returning its
+  final snapshot.
 - **`close_conn` saturates rather than wraps.** An unbalanced close reporting billions
   of open connections is worse than reporting zero.
 - **A stats snapshot is not atomic.** Making it so would need a lock on the I/O path;
@@ -366,6 +379,31 @@ thread at once.
 `conns == 0` is the barrier that makes a user's totals final: bytes are counted as they
 move, so a snapshot taken mid-transfer is a race. The test harness's `quiet()` helper
 exists for that.
+
+### Removing a user is a revocation barrier
+
+Suspension and removal deliberately have different meanings. Setting `enabled = false`
+is admission control: subsequent authentications see the user as absent, while sessions
+that already authenticated keep running. `remove_user`, by contrast, is an async strong
+revocation operation:
+
+1. under the registry's writer lock, mark the `UserContext` revoked and cancel every
+   registered connection before retiring its credential indexes;
+2. make proof admission and connection registration one lifecycle operation, so a
+   racing connection is either included in the drain or rejected before success;
+3. keep a draining tombstone for the id, so it cannot be re-added as a second accounting
+   generation while old sockets are closing;
+4. wait for `conns == 0`, then return the final byte and lifetime-connection counters.
+
+The per-connection cancellation token is observed at two levels. Metered TCP and generic
+QUIC streams fail pending and future I/O with `ConnectionAborted`; protocols that multiplex
+an authenticated user over a whole transport (Hysteria2, TUIC and AnyTLS) also close that
+transport so the old client cannot open another logical stream. On the normal Tokio
+engine runtime the drain finalizer is spawned before the caller awaits it. If that API
+request is cancelled, the final snapshot remains on the tombstone; repeating
+`remove_user` for the same id attaches to the same generation and returns it. The id
+stays reserved, even after its connections reach zero, until that result is collected;
+this prevents a re-add from silently discarding final counters.
 
 ### Closing a billing period
 
@@ -691,9 +729,9 @@ For review checklists and for the next protocol conversion.
 
 1. A disabled user reports **absent**, never present-but-denied.
 2. A hash hit is a candidate, not proof; finish with a constant-time comparison.
-3. The registry calls `note_auth` — unless the bytes it matched on are copyable off
-   the wire, in which case it says so and the handler counts once something
-   unforgeable arrives. TUIC, VMess and Shadowsocks 2022 are the three.
+3. Registry lookups never change accounting. After sufficient proof, the handler
+   admits exactly once; TUIC, VMess and Shadowsocks 2022 wait beyond their first
+   copyable identity field.
 4. No lock a control-plane call can hold on the connection path. A lookup does take
    one `DashMap` shard read guard, for the length of a constant-time comparison; what
    it must never wait on is a writer, a reload, or I/O. (One allocation survives:

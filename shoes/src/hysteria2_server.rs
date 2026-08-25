@@ -25,6 +25,20 @@ const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Maximum number of concurrent UDP sessions one connection may hold open.
+///
+/// A session is not free: it owns a client-side UDP socket, a spawned task, and
+/// that task's 64 KiB receive buffer. The session id is a client-chosen `u32`, so
+/// without a ceiling here an authenticated client can name four billion of them and
+/// the only thing bounding the cost is how fast it can send datagrams. That is a
+/// file-descriptor exhaustion long before it is a memory one, and on a shared
+/// inbound it takes every other user's connections down with it.
+///
+/// 512 leaves the ceiling well above what a real client reaches -- each session is
+/// one destination flow, and even a busy peer-to-peer workload sits far below it --
+/// while capping one connection at roughly 32 MiB and 512 descriptors.
+const MAX_UDP_SESSIONS: usize = 512;
+
 /// HTTP/3 error code for normal closure.
 /// Per official hysteria reference: https://github.com/apernet/hysteria/blob/master/core/server/server.go#L20
 const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
@@ -36,8 +50,9 @@ use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
+use crate::routing::protocol::sniff_tcp;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::tcp_server::setup_client_tcp_stream_with_metadata;
 use crate::util::allocate_vec;
 
 /// The accounting record for one authenticated QUIC connection, or `None` when the
@@ -53,19 +68,54 @@ use crate::util::allocate_vec;
 /// loops runs in a task of its own and a task local would not survive the spawn.
 type Meter = Option<Arc<ConnContext>>;
 
+/// Decode the QUIC-varint address length at byte 8 of a Hysteria UDP datagram.
+///
+/// The first nine bytes are fixed-width through the first varint byte. Returning
+/// `None` for a truncated multi-byte varint lets the datagram loop discard hostile
+/// input without ever constructing an out-of-bounds slice.
+fn decode_udp_address_length(data: &[u8]) -> Option<(usize, usize)> {
+    let first_byte = *data.get(8)?;
+    let num_bytes = 1usize << (first_byte >> 6);
+    let mut value = u64::from(first_byte & 0b0011_1111);
+    let next_index = 8usize.checked_add(num_bytes)?;
+
+    for byte in data.get(9..next_index)? {
+        value = (value << 8) | u64::from(*byte);
+    }
+
+    Some((usize::try_from(value).ok()?, next_index))
+}
+
+#[inline]
+fn valid_udp_fragment(fragment_id: u8, fragment_count: u8) -> bool {
+    fragment_count != 0 && fragment_id < fragment_count
+}
+
+#[derive(Clone)]
+struct Hysteria2ConnectionSettings {
+    users: Arc<dyn UserRegistry>,
+    metered: bool,
+    udp_enabled: bool,
+    up_mbps: u64,
+    down_mbps: u64,
+    masquerade: Arc<crate::hysteria2_masquerade::Hysteria2Masquerade>,
+}
+
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    users: Arc<dyn UserRegistry>,
-    metered: bool,
     conn: quinn::Incoming,
-    udp_enabled: bool,
+    settings: Hysteria2ConnectionSettings,
 ) -> std::io::Result<()> {
     let connection = conn.await?;
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
     let cancel_token = CancellationToken::new();
+    // `process_connection` has several early returns and drives attacker-controlled
+    // parsers. Keep cleanup exception-safe: unwinding or dropping this future must
+    // cancel every child token even when control never reaches the normal epilogue.
+    let _cancel_guard = cancel_token.clone().drop_guard();
 
     // we unfortunately need to keep the h3 connection around because it closes the underlying
     // connection on drop, see
@@ -81,9 +131,9 @@ async fn process_connection(
             .map_err(|e| std::io::Error::other(format!("H3 connection setup failed: {e}")))?;
 
     // Per sing-box reference, authentication timeout is 3 seconds
-    let user = match timeout(
+    let meter = match timeout(
         AUTH_TIMEOUT,
-        auth_connection(&mut h3_conn, users.as_ref(), udp_enabled),
+        auth_connection(&mut h3_conn, &connection, &settings),
     )
     .await
     {
@@ -106,11 +156,7 @@ async fn process_connection(
     // framing and QPACK encoding quinn and h3 own between them. It is a few hundred
     // bytes once per connection, and the same argument already applies to the QUIC
     // handshake that carried it.
-    let meter: Meter = metered.then(|| {
-        let context = ConnContext::new();
-        context.bind(user);
-        context
-    });
+    let removal_meter = meter.clone();
 
     let udp_connection = connection.clone();
     let udp_client_proxy_selector = client_proxy_selector.clone();
@@ -123,7 +169,7 @@ async fn process_connection(
     // Use try_join! to run all loops concurrently within the same task, like Quinn's perf example.
     // This reduces task count and avoids spawning separate tasks for the main loops.
     let udp_loop = async {
-        if udp_enabled {
+        if settings.udp_enabled {
             run_udp_local_to_remote_loop(
                 udp_connection,
                 udp_client_proxy_selector,
@@ -159,7 +205,25 @@ async fn process_connection(
     let tcp_connection = connection.clone();
     let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver, meter);
 
-    let result = tokio::try_join!(udp_loop, uni_loop, tcp_loop);
+    let user_removed = async move {
+        match removal_meter {
+            Some(context) => context.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+
+    let result = tokio::select! {
+        biased;
+        () = user_removed => {
+            cancel_token.cancel();
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"user removed");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "connection closed because its user was removed",
+            ))
+        }
+        result = async { tokio::try_join!(udp_loop, uni_loop, tcp_loop) } => result,
+    };
 
     cancel_token.cancel();
 
@@ -183,7 +247,7 @@ async fn process_connection(
 /// user it is somebody's live credential, or a guess at one, and neither belongs in
 /// a log line.
 fn validate_auth_request<T>(
-    req: http::Request<T>,
+    req: &http::Request<T>,
     users: &dyn UserRegistry,
 ) -> std::io::Result<Arc<UserContext>> {
     if req.uri() != "https://hysteria/auth" {
@@ -226,9 +290,9 @@ fn generate_ascii_string() -> String {
 
 async fn auth_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
-    users: &dyn UserRegistry,
-    udp_enabled: bool,
-) -> std::io::Result<Arc<UserContext>> {
+    connection: &quinn::Connection,
+    settings: &Hysteria2ConnectionSettings,
+) -> std::io::Result<Meter> {
     loop {
         match h3_conn
             .accept()
@@ -239,38 +303,93 @@ async fn auth_connection(
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
                     std::io::Error::other(format!("Failed to resolve request: {err}"))
                 })?;
-                match validate_auth_request(req, users) {
+                match validate_auth_request(&req, settings.users.as_ref()) {
                     Ok(user) => {
+                        // Admission and connection registration are one lifecycle
+                        // operation. Do it before sending success, so remove_user
+                        // cannot return while this peer is being told it authenticated.
+                        let meter = if settings.metered {
+                            let context = ConnContext::new();
+                            if !context.bind_authenticated(user) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "user could not be admitted: removed, suspended, or at their connection limit",
+                                ));
+                            }
+                            Some(context)
+                        } else {
+                            if !user.admit_unmetered() {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "user could not be admitted: removed, suspended, or at their connection limit",
+                                ));
+                            }
+                            None
+                        };
+
+                        // Hysteria2's header is bytes per second despite the
+                        // configuration being expressed in Mbps. Missing and
+                        // malformed values are zero in sing-quic and select BBR.
+                        let client_receive_bps = req
+                            .headers()
+                            .get("Hysteria-CC-RX")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let bandwidth = crate::hysteria2::brutal::negotiate_server(
+                            client_receive_bps,
+                            settings.up_mbps,
+                            settings.down_mbps,
+                        );
+                        if let Some(send_bps) = bandwidth.send_bps {
+                            crate::hysteria2::brutal::activate(connection, send_bps)?;
+                        }
+                        let advertised_receive = bandwidth.advertised_receive.header_value();
+
                         let resp = http::Response::builder()
                             .status(http::status::StatusCode::from_u16(233).unwrap())
-                            .header("Hysteria-UDP", if udp_enabled { "true" } else { "false" })
-                            .header("Hysteria-CC-RX", "0")
+                            .header(
+                                "Hysteria-UDP",
+                                if settings.udp_enabled {
+                                    "true"
+                                } else {
+                                    "false"
+                                },
+                            )
+                            .header("Hysteria-CC-RX", advertised_receive)
                             .header("Hysteria-Padding", generate_ascii_string())
                             .body(())
                             .unwrap();
 
-                        stream.send_response(resp).await.map_err(|e| {
-                            std::io::Error::other(format!("failed to send auth response: {e}"))
-                        })?;
+                        let respond = async {
+                            stream.send_response(resp).await.map_err(|e| {
+                                std::io::Error::other(format!("failed to send auth response: {e}"))
+                            })?;
+                            stream.finish().await.map_err(|e| {
+                                std::io::Error::other(format!("failed to finish auth stream: {e}"))
+                            })
+                        };
 
-                        stream.finish().await.map_err(|e| {
-                            std::io::Error::other(format!("failed to finish auth stream: {e}"))
-                        })?;
+                        if let Some(context) = &meter {
+                            tokio::select! {
+                                biased;
+                                () = context.cancelled() => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionAborted,
+                                        "user removed",
+                                    ));
+                                }
+                                result = respond => result?,
+                            }
+                        } else {
+                            respond.await?;
+                        }
 
-                        return Ok(user);
+                        return Ok(meter);
                     }
                     Err(e) => {
-                        error!("Received non-hysteria2 auth http3 request: {e}");
-                        let resp = http::Response::builder()
-                            .status(http::status::StatusCode::NOT_FOUND)
-                            .body(())
-                            .unwrap();
-                        stream.send_response(resp).await.map_err(|e| {
-                            std::io::Error::other(format!("failed to send reject response: {e}"))
-                        })?;
-                        stream.finish().await.map_err(|e| {
-                            std::io::Error::other(format!("failed to finish reject stream: {e}"))
-                        })?;
+                        debug!("Serving Hysteria2 masquerade response: {e}");
+                        settings.masquerade.respond(req, stream).await?;
                     }
                 }
             }
@@ -295,6 +414,25 @@ struct UdpSession {
     override_remote_write_address: Option<SocketAddr>,
     last_activity: std::time::Instant,
     cancel_token: CancellationToken,
+}
+
+impl Drop for UdpSession {
+    /// Stop the remote-to-local task this session started.
+    ///
+    /// A `CancellationToken` does not fire when its last handle is dropped -- only
+    /// an explicit `cancel` or a `DropGuard` does that -- and the spawned loop holds
+    /// its own clone of this one along with the client socket and a 64 KiB receive
+    /// buffer. So every path that discards a session without going through the
+    /// reaper would otherwise strand that task, its fd and its buffer until the
+    /// whole QUIC connection ends: the send-failure `remove` below is one such path,
+    /// and it is the one an unreachable destination reaches on the first packet.
+    ///
+    /// Cancelling here rather than at each call site makes the release a property of
+    /// the session's lifetime, so a future path that drops one is covered too. The
+    /// reaper's explicit `cancel` is left in place and is simply idempotent.
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
 }
 
 struct FragmentedPacket {
@@ -332,17 +470,27 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
+        let removal_meter = meter.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_loop(
+            let work = run_udp_remote_to_local_loop(
                 session_id,
                 connection,
                 client_socket,
                 override_local_write_location,
                 meter,
                 session_cancel_token,
-            )
-            .await
-            {
+            );
+            let result = if let Some(context) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = context.cancelled() => Ok(()),
+                    result = work => result,
+                }
+            } else {
+                work.await
+            };
+
+            if let Err(e) = result {
                 error!("UDP remote-to-local write loop ended with error: {e}");
             }
         });
@@ -422,10 +570,22 @@ async fn run_udp_remote_to_local_loop(
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
 
-        assert!(
-            max_datagram_size > header_overhead,
-            "max datagram size ({max_datagram_size}) is smaller than header overhead ({header_overhead})"
-        );
+        // Not an assertion, because `header_overhead` is not a fact about this
+        // program: the address in it is the location the *client* asked for, echoed
+        // back so it recognises the reply, and this inbound accepts one of up to 2048
+        // bytes while a QUIC datagram holds barely more than an MTU. A client that
+        // names a destination longer than the datagram it must be announced in makes
+        // this arithmetic underflow one line below, and a panic there would be a
+        // remote client deciding when a task on this server dies.
+        //
+        // The address is fixed for the session's lifetime, so this cannot come right
+        // on a later packet: end the loop and let the reaper collect the session.
+        if max_datagram_size <= header_overhead {
+            return Err(std::io::Error::other(format!(
+                "the requested destination needs {header_overhead} header bytes, which does not \
+                 fit a {max_datagram_size} byte datagram"
+            )));
+        }
 
         if header_overhead + payload_len <= max_datagram_size {
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
@@ -446,7 +606,7 @@ async fn run_udp_remote_to_local_loop(
                 .send_datagram(datagram)
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
             if let Some(meter) = &meter {
-                meter.count_datagram_tx(datagram_len);
+                meter.count_datagram_tx(datagram_len).await;
             }
         } else {
             let available_payload = max_datagram_size - header_overhead;
@@ -470,7 +630,7 @@ async fn run_udp_remote_to_local_loop(
                     ))
                 })?;
                 if let Some(meter) = &meter {
-                    meter.count_datagram_tx(datagram_len);
+                    meter.count_datagram_tx(datagram_len).await;
                 }
             }
         }
@@ -518,7 +678,7 @@ async fn run_udp_local_to_remote_loop(
         // has already received. Billing only the well-formed ones would let a client
         // move bytes for free by malforming them.
         if let Some(meter) = &meter {
-            meter.count_datagram_rx(data.len());
+            meter.count_datagram_rx(data.len()).await;
         }
 
         // Per official hysteria reference (server.go:332-353), parse errors are ignored
@@ -532,30 +692,14 @@ async fn run_udp_local_to_remote_loop(
         let fragment_id = data[6];
         let fragment_count = data[7];
 
-        let (address_len, next_index) = {
-            let first_byte = data[8];
-            let length_indicator = first_byte >> 6;
-            let mut value: u64 = (first_byte & 0b00111111) as u64;
-            let num_bytes = match length_indicator {
-                0 => 1,
-                1 => 2,
-                2 => 4,
-                3 => 8,
-                _ => {
-                    // impossible since we only have 2 bits
-                    unreachable!();
-                }
-            };
-            let mut next_index = 9;
-            if num_bytes > 1 {
-                let remaining = &data[9..9 + (num_bytes - 1)];
-                for byte in remaining {
-                    value <<= 8;
-                    value |= *byte as u64;
-                }
-                next_index += num_bytes - 1;
-            }
-            (value as usize, next_index)
+        if !valid_udp_fragment(fragment_id, fragment_count) {
+            debug!("Ignoring datagram with invalid fragment {fragment_id}/{fragment_count}");
+            continue;
+        }
+
+        let Some((address_len, next_index)) = decode_udp_address_length(&data) else {
+            debug!("Ignoring datagram with truncated address length");
+            continue;
         };
 
         if address_len == 0 {
@@ -591,11 +735,26 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
+        // Read before taking the entry, which borrows the map for the rest of the
+        // match. Nothing mutates in between, so this is the exact live count.
+        let session_count = sessions.len();
+
         let mut session_entry = sessions.entry(session_id);
         let session = match session_entry {
             Entry::Vacant(entry) => {
+                if session_count >= MAX_UDP_SESSIONS {
+                    // Refusing the packet rather than evicting somebody: an eviction
+                    // policy would let a client at the ceiling knock out its own
+                    // established flows by naming new ids, and would hand an attacker
+                    // a way to churn sockets indefinitely at a fixed occupancy.
+                    debug!(
+                        "Refusing new UDP session {session_id}: at the {MAX_UDP_SESSIONS} session limit"
+                    );
+                    continue;
+                }
+
                 let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), &resolver)
+                    .judge_udp(remote_location.clone().into(), &resolver)
                     .await;
 
                 let (_chain_group, updated_location) = match action {
@@ -676,10 +835,18 @@ async fn run_udp_local_to_remote_loop(
             Entry::Occupied(ref mut entry) => entry.get_mut(),
         };
 
-        let (complete_payload, remote_location) = if fragment_count == 0 {
-            error!("Ignoring empty UDP fragment for session {session_id}");
-            continue;
-        } else if fragment_count == 1 {
+        // The client just sent something for this session, so it is not idle. Without
+        // this the field only ever held its creation time and the reaper below tore
+        // every session down 60 seconds in, however busy it was -- a plain bug, and
+        // the reason the idle limit did not bound the map either.
+        //
+        // Refreshed here, on arrival, rather than after a successful forward: a
+        // session receiving the fragments of one large packet is active even before
+        // any of them can be reassembled and sent, and being reaped mid-reassembly
+        // would discard the fragments already held.
+        session.last_activity = std::time::Instant::now();
+
+        let (complete_payload, remote_location) = if fragment_count == 1 {
             (payload_fragment, remote_location)
         } else {
             let is_new = !session.fragments.contains(&packet_id);
@@ -749,7 +916,7 @@ async fn run_udp_local_to_remote_loop(
                         remote_location.clone()
                     );
                     let action = client_proxy_selector
-                        .judge(remote_location.clone().into(), &resolver)
+                        .judge_udp(remote_location.clone().into(), &resolver)
                         .await;
                     let updated_location = match action {
                         Ok(ConnectDecision::Allow {
@@ -824,16 +991,28 @@ async fn run_tcp_loop(
         // counters cover all of them at once and the live-connection count follows
         // the QUIC connection rather than the streams multiplexed over it.
         let meter = meter.clone();
+        let removal_meter = meter.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_tcp_stream(
+            let work = process_tcp_stream(
                 client_proxy_selector,
                 resolver,
                 meter,
                 send_stream,
                 recv_stream,
-            )
-            .await
-            {
+            );
+            let result = if let Some(meter) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = meter.cancelled() => Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "user removed",
+                    )),
+                    result = work => result,
+                }
+            } else {
+                work.await
+            };
+            if let Err(e) = result {
                 error!("Failed to process streams: {e}");
             }
         });
@@ -940,13 +1119,25 @@ async fn process_tcp_stream(
         }
     };
 
+    let mut replay = stream_reader
+        .unparsed_data_owned()
+        .map(Vec::from)
+        .unwrap_or_default();
+    drop(stream_reader);
+    let sniffed = if client_proxy_selector.needs_tcp_protocol_sniff() {
+        sniff_tcp(&mut server_stream, &mut replay).await?
+    } else {
+        None
+    };
+
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream(
+        setup_client_tcp_stream_with_metadata(
             &mut server_stream,
             client_proxy_selector,
             resolver,
             remote_location.clone(),
+            sniffed,
         ),
     );
 
@@ -973,22 +1164,20 @@ async fn process_tcp_stream(
         }
     };
 
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
+    let client_requires_flush = if replay.is_empty() {
         false
     } else {
-        let len = unparsed_data.len();
+        let len = replay.len();
         let mut i = 0;
         while i < len {
             let count = client_stream
-                .write(&unparsed_data[i..len])
+                .write(&replay[i..len])
                 .await
                 .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
             i += count;
         }
         true
     };
-    drop(stream_reader);
 
     // Use 32KB buffers to match hysteria2/sing-box reference implementations
     let copy_result = copy_bidirectional_with_sizes(
@@ -1073,15 +1262,28 @@ pub async fn start_hysteria2_server(
     selector: Arc<SelectorSlot>,
     num_endpoints: usize,
     udp_enabled: bool,
+    up_mbps: u64,
+    down_mbps: u64,
+    // Salamander obfuscation, or `None` for plain QUIC.
+    obfs: Option<crate::hysteria2_obfs::Salamander>,
+    masquerade: Arc<crate::hysteria2_masquerade::Hysteria2Masquerade>,
     shutdown: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
+        let obfs = obfs.clone();
+        let connection_settings = Hysteria2ConnectionSettings {
+            users: users.clone(),
+            metered,
+            udp_enabled,
+            up_mbps,
+            down_mbps,
+            masquerade: masquerade.clone(),
+        };
         // No resolver clone: the accept loop takes it from the selector slot, so the
         // rules and the DNS a connection routes by are always one generation.
         let selector = selector.clone();
-        let users = users.clone();
         let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
@@ -1103,8 +1305,15 @@ pub async fn start_hysteria2_server(
                 .min_mtu(1200)
                 // Enable MTU discovery for larger packets on capable networks
                 .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // Enable GSO (Generic Segmentation Offload) for better throughput
-                .enable_segmentation_offload(true)
+                // QUIC exists before the HTTP/3 auth request carrying
+                // Hysteria-CC-RX. This factory starts each connection on BBR and
+                // exposes a connection-local switch that auth flips to Brutal.
+                .congestion_controller_factory(Arc::new(crate::hysteria2::brutal::BrutalConfig))
+                // Enable GSO (Generic Segmentation Offload) for better throughput.
+                // Salamander gives every datagram its own salt, so a coalesced
+                // batch cannot be obfuscated as one buffer -- the offload has to
+                // go when obfuscation is on.
+                .enable_segmentation_offload(obfs.is_none())
                 // Lower initial RTT estimate for faster initial window growth
                 .initial_rtt(Duration::from_millis(100));
 
@@ -1122,12 +1331,34 @@ pub async fn start_hysteria2_server(
             )
             .unwrap();
 
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket2_socket.into(),
-                Arc::new(quinn::TokioRuntime),
-            )
+            // `wrap_udp_socket` lives on the Runtime trait.
+            use quinn::Runtime as _;
+            let runtime = Arc::new(quinn::TokioRuntime);
+            let endpoint = match obfs {
+                // Obfuscation is a transformation of the bytes leaving and
+                // entering the socket, so it wraps quinn's own socket rather
+                // than replacing it: everything platform-specific about the UDP
+                // path stays where quinn maintains it.
+                Some(salamander) => {
+                    let inner = runtime
+                        .wrap_udp_socket(socket2_socket.into())
+                        .expect("wrap the hysteria2 udp socket");
+                    quinn::Endpoint::new_with_abstract_socket(
+                        quinn::EndpointConfig::default(),
+                        Some(server_config),
+                        Arc::new(crate::hysteria2_obfs::ObfuscatedUdpSocket::new(
+                            inner, salamander,
+                        )),
+                        runtime,
+                    )
+                }
+                None => quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server_config),
+                    socket2_socket.into(),
+                    runtime,
+                ),
+            }
             .unwrap();
 
             loop {
@@ -1145,15 +1376,13 @@ pub async fn start_hysteria2_server(
                 // The resolver travels with the rules, so a connection cannot be
                 // accepted under one generation and route by another's DNS.
                 let (cloned_selector, cloned_resolver) = selector.load();
-                let cloned_users = users.clone();
+                let connection_settings = connection_settings.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
-                        cloned_users,
-                        metered,
                         conn,
-                        udp_enabled,
+                        connection_settings,
                     )
                     .await
                     {
@@ -1170,4 +1399,84 @@ pub async fn start_hysteria2_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_FRAGMENT_CACHE_SIZE, UdpSession, decode_udp_address_length, valid_udp_fragment,
+    };
+    use crate::address::{Address, NetLocation};
+    use lru::LruCache;
+    use std::net::Ipv4Addr;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    /// Dropping a session must stop the task it started.
+    ///
+    /// The reaper cancels explicitly, but it is not the only way a session leaves
+    /// the map: a failed forward removes one too, and that is the path an
+    /// unreachable destination takes on its very first packet. Constructed by hand
+    /// rather than through `start`, because the point is the struct's own lifetime.
+    #[tokio::test]
+    async fn dropping_a_session_cancels_its_background_task() {
+        let parent = CancellationToken::new();
+        let token = parent.child_token();
+
+        let session = UdpSession {
+            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
+            send_socket: Arc::new(
+                tokio::net::UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback socket"),
+            ),
+            last_location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
+            last_socket_addr: "127.0.0.1:1".parse().unwrap(),
+            override_remote_write_address: None,
+            last_activity: std::time::Instant::now(),
+            cancel_token: token.clone(),
+        };
+
+        assert!(!token.is_cancelled(), "a live session is not cancelled");
+        drop(session);
+        assert!(
+            token.is_cancelled(),
+            "the spawned loop holds its own clone of this token and would otherwise              keep its socket and 64 KiB buffer alive until the connection ended"
+        );
+        assert!(
+            !parent.is_cancelled(),
+            "one session ending must not take the whole connection with it"
+        );
+    }
+
+    #[test]
+    fn udp_address_length_rejects_truncated_multibyte_varints() {
+        for first_byte in [0x40, 0x80, 0xc0] {
+            let mut datagram = [0u8; 9];
+            datagram[8] = first_byte;
+            assert_eq!(decode_udp_address_length(&datagram), None);
+        }
+    }
+
+    #[test]
+    fn udp_address_length_accepts_complete_varints() {
+        let mut one_byte = [0u8; 9];
+        one_byte[8] = 7;
+        assert_eq!(decode_udp_address_length(&one_byte), Some((7, 9)));
+
+        let mut eight_byte = [0u8; 16];
+        eight_byte[8] = 0xc0;
+        eight_byte[15] = 1;
+        assert_eq!(decode_udp_address_length(&eight_byte), Some((1, 16)));
+    }
+
+    #[test]
+    fn udp_fragment_indices_must_be_within_the_declared_count() {
+        assert!(!valid_udp_fragment(0, 0));
+        assert!(!valid_udp_fragment(1, 1));
+        assert!(!valid_udp_fragment(2, 2));
+        assert!(valid_udp_fragment(0, 1));
+        assert!(valid_udp_fragment(1, 2));
+    }
 }

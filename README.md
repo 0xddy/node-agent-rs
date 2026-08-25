@@ -26,15 +26,21 @@ engine.add_user("vless-443", UserSpec {
     uuid: Some("b85798ef-e9dc-46a4-9a87-8da4499d36d0".into()),
     password: None,
     enabled: true,
+    max_conns: None,
+    upload_limit_bps: None,
+    download_limit_bps: None,
 })?;                              // live on the next handshake
 
 let period = engine.take_inbound_traffic("vless-443")?;
 ```
 
 Users can be added, suspended and removed on a live listener, each authenticating
-independently with per-user byte accounting; rules and protocol settings can be swapped
-without disturbing established connections. Every protocol shoes can tell users apart on
-is covered: VLESS, VMess, Trojan, Shadowsocks 2022, Hysteria2, TUIC, AnyTLS, NaiveProxy.
+independently with per-user byte accounting. Suspending a user refuses new handshakes but
+leaves their current sessions alone; removing one revokes the credential, actively closes
+all of their sessions, and waits for final counters. Rules and protocol settings can still
+be swapped without disturbing established connections. Every protocol shoes can tell
+users apart on is covered: VLESS, VMess, Trojan, Shadowsocks 2022, Hysteria2, TUIC,
+AnyTLS, NaiveProxy.
 
 ## Layout
 
@@ -43,20 +49,26 @@ is covered: VLESS, VMess, Trojan, Shadowsocks 2022, Hysteria2, TUIC, AnyTLS, Nai
 | `shoes/` | upstream, imported verbatim by `git subtree`. **Never restructure it** — it has to stay mergeable. Its extension points live in `shoes/src/dynamic/`. |
 | `crates/shoes-engine/` | the integration point: `Engine`, the in-memory user registry, the acceptance suites. This is what an embedder links. |
 | `crates/shoes-api/` | the argument and report types `Engine`'s methods take, split out so a conversion layer can name them without linking the proxy engine. |
+| `crates/acp-proto/` | the ACP protobuf contract, deterministic topology digest, and Go-compatible HMAC authentication. |
+| `crates/node-agent/` | the ACP panel client and production daemon that translates panel topology into transactional `shoes-engine` updates. |
 | `docs/` | the design record. |
 
-There is deliberately **no crate above `shoes-engine`** — no daemon, no wire protocol.
-Shipping one would put transport and policy decisions in the repository that has to stay
-mergeable, and would make anyone wanting a different transport fork it.
+`shoes-engine` remains transport-neutral. The ACP-specific daemon is a separate consumer
+above that seam, so proxy wire-format changes stay in `shoes/`, generic runtime control
+stays in `shoes-engine`, and panel policy stays in `node-agent`.
 
 ## Documentation
 
 - **[docs/dynamic-engine-design.md](docs/dynamic-engine-design.md)** — the architecture:
   the crate seam, the registry, metering, RCU reload, and a collected invariant
   checklist in §9. **Read this before changing anything under `shoes/src/dynamic/` or
-  adding a protocol** — four of those invariants fail silently.
+  adding a protocol** — several of those invariants surface only under concurrency,
+  removal, or cross-task protocol paths.
 - **[docs/dynamic-engine-plan.md](docs/dynamic-engine-plan.md)** — the schedule the
   conversion followed, each increment annotated with what it actually took.
+- **[docs/node-agent-panel-compatibility.md](docs/node-agent-panel-compatibility.md)** —
+  the exact compatibility boundary for the existing node-agent TOML, panel routing,
+  DNS policy, outbound adapters, and strict rejection cases.
 
 ## Building and checking
 
@@ -81,6 +93,33 @@ cargo test --workspace
 `shoes/` still emits a handful of upstream warnings, most of them platform-conditional
 on Windows; `crates/` and `shoes/src/dynamic/` are expected to be warning-free.
 
+## Running the ACP node agent
+
+The Rust daemon accepts the same flat bootstrap TOML as the Go node-agent:
+
+```toml
+panel_grpc_endpoint = "grpcs://panel.example.com:443"
+machine_id = "replace-with-machine-id"
+node_id = "replace-with-node-id"
+machine_secret = "replace-with-machine-secret"
+
+# Optional TLS and diagnostics settings:
+ca_cert_path = ""
+tls_insecure_skip_verify = false
+debug = false
+log_file_path = "node-agent.log"
+traffic_report_min_delta_bytes = 26214400
+```
+
+```bash
+cargo build --release -p node-agent --locked
+./target/release/node-agent ./node-agent.toml
+```
+
+`node-agent version --json` prints the release identity used in ACP Hello. During a
+gray switch, stop the Go process before starting Rust: the panel must not see two
+agents using the same `machine_id` / `node_id` concurrently.
+
 ## Adding a protocol
 
 The convention every increment has followed:
@@ -89,10 +128,13 @@ The convention every increment has followed:
    injected, the config's own credential becomes a one-user `StaticUserRegistry`, so
    behaviour is identical to what it replaced.
 2. A disabled user is reported **absent**, never present-but-denied.
-3. Metering: the task local where authentication is inline, an explicit
-   `Arc<ConnContext>` wherever it crosses a `tokio::spawn`. Getting this wrong is
-   silent — TCP still adds up and the user's counters sit at zero.
-4. An end-to-end suite under `crates/shoes-engine/tests/`, driving `Engine` in process.
-5. All three gates above.
-6. A commit message that explains the design decision and **names any pre-existing bug
+3. Lookups only resolve candidates. After sufficient protocol proof, admission must
+   happen exactly once so counting and removable-connection registration are atomic.
+4. Metering: the task local where authentication is inline, an explicit
+   `Arc<ConnContext>` wherever it crosses a `tokio::spawn`. Tracked dynamic users
+   fail closed when that context is missing, so a task-local propagation mistake
+   rejects authentication instead of creating a session removal cannot cancel.
+5. An end-to-end suite under `crates/shoes-engine/tests/`, driving `Engine` in process.
+6. All three gates above.
+7. A commit message that explains the design decision and **names any pre-existing bug
    the new suite flushed out** — several have turned up that way.

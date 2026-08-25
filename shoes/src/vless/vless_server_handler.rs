@@ -9,8 +9,8 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
-use crate::dynamic::{UserRegistry, bind_connection_user};
-use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+use crate::dynamic::{UserRegistry, bind_connection_user, current_connection};
+use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -172,7 +172,12 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 return Err(std::io::Error::other("Unknown user id"));
             }
         };
-        bind_connection_user(&user);
+        if !bind_connection_user(&user) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "user could not be admitted: removed, suspended, or at their connection limit",
+            ));
+        }
 
         stream_reader.consume(17);
 
@@ -206,14 +211,16 @@ impl TcpServerHandler for VlessTcpServerHandler {
 
                     // Pass any unparsed data for the h2mux session
                     let initial_data = stream_reader.unparsed_data_owned();
+                    let meter = current_connection();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_h2mux_session(
+                        if let Err(e) = handle_h2mux_session_with_meter(
                             server_stream,
                             initial_data,
                             udp_enabled,
                             proxy_selector,
                             resolver,
+                            meter,
                         )
                         .await
                         {
@@ -344,7 +351,12 @@ where
             return Err(std::io::Error::other("Unknown user id"));
         }
     };
-    bind_connection_user(&user);
+    if !bind_connection_user(&user) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "user could not be admitted: removed, suspended, or at their connection limit",
+        ));
+    }
 
     stream_reader.consume(17);
 

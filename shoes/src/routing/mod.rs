@@ -5,6 +5,9 @@
 //! per-destination sessions that each route through the appropriate upstream chain
 //! based on routing rules.
 
+pub mod predicate;
+pub(crate) mod protocol;
+pub mod srs;
 mod udp_router;
 
 pub use udp_router::{ServerStream, run_udp_routing};

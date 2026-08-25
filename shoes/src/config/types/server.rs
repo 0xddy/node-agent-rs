@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
-use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
+use super::common::{
+    default_reality_server_short_ids, default_reality_time_diff, default_true, is_false,
+};
 use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
@@ -635,6 +637,45 @@ impl WebsocketPingType {
     }
 }
 
+/// Obfuscation applied below Hysteria2's QUIC layer.
+///
+/// Tagged by `type` so more schemes can be added without breaking configs that
+/// already name `salamander`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Hysteria2ObfsConfig {
+    Salamander { password: String },
+}
+
+/// The HTTP site shown to peers that do not complete Hysteria2 authentication.
+///
+/// The two variants intentionally match the subset emitted by node-agent's
+/// `hysteria2-salamander@1` provider. A fixed response is always HTML there;
+/// keeping the content type beside the content makes that wire-visible choice
+/// explicit while still allowing a standalone shoes config to override it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Hysteria2MasqueradeConfig {
+    String {
+        content: String,
+        #[serde(default = "default_hysteria2_masquerade_content_type")]
+        content_type: String,
+    },
+    Proxy {
+        url: String,
+        #[serde(default)]
+        rewrite_host: bool,
+        /// Use the operating system's TLS trust policy for an HTTPS upstream.
+        /// Omitted/false preserves historical shoes configurations.
+        #[serde(default, skip_serializing_if = "is_false")]
+        use_native_roots: bool,
+    },
+}
+
+fn default_hysteria2_masquerade_content_type() -> String {
+    "text/html; charset=utf-8".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
@@ -739,6 +780,32 @@ pub enum ServerProxyConfig {
         password: String,
         #[serde(default = "default_true")]
         udp_enabled: bool,
+        /// Maximum server-to-client Brutal rate, in decimal Mbps.
+        ///
+        /// Zero leaves the rate uncapped by the server; a client must still
+        /// advertise a non-zero `Hysteria-CC-RX` before Brutal is selected.
+        #[serde(default)]
+        up_mbps: u64,
+        /// Server receive rate advertised to the client, in decimal Mbps.
+        ///
+        /// This is negotiated independently from `up_mbps`. For a fixed-rate
+        /// request, zero is written as `Hysteria-CC-RX: 0` (uncapped); a client
+        /// requesting bandwidth detection receives the literal value `auto`.
+        #[serde(default)]
+        down_mbps: u64,
+        /// Salamander obfuscation, applied beneath QUIC.
+        ///
+        /// Absent means plain QUIC on the wire, which is the default and what
+        /// every existing config gets. Present, it must match the client
+        /// exactly: obfuscation is symmetric and unauthenticated, so a
+        /// mismatched password does not fail to authenticate -- it makes the
+        /// handshake unreadable and the connection simply never forms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        obfs: Option<Hysteria2ObfsConfig>,
+        /// Response served to ordinary HTTP/3 probes and failed authentication.
+        /// Absent preserves the historical 404 response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        masquerade: Option<Hysteria2MasqueradeConfig>,
     },
     #[serde(alias = "tuic")]
     TuicV5 {
@@ -1055,6 +1122,10 @@ mod tests {
             protocol: ServerProxyConfig::Hysteria2 {
                 password: "hysteria_pass".to_string(),
                 udp_enabled: true,
+                up_mbps: 0,
+                down_mbps: 0,
+                obfs: None,
+                masquerade: None,
             },
             transport: Transport::Quic,
             tcp_settings: None,
@@ -1683,5 +1754,14 @@ client_chain:
         println!("Serialized:\n{serialized}");
         let deserialized: ShadowTlsRemoteHandshake = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.client_chain.len(), original.client_chain.len());
+    }
+
+    #[test]
+    fn masquerade_native_roots_false_stays_omitted_on_roundtrip() {
+        let config: Hysteria2MasqueradeConfig =
+            serde_yaml::from_str("type: proxy\nurl: https://example.com/\nrewrite_host: false\n")
+                .unwrap();
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        assert!(!serialized.contains("use_native_roots"));
     }
 }

@@ -1,11 +1,17 @@
 //! Configuration validation - validates configs and creates final ServerConfigs.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::sync::Arc;
 
 use crate::address::NetLocationMask;
-use crate::dns::ParsedDnsUrl;
+use crate::dns::{
+    DnsPredefinedResponse, DnsRcode, DnsRejectMethod, ParsedDnsUrl, PolicyAction, PolicyResolver,
+    PolicyRuleSpec, parse_predefined_lookup_addresses,
+};
 use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::reality::{decode_private_key, decode_short_id};
+use crate::routing::srs::{SrsDefaultRule, SrsLogicalMode, SrsRule, SrsRuleSet, parse_bytes_named};
 use crate::socket_util::supports_reuse_port;
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
@@ -13,8 +19,9 @@ use crate::uuid_util::parse_uuid;
 use super::pem::{embed_optional_pem_from_map, embed_pem_from_map};
 use super::types::{
     ClientChain, ClientChainHop, ClientConfig, ClientProxyConfig, Config, ConfigSelection,
-    DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup,
-    ExpandedDnsSpec, PemSource, RuleActionConfig, RuleConfig, ServerConfig, ServerProxyConfig,
+    DEFAULT_REALITY_SHORT_ID, DnsConfig, DnsConfigGroup, DnsPolicyActionConfig, DnsServerSpec,
+    ExpandedDnsGroup, ExpandedDnsPolicyAction, ExpandedDnsPolicyRule, ExpandedDnsSpec, PemSource,
+    RouteMatchConfig, RuleActionConfig, RuleConfig, ServerConfig, ServerProxyConfig,
     ServerQuicConfig, ShadowTlsServerConfig, ShadowTlsServerHandshakeConfig, ShadowsocksConfig,
     TlsServerConfig, Transport, TunConfig, WebsocketServerConfig, direct_allow_rule,
 };
@@ -52,9 +59,11 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         String::from("allow-all-direct"),
         vec![RuleConfig {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            match_config: None,
             action: RuleActionConfig::Allow {
                 override_address: None,
                 client_chains: NoneOrSome::One(ClientChain::default()),
+                client_chain_selection: crate::config::ClientChainSelectionConfig::default(),
             },
         }],
     );
@@ -62,6 +71,7 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
         String::from("block-all"),
         vec![RuleConfig {
             masks: OneOrSome::One(NetLocationMask::ANY),
+            match_config: None,
             action: RuleActionConfig::Block,
         }],
     );
@@ -161,11 +171,15 @@ pub fn create_server_configs(all_configs: Vec<Config>) -> std::io::Result<Valida
     let group_names: HashSet<&str> = expanded_dns_groups.keys().map(|s| s.as_str()).collect();
 
     for name in dns_group_order {
-        let specs = expanded_dns_groups.get(&name).unwrap();
-        let expanded_specs = expand_dns_specs(specs, &client_groups, &named_pems, &group_names)?;
+        let group = expanded_dns_groups.get(&name).unwrap();
+        let specs: Vec<DnsServerSpec> = group.dns_servers.iter().cloned().collect();
+        let expanded_specs = expand_dns_specs(&specs, &client_groups, &named_pems, &group_names)?;
+        let (final_server, rules) = expand_dns_policy(group, &expanded_specs)?;
         final_dns_groups.push(ExpandedDnsGroup {
             name,
             specs: expanded_specs,
+            final_server,
+            rules,
         });
     }
 
@@ -336,10 +350,11 @@ fn topological_sort(dependencies: &HashMap<String, Vec<String>>) -> std::io::Res
 }
 
 /// Phase 1: Expand DNS group composition references.
-/// Returns a map of group name to flat list of server specs (no group references).
+/// Returns groups with a flat list of server specs (no group references), while
+/// retaining each group's own policy metadata.
 fn expand_dns_groups_composition(
     dns_groups: HashMap<String, DnsConfigGroup>,
-) -> std::io::Result<HashMap<String, Vec<DnsServerSpec>>> {
+) -> std::io::Result<HashMap<String, DnsConfigGroup>> {
     // Build composition dependency graph and validate references
     let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -376,7 +391,7 @@ fn expand_dns_groups_composition(
     })?;
 
     // Expand in topological order
-    let mut expanded: HashMap<String, Vec<DnsServerSpec>> = HashMap::new();
+    let mut expanded: HashMap<String, DnsConfigGroup> = HashMap::new();
 
     for name in order {
         let group = dns_groups.get(&name).unwrap();
@@ -384,11 +399,25 @@ fn expand_dns_groups_composition(
             .dns_servers
             .iter()
             .flat_map(|spec| match spec.as_group_ref() {
-                Some(ref_name) => expanded.get(ref_name).unwrap().clone(),
+                Some(ref_name) => expanded
+                    .get(ref_name)
+                    .unwrap()
+                    .dns_servers
+                    .iter()
+                    .cloned()
+                    .collect(),
                 None => vec![spec.clone()],
             })
             .collect();
-        expanded.insert(name, specs);
+        expanded.insert(
+            name.clone(),
+            DnsConfigGroup {
+                dns_group: name,
+                dns_servers: NoneOrSome::Some(specs),
+                final_server: group.final_server.clone(),
+                rules: group.rules.clone(),
+            },
+        );
     }
 
     Ok(expanded)
@@ -397,13 +426,14 @@ fn expand_dns_groups_composition(
 /// Phase 2: Topological sort on expanded DNS groups based on bootstrap_url dependencies.
 /// Returns groups in order such that bootstrap dependencies come before dependents.
 fn topological_sort_dns_groups_by_bootstrap(
-    expanded_groups: &HashMap<String, Vec<DnsServerSpec>>,
+    expanded_groups: &HashMap<String, DnsConfigGroup>,
 ) -> std::io::Result<Vec<String>> {
     // Build dependency graph: for each group, collect which groups it references via bootstrap_url
     let dependencies: HashMap<String, Vec<String>> = expanded_groups
         .iter()
-        .map(|(group_name, specs)| {
-            let deps: Vec<String> = specs
+        .map(|(group_name, group)| {
+            let deps: Vec<String> = group
+                .dns_servers
                 .iter()
                 .filter_map(|spec| spec.bootstrap_url())
                 .filter(|url| expanded_groups.contains_key(*url))
@@ -424,7 +454,8 @@ fn topological_sort_dns_groups_by_bootstrap(
 
 /// Extracts inline DNS specs from a config into dns_groups with a generated name.
 /// Replaces config.dns.servers with a single group name reference.
-/// If servers is already a single group reference or empty, does nothing.
+/// If servers is already a single group reference and has no inline policy, or
+/// is an empty legacy config, does nothing.
 fn extract_inline_dns(
     dns: &mut Option<DnsConfig>,
     dns_groups: &mut HashMap<String, DnsConfigGroup>,
@@ -434,14 +465,24 @@ fn extract_inline_dns(
         return Ok(());
     };
 
-    // Empty means use default resolver - nothing to extract
+    let has_policy = config.final_server.is_some() || !config.rules.is_empty();
+
+    // Empty means use default resolver, but a policy cannot exist without an
+    // upstream to serve as its final fallback.
     if config.servers.is_empty() {
+        if has_policy {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DNS policy requires at least one configured server",
+            ));
+        }
         return Ok(());
     }
 
-    // Already a single group reference - nothing to extract
+    // Already a single group reference with no overlay policy - nothing to extract.
     if let NoneOrSome::One(spec) = &config.servers
         && spec.as_group_ref().is_some()
+        && !has_policy
     {
         return Ok(());
     }
@@ -453,6 +494,8 @@ fn extract_inline_dns(
     let group = DnsConfigGroup {
         dns_group: generated_name.clone(),
         dns_servers: std::mem::replace(&mut config.servers, NoneOrSome::Unspecified),
+        final_server: config.final_server.take(),
+        rules: std::mem::take(&mut config.rules),
     };
     dns_groups.insert(generated_name.clone(), group);
 
@@ -499,7 +542,8 @@ fn validate_dns_group_ref(
 ///
 /// Expands client chains (resolves group refs to configs) and validates:
 /// - Inline client configs (PEMs, etc.)
-/// - Protocol compatibility (system doesn't support chains, UDP/H3 only direct chains)
+/// - Protocol compatibility (system has no chain, plain UDP is direct-only,
+///   QUIC/H3 require at least one UDP-capable chain)
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
     specs: &[DnsServerSpec],
@@ -519,6 +563,8 @@ fn expand_dns_specs(
 
         // Expand and validate client chains
         let client_chains_raw = spec.client_chains();
+        let client_chain_selection = spec.client_chain_selection();
+        validate_client_chain_selection(&client_chain_selection)?;
         let mut expanded_chains: Vec<ClientChain> = Vec::new();
 
         for chain_selection in client_chains_raw.iter() {
@@ -535,6 +581,7 @@ fn expand_dns_specs(
                 validate_client_chain_hop(hop, client_groups, named_pems)?;
             }
             expand_client_chain(&mut chain.hops, client_groups)?;
+            validate_direct_connector_positions(&chain.hops, expanded_chains.len())?;
             expanded_chains.push(chain);
         }
 
@@ -547,7 +594,8 @@ fn expand_dns_specs(
                 ));
             }
 
-            // Check if all chains are direct-only (for UDP/H3 validation)
+            // Plain UDP still requires a native socket. DoQ and DoH3 can use
+            // any UDP-capable chain through the proxy QUIC socket adapter.
             let all_direct = expanded_chains.iter().all(is_chain_direct_only);
 
             if !all_direct {
@@ -557,13 +605,21 @@ fn expand_dns_specs(
                             "UDP DNS only supports direct client_chain (for bind_interface)",
                         ));
                     }
-                    ParsedDnsUrl::H3 { .. } => {
+                    ParsedDnsUrl::H3 { .. } | ParsedDnsUrl::Quic { .. }
+                        if !expanded_chains.iter().any(chain_supports_udp) =>
+                    {
                         return Err(std::io::Error::other(
-                            "H3 DNS only supports direct client_chain (for bind_interface)",
+                            "DNS-over-QUIC client_chain has no UDP-capable chain",
                         ));
                     }
+                    ParsedDnsUrl::H3 { .. } | ParsedDnsUrl::Quic { .. } => {}
                     _ => {}
                 }
+            } else if matches!(
+                &parsed_url,
+                ParsedDnsUrl::Quic { .. } | ParsedDnsUrl::H3 { .. }
+            ) {
+                validate_quic_dns_direct_chains(&expanded_chains)?;
             }
         }
 
@@ -588,9 +644,12 @@ fn expand_dns_specs(
         }
 
         result.push(ExpandedDnsSpec {
+            tag: spec.tag().map(String::from),
             url: url_str.to_string(),
             server_name: server_name_override.map(String::from),
+            use_native_roots: spec.use_native_roots(),
             client_chains: expanded_chains,
+            client_chain_selection,
             bootstrap_url: spec.bootstrap_url().map(String::from),
             ip_strategy: spec.ip_strategy(),
             timeout_secs: spec.timeout_secs(),
@@ -600,6 +659,467 @@ fn expand_dns_specs(
     }
 
     Ok(result)
+}
+
+/// Validate tagged upstreams and convert user-facing DNS rules into their
+/// runtime form. Legacy groups (no tags/final/rules) retain their existing
+/// composite-resolver behaviour unchanged.
+fn expand_dns_policy(
+    group: &DnsConfigGroup,
+    specs: &[ExpandedDnsSpec],
+) -> std::io::Result<(Option<String>, Vec<ExpandedDnsPolicyRule>)> {
+    let policy_mode = group.final_server.is_some()
+        || !group.rules.is_empty()
+        || specs.iter().any(|spec| spec.tag.is_some());
+    if !policy_mode {
+        return Ok((None, Vec::new()));
+    }
+    if specs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("DNS group '{}' policy has no upstreams", group.dns_group),
+        ));
+    }
+
+    let mut tags = HashSet::new();
+    for (index, spec) in specs.iter().enumerate() {
+        let tag = spec.tag.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' uses policy, but upstream {index} has no tag",
+                    group.dns_group
+                ),
+            )
+        })?;
+        if tag.is_empty() || tag.trim() != tag {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' upstream {index} has an invalid tag {tag:?}",
+                    group.dns_group
+                ),
+            ));
+        }
+        if !tags.insert(tag) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' has duplicate upstream tag {tag:?}",
+                    group.dns_group
+                ),
+            ));
+        }
+    }
+
+    let final_server = match group.final_server.as_deref() {
+        Some(tag) if tag.is_empty() || tag.trim() != tag => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' has an invalid final tag {tag:?}",
+                    group.dns_group
+                ),
+            ));
+        }
+        Some(tag) if !tags.contains(tag) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' final references unknown upstream tag {tag:?}",
+                    group.dns_group
+                ),
+            ));
+        }
+        Some(tag) => tag.to_string(),
+        None => specs[0]
+            .tag
+            .clone()
+            .expect("policy-mode upstream tags were validated"),
+    };
+
+    let mut expanded_rules = Vec::with_capacity(group.rules.len());
+    for (index, rule) in group.rules.iter().enumerate() {
+        for (rule_set_index, reference) in rule.rule_set.iter().enumerate() {
+            load_dns_rule_set(group, index, rule_set_index, reference)?;
+        }
+        let rule_set = rule.rule_set.clone();
+        let action = match rule.action {
+            DnsPolicyActionConfig::Route => {
+                if !rule.rcode.is_empty()
+                    || !rule.method.is_empty()
+                    || !rule.answer.is_empty()
+                    || !rule.ns.is_empty()
+                    || !rule.extra.is_empty()
+                {
+                    return Err(invalid_dns_rule(
+                        group,
+                        index,
+                        "route action must not contain rcode, method, answer, ns, or extra",
+                    ));
+                }
+                let tag = rule.server.as_deref().ok_or_else(|| {
+                    invalid_dns_rule(group, index, "route action requires server tag")
+                })?;
+                if tag.is_empty() || tag.trim() != tag || !tags.contains(tag) {
+                    return Err(invalid_dns_rule(
+                        group,
+                        index,
+                        format!("route references unknown upstream tag {tag:?}"),
+                    ));
+                }
+                ExpandedDnsPolicyAction::Route(tag.to_string())
+            }
+            DnsPolicyActionConfig::Reject => {
+                if rule.server.is_some()
+                    || !rule.rcode.is_empty()
+                    || !rule.answer.is_empty()
+                    || !rule.ns.is_empty()
+                    || !rule.extra.is_empty()
+                    || rule.timeout_millis != 0
+                {
+                    return Err(invalid_dns_rule(
+                        group,
+                        index,
+                        "reject action must not contain server, rcode, answer, ns, extra, or timeout_millis",
+                    ));
+                }
+                let method = DnsRejectMethod::parse(&rule.method).ok_or_else(|| {
+                    invalid_dns_rule(
+                        group,
+                        index,
+                        format!(
+                            "reject method must be default or drop, got {:?}",
+                            rule.method
+                        ),
+                    )
+                })?;
+                ExpandedDnsPolicyAction::Reject(method)
+            }
+            DnsPolicyActionConfig::Predefined => {
+                if rule.server.is_some() || !rule.method.is_empty() || rule.timeout_millis != 0 {
+                    return Err(invalid_dns_rule(
+                        group,
+                        index,
+                        "predefined action must not contain server, method, or timeout_millis",
+                    ));
+                }
+                let rcode = DnsRcode::parse(&rule.rcode).ok_or_else(|| {
+                    invalid_dns_rule(
+                        group,
+                        index,
+                        format!(
+                            "predefined rcode must be NOERROR, NXDOMAIN, REFUSED, or SERVFAIL, got {:?}",
+                            rule.rcode
+                        ),
+                    )
+                })?;
+                let addresses =
+                    parse_predefined_lookup_addresses(&rule.answer, &rule.ns, &rule.extra)
+                        .map_err(|error| invalid_dns_rule(group, index, error))?;
+                ExpandedDnsPolicyAction::Predefined(DnsPredefinedResponse::new(rcode, addresses))
+            }
+        };
+
+        expanded_rules.push(ExpandedDnsPolicyRule {
+            exact: rule.domain.clone(),
+            suffix: rule.domain_suffix.clone(),
+            keyword: rule.domain_keyword.clone(),
+            regex: rule.domain_regex.clone(),
+            rule_set,
+            action,
+            timeout_millis: rule.timeout_millis,
+        });
+    }
+
+    // Compile once during validation so malformed/oversized patterns fail the
+    // engine's preflight path, before DnsRegistry is constructed.
+    let dummy: Arc<dyn crate::resolver::Resolver> =
+        Arc::new(crate::resolver::NativeResolver::new());
+    let policy_specs = expanded_rules
+        .iter()
+        .map(|rule| PolicyRuleSpec {
+            exact: rule.exact.clone(),
+            suffix: rule.suffix.clone(),
+            keyword: rule.keyword.clone(),
+            regex: rule.regex.clone(),
+            rule_set: rule.rule_set.clone(),
+            timeout: (rule.timeout_millis != 0)
+                .then(|| std::time::Duration::from_millis(rule.timeout_millis)),
+            action: match &rule.action {
+                ExpandedDnsPolicyAction::Route(_) => PolicyAction::Route(dummy.clone()),
+                ExpandedDnsPolicyAction::Reject(method) => PolicyAction::Reject(*method),
+                ExpandedDnsPolicyAction::Predefined(response) => {
+                    PolicyAction::Predefined(response.clone())
+                }
+            },
+        })
+        .collect();
+    PolicyResolver::new(dummy, policy_specs).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("DNS group '{}': {error}", group.dns_group),
+        )
+    })?;
+
+    Ok((Some(final_server), expanded_rules))
+}
+
+fn invalid_dns_rule(
+    group: &DnsConfigGroup,
+    index: usize,
+    message: impl std::fmt::Display,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("DNS group '{}' rules[{index}]: {message}", group.dns_group),
+    )
+}
+
+const MAX_LOCAL_DNS_RULE_SET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DNS_RULE_SET_PATTERNS: usize = 1_000_000;
+const MAX_DNS_RULE_SET_REGEX_PATTERNS: usize = 512;
+const MAX_DNS_RULE_SET_PATTERN_BYTES_PER_ENTRY: usize = 4_096;
+const MAX_DNS_RULE_SET_PATTERN_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct DnsRuleSetBudget {
+    patterns: usize,
+    regex_patterns: usize,
+    pattern_bytes: usize,
+}
+
+fn load_dns_rule_set(
+    group: &DnsConfigGroup,
+    rule_index: usize,
+    rule_set_index: usize,
+    reference: &super::types::RouteRuleSetConfig,
+) -> std::io::Result<RouteMatchConfig> {
+    let path = reference.path.as_path();
+    if !path.is_absolute() {
+        return Err(invalid_dns_rule(
+            group,
+            rule_index,
+            format!(
+                "rule_set[{rule_set_index}].path must be absolute: {:?}",
+                reference.path
+            ),
+        ));
+    }
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        invalid_dns_rule(
+            group,
+            rule_index,
+            format!(
+                "failed to open rule_set[{rule_set_index}] {:?}: {error}",
+                reference.path
+            ),
+        )
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_LOCAL_DNS_RULE_SET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            invalid_dns_rule(
+                group,
+                rule_index,
+                format!(
+                    "failed to read rule_set[{rule_set_index}] {:?}: {error}",
+                    reference.path
+                ),
+            )
+        })?;
+    if bytes.len() as u64 > MAX_LOCAL_DNS_RULE_SET_BYTES {
+        return Err(invalid_dns_rule(
+            group,
+            rule_index,
+            format!(
+                "rule_set[{rule_set_index}] {:?} exceeds {} bytes",
+                reference.path, MAX_LOCAL_DNS_RULE_SET_BYTES
+            ),
+        ));
+    }
+
+    let parsed = parse_bytes_named(&reference.format, &bytes).map_err(|error| {
+        invalid_dns_rule(
+            group,
+            rule_index,
+            format!(
+                "invalid rule_set[{rule_set_index}] {:?}: {error}",
+                reference.path
+            ),
+        )
+    })?;
+    dns_rule_set_match_config(&parsed).map_err(|message| {
+        invalid_dns_rule(
+            group,
+            rule_index,
+            format!(
+                "unsupported rule_set[{rule_set_index}] {:?}: {message}",
+                reference.path
+            ),
+        )
+    })
+}
+
+fn dns_rule_set_match_config(rule_set: &SrsRuleSet) -> Result<RouteMatchConfig, String> {
+    if !rule_set.unsupported_fields.is_empty() {
+        return Err(format!(
+            "top-level fields cannot be evaluated: {}",
+            rule_set.unsupported_fields.join(", ")
+        ));
+    }
+    if rule_set.rules.is_empty() {
+        return Err("empty rule-set cannot be represented without broadening its match".into());
+    }
+
+    let mut budget = DnsRuleSetBudget::default();
+    let mut rules = rule_set
+        .rules
+        .iter()
+        .map(|rule| dns_srs_rule_match_config(rule, &mut budget))
+        .collect::<Result<Vec<_>, _>>()?;
+    if rules.len() == 1 {
+        Ok(rules.pop().unwrap())
+    } else {
+        Ok(RouteMatchConfig {
+            any: rules,
+            ..RouteMatchConfig::default()
+        })
+    }
+}
+
+fn dns_srs_rule_match_config(
+    rule: &SrsRule,
+    budget: &mut DnsRuleSetBudget,
+) -> Result<RouteMatchConfig, String> {
+    match rule {
+        SrsRule::Default(rule) => dns_srs_default_match_config(rule, budget),
+        SrsRule::Logical(rule) => {
+            if !rule.unsupported_fields.is_empty() {
+                return Err(format!(
+                    "logical rule fields cannot be evaluated: {}",
+                    rule.unsupported_fields.join(", ")
+                ));
+            }
+            if rule.rules.is_empty() && matches!(rule.mode, SrsLogicalMode::Or) {
+                return Err("empty logical OR cannot be represented without broadening it".into());
+            }
+            let children = rule
+                .rules
+                .iter()
+                .map(|child| dns_srs_rule_match_config(child, budget))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut config = RouteMatchConfig {
+                invert: rule.invert,
+                ..RouteMatchConfig::default()
+            };
+            match rule.mode {
+                SrsLogicalMode::And => config.all = children,
+                SrsLogicalMode::Or => config.any = children,
+            }
+            Ok(config)
+        }
+        SrsRule::Unsupported(rule) => Err(format!(
+            "rule type {:?} cannot be evaluated (fields: {})",
+            rule.rule_type,
+            rule.fields.join(", ")
+        )),
+    }
+}
+
+fn dns_srs_default_match_config(
+    rule: &SrsDefaultRule,
+    budget: &mut DnsRuleSetBudget,
+) -> Result<RouteMatchConfig, String> {
+    if !rule.unsupported_fields.is_empty() {
+        return Err(format!(
+            "rule fields cannot be evaluated: {}",
+            rule.unsupported_fields.join(", ")
+        ));
+    }
+    let mut unavailable = Vec::new();
+    if !rule.network.is_empty() {
+        unavailable.push("network");
+    }
+    if !rule.ip_cidr.is_empty() {
+        unavailable.push("ip_cidr");
+    }
+    if !rule.port.is_empty() {
+        unavailable.push("port");
+    }
+    if !rule.port_range.is_empty() {
+        unavailable.push("port_range");
+    }
+    if !unavailable.is_empty() {
+        return Err(format!(
+            "DNS hostname matching cannot evaluate {}",
+            unavailable.join(", ")
+        ));
+    }
+
+    account_dns_rule_set_patterns(&rule.domain, false, budget)?;
+    account_dns_rule_set_patterns(&rule.domain_suffix, false, budget)?;
+    account_dns_rule_set_patterns(&rule.domain_keyword, false, budget)?;
+    account_dns_rule_set_patterns(&rule.domain_regex, true, budget)?;
+
+    Ok(RouteMatchConfig {
+        domain: rule.domain.clone(),
+        domain_suffix: rule.domain_suffix.clone(),
+        domain_keyword: rule.domain_keyword.clone(),
+        domain_regex: rule.domain_regex.clone(),
+        invert: rule.invert,
+        ..RouteMatchConfig::default()
+    })
+}
+
+fn account_dns_rule_set_patterns(
+    patterns: &[String],
+    regex: bool,
+    budget: &mut DnsRuleSetBudget,
+) -> Result<(), String> {
+    budget.patterns = budget
+        .patterns
+        .checked_add(patterns.len())
+        .ok_or_else(|| "rule-set pattern count overflow".to_string())?;
+    if budget.patterns > MAX_DNS_RULE_SET_PATTERNS {
+        return Err(format!(
+            "rule-set contains {} patterns, limit is {MAX_DNS_RULE_SET_PATTERNS}",
+            budget.patterns
+        ));
+    }
+    if regex {
+        budget.regex_patterns = budget
+            .regex_patterns
+            .checked_add(patterns.len())
+            .ok_or_else(|| "rule-set regex count overflow".to_string())?;
+        if budget.regex_patterns > MAX_DNS_RULE_SET_REGEX_PATTERNS {
+            return Err(format!(
+                "rule-set contains {} regex patterns, limit is {MAX_DNS_RULE_SET_REGEX_PATTERNS}",
+                budget.regex_patterns
+            ));
+        }
+    }
+    for pattern in patterns {
+        if pattern.len() > MAX_DNS_RULE_SET_PATTERN_BYTES_PER_ENTRY {
+            return Err(format!(
+                "rule-set pattern is {} bytes, per-entry limit is {MAX_DNS_RULE_SET_PATTERN_BYTES_PER_ENTRY}",
+                pattern.len()
+            ));
+        }
+        budget.pattern_bytes = budget
+            .pattern_bytes
+            .checked_add(pattern.len())
+            .ok_or_else(|| "rule-set pattern byte count overflow".to_string())?;
+        if budget.pattern_bytes > MAX_DNS_RULE_SET_PATTERN_BYTES {
+            return Err(format!(
+                "rule-set patterns contain {} bytes, limit is {MAX_DNS_RULE_SET_PATTERN_BYTES}",
+                budget.pattern_bytes
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check if a client chain is direct-only (single hop with all direct protocol configs).
@@ -622,6 +1142,127 @@ fn is_chain_direct_only(chain: &ClientChain) -> bool {
             ConfigSelection::GroupName(_) => false,
         }),
     }
+}
+
+/// Mirror `ClientProxyChain`'s final-hop capability selection without opening
+/// sockets. A one-hop chain may use direct, UDP-over-TCP, or a native datagram
+/// protocol; in a multi-hop chain only the final protocol can terminate UDP
+/// over the already-established byte stream.
+fn chain_supports_udp(chain: &ClientChain) -> bool {
+    let (final_hop, is_initial_hop) = match &chain.hops {
+        OneOrSome::One(hop) => (hop, true),
+        OneOrSome::Some(hops) => (
+            hops.last()
+                .expect("OneOrSome::Some is guaranteed to be non-empty"),
+            false,
+        ),
+    };
+
+    let config_supports_udp = |config: &ClientConfig| {
+        (is_initial_hop && config.protocol.is_direct())
+            || config.protocol.supports_udp_over_tcp()
+            || (is_initial_hop && config.protocol.supports_native_udp())
+    };
+
+    match final_hop {
+        ClientChainHop::Single(ConfigSelection::Config(config)) => config_supports_udp(config),
+        ClientChainHop::Pool(selections) => selections.iter().any(|selection| match selection {
+            ConfigSelection::Config(config) => config_supports_udp(config),
+            ConfigSelection::GroupName(_) => false,
+        }),
+        ClientChainHop::Single(ConfigSelection::GroupName(_)) => false,
+    }
+}
+
+/// Validate the subset of a direct client config that the DNS QUIC socket
+/// binder can faithfully apply. Unlike the normal socket connector, the QUIC
+/// binder currently projects only `bind_interface` onto its native UDP socket.
+fn validate_quic_dns_direct_chains(chains: &[ClientChain]) -> std::io::Result<()> {
+    let mut bind_interfaces = Vec::new();
+
+    let mut validate_config = |config: &ClientConfig| -> std::io::Result<()> {
+        let mut unsupported = Vec::new();
+        if config.inet4_bind_address.is_some() {
+            unsupported.push("inet4_bind_address");
+        }
+        if config.inet6_bind_address.is_some() {
+            unsupported.push("inet6_bind_address");
+        }
+        if config.routing_mark != 0 {
+            unsupported.push("routing_mark");
+        }
+        if config.connect_timeout.is_some() {
+            unsupported.push("connect_timeout");
+        }
+        if config.bind_address_no_port {
+            unsupported.push("bind_address_no_port");
+        }
+        if !config.address.is_unspecified() {
+            unsupported.push("address");
+        }
+        if config.transport != Transport::default() {
+            unsupported.push("transport");
+        }
+        if config.tcp_settings.is_some() {
+            unsupported.push("tcp_settings");
+        }
+        if config.quic_settings.is_some() {
+            unsupported.push("quic_settings");
+        }
+
+        if !unsupported.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "QUIC-based DNS direct client_chain only supports bind_interface; unsupported fields: {}",
+                    unsupported.join(", ")
+                ),
+            ));
+        }
+
+        let bind_interface = match &config.bind_interface {
+            crate::option_util::NoneOrOne::One(value) => Some(value.clone()),
+            crate::option_util::NoneOrOne::Unspecified | crate::option_util::NoneOrOne::None => {
+                None
+            }
+        };
+        bind_interfaces.push(bind_interface);
+        Ok(())
+    };
+
+    for chain in chains {
+        let hop = match &chain.hops {
+            OneOrSome::One(hop) => hop,
+            OneOrSome::Some(_) => unreachable!("caller verified a direct-only chain"),
+        };
+        match hop {
+            ClientChainHop::Single(ConfigSelection::Config(config)) => validate_config(config)?,
+            ClientChainHop::Pool(selections) => {
+                for selection in selections.iter() {
+                    match selection {
+                        ConfigSelection::Config(config) => validate_config(config)?,
+                        ConfigSelection::GroupName(_) => {
+                            unreachable!("DNS client groups must be expanded before validation")
+                        }
+                    }
+                }
+            }
+            ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
+                unreachable!("DNS client groups must be expanded before validation")
+            }
+        }
+    }
+
+    if let Some(first) = bind_interfaces.first()
+        && bind_interfaces.iter().skip(1).any(|value| value != first)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "QUIC-based DNS direct client_chain entries must use the same bind_interface",
+        ));
+    }
+
+    Ok(())
 }
 
 fn validate_server_config(
@@ -882,10 +1523,109 @@ fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Resul
     Ok(())
 }
 
+fn contains_hysteria2(config: &ClientProxyConfig) -> bool {
+    match config {
+        ClientProxyConfig::Hysteria2 { .. } => true,
+        ClientProxyConfig::Tls(config) => contains_hysteria2(&config.protocol),
+        ClientProxyConfig::Reality { protocol, .. }
+        | ClientProxyConfig::ShadowTls { protocol, .. } => contains_hysteria2(protocol),
+        ClientProxyConfig::Websocket(config) => contains_hysteria2(&config.protocol),
+        _ => false,
+    }
+}
+
 fn validate_client_config(
     client_config: &mut ClientConfig,
     named_pems: &HashMap<String, String>,
 ) -> std::io::Result<()> {
+    let is_hysteria2 = client_config.protocol.is_hysteria2();
+    if !is_hysteria2 && contains_hysteria2(&client_config.protocol) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Hysteria2 cannot be nested inside TLS, Reality, ShadowTLS, or WebSocket; it owns its own QUIC/TLS transport",
+        ));
+    }
+    if is_hysteria2 {
+        if client_config.transport != Transport::Quic {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Hysteria2 requires transport: quic",
+            ));
+        }
+        if client_config.address.is_unspecified() || client_config.address.port() == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Hysteria2 requires a non-zero server address and port",
+            ));
+        }
+        if client_config.bind_address_no_port {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Hysteria2 does not support bind_address_no_port because its transport is UDP",
+            ));
+        }
+        if client_config.connect_timeout.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Hysteria2 connect_timeout is not supported because its UDP dial timeout is not implemented precisely",
+            ));
+        }
+    }
+    if client_config
+        .dns_resolver
+        .as_deref()
+        .is_some_and(|tag| tag.is_empty() || tag.trim() != tag)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dns_resolver must be a non-empty trimmed upstream tag",
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if client_config.routing_mark != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "routing_mark is only supported on Linux",
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if client_config.bind_address_no_port {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bind_address_no_port is only supported on Linux",
+        ));
+    }
+
+    if client_config.transport == Transport::Quic && !is_hysteria2 {
+        let mut unsupported = Vec::new();
+        if client_config.inet4_bind_address.is_some() {
+            unsupported.push("inet4_bind_address");
+        }
+        if client_config.inet6_bind_address.is_some() {
+            unsupported.push("inet6_bind_address");
+        }
+        if client_config.routing_mark != 0 {
+            unsupported.push("routing_mark");
+        }
+        if client_config.connect_timeout.is_some() {
+            unsupported.push("connect_timeout");
+        }
+        if client_config.bind_address_no_port {
+            unsupported.push("bind_address_no_port");
+        }
+        if !unsupported.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "QUIC transport does not support dialer socket fields: {}",
+                    unsupported.join(", ")
+                ),
+            ));
+        }
+    }
+
     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -993,6 +1733,28 @@ fn validate_client_proxy_config(
 
         ClientProxyConfig::Websocket(ws_config) => {
             validate_client_proxy_config(&mut ws_config.protocol, named_pems)?;
+        }
+
+        ClientProxyConfig::Hysteria2 {
+            obfs,
+            server_ports,
+            hop_interval,
+            ..
+        } => {
+            if !server_ports.is_empty() || hop_interval.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Hysteria2 server_ports/hop_interval port hopping is not supported; use server/server_port without hopping",
+                ));
+            }
+            if let Some(crate::config::Hysteria2ClientObfs::Salamander { password }) = obfs
+                && password.is_empty()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Hysteria2 salamander obfs password is required",
+                ));
+            }
         }
 
         _ => {}
@@ -1241,6 +2003,19 @@ fn validate_server_proxy_config(
                 }
             }
         }
+        ServerProxyConfig::Hysteria2 {
+            obfs, masquerade, ..
+        } => {
+            if obfs.is_some() && masquerade.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Hysteria2 masquerade requires obfs to be disabled",
+                ));
+            }
+            if let Some(masquerade) = masquerade {
+                crate::hysteria2_masquerade::validate_config(masquerade)?;
+            }
+        }
         ServerProxyConfig::TuicV5 { uuid, .. } => {
             parse_uuid(uuid)?;
         }
@@ -1326,9 +2101,12 @@ fn validate_rule_config(
 ) -> std::io::Result<()> {
     if let RuleActionConfig::Allow {
         ref mut client_chains,
+        ref client_chain_selection,
         ..
     } = rule_config.action
     {
+        validate_client_chain_selection(client_chain_selection)?;
+
         // Handle unspecified: default to single chain with direct hop
         if client_chains.is_unspecified() {
             *client_chains = NoneOrSome::One(ClientChain::default());
@@ -1353,6 +2131,62 @@ fn validate_rule_config(
             // Validate that direct connectors only appear at hop 0
             validate_direct_connector_positions(&chain.hops, chain_index)?;
         }
+    }
+
+    Ok(())
+}
+
+fn validate_client_chain_selection(
+    selection: &crate::config::ClientChainSelectionConfig,
+) -> std::io::Result<()> {
+    let crate::config::ClientChainSelectionConfig::UrlTest {
+        url,
+        interval_millis,
+        idle_timeout_millis,
+        ..
+    } = selection
+    else {
+        return Ok(());
+    };
+
+    if *interval_millis == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest interval_millis must be greater than zero",
+        ));
+    }
+    let idle_timeout_millis = if *idle_timeout_millis == 0 {
+        crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS
+    } else {
+        *idle_timeout_millis
+    };
+    if *interval_millis > idle_timeout_millis {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest interval_millis must be less than or equal to idle_timeout_millis",
+        ));
+    }
+
+    let link = if url.is_empty() {
+        "https://www.gstatic.com/generate_204"
+    } else {
+        url.as_str()
+    };
+    let parsed = url::Url::parse(link).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid client_chain_selection urltest URL {link:?}: {error}"),
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest URL must be an absolute HTTP or HTTPS URL without user info",
+        ));
     }
 
     Ok(())
@@ -1398,6 +2232,32 @@ fn validate_direct_connector_positions(
                      Direct connectors can only be used at hop 0 (the first hop) \
                      because they create the TCP connection. At hop 1+, the connection \
                      already exists through the previous hop.",
+                    chain_index, hop_index
+                ),
+            ));
+        }
+
+        let has_hysteria2 = match hop {
+            ClientChainHop::Single(ConfigSelection::Config(config)) => {
+                config.protocol.is_hysteria2()
+            }
+            ClientChainHop::Single(ConfigSelection::GroupName(_)) => {
+                unreachable!("Group references should be expanded before validation")
+            }
+            ClientChainHop::Pool(selections) => {
+                selections.iter().any(|selection| match selection {
+                    ConfigSelection::Config(config) => config.protocol.is_hysteria2(),
+                    ConfigSelection::GroupName(_) => {
+                        unreachable!("Group references should be expanded before validation")
+                    }
+                })
+            }
+        };
+        if has_hysteria2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Hysteria2 connector at chain {} hop {} is invalid. Hysteria2 must be hop 0 because it creates and owns its UDP/QUIC transport.",
                     chain_index, hop_index
                 ),
             ));
@@ -1525,7 +2385,228 @@ fn expand_selection(
 mod tests {
     use super::*;
     use crate::config::pem::convert_cert_paths;
+    use crate::config::types::{DnsPolicyRuleConfig, RouteRuleSetConfig};
     use crate::dns::IpStrategy;
+    use crate::routing::predicate::{RouteContext, RoutePredicate};
+
+    #[test]
+    fn hysteria2_client_validation_is_strict_about_transport_and_hopping() {
+        let parse = |extra: &str| {
+            serde_yaml::from_str::<ClientConfig>(&format!(
+                "address: 127.0.0.1:443\ntransport: quic\nprotocol:\n  type: hysteria2\n  password: secret\n{extra}"
+            ))
+            .unwrap()
+        };
+
+        let mut valid = parse("");
+        validate_client_config(&mut valid, &HashMap::new()).unwrap();
+
+        let mut wrong_transport = valid.clone();
+        wrong_transport.transport = Transport::Tcp;
+        assert!(
+            validate_client_config(&mut wrong_transport, &HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("transport: quic")
+        );
+
+        let mut hopping = parse("  server_ports: ['443', '8443']\n  hop_interval: 30s\n");
+        assert!(
+            validate_client_config(&mut hopping, &HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("port hopping")
+        );
+
+        let mut empty_obfs = parse("  obfs:\n    type: salamander\n    password: ''\n");
+        assert!(
+            validate_client_config(&mut empty_obfs, &HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("obfs password")
+        );
+
+        let mut custom_timeout = valid;
+        custom_timeout.connect_timeout = Some(std::time::Duration::from_secs(3));
+        assert!(
+            validate_client_config(&mut custom_timeout, &HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("connect_timeout")
+        );
+    }
+
+    #[test]
+    fn hysteria2_cannot_be_wrapped_or_placed_after_another_hop() {
+        let nested: ClientProxyConfig = serde_yaml::from_str(
+            "type: tls\nverify: false\nprotocol:\n  type: hysteria2\n  password: secret\n",
+        )
+        .unwrap();
+        let mut nested_config = ClientConfig {
+            protocol: nested,
+            ..ClientConfig::default()
+        };
+        assert!(
+            validate_client_config(&mut nested_config, &HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be nested")
+        );
+
+        let hysteria2: ClientConfig = serde_yaml::from_str(
+            "address: 127.0.0.1:443\ntransport: quic\nprotocol:\n  type: hysteria2\n  password: secret\n",
+        )
+        .unwrap();
+        let hops = OneOrSome::Some(vec![
+            ClientChainHop::Single(ConfigSelection::Config(ClientConfig::default())),
+            ClientChainHop::Single(ConfigSelection::Config(hysteria2)),
+        ]);
+        assert!(
+            validate_direct_connector_positions(&hops, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("Hysteria2 must be hop 0")
+        );
+    }
+
+    #[test]
+    fn urltest_selection_validation_is_strict() {
+        let valid = crate::config::ClientChainSelectionConfig::UrlTest {
+            url: "https://example.com/generate_204".to_string(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 1,
+            tolerance_millis: 0,
+            idle_timeout_millis: crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+        };
+        validate_client_chain_selection(&valid).unwrap();
+
+        let empty_url_uses_default = crate::config::ClientChainSelectionConfig::UrlTest {
+            url: String::new(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 30_000,
+            tolerance_millis: 50,
+            idle_timeout_millis: crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+        };
+        validate_client_chain_selection(&empty_url_uses_default).unwrap();
+
+        let zero_interval = crate::config::ClientChainSelectionConfig::UrlTest {
+            url: "http://example.com/".to_string(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 0,
+            tolerance_millis: 50,
+            idle_timeout_millis: crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+        };
+        assert!(
+            validate_client_chain_selection(&zero_interval)
+                .unwrap_err()
+                .to_string()
+                .contains("greater than zero")
+        );
+
+        let interval_exceeds_idle = crate::config::ClientChainSelectionConfig::UrlTest {
+            url: "http://example.com/".to_string(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 2,
+            tolerance_millis: 0,
+            idle_timeout_millis: 1,
+        };
+        assert!(
+            validate_client_chain_selection(&interval_exceeds_idle)
+                .unwrap_err()
+                .to_string()
+                .contains("less than or equal")
+        );
+
+        for invalid_url in [
+            "ftp://example.com/file",
+            "/relative-url",
+            "https://user:pass@example.com/",
+        ] {
+            let invalid = crate::config::ClientChainSelectionConfig::UrlTest {
+                url: invalid_url.to_string(),
+                use_native_roots: false,
+                reselect_on_connection_failure: false,
+                interval_millis: 1,
+                tolerance_millis: 0,
+                idle_timeout_millis: crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+            };
+            assert!(validate_client_chain_selection(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn dns_expansion_preserves_and_validates_urltest_chain_selection() {
+        let valid_yaml = r#"
+- dns_group: urltest-dns
+  dns_servers:
+    url: tcp://1.1.1.1
+    client_chain:
+      - direct
+      - direct
+    client_chain_selection:
+      type: urltest
+      url: https://www.gstatic.com/generate_204
+      interval_millis: 30000
+      tolerance_millis: 50
+      idle_timeout_millis: 1800000
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(valid_yaml).unwrap();
+        let validated = create_server_configs(configs).unwrap();
+        assert!(matches!(
+            &validated.dns_groups[0].specs[0].client_chain_selection,
+            crate::config::ClientChainSelectionConfig::UrlTest {
+                interval_millis: 30_000,
+                tolerance_millis: 50,
+                idle_timeout_millis: 1_800_000,
+                ..
+            }
+        ));
+
+        let invalid_yaml = valid_yaml.replace("interval_millis: 30000", "interval_millis: 0");
+        let configs: Vec<Config> = serde_yaml::from_str(&invalid_yaml).unwrap();
+        let error = create_server_configs(configs)
+            .err()
+            .expect("zero URLTest interval must be rejected");
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    fn expanded_tagged_system(tag: Option<&str>) -> ExpandedDnsSpec {
+        ExpandedDnsSpec {
+            tag: tag.map(String::from),
+            url: "system".to_string(),
+            server_name: None,
+            use_native_roots: false,
+            client_chains: Vec::new(),
+            client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
+            bootstrap_url: None,
+            ip_strategy: IpStrategy::default(),
+            timeout_secs: 5,
+            connect_timeout_secs: 5,
+            attempts: 1,
+        }
+    }
+
+    fn dns_policy_rule(action: DnsPolicyActionConfig) -> DnsPolicyRuleConfig {
+        DnsPolicyRuleConfig {
+            domain: Vec::new(),
+            domain_suffix: Vec::new(),
+            domain_keyword: Vec::new(),
+            domain_regex: Vec::new(),
+            rule_set: Vec::new(),
+            action,
+            server: None,
+            rcode: String::new(),
+            method: String::new(),
+            answer: Vec::new(),
+            ns: Vec::new(),
+            extra: Vec::new(),
+            timeout_millis: 0,
+        }
+    }
 
     async fn validate_configs_test(configs: Vec<Config>) -> std::io::Result<Vec<Config>> {
         let (converted_configs, _) = convert_cert_paths(configs).await?;
@@ -1543,9 +2624,12 @@ mod tests {
                 rule_group: "test-rules".to_string(),
                 rules: OneOrSome::One(RuleConfig {
                     masks: OneOrSome::One(NetLocationMask::ANY),
+                    match_config: None,
                     action: RuleActionConfig::Allow {
                         override_address: None,
                         client_chains: NoneOrSome::One(ClientChain::default()),
+                        client_chain_selection: crate::config::ClientChainSelectionConfig::default(
+                        ),
                     },
                 }),
             }),
@@ -1556,6 +2640,126 @@ mod tests {
         ];
 
         assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[test]
+    fn test_tcp_dialer_source_addresses_and_timeout_validate() {
+        let mut config = ClientConfig {
+            inet4_bind_address: Some("192.0.2.10".parse().unwrap()),
+            inet6_bind_address: Some("2001:db8::10".parse().unwrap()),
+            connect_timeout: Some(std::time::Duration::from_secs(8)),
+            ..Default::default()
+        };
+        assert!(validate_client_config(&mut config, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn test_quic_rejects_unimplemented_dialer_socket_fields() {
+        let mut config = ClientConfig {
+            transport: Transport::Quic,
+            inet4_bind_address: Some("192.0.2.10".parse().unwrap()),
+            inet6_bind_address: Some("2001:db8::10".parse().unwrap()),
+            connect_timeout: Some(std::time::Duration::from_secs(8)),
+            ..Default::default()
+        };
+        let error = validate_client_config(&mut config, &HashMap::new()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("QUIC"));
+        assert!(message.contains("inet4_bind_address"));
+        assert!(message.contains("inet6_bind_address"));
+        assert!(message.contains("connect_timeout"));
+    }
+
+    #[test]
+    fn test_dns_quic_direct_chain_rejects_unprojected_dialer_fields() {
+        let cases = [
+            (
+                ClientConfig {
+                    inet4_bind_address: Some("192.0.2.10".parse().unwrap()),
+                    ..Default::default()
+                },
+                "inet4_bind_address",
+            ),
+            (
+                ClientConfig {
+                    inet6_bind_address: Some("2001:db8::10".parse().unwrap()),
+                    ..Default::default()
+                },
+                "inet6_bind_address",
+            ),
+            (
+                ClientConfig {
+                    routing_mark: 100,
+                    ..Default::default()
+                },
+                "routing_mark",
+            ),
+            (
+                ClientConfig {
+                    connect_timeout: Some(std::time::Duration::from_secs(2)),
+                    ..Default::default()
+                },
+                "connect_timeout",
+            ),
+            (
+                ClientConfig {
+                    bind_address_no_port: true,
+                    ..Default::default()
+                },
+                "bind_address_no_port",
+            ),
+        ];
+
+        for (config, field) in cases {
+            let chain = ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
+            };
+            let error = validate_quic_dns_direct_chains(&[chain]).unwrap_err();
+            assert!(
+                error.to_string().contains(field),
+                "expected {field} rejection, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dns_quic_direct_chain_allows_one_shared_bind_interface() {
+        let direct = |bind_interface: &str| ClientChain {
+            hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                ClientConfig {
+                    bind_interface: crate::option_util::NoneOrOne::One(bind_interface.to_string()),
+                    ..Default::default()
+                },
+            ))),
+        };
+
+        assert!(validate_quic_dns_direct_chains(&[direct("eth0"), direct("eth0")]).is_ok());
+        let error = validate_quic_dns_direct_chains(&[direct("eth0"), direct("eth1")]).unwrap_err();
+        assert!(error.to_string().contains("same bind_interface"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_linux_only_dialer_fields_are_rejected_during_validation() {
+        for (mut config, field) in [
+            (
+                ClientConfig {
+                    routing_mark: 100,
+                    ..Default::default()
+                },
+                "routing_mark",
+            ),
+            (
+                ClientConfig {
+                    bind_address_no_port: true,
+                    ..Default::default()
+                },
+                "bind_address_no_port",
+            ),
+        ] {
+            let error = validate_client_config(&mut config, &HashMap::new()).unwrap_err();
+            assert!(error.to_string().contains(field));
+        }
     }
 
     #[tokio::test]
@@ -2138,15 +3342,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dns_policy_expansion_validates_tags_actions_and_patterns() {
+        let mut route = dns_policy_rule(DnsPolicyActionConfig::Route);
+        route.domain = vec!["exact.example".to_string()];
+        route.domain_suffix = vec!["example.net".to_string()];
+        route.domain_keyword = vec!["needle".to_string()];
+        route.domain_regex = vec![r"^api[0-9]+\.example$".to_string()];
+        route.server = Some("secondary".to_string());
+        route.timeout_millis = 1_250;
+        let predefined = dns_policy_rule(DnsPolicyActionConfig::Predefined);
+        let reject = dns_policy_rule(DnsPolicyActionConfig::Reject);
+        let group = DnsConfigGroup {
+            dns_group: "policy-dns".to_string(),
+            dns_servers: NoneOrSome::Unspecified,
+            final_server: Some("primary".to_string()),
+            rules: vec![route, predefined, reject],
+        };
+        let specs = vec![
+            expanded_tagged_system(Some("primary")),
+            expanded_tagged_system(Some("secondary")),
+        ];
+
+        let (final_server, rules) = expand_dns_policy(&group, &specs).unwrap();
+        assert_eq!(final_server.as_deref(), Some("primary"));
+        assert!(matches!(
+            &rules[0].action,
+            ExpandedDnsPolicyAction::Route(tag) if tag == "secondary"
+        ));
+        assert_eq!(rules[0].timeout_millis, 1_250);
+        assert!(matches!(
+            &rules[1].action,
+            ExpandedDnsPolicyAction::Predefined(response) if response.addresses.is_empty()
+        ));
+        assert!(matches!(
+            &rules[2].action,
+            ExpandedDnsPolicyAction::Reject(DnsRejectMethod::Default)
+        ));
+
+        let mut unknown = group.clone();
+        unknown.rules[0].server = Some("missing".to_string());
+        assert!(
+            expand_dns_policy(&unknown, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown upstream tag")
+        );
+
+        let untagged = vec![
+            expanded_tagged_system(Some("primary")),
+            expanded_tagged_system(None),
+        ];
+        assert!(
+            expand_dns_policy(&group, &untagged)
+                .unwrap_err()
+                .to_string()
+                .contains("has no tag")
+        );
+
+        let mut invalid_timeout = group.clone();
+        invalid_timeout.rules[1].timeout_millis = 1;
+        assert!(
+            expand_dns_policy(&invalid_timeout, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("timeout_millis")
+        );
+
+        let mut invalid_regex = group;
+        invalid_regex.rules[0].domain_regex = vec!["[unterminated".to_string()];
+        assert!(
+            expand_dns_policy(&invalid_regex, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("domain_regex")
+        );
+    }
+
+    #[test]
+    fn test_dns_policy_loads_domain_only_local_source_rule_set() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "shoes-dns-policy-{}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            br#"{"version":4,"rules":[{"domain_suffix":["ads.example"]}]}"#,
+        )
+        .unwrap();
+
+        let mut rule = dns_policy_rule(DnsPolicyActionConfig::Predefined);
+        rule.rule_set = vec![RouteRuleSetConfig {
+            format: "source".to_string(),
+            path: path.clone(),
+        }];
+        let group = DnsConfigGroup {
+            dns_group: "adblock-dns".to_string(),
+            dns_servers: NoneOrSome::Unspecified,
+            final_server: Some("system".to_string()),
+            rules: vec![rule],
+        };
+        let specs = vec![expanded_tagged_system(Some("system"))];
+        let (_, rules) = expand_dns_policy(&group, &specs).unwrap();
+        let matcher = RoutePredicate::compile(&RouteMatchConfig {
+            rule_set: rules[0].rule_set.clone(),
+            ..RouteMatchConfig::default()
+        })
+        .unwrap();
+        let location = crate::address::NetLocation::new(
+            crate::address::Address::Hostname("track.ads.example".to_string()),
+            53,
+        );
+        assert!(matcher.matches(&location, None, &RouteContext::default()));
+
+        // An IP-dependent SRS rule cannot be evaluated before DNS resolution;
+        // rejecting the whole reference prevents an accidental broad match.
+        std::fs::write(
+            &path,
+            br#"{"version":4,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}"#,
+        )
+        .unwrap();
+        let error = expand_dns_policy(&group, &specs).unwrap_err();
+        assert!(error.to_string().contains("cannot evaluate ip_cidr"));
+
+        // Domain-only rule-set arms share sing-box's destination-address OR
+        // category with direct domain fields.
+        std::fs::write(
+            &path,
+            br#"{"version":4,"rules":[{"domain_suffix":["ads.example"]}]}"#,
+        )
+        .unwrap();
+        let mut mixed = group;
+        mixed.rules[0].domain = vec!["direct.example".to_string()];
+        let (_, mixed_rules) = expand_dns_policy(&mixed, &specs).unwrap();
+        assert_eq!(mixed_rules[0].exact, ["direct.example"]);
+        assert_eq!(mixed_rules[0].rule_set.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn test_dns_system_with_client_chain_rejected() {
         let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
             dns_group: "test-dns".to_string(),
+            final_server: None,
+            rules: Vec::new(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                tag: None,
+                client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                 url: "system".to_string(),
                 client_chain: NoneOrSome::One(ConfigSelection::Config(ClientChain::default())),
                 bootstrap_url: None,
                 server_name: None,
+                use_native_roots: false,
                 ip_strategy: IpStrategy::default(),
                 timeout_secs: 10,
                 connect_timeout_secs: 5,
@@ -2181,13 +3532,18 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "udp://8.8.8.8".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "test-proxy".to_string(),
                     )),
                     bootstrap_url: None,
                     server_name: None,
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2217,13 +3573,18 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "udp://8.8.8.8".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "direct-chain".to_string(),
                     )),
                     bootstrap_url: None,
                     server_name: None,
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2236,30 +3597,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dns_h3_with_proxy_chain_rejected() {
+    async fn test_dns_quic_with_udp_capable_proxy_chain_allowed() {
         use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
 
-        // Create a non-direct (socks5) chain - should be rejected for H3.
-        let mut socks_config = ClientConfig::default();
-        socks_config.protocol = ClientProxyConfig::Socks {
-            username: None,
-            password: None,
+        let mut proxy_config = ClientConfig::default();
+        proxy_config.address =
+            crate::address::NetLocation::from_str("127.0.0.1:1080", None).unwrap();
+        proxy_config.protocol = ClientProxyConfig::Vless {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            udp_enabled: true,
+            packet_encoding: None,
+            h2mux: None,
         };
 
         let configs = vec![
             Config::ClientConfigGroup(ClientConfigGroup {
                 client_group: "test-proxy".to_string(),
-                client_proxies: OneOrSome::One(ConfigSelection::Config(socks_config)),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(proxy_config)),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
-                    url: "h3://1.1.1.1/dns-query".to_string(),
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
+                    url: "quic://94.140.14.14".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "test-proxy".to_string(),
                     )),
                     bootstrap_url: None,
-                    server_name: None,
+                    server_name: Some("dns.adguard-dns.com".to_string()),
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2268,13 +3637,96 @@ mod tests {
             }),
         ];
 
-        let result = validate_configs_test(configs).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("H3 DNS only supports direct client_chain"),
-            "Expected H3 DNS client_chain error, got: {err}"
-        );
+        assert!(validate_configs_test(configs).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_quic_with_unprojected_direct_dialer_fields_rejected() {
+        use crate::config::types::ClientConfigGroup;
+
+        let direct_config = ClientConfig {
+            inet4_bind_address: Some("192.0.2.10".parse().unwrap()),
+            connect_timeout: Some(std::time::Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "direct-chain".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(direct_config)),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
+                    url: "quic://94.140.14.14".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "direct-chain".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: Some("dns.adguard-dns.com".to_string()),
+                    use_native_roots: false,
+                    ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
+                    connect_timeout_secs: 5,
+                    attempts: 1,
+                }),
+            }),
+        ];
+
+        let error = validate_configs_test(configs)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("QUIC-based DNS direct client_chain"));
+        assert!(error.contains("inet4_bind_address"));
+        assert!(error.contains("connect_timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_dns_h3_with_udp_capable_proxy_chain_allowed() {
+        use crate::config::types::{ClientConfigGroup, ClientProxyConfig};
+
+        let mut proxy_config = ClientConfig::default();
+        proxy_config.address =
+            crate::address::NetLocation::from_str("127.0.0.1:1080", None).unwrap();
+        proxy_config.protocol = ClientProxyConfig::Vless {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            udp_enabled: true,
+            packet_encoding: None,
+            h2mux: None,
+        };
+
+        let configs = vec![
+            Config::ClientConfigGroup(ClientConfigGroup {
+                client_group: "test-proxy".to_string(),
+                client_proxies: OneOrSome::One(ConfigSelection::Config(proxy_config)),
+            }),
+            Config::DnsConfigGroup(DnsConfigGroup {
+                dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
+                dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
+                    url: "h3://1.1.1.1/dns-query".to_string(),
+                    client_chain: NoneOrSome::One(ConfigSelection::GroupName(
+                        "test-proxy".to_string(),
+                    )),
+                    bootstrap_url: None,
+                    server_name: None,
+                    use_native_roots: false,
+                    ip_strategy: IpStrategy::default(),
+                    timeout_secs: 10,
+                    connect_timeout_secs: 5,
+                    attempts: 1,
+                }),
+            }),
+        ];
+
+        assert!(validate_configs_test(configs).await.is_ok());
     }
 
     #[tokio::test]
@@ -2289,13 +3741,18 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "h3://1.1.1.1/dns-query".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "direct-chain".to_string(),
                     )),
                     bootstrap_url: None,
                     server_name: None,
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2318,13 +3775,18 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "tcp://8.8.8.8".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "test-proxy".to_string(),
                     )),
                     bootstrap_url: None,
                     server_name: None,
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2348,13 +3810,18 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "tls://1.1.1.1".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "test-proxy".to_string(),
                     )),
                     bootstrap_url: None,
                     server_name: None,
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2378,13 +3845,18 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "test-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
+                    tag: None,
+                    client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "https://1.1.1.1/dns-query".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
                         "test-proxy".to_string(),
                     )),
                     bootstrap_url: None,
                     server_name: None,
+                    use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
@@ -2403,6 +3875,8 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "base-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("udp://8.8.8.8".to_string()),
                     DnsServerSpec::Simple("udp://8.8.4.4".to_string()),
@@ -2410,6 +3884,8 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "full-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // Group reference
                     DnsServerSpec::Simple("tls://1.1.1.1".to_string()),
@@ -2431,10 +3907,14 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "level-a".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "level-b".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("level-a".to_string()),
                     DnsServerSpec::Simple("udp://1.1.1.1".to_string()),
@@ -2442,6 +3922,8 @@ mod tests {
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "level-c".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("level-b".to_string()),
                     DnsServerSpec::Simple("system".to_string()),
@@ -2463,10 +3945,14 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "group-a".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-b".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "group-b".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("group-a".to_string())),
             }),
         ];
@@ -2485,6 +3971,8 @@ mod tests {
         // Reference to non-existent group
         let configs = vec![Config::DnsConfigGroup(DnsConfigGroup {
             dns_group: "my-dns".to_string(),
+            final_server: None,
+            rules: Vec::new(),
             dns_servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent".to_string())),
         })];
 
@@ -2504,21 +3992,31 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "bootstrap-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "base-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tls://1.1.1.1".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "full-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::Some(vec![
                     DnsServerSpec::Simple("base-dns".to_string()), // Composition reference
                     DnsServerSpec::WithOptions {
+                        tag: None,
+                        client_chain_selection:
+                            crate::config::ClientChainSelectionConfig::RoundRobin,
                         url: "tls://8.8.4.4".to_string(), // IP-based, no resolution needed
                         client_chain: NoneOrSome::None,
                         bootstrap_url: Some("bootstrap-dns".to_string()), // Bootstrap reference (not used since URL is IP)
                         server_name: Some("dns.google".to_string()),      // SNI override
+                        use_native_roots: false,
                         ip_strategy: IpStrategy::default(),
                         timeout_secs: 10,
                         connect_timeout_secs: 5,
@@ -2546,6 +4044,8 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "my-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
@@ -2565,6 +4065,8 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    final_server: None,
+                    rules: Vec::new(),
                     servers: NoneOrSome::One(DnsServerSpec::Simple("my-dns".to_string())),
                 }),
             }),
@@ -2594,6 +4096,8 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "base-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::Server(ServerConfig {
@@ -2613,6 +4117,8 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    final_server: None,
+                    rules: Vec::new(),
                     servers: NoneOrSome::Some(vec![
                         DnsServerSpec::Simple("base-dns".to_string()), // group ref
                         DnsServerSpec::Simple("udp://1.1.1.1".to_string()), // URL
@@ -2650,10 +4156,14 @@ mod tests {
         let configs = vec![
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "fast-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("udp://8.8.8.8".to_string())),
             }),
             Config::DnsConfigGroup(DnsConfigGroup {
                 dns_group: "secure-dns".to_string(),
+                final_server: None,
+                rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::Simple("tcp://1.1.1.1".to_string())),
             }),
             Config::Server(ServerConfig {
@@ -2673,6 +4183,8 @@ mod tests {
                 quic_settings: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
+                    final_server: None,
+                    rules: Vec::new(),
                     servers: NoneOrSome::Some(vec![
                         DnsServerSpec::Simple("fast-dns".to_string()),
                         DnsServerSpec::Simple("secure-dns".to_string()),
@@ -2724,6 +4236,8 @@ mod tests {
             quic_settings: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
+                final_server: None,
+                rules: Vec::new(),
                 servers: NoneOrSome::One(DnsServerSpec::Simple("nonexistent-dns".to_string())),
             }),
         })];

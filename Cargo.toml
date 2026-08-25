@@ -7,6 +7,9 @@ members = [
     # Our additions live outside it.
     "crates/shoes-api",
     "crates/shoes-engine",
+    # The node-agent rewrite: ACP wire contract, then the agent itself.
+    "crates/acp-proto",
+    "crates/node-agent",
 ]
 
 [workspace.package]
@@ -18,26 +21,65 @@ publish = false
 shoes = { path = "shoes" }
 shoes-api = { path = "crates/shoes-api" }
 shoes-engine = { path = "crates/shoes-engine" }
+acp-proto = { path = "crates/acp-proto" }
+node-agent = { path = "crates/node-agent" }
 
 # Versions use "*" to match upstream shoes/Cargo.toml's convention; Cargo.lock
 # at the workspace root is the single source of truth for resolved versions.
 arc-swap = "*"
 async-trait = "*"
+base64 = "*"
+chrono = "*"
 dashmap = "*"
+hmac = "*"
+if-addrs = "*"
 log = { version = "*", features = ["std"] }
+prost = "*"
+rand = "*"
+rcgen = "*"
+reqwest = { version = "*", default-features = false, features = ["http2", "rustls-tls"] }
+rustls = "*"
+rustls-native-certs = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
 serde_yaml = "*"
+sha2 = "*"
 subtle = "*"
+sysinfo = "*"
+toml = "*"
 tokio = { version = "*", features = [
     "io-util",
     "macros",
     "net",
     "rt-multi-thread",
+    "signal",
     "sync",
     "time",
 ] }
+tokio-stream = { version = "*", features = ["net"] }
 tokio-util = { version = "*", features = ["time"] }
+url = "*"
+# gRPC. `tls-aws-lc` is not a free choice: shoes installs aws-lc-rs as the
+# process-wide rustls provider, and two providers in one process panic.
+tonic = { version = "*", features = [
+    "tls-aws-lc",
+    "tls-native-roots",
+    "tls-webpki-roots",
+] }
+tonic-prost = "*"
+tempfile = "*"
+windows = { version = "*", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+# Build-time only. protox is a pure-Rust protobuf compiler, so building this
+# workspace never requires a `protoc` on PATH.
+prost-build = "*"
+protox = "*"
+tonic-prost-build = "*"
 
 # Profiles must live at the workspace root; a member's [profile] is ignored.
 # These mirror shoes/Cargo.toml so release builds keep upstream's characteristics.

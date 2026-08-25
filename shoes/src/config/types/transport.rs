@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::address::{NetLocation, NetLocationPortRange};
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
 
-use super::common::default_true;
+use super::common::{default_true, is_false};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -81,6 +81,10 @@ pub struct ServerQuicConfig {
 pub struct ClientQuicConfig {
     #[serde(default = "default_true")]
     pub verify: bool,
+    /// Use the operating system's trust policy instead of shoes' bundled
+    /// Mozilla/WebPKI roots. Omitted/false preserves historical shoes YAML.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_native_roots: bool,
     #[serde(alias = "server_fingerprint", default)]
     pub server_fingerprints: NoneOrSome<String>,
     #[serde(default)]
@@ -97,6 +101,7 @@ impl Default for ClientQuicConfig {
     fn default() -> Self {
         Self {
             verify: true,
+            use_native_roots: false,
             server_fingerprints: NoneOrSome::Unspecified,
             sni_hostname: NoneOrOne::Unspecified,
             alpn_protocols: NoneOrSome::Unspecified,

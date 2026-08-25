@@ -17,7 +17,7 @@ use crate::anytls::anytls_server_session::AnyTlsSession;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::dynamic::{UserRegistry, bind_connection_user};
+use crate::dynamic::{UserRegistry, bind_connection_user, current_connection};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
@@ -111,6 +111,7 @@ impl TcpServerHandler for AnyTlsServerHandler {
         let auth_data = reader.peek_slice(&mut server_stream, 32).await?;
         let hash: [u8; 32] = auth_data.try_into().expect("peek_slice returned 32 bytes");
 
+        let meter = current_connection();
         let user_name = match self.users.find_password_sha256(&hash) {
             Some(user) => {
                 log::debug!("AnyTLS user authenticated: {}", user.id());
@@ -120,7 +121,12 @@ impl TcpServerHandler for AnyTlsServerHandler {
                 // the TLS handshake already counted against nobody over to whoever
                 // just proved they own it. Inline on the accepting task, before the
                 // session is spawned, which is what lets the task local reach it.
-                bind_connection_user(&user);
+                if !bind_connection_user(&user) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "user could not be admitted: removed, suspended, or at their connection limit",
+                    ));
+                }
                 user.id().to_string()
             }
             None => {
@@ -161,9 +167,28 @@ impl TcpServerHandler for AnyTlsServerHandler {
             initial_data,
         );
 
-        // Run the session in a background task
+        // Hyper-style session ownership outlives this setup future. Carry the
+        // connection context across that spawn so removing the user can close the
+        // whole multiplexed session, including child streams waiting on routing.
         tokio::spawn(async move {
-            if let Err(e) = session.run().await {
+            let result = if let Some(meter) = meter {
+                tokio::select! {
+                    result = session.run_core() => result,
+                    () = meter.cancelled() => {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "user removed",
+                        ))
+                    }
+                }
+            } else {
+                session.run_core().await
+            };
+            // The selected core future is now gone, so this is the sole cleanup
+            // owner and cannot be cancelled by the select above.
+            session.close().await;
+
+            if let Err(e) = result {
                 log::debug!("AnyTLS session ended: {}", e);
             }
         });

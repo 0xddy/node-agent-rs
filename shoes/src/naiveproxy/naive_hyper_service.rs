@@ -169,6 +169,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
     if use_h2 {
         // HTTP/2 for NaiveProxy clients
         tokio::spawn(async move {
+            let removal_meter = service_config.meter.clone();
             let service = hyper::service::service_fn(move |req| {
                 let config = service_config.clone();
                 async move { naive_service(req, config).await }
@@ -177,16 +178,37 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             // H2 settings tuned for reasonable throughput without excessive memory
             // Reference naiveproxy uses ~64KB default, we use 256 KB for better throughput
             const WINDOW_SIZE: u32 = 256 * 1024; // 256 KB (was 16 MB)
-            const MAX_FRAME_SIZE: u32 = (1 << 24) - 1; // ~16 MB (max allowed by HTTP/2)
+            // `max_frame_size` is advertised *to the peer*: it is the largest single frame they
+            // may send us, and therefore what our HTTP/2 layer must be prepared to buffer
+            // before a byte of it can be handed on. The old value was the protocol maximum,
+            // which is not a throughput setting so much as an absence of one -- the framing
+            // overhead it saves over 64 KiB is 9 bytes in 65536. sing-mux advertises 32 KiB
+            // here for the same reason.
+            const MAX_FRAME_SIZE: u32 = 64 * 1024; // 64 KiB, matching COPY_BUF_SIZE
 
-            let result = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                 .auto_date_header(false)
                 .initial_stream_window_size(WINDOW_SIZE)
                 .initial_connection_window_size(WINDOW_SIZE)
                 .max_frame_size(MAX_FRAME_SIZE)
-                .max_concurrent_streams(1024)
-                .serve_connection(io, service)
-                .await;
+                // Each concurrent stream is a live CONNECT tunnel holding a pair of
+                // `COPY_BUF_SIZE` buffers, so this number is the multiplier on this
+                // connection's memory ceiling -- see `handle_naive_stream`. 256 is
+                // still far more simultaneous tunnels than a client driving a browser
+                // opens, and a client that does hit it has its extra streams queued by
+                // its own HTTP/2 layer rather than refused.
+                .max_concurrent_streams(256)
+                .serve_connection(io, service);
+
+            let result = if let Some(meter) = removal_meter {
+                tokio::select! {
+                    biased;
+                    () = meter.cancelled() => return,
+                    result = connection => result,
+                }
+            } else {
+                connection.await
+            };
 
             if let Err(e) = result {
                 debug!("Naive HTTP/2 connection error: {}", e);
@@ -295,12 +317,20 @@ async fn naive_service(
                 // first, and the meter has no way to separate them afterwards. One
                 // connection, one user; a client wanting to be somebody else opens
                 // another.
-                if let Some(meter) = &config.meter
-                    && !meter.bind_or_matches(&user)
-                {
+                if let Some(meter) = &config.meter {
+                    if !meter.bind_or_matches(&user) {
+                        debug!(
+                            "NaiveProxy: a second user on a connection already bound to \
+                             another, returning 400"
+                        );
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(empty_body())
+                            .unwrap());
+                    }
+                } else if !user.admit_unmetered() {
                     debug!(
-                        "NaiveProxy: a second user on a connection already bound to \
-                         another, returning 400"
+                        "NaiveProxy: user could not be admitted: removed, suspended, or at their connection limit"
                     );
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
@@ -358,17 +388,31 @@ async fn naive_service(
     let resolver = config.resolver.clone();
     let proxy_selector = config.proxy_selector.clone();
     let udp_enabled = config.udp_enabled;
+    let removal_meter = config.meter.clone();
 
     tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                let io = HyperUpgradedStream(TokioIo::new(upgraded));
+        let tunnel = async move {
+            match on_upgrade.await {
+                Ok(upgraded) => {
+                    let io = HyperUpgradedStream(TokioIo::new(upgraded));
 
-                if padding_type != PaddingType::None {
-                    let stream =
-                        NaivePaddingStream::new(io, PaddingDirection::Server, padding_type);
-                    if let Err(e) = handle_naive_stream(
-                        stream,
+                    if padding_type != PaddingType::None {
+                        let stream =
+                            NaivePaddingStream::new(io, PaddingDirection::Server, padding_type);
+                        if let Err(e) = handle_naive_stream(
+                            stream,
+                            destination,
+                            resolver,
+                            proxy_selector,
+                            udp_enabled,
+                            &username,
+                        )
+                        .await
+                        {
+                            debug!("NaiveProxy tunnel error: {}", e);
+                        }
+                    } else if let Err(e) = handle_naive_stream(
+                        io,
                         destination,
                         resolver,
                         proxy_selector,
@@ -379,22 +423,21 @@ async fn naive_service(
                     {
                         debug!("NaiveProxy tunnel error: {}", e);
                     }
-                } else if let Err(e) = handle_naive_stream(
-                    io,
-                    destination,
-                    resolver,
-                    proxy_selector,
-                    udp_enabled,
-                    &username,
-                )
-                .await
-                {
-                    debug!("NaiveProxy tunnel error: {}", e);
+                }
+                Err(e) => {
+                    debug!("NaiveProxy upgrade failed: {}", e);
                 }
             }
-            Err(e) => {
-                debug!("NaiveProxy upgrade failed: {}", e);
+        };
+
+        if let Some(meter) = removal_meter {
+            tokio::select! {
+                biased;
+                () = meter.cancelled() => {}
+                () = tunnel => {}
             }
+        } else {
+            tunnel.await;
         }
     });
 
@@ -572,7 +615,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
                 let uot_v2_stream = UotV2Stream::new(stream);
 
                 let action = proxy_selector
-                    .judge(destination.clone().into(), &resolver)
+                    .judge_udp(destination.clone().into(), &resolver)
                     .await?;
 
                 match action {
@@ -620,7 +663,7 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
     );
 
     let action = proxy_selector
-        .judge(remote_location.clone().into(), &resolver)
+        .judge_tcp(remote_location.clone().into(), &resolver)
         .await?;
 
     let mut client_stream: Box<dyn AsyncStream> = match action {
@@ -637,8 +680,18 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         }
     };
 
-    // Use larger buffers for better throughput (default 8KB is too small)
-    const COPY_BUF_SIZE: usize = 256 * 1024;
+    // Larger than the 16 KiB default, because a single CONNECT tunnel here carries a
+    // whole client connection and the default costs syscalls on a fast link.
+    //
+    // But not as large as it wants to be. This pair of buffers is charged per
+    // *stream*, not per connection, and NaiveProxy multiplexes every CONNECT over one
+    // HTTP/2 connection -- so the real figure is this number, doubled for the two
+    // directions, times `max_concurrent_streams`. At the 256 KiB it used to be that
+    // came to half a gigabyte for one authenticated client, which is a resource
+    // exhaustion an ordinary user reaches by accident and a malicious one reaches on
+    // purpose. 64 KiB is what the reference implementation uses, and keeps the
+    // ceiling in tens of megabytes.
+    const COPY_BUF_SIZE: usize = 64 * 1024;
     let result = copy_bidirectional_with_sizes(
         &mut stream,
         &mut client_stream,

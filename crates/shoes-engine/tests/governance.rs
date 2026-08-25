@@ -30,6 +30,9 @@ fn user(id: &str, uuid: &str) -> UserSpec {
         uuid: Some(uuid.to_string()),
         password: None,
         enabled: true,
+        max_conns: None,
+        upload_limit_bps: None,
+        download_limit_bps: None,
     }
 }
 

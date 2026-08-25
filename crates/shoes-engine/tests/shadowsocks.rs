@@ -234,15 +234,20 @@ async fn shadowsocks_users_are_found_by_their_identity_header() {
         reach(bob_leg, sink.address).await.is_ok(),
     );
 
-    // -- 8. removal is forward-looking only ------------------------------------
-    checks.section("8. removing a user leaves their open connection alone");
+    // -- 8. removal closes existing sessions -----------------------------------
+    checks.section("8. removing a user closes their open connection");
     let mut held = Socks::connect(bob_leg, sink.address)
         .await
         .expect("bob should be able to open a connection");
     held.write_all(b"wh").await.expect("send half a request");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    checks.that("bob is removed", engine.remove_user("ss", "bob").is_ok());
+    let removed =
+        tokio::time::timeout(Duration::from_secs(5), engine.remove_user("ss", "bob")).await;
+    checks.that(
+        "bob is removed after his connection drains",
+        matches!(removed, Ok(Ok(ref user)) if user.conns == 0),
+    );
     checks.that(
         "a new bob connection is refused",
         denied(bob_leg, sink.address).await,
@@ -252,12 +257,11 @@ async fn shadowsocks_users_are_found_by_their_identity_header() {
         reach(alice_leg, sink.address).await.is_ok(),
     );
 
-    held.write_all(b"o\n").await.expect("send the second half");
-    checks.eq(
-        "bob's already-open connection still completes",
-        read_line(&mut held).await.ok(),
-        Some("sink".to_string()),
-    );
+    let closed = match held.write_all(b"o\n").await {
+        Err(_) => true,
+        Ok(()) => read_line(&mut held).await.is_err(),
+    };
+    checks.that("bob's already-open connection is actively closed", closed);
     drop(held);
 
     checks.finish();
