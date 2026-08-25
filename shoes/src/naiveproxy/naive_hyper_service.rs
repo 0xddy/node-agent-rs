@@ -234,7 +234,10 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         });
     }
 
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    // Hyper owns the stream now, but Basic authentication happens later on an
+    // individual request. Do not let this handoff authenticate an outer QUIC
+    // transport before such a request exists.
+    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
 }
 
 /// HTTP/1.1 fallback service - only serves static files, no proxy functionality

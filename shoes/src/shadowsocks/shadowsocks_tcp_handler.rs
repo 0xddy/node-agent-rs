@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use log::debug;
@@ -15,10 +14,10 @@ use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksUdpMode;
 use crate::dynamic::{UserContext, UserRegistry, bind_connection_user, current_connection};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
-use crate::replay_filter::ReplayFilter;
 use crate::resolver::Resolver;
 use crate::socks_handler::{read_location, write_location_to_vec};
 use crate::stream_reader::StreamReader;
+use crate::tcp::inbound_replay::{ShadowsocksSaltFilter, new_shadowsocks_salt_filter};
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -140,13 +139,33 @@ impl ShadowsocksTcpHandler {
         }
     }
 
-    /// Create a new AEAD2022 handler for server use
+    /// Create one standalone AEAD2022 server handler with a fresh salt namespace.
+    /// Built-in multi-bind/reload listeners inject one inbound-scoped filter into
+    /// every handler generation instead.
     pub fn new_aead2022_server(
         cipher: ShadowsocksCipher,
         key_bytes: &[u8],
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
+    ) -> Self {
+        Self::new_aead2022_server_with_replay_filter(
+            cipher,
+            key_bytes,
+            udp_enabled,
+            proxy_selector,
+            resolver,
+            new_shadowsocks_salt_filter(),
+        )
+    }
+
+    pub(crate) fn new_aead2022_server_with_replay_filter(
+        cipher: ShadowsocksCipher,
+        key_bytes: &[u8],
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        salt_checker: ShadowsocksSaltFilter,
     ) -> Self {
         let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(Blake3Key::new(
             key_bytes.to_vec().into_boxed_slice(),
@@ -156,7 +175,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(ReplayFilter::new(SALT_WINDOW)))),
+            salt_checker: Some(salt_checker),
             udp_mode: if udp_enabled {
                 ShadowsocksUdpMode::Uot
             } else {
@@ -194,7 +213,7 @@ impl ShadowsocksTcpHandler {
             cipher,
             key,
             aead2022: true,
-            salt_checker: Some(Arc::new(Mutex::new(ReplayFilter::new(SALT_WINDOW)))),
+            salt_checker: Some(new_shadowsocks_salt_filter()),
             udp_mode,
             udp_codec_config,
             proxy_selector: None,
@@ -213,6 +232,10 @@ impl ShadowsocksTcpHandler {
     /// This is the only 2022 arrangement that can serve more than one user, and it
     /// exists only for the AES ciphers, so an unsuitable cipher is refused here rather
     /// than accepted into an inbound nobody can reach.
+    ///
+    /// This public constructor represents one standalone inbound and creates a
+    /// fresh salt namespace. Built-in listeners share an inbound-scoped filter
+    /// across bind addresses and reload generations.
     pub fn new_aead2022_multi_user_server(
         cipher: ShadowsocksCipher,
         identity_psk: &[u8],
@@ -220,6 +243,26 @@ impl ShadowsocksTcpHandler {
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
+    ) -> std::io::Result<Self> {
+        Self::new_aead2022_multi_user_server_with_replay_filter(
+            cipher,
+            identity_psk,
+            users,
+            udp_enabled,
+            proxy_selector,
+            resolver,
+            new_shadowsocks_salt_filter(),
+        )
+    }
+
+    pub(crate) fn new_aead2022_multi_user_server_with_replay_filter(
+        cipher: ShadowsocksCipher,
+        identity_psk: &[u8],
+        users: Arc<dyn UserRegistry>,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        salt_checker: ShadowsocksSaltFilter,
     ) -> std::io::Result<Self> {
         if !eih::supports_identity_headers(&cipher) {
             return Err(std::io::Error::new(
@@ -234,8 +277,14 @@ impl ShadowsocksTcpHandler {
 
         // `key` ends up holding the identity PSK, which is never used as a session key
         // on this path: `setup_server_stream` resolves one per connection.
-        let mut handler =
-            Self::new_aead2022_server(cipher, identity_psk, udp_enabled, proxy_selector, resolver);
+        let mut handler = Self::new_aead2022_server_with_replay_filter(
+            cipher,
+            identity_psk,
+            udp_enabled,
+            proxy_selector,
+            resolver,
+            salt_checker,
+        );
         handler.identity = Some(IdentityRole::Server {
             identity_psk: identity_psk.to_vec().into_boxed_slice(),
             users,
@@ -389,10 +438,6 @@ fn check_psk_len(cipher: &ShadowsocksCipher, len: usize) -> std::io::Result<()> 
     }
     Ok(())
 }
-
-/// How long a Shadowsocks AEAD salt is remembered, per SIP022: "salts only have to
-/// be stored for 60 seconds".
-const SALT_WINDOW: Duration = Duration::from_secs(60);
 
 #[async_trait]
 impl TcpServerHandler for ShadowsocksTcpHandler {

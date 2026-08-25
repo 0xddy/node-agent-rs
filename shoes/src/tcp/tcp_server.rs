@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 use super::handshake_gate::{
     HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
 };
-use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
-use super::tcp_server_handler_factory::create_tcp_server_handler;
+use super::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
+use super::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
 
 use crate::address::NetLocation;
 use crate::async_stream::AsyncMessageStream;
@@ -31,7 +31,9 @@ use crate::dynamic::{
 };
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
-use crate::routing::protocol::{SniffedTcpMetadata, sniff_tcp};
+use crate::routing::protocol::{
+    SniffedTcpMetadata, TcpPrefixClassification, classify_tcp_prefix, sniff_tcp,
+};
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
@@ -263,15 +265,17 @@ where
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
-            connection_success_response,
+            mut connection_success_response,
             initial_remote_data,
         } => {
             let mut replay = initial_remote_data.map(Vec::from).unwrap_or_default();
-            let sniffed = if proxy_selector.needs_tcp_protocol_sniff() {
-                sniff_tcp(&mut server_stream, &mut replay).await?
-            } else {
-                None
-            };
+            let sniffed = sniff_tcp_after_success_response(
+                &mut server_stream,
+                proxy_selector.needs_tcp_sniff(),
+                &mut connection_success_response,
+                &mut replay,
+            )
+            .await?;
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
                 setup_client_tcp_stream_with_metadata(
@@ -392,12 +396,50 @@ where
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled => {
+        TcpServerSetupResult::AlreadyHandled
+        | TcpServerSetupResult::UnauthenticatedFallbackHandled => {
             // Connection is being handled by a spawned task (e.g., Reality fallback).
             // Nothing more to do here.
             Ok(())
         }
     }
+}
+
+/// Sniff application bytes without deadlocking response-gated inbound protocols.
+///
+/// SOCKS5, HTTP CONNECT and Snell clients do not send application data until the
+/// inbound acknowledges their tunnel request. When a protocol rule needs sniffed
+/// metadata, that acknowledgement therefore has to be written *and flushed* before
+/// [`sniff_tcp`] is allowed to read. Taking the response here also prevents the
+/// normal post-connect path from sending it twice. Protocols without a response and
+/// handshakes which already supplied early data retain the same replay-safe sniffer.
+pub(crate) async fn sniff_tcp_after_success_response(
+    server_stream: &mut Box<dyn AsyncStream>,
+    should_sniff: bool,
+    connection_success_response: &mut Option<Box<[u8]>>,
+    replay: &mut Vec<u8>,
+) -> std::io::Result<Option<SniffedTcpMetadata>> {
+    if !should_sniff {
+        return Ok(None);
+    }
+
+    // A complete handshake-carried payload can be classified without client I/O,
+    // so preserve the usual "success after outbound connect" timing in that case.
+    // Only the NeedMore branch can block on a response-gated client.
+    match classify_tcp_prefix(replay) {
+        TcpPrefixClassification::Matched(metadata) => return Ok(Some(metadata)),
+        TcpPrefixClassification::NoMatch => return Ok(None),
+        TcpPrefixClassification::NeedMore => {}
+    }
+
+    if let Some(response) = connection_success_response.take() {
+        write_all(server_stream, &response).await?;
+        // This flush cannot be deferred to copy_bidirectional: the client may be
+        // waiting for these bytes before it produces anything for the sniffer.
+        server_stream.flush().await?;
+    }
+
+    sniff_tcp(server_stream, replay).await
 }
 
 pub async fn setup_client_tcp_stream(
@@ -572,11 +614,13 @@ async fn start_tcp_servers(
     // later update changing one is refused rather than silently ignored.
     let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
     handle.record_listener_settings(&config);
+    let replay_state = handle.replay_state();
 
     let ServerConfig {
         bind_location,
         tcp_settings,
         protocol,
+        sniff,
         rules,
         ..
     } = config;
@@ -594,9 +638,10 @@ async fn start_tcp_servers(
 
     let tcp_config = tcp_settings.unwrap_or_else(TcpConfig::default);
 
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector_with_sniff_policy(
         rules.clone(),
         resolver.clone(),
+        sniff,
     ));
 
     match bind_location {
@@ -606,12 +651,13 @@ async fn start_tcp_servers(
                     // Shares protocol state across ports without reusing an
                     // interface-specific UDP bind IP.
                     let handler_slot = handle.slot_for_ip(socket_addr.ip(), &resolver, || {
-                        create_tcp_server_handler(
+                        create_tcp_server_handler_with_replay_state(
                             protocol.clone(),
                             &client_proxy_selector,
                             &resolver,
                             Some(socket_addr.ip()),
                             users.as_ref(),
+                            &replay_state,
                         )
                         .into()
                     });
@@ -635,14 +681,16 @@ async fn start_tcp_servers(
             #[cfg(target_family = "unix")]
             {
                 let handler_slot = handle.slot_for_path(
-                    create_tcp_server_handler(
+                    create_tcp_server_handler_with_replay_state(
                         protocol,
                         &client_proxy_selector,
                         &resolver,
                         None,
                         users.as_ref(),
+                        &replay_state,
                     )
                     .into(),
+                    &resolver,
                 );
                 debug!("TCP handler: {handler_slot:?}");
                 let cancel = handle.cancel_token();
@@ -663,4 +711,136 @@ async fn start_tcp_servers(
     }
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    use super::sniff_tcp_after_success_response;
+    use crate::async_stream::{AsyncPing, AsyncStream};
+    use crate::routing::predicate::RouteProtocol;
+
+    struct TestDuplexStream(tokio::io::DuplexStream);
+
+    impl AsyncRead for TestDuplexStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestDuplexStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestDuplexStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            unreachable!("test stream does not support ping")
+        }
+    }
+
+    impl AsyncStream for TestDuplexStream {}
+
+    #[tokio::test]
+    async fn tunnel_success_response_is_flushed_before_sniff_reads_payload() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: sniff.example\r\n\r\n";
+
+        let (server, mut client) = tokio::io::duplex(1024);
+        let client_task = tokio::spawn(async move {
+            let mut response = vec![0; RESPONSE.len()];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, RESPONSE);
+            client.write_all(REQUEST).await.unwrap();
+        });
+
+        let mut stream: Box<dyn AsyncStream> = Box::new(TestDuplexStream(server));
+        let mut response = Some(RESPONSE.to_vec().into_boxed_slice());
+        let mut replay = Vec::new();
+        let metadata = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sniff_tcp_after_success_response(&mut stream, true, &mut response, &mut replay),
+        )
+        .await
+        .expect("the response-gated client must not wait for the 300 ms sniff timeout")
+        .unwrap()
+        .expect("HTTP request should be classified");
+
+        client_task.await.unwrap();
+        assert!(response.is_none(), "the normal path must not send it twice");
+        assert_eq!(replay, REQUEST);
+        assert_eq!(metadata.protocol, RouteProtocol::Http);
+        assert_eq!(metadata.domain.as_deref(), Some("sniff.example"));
+    }
+
+    #[tokio::test]
+    async fn existing_early_data_is_classified_without_touching_the_stream() {
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: early.example\r\n\r\n";
+        let (server, _client) = tokio::io::duplex(64);
+        let mut stream: Box<dyn AsyncStream> = Box::new(TestDuplexStream(server));
+        let mut response = Some(Box::from(&b"ok"[..]));
+        let mut replay = REQUEST.to_vec();
+
+        let metadata = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            sniff_tcp_after_success_response(&mut stream, true, &mut response, &mut replay),
+        )
+        .await
+        .expect("complete early data must not wait for a read")
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(metadata.domain.as_deref(), Some("early.example"));
+        assert_eq!(replay, REQUEST);
+        assert_eq!(
+            response.as_deref(),
+            Some(&b"ok"[..]),
+            "classification without a read keeps the normal post-connect response timing"
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_without_protocol_rules_leaves_deferred_response_untouched() {
+        let (server, _client) = tokio::io::duplex(64);
+        let mut stream: Box<dyn AsyncStream> = Box::new(TestDuplexStream(server));
+        let mut response = Some(Box::from(&b"ok"[..]));
+        let mut replay = b"early".to_vec();
+
+        let metadata =
+            sniff_tcp_after_success_response(&mut stream, false, &mut response, &mut replay)
+                .await
+                .unwrap();
+
+        assert!(metadata.is_none());
+        assert_eq!(response.as_deref(), Some(&b"ok"[..]));
+        assert_eq!(replay, b"early");
+    }
 }

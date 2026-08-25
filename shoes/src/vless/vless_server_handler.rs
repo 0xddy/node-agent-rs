@@ -121,7 +121,7 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
         }
     });
 
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
 }
 
 #[async_trait]

@@ -491,6 +491,17 @@ async fn both_protocols_compile_to_engine_accepted_native_shoes_json() {
         vless.spec.config["protocol"]["reality_targets"]["example.com"]["vision"],
         true
     );
+    assert_eq!(vless.spec.config["sniff"], false);
+    let hysteria2 = output
+        .runtime
+        .inbounds
+        .iter()
+        .find(|inbound| inbound.protocol == "hysteria2")
+        .unwrap();
+    assert!(
+        hysteria2.spec.config.get("sniff").is_none(),
+        "Hysteria2 has no provider sniff switch and must retain Shoes auto mode"
+    );
     let user = &vless.spec.users.as_ref().unwrap()[0];
     assert_eq!(user.upload_limit_bps, Some(1_000_000));
     assert_eq!(user.download_limit_bps, Some(2_000_000));
@@ -1962,6 +1973,7 @@ fn protocol_route_rules_require_provider_sniff_and_compile_http_tls_only() {
     });
 
     let compiled = compile_with_warnings(&top).expect("sniff-enabled VLESS supports protocol");
+    assert_eq!(compiled.runtime.inbounds[0].spec.config["sniff"], true);
     assert_eq!(
         compiled.runtime.inbounds[0].spec.config["rules"][0]["match"]["protocol"],
         json!(["tls", "http"])
@@ -1987,10 +1999,11 @@ fn protocol_route_rules_require_provider_sniff_and_compile_http_tls_only() {
         vec![],
     )];
     top.route.as_mut().unwrap().rules[0].protocol = vec!["tls".into()];
-    let error = compile_with_warnings(&top).unwrap_err().to_string();
-    assert!(
-        error.contains("Hysteria2 has no panel sniff option"),
-        "{error}"
+    let compiled = compile_with_warnings(&top)
+        .expect("Hysteria2 uses engine-level demand-driven protocol sniffing");
+    assert_eq!(
+        compiled.runtime.inbounds[0].spec.config["rules"][0]["match"]["protocol"],
+        json!(["tls"])
     );
 }
 

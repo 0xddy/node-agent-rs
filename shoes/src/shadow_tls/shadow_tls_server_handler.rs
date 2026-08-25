@@ -246,7 +246,7 @@ async fn shadowtls_fallback_to_handshake_server(
         }
     });
 
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
 }
 
 #[inline]
@@ -329,7 +329,7 @@ pub async fn setup_shadowtls_server_stream(
         });
 
     if let Ok(ref setup_result) = target_setup_result
-        && matches!(setup_result, TcpServerSetupResult::AlreadyHandled)
+        && setup_result.is_already_handled()
     {
         return target_setup_result;
     }

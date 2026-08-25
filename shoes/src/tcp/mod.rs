@@ -1,5 +1,6 @@
 pub mod chain_builder;
 pub mod handshake_gate;
+pub(crate) mod inbound_replay;
 pub mod proxy_connector;
 pub mod proxy_connector_impl;
 pub mod socket_connector;

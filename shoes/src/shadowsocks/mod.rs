@@ -2,7 +2,7 @@ mod aead_util;
 mod blake3_key;
 mod default_key;
 mod eih;
-mod salt_checker;
+pub(crate) mod salt_checker;
 mod shadowsocks_cipher;
 mod shadowsocks_key;
 mod shadowsocks_stream;

@@ -21,7 +21,8 @@ pub mod digest;
 /// `x-acp-topology-digest` header before comparing it.
 pub mod hex;
 
-/// SHA-256 of `proto/acp.proto`, as a guard against silent divergence.
+/// SHA-256 of the LF-normalized `proto/acp.proto`, as a guard against silent
+/// divergence.
 ///
 /// `acp.proto` is shared with `panel-api-server`; this crate holds a *copy*, not
 /// a fork. If the upstream contract changes, this constant must be updated in
@@ -43,8 +44,11 @@ mod tests {
 
     #[test]
     fn the_vendored_proto_matches_its_recorded_checksum() {
-        let source = include_bytes!("../proto/acp.proto");
-        let actual = crate::hex::encode(&Sha256::digest(source));
+        // Git may materialize text files with CRLF on Windows even though the
+        // canonical panel copy uses LF. Line endings do not change the protobuf
+        // contract, so hash the one canonical representation on every platform.
+        let source = include_str!("../proto/acp.proto").replace("\r\n", "\n");
+        let actual = crate::hex::encode(&Sha256::digest(source.as_bytes()));
         assert_eq!(
             actual,
             super::PROTO_SHA256,

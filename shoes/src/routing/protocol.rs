@@ -9,10 +9,9 @@
 use std::io;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 
-use crate::async_stream::AsyncStream;
 use crate::routing::predicate::RouteProtocol;
 
 /// sing-box's default timeout for the `sniff` route action.
@@ -28,7 +27,7 @@ pub(crate) struct SniffedTcpMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Classification {
+pub(crate) enum TcpPrefixClassification {
     Matched(SniffedTcpMetadata),
     NeedMore,
     NoMatch,
@@ -40,14 +39,17 @@ enum Classification {
 /// bytes read from `stream` are appended to it and must later be written upstream.
 /// Timeout, EOF, malformed input and the size limit simply mean "unclassified";
 /// transport errors other than EOF are returned to the caller.
-pub(crate) async fn sniff_tcp(
-    stream: &mut Box<dyn AsyncStream>,
+pub(crate) async fn sniff_tcp<S>(
+    stream: &mut S,
     replay: &mut Vec<u8>,
-) -> io::Result<Option<SniffedTcpMetadata>> {
-    match classify(replay) {
-        Classification::Matched(metadata) => return Ok(Some(metadata)),
-        Classification::NoMatch => return Ok(None),
-        Classification::NeedMore => {}
+) -> io::Result<Option<SniffedTcpMetadata>>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    match classify_tcp_prefix(replay) {
+        TcpPrefixClassification::Matched(metadata) => return Ok(Some(metadata)),
+        TcpPrefixClassification::NoMatch => return Ok(None),
+        TcpPrefixClassification::NeedMore => {}
     }
 
     let sniff = async {
@@ -65,10 +67,10 @@ pub(crate) async fn sniff_tcp(
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(error) => return Err(error),
             }
-            match classify(replay) {
-                Classification::Matched(metadata) => return Ok(Some(metadata)),
-                Classification::NeedMore => {}
-                Classification::NoMatch => return Ok(None),
+            match classify_tcp_prefix(replay) {
+                TcpPrefixClassification::Matched(metadata) => return Ok(Some(metadata)),
+                TcpPrefixClassification::NeedMore => {}
+                TcpPrefixClassification::NoMatch => return Ok(None),
             }
         }
     };
@@ -79,51 +81,53 @@ pub(crate) async fn sniff_tcp(
     }
 }
 
-fn classify(bytes: &[u8]) -> Classification {
+pub(crate) fn classify_tcp_prefix(bytes: &[u8]) -> TcpPrefixClassification {
     let tls = classify_tls(bytes);
-    if matches!(tls, Classification::Matched(_)) {
+    if matches!(tls, TcpPrefixClassification::Matched(_)) {
         return tls;
     }
     let http = classify_http(bytes);
-    if matches!(http, Classification::Matched(_)) {
+    if matches!(http, TcpPrefixClassification::Matched(_)) {
         return http;
     }
-    if matches!(tls, Classification::NeedMore) || matches!(http, Classification::NeedMore) {
-        Classification::NeedMore
+    if matches!(tls, TcpPrefixClassification::NeedMore)
+        || matches!(http, TcpPrefixClassification::NeedMore)
+    {
+        TcpPrefixClassification::NeedMore
     } else {
-        Classification::NoMatch
+        TcpPrefixClassification::NoMatch
     }
 }
 
-fn classify_http(bytes: &[u8]) -> Classification {
+fn classify_http(bytes: &[u8]) -> TcpPrefixClassification {
     const METHODS: &[&[u8]] = &[
         b"GET", b"HEAD", b"POST", b"PUT", b"DELETE", b"CONNECT", b"OPTIONS", b"TRACE", b"PATCH",
         b"PRI",
     ];
     let Some(space) = bytes.iter().position(|byte| *byte == b' ') else {
         return if METHODS.iter().any(|method| method.starts_with(bytes)) {
-            Classification::NeedMore
+            TcpPrefixClassification::NeedMore
         } else {
-            Classification::NoMatch
+            TcpPrefixClassification::NoMatch
         };
     };
     if !METHODS.iter().any(|method| *method == &bytes[..space]) {
-        return Classification::NoMatch;
+        return TcpPrefixClassification::NoMatch;
     }
     let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
         return if bytes.len() < MAX_SNIFF_BYTES {
-            Classification::NeedMore
+            TcpPrefixClassification::NeedMore
         } else {
-            Classification::NoMatch
+            TcpPrefixClassification::NoMatch
         };
     };
     let header = &bytes[..header_end + 4];
     let Ok(text) = std::str::from_utf8(header) else {
-        return Classification::NoMatch;
+        return TcpPrefixClassification::NoMatch;
     };
     let mut lines = text.split("\r\n");
     let Some(request_line) = lines.next() else {
-        return Classification::NoMatch;
+        return TcpPrefixClassification::NoMatch;
     };
     let mut request_parts = request_line.split(' ');
     let (Some(_method), Some(target), Some(version), None) = (
@@ -132,10 +136,10 @@ fn classify_http(bytes: &[u8]) -> Classification {
         request_parts.next(),
         request_parts.next(),
     ) else {
-        return Classification::NoMatch;
+        return TcpPrefixClassification::NoMatch;
     };
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1" | "HTTP/2.0") {
-        return Classification::NoMatch;
+        return TcpPrefixClassification::NoMatch;
     }
 
     let header_host = lines.find_map(|line| {
@@ -156,52 +160,52 @@ fn classify_http(bytes: &[u8]) -> Classification {
         .map(str::to_owned)
         .or(target_host)
         .and_then(|host| normalize_authority_host(&host));
-    Classification::Matched(SniffedTcpMetadata {
+    TcpPrefixClassification::Matched(SniffedTcpMetadata {
         protocol: RouteProtocol::Http,
         domain,
     })
 }
 
-fn classify_tls(bytes: &[u8]) -> Classification {
+fn classify_tls(bytes: &[u8]) -> TcpPrefixClassification {
     if bytes.is_empty() {
-        return Classification::NeedMore;
+        return TcpPrefixClassification::NeedMore;
     }
     if bytes[0] != 0x16 {
-        return Classification::NoMatch;
+        return TcpPrefixClassification::NoMatch;
     }
 
     let mut record_offset = 0usize;
     let mut handshake = Vec::new();
     loop {
         if bytes.len() < record_offset + 5 {
-            return Classification::NeedMore;
+            return TcpPrefixClassification::NeedMore;
         }
         if bytes[record_offset] != 0x16 || bytes[record_offset + 1] != 0x03 {
-            return Classification::NoMatch;
+            return TcpPrefixClassification::NoMatch;
         }
         let record_len =
             u16::from_be_bytes([bytes[record_offset + 3], bytes[record_offset + 4]]) as usize;
         if record_len == 0 || record_len > 18_432 {
-            return Classification::NoMatch;
+            return TcpPrefixClassification::NoMatch;
         }
         let record_end = record_offset + 5 + record_len;
         if bytes.len() < record_end {
-            return Classification::NeedMore;
+            return TcpPrefixClassification::NeedMore;
         }
         handshake.extend_from_slice(&bytes[record_offset + 5..record_end]);
         if handshake.len() >= 4 {
             if handshake[0] != 0x01 {
-                return Classification::NoMatch;
+                return TcpPrefixClassification::NoMatch;
             }
             let hello_len = ((handshake[1] as usize) << 16)
                 | ((handshake[2] as usize) << 8)
                 | handshake[3] as usize;
             if hello_len > MAX_SNIFF_BYTES - 4 {
-                return Classification::NoMatch;
+                return TcpPrefixClassification::NoMatch;
             }
             if handshake.len() >= hello_len + 4 {
                 let domain = parse_client_hello_sni(&handshake[4..hello_len + 4]);
-                return Classification::Matched(SniffedTcpMetadata {
+                return TcpPrefixClassification::Matched(SniffedTcpMetadata {
                     protocol: RouteProtocol::Tls,
                     domain,
                 });
@@ -209,7 +213,7 @@ fn classify_tls(bytes: &[u8]) -> Classification {
         }
         record_offset = record_end;
         if record_offset >= MAX_SNIFF_BYTES {
-            return Classification::NoMatch;
+            return TcpPrefixClassification::NoMatch;
         }
     }
 }
@@ -397,10 +401,10 @@ mod tests {
 
     #[test]
     fn classifies_complete_http_and_host() {
-        let result = classify(b"GET / HTTP/1.1\r\nHost: Example.COM:443\r\n\r\nbody");
+        let result = classify_tcp_prefix(b"GET / HTTP/1.1\r\nHost: Example.COM:443\r\n\r\nbody");
         assert_eq!(
             result,
-            Classification::Matched(SniffedTcpMetadata {
+            TcpPrefixClassification::Matched(SniffedTcpMetadata {
                 protocol: RouteProtocol::Http,
                 domain: Some("example.com".into()),
             })
@@ -409,32 +413,44 @@ mod tests {
 
     #[test]
     fn waits_for_partial_http_without_guessing() {
-        assert_eq!(classify(b"GE"), Classification::NeedMore);
         assert_eq!(
-            classify(b"GET / HTTP/1.1\r\nHost: example.com\r\n"),
-            Classification::NeedMore
+            classify_tcp_prefix(b"GE"),
+            TcpPrefixClassification::NeedMore
         );
-        assert_eq!(classify(b"GARBAGE\0"), Classification::NoMatch);
+        assert_eq!(
+            classify_tcp_prefix(b"GET / HTTP/1.1\r\nHost: example.com\r\n"),
+            TcpPrefixClassification::NeedMore
+        );
+        assert_eq!(
+            classify_tcp_prefix(b"GARBAGE\0"),
+            TcpPrefixClassification::NoMatch
+        );
     }
 
     #[test]
     fn classifies_tls_client_hello_and_sni() {
         let hello = tls_client_hello("TLS.Example.COM");
         assert_eq!(
-            classify(&hello),
-            Classification::Matched(SniffedTcpMetadata {
+            classify_tcp_prefix(&hello),
+            TcpPrefixClassification::Matched(SniffedTcpMetadata {
                 protocol: RouteProtocol::Tls,
                 domain: Some("tls.example.com".into()),
             })
         );
-        assert_eq!(classify(&hello[..5]), Classification::NeedMore);
+        assert_eq!(
+            classify_tcp_prefix(&hello[..5]),
+            TcpPrefixClassification::NeedMore
+        );
     }
 
     #[test]
     fn rejects_non_client_tls_handshake() {
         let mut hello = tls_client_hello("example.com");
         hello[5] = 2;
-        assert_eq!(classify(&hello), Classification::NoMatch);
+        assert_eq!(
+            classify_tcp_prefix(&hello),
+            TcpPrefixClassification::NoMatch
+        );
     }
 
     #[tokio::test]

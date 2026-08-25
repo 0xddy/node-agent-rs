@@ -76,7 +76,13 @@ shoes 不认识 ACP protobuf、machine/node ID 或面板资源 ID。既有 shoes
 - 顶层直接条件与 `rule_set` 的混写；destination-address 与 destination-port 分别按 sing-box 的类别状态合并，同类别可由直接字段或规则集命中，不同类别仍保持 AND
 - `route`、`reject`、`reject-drop`、`final`
 
-`protocol` 只在 VLESS provider 的 `sniff=true` 时启用。嗅探按需执行，限制为 300 ms / 64 KiB；HTTP Host 和 TLS SNI 可参与后续域名规则，读取的首包字节会完整转发。没有 protocol 规则时不读取应用数据，也不会增加 300 ms 等待。
+VLESS provider 的 `sniff` 开关会被显式传入 shoes：`true` 与 Go 一样对每条 TCP 流执行有界嗅探，因此即使原始目标是 IP，domain-only 规则也能使用 HTTP Host / TLS SNI；`false` 明确关闭嗅探。Hysteria2 没有面板 sniff 开关，保持 shoes 的 Auto 模式，只在存在 `protocol` 规则时自动启用。嗅探限制为 300 ms / 64 KiB，读取的首包字节会完整回放；带 SNI/Host/protocol metadata 的 TCP 判定单独绕过 destination-only cache，普通 TCP/UDP 仍可缓存，因此同一 IP:port 上不同 SNI 不会串用决定，也不会让大规则集的 UDP 路由退化成全量线性扫描。
+
+SOCKS5、HTTP CONNECT、Snell 等等待隧道应答的客户端会先收到并 flush 成功应答，再读取应用首包，因而不再固定空等 300 ms。这个时序意味着：仅在确实需要继续读取首包时，客户端可能先看到隧道成功，随后因 sniff 后命中的 reject 或出站连接失败而被关闭；不需要继续读取时仍保留“出站成功后再应答”的原时序。普通 TCP、generic QUIC、Hysteria2、TUIC、TUN，以及 VLESS h2mux 的每个 TCP 子流使用相同的 metadata 与 replay 路径；h2mux 不能再绕过 `protocol` / SNI / Host 规则。
+
+QUIC 入站在占用未认证预算前要求地址已验证；首次无 token 的客户端通过标准 QUIC Retry 验证，不能用伪造源地址的 Initial 数据报耗尽全局或单源额度。Hysteria2、TUIC 和 generic QUIC 的 transport handshake 最多占用 admission 15 秒，Hysteria2 H3 setup 另有同样的短上限；整个未认证阶段仍受从入场开始计算、不会被 PING/keepalive 重置的 60 秒绝对 deadline 约束。generic QUIC 另把底层 active-connection quota 与每条 bidi stream 的 pending-handshake gate 分开：首条真正完成协议握手的流只解除 pre-auth deadline，不释放连接额度，因而“成功一条廉价流后以 PING 保持无限空连接”不能绕过 gate。认证失败后转入 VLESS/ShadowTLS/AnyTLS camouflage fallback 的流只释放自己的 stream permit，不会把整个 QUIC connection 误标为已认证；Naive 的请求级延迟认证不在面板 provider 范围内，generic QUIC + Naive 仍受该 60 秒边界。
+
+VMess auth id 与 Shadowsocks 2022 salt 的防重放状态由 inbound 生命周期持有：同一 inbound 的所有 bind IP 和热重载 handler generation 共享过滤器，不同 inbound 仍彼此隔离。频繁的面板同步不会重开 VMess ±120 秒或 Shadowsocks salt window。
 
 远程规则集使用不可变内容快照。下载有 64 MiB 实际读取上限，候选内容先经 shoes 同一解析器验证；只有 shoes 运行时事务成功后才推进磁盘 last-good。刷新失败、解析失败或应用失败都继续使用上一成功版本。
 
@@ -84,7 +90,7 @@ shoes 不认识 ACP protobuf、machine/node ID 或面板资源 ID。既有 shoes
 
 - 顶层 `auto_detect_interface`、`default_interface`、`default_mark`、`find_process`、`geoip`、`geosite`、`override_android_vpn` 与默认网络策略/类型/fallback 字段；
 - 规则中的 source IP/port、private-IP、进程/包名/用户、Wi-Fi/网络类型、GeoIP/Geosite、`rule_set_ip_cidr_match_source` 以及 route/direct/sniff/resolve option 对象；
-- Hysteria2 入站上的 protocol sniff 规则，以及 VLESS `sniff=false` 时的 protocol 规则；
+- VLESS `sniff=false` 时的 protocol 规则；
 - VLESS 入站 `tcp_fast_open=true`。
 
 这些字段大多不由当前面板编辑器产生；若以后面板开始使用，应先补 shoes 的通用能力，再放开 node-agent 翻译。

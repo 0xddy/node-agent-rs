@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::async_stream::{AsyncPing, AsyncStream};
+
 /// TCP socket state machine.
 ///
 /// Follows shadowsocks-rust patterns for proper connection lifecycle management.
@@ -298,6 +300,18 @@ impl AsyncWrite for TcpConnection {
         Poll::Pending
     }
 }
+
+impl AsyncPing for TcpConnection {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+
+    fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        unreachable!("a TUN TCP stream does not support transport pings")
+    }
+}
+
+impl AsyncStream for TcpConnection {}
 
 #[cfg(test)]
 mod tests {

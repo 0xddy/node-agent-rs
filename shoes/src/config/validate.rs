@@ -4063,6 +4063,7 @@ mod tests {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
+                sniff: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     final_server: None,
@@ -4115,6 +4116,7 @@ mod tests {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
+                sniff: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     final_server: None,
@@ -4181,6 +4183,7 @@ mod tests {
                 transport: Transport::Tcp,
                 tcp_settings: None,
                 quic_settings: None,
+                sniff: None,
                 rules: direct_allow_rule(),
                 dns: Some(DnsConfig {
                     final_server: None,
@@ -4234,6 +4237,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: direct_allow_rule(),
             dns: Some(DnsConfig {
                 final_server: None,

@@ -1,12 +1,14 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use log::{debug, error};
 use quinn::EndpointConfig;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::async_stream::AsyncStream;
@@ -24,10 +26,15 @@ use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
-use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use crate::tcp::handshake_gate::{
+    HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
+};
+use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
 use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
-use crate::tcp::tcp_server::{run_udp_copy, setup_client_tcp_stream};
-use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
+use crate::tcp::tcp_server::{
+    run_udp_copy, setup_client_tcp_stream_with_metadata, sniff_tcp_after_success_response,
+};
+use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
 
 /// How long a cancelled QUIC endpoint waits for its live connections before it
 /// drops the socket.
@@ -39,6 +46,175 @@ use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
 /// indefinitely and block whatever wants to listen there next.
 pub(crate) const QUIC_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The absolute lifetime of an application-layer-unauthenticated QUIC peer.
+///
+/// This outer deadline starts when a Retry-validated Incoming is charged to a gate
+/// and covers the transport handshake plus H3/application setup. Native protocols
+/// retain their shorter application-authentication timer inside this ceiling. QUIC
+/// activity, including PING frames, cannot reset either deadline.
+pub(crate) const QUIC_PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum time spent on the QUIC transport handshake after Retry has validated
+/// the peer's address.
+///
+/// Application protocols keep their own authentication window inside the outer
+/// pre-auth deadline. A shorter transport-only window prevents a real but silent
+/// peer from holding one listener admission for the transport's 30-60 second idle
+/// timeout without ever reaching application authentication.
+pub(crate) const QUIC_TRANSPORT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Live generic-QUIC transports admitted by one listener.
+///
+/// Unlike the stream gate, this is deliberately an active-connection quota rather
+/// than a pending-handshake quota. Generic QUIC has no connection-level identity:
+/// every bidi stream can authenticate independently (or use an unauthenticated
+/// protocol), so releasing this quota after one cheap stream would allow unlimited
+/// empty transports kept alive with QUIC PING frames. These names stay separate from
+/// the handshake constants so their different lifetime and sizing are explicit.
+const MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS: usize = 1024;
+const MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS_PER_SOURCE: usize = 64;
+
+/// Error codes used only by the generic QUIC transport.
+///
+/// Zero means success/application shutdown in a number of protocols. Refusing work
+/// because a resource or authentication deadline was exceeded must be observable as
+/// an error by the peer rather than looking like a clean end of stream.
+const QUIC_ERR_PRE_AUTH_TIMEOUT: u32 = 1;
+const QUIC_ERR_HANDSHAKE_LIMIT: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncomingAddressAction {
+    Accept,
+    Retry,
+    Refuse,
+}
+
+fn incoming_address_action(validated: bool, may_retry: bool) -> IncomingAddressAction {
+    if validated {
+        IncomingAddressAction::Accept
+    } else if may_retry {
+        IncomingAddressAction::Retry
+    } else {
+        // Quinn currently guarantees that an unvalidated Incoming may be retried.
+        // Keep this branch defensive: accepting here after an API/implementation
+        // change would charge a spoofable source address to the listener gate.
+        IncomingAddressAction::Refuse
+    }
+}
+
+/// Require QUIC address validation before allocating a connection or gate permit.
+///
+/// A successful Retry consumes `incoming`; the client's token-bearing Initial will
+/// arrive through `Endpoint::accept` as a new, validated Incoming. A theoretically
+/// impossible Retry failure returns the original Incoming, which is explicitly
+/// refused rather than accidentally accepted without validation.
+pub(crate) fn require_validated_quic_address(
+    incoming: quinn::Incoming,
+    protocol: &str,
+) -> Option<quinn::Incoming> {
+    let remote = incoming.remote_address();
+    match incoming_address_action(incoming.remote_address_validated(), incoming.may_retry()) {
+        IncomingAddressAction::Accept => Some(incoming),
+        IncomingAddressAction::Retry => {
+            debug!("requiring QUIC address validation from {remote} before {protocol} admission");
+            if let Err(error) = incoming.retry() {
+                debug!(
+                    "QUIC Retry unexpectedly unavailable for {remote}; refusing {protocol} peer"
+                );
+                error.into_incoming().refuse();
+            }
+            None
+        }
+        IncomingAddressAction::Refuse => {
+            debug!("refusing unvalidated {protocol} peer {remote}: QUIC Retry is unavailable");
+            incoming.refuse();
+            None
+        }
+    }
+}
+
+/// Pending protocol handshakes carried by one generic QUIC connection.
+///
+/// Generic QUIC differs from Hysteria2 and TUIC: the QUIC connection itself has no
+/// application authentication, and every bidi stream performs an independent
+/// configured-protocol handshake. Its connection-lifetime permit is therefore kept
+/// separately by `process_connection`, while every pending stream takes a permit
+/// from this state. Keeping the two gates separate matters: a source legitimately at
+/// its connection ceiling must still be able to authenticate a stream on those
+/// connections rather than deadlocking against its own connection permits.
+struct QuicHandshakeState {
+    stream_gate: Arc<HandshakeGate>,
+    source: IpAddr,
+    first_handshake_completed: AtomicBool,
+    first_handshake_notify: Notify,
+}
+
+impl QuicHandshakeState {
+    fn new(stream_gate: Arc<HandshakeGate>, source: IpAddr) -> Arc<Self> {
+        Arc::new(Self {
+            stream_gate,
+            source,
+            first_handshake_completed: AtomicBool::new(false),
+            first_handshake_notify: Notify::new(),
+        })
+    }
+
+    fn enter_stream(self: &Arc<Self>) -> Option<QuicStreamHandshakePermit> {
+        self.stream_gate
+            .enter(Some(self.source))
+            .map(|permit| QuicStreamHandshakePermit {
+                state: self.clone(),
+                _permit: permit,
+            })
+    }
+
+    fn first_handshake_completed(&self) -> bool {
+        self.first_handshake_completed.load(Ordering::Acquire)
+    }
+}
+
+async fn first_handshake_completed_before_deadline(
+    state: Arc<QuicHandshakeState>,
+    deadline: Instant,
+) -> bool {
+    loop {
+        // `notify_one` stores a permit when it races this future before polling, so
+        // constructing the waiter before the acquire-load cannot lose completion.
+        let completed = state.first_handshake_notify.notified();
+        if state.first_handshake_completed() {
+            return true;
+        }
+        tokio::select! {
+            () = completed => {}
+            () = sleep_until(deadline) => return state.first_handshake_completed(),
+        }
+    }
+}
+
+/// One generic QUIC stream's place in the pending-handshake budget.
+///
+/// `complete` is deliberately explicit. Dropping before it means the configured
+/// protocol handshake failed or was cancelled, so only a real successful setup can
+/// disarm the connection's absolute pre-auth deadline.
+struct QuicStreamHandshakePermit {
+    state: Arc<QuicHandshakeState>,
+    _permit: HandshakePermit,
+}
+
+impl QuicStreamHandshakePermit {
+    fn complete(self) {
+        let was_complete = self
+            .state
+            .first_handshake_completed
+            .swap(true, Ordering::AcqRel);
+        if !was_complete {
+            self.state.first_handshake_notify.notify_one();
+        }
+        // `self` then drops the independent stream permit. The connection permit is
+        // owned by `process_connection`, whose completion waiter releases it.
+    }
+}
+
 async fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
@@ -49,17 +225,24 @@ async fn start_quic_server(
     metered: bool,
     cancel: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    // TODO: consider setting transport config
-    //   Arc::get_mut(&mut server_config.transport)
-    //     .unwrap()
-    //     .max_concurrent_bidi_streams(1024_u32.into())
-    //     .max_concurrent_uni_streams(0_u8.into())
-    //     .keep_alive_interval(Some(Duration::from_secs(15)))
-    //     .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-
     let mut join_handles = vec![];
+    // Connections and stream handshakes are different resources and need independent
+    // shares. Sharing each gate across the endpoint fan-out prevents `num_endpoints`
+    // from multiplying either ceiling.
+    let connection_gate = HandshakeGate::new(
+        MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS,
+        MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS_PER_SOURCE,
+    );
+    let stream_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
     for _ in 0..num_endpoints {
-        let server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+        // A peer cannot create more simultaneous bidi streams on one connection than
+        // one source is allowed to hold in the listener-wide stream-handshake gate.
+        // Generic QUIC has no use for peer-opened unidirectional streams.
+        Arc::get_mut(&mut server_config.transport)
+            .unwrap()
+            .max_concurrent_bidi_streams((MAX_PENDING_PER_SOURCE as u32).into())
+            .max_concurrent_uni_streams(0_u8.into());
 
         // Only ask for SO_REUSEPORT when there is actually a second endpoint to share
         // the port with; a single endpoint does not need it, and platforms that lack
@@ -80,6 +263,8 @@ async fn start_quic_server(
         )?;
 
         let handler_slot = handler_slot.clone();
+        let connection_gate = connection_gate.clone();
+        let stream_gate = stream_gate.clone();
         let cancel = cancel.clone();
         let join_handle = tokio::spawn(async move {
             loop {
@@ -92,14 +277,35 @@ async fn start_quic_server(
                         None => break,
                     },
                 };
+                let Some(conn) = require_validated_quic_address(conn, "generic QUIC") else {
+                    continue;
+                };
+                let remote_ip = conn.remote_address().ip();
+                let Some(connection_permit) = connection_gate.enter(Some(remote_ip)) else {
+                    debug!(
+                        "refusing QUIC peer {remote_ip}: the listener is at its connection limit"
+                    );
+                    conn.refuse();
+                    continue;
+                };
+                let pre_auth_deadline = Instant::now() + QUIC_PRE_AUTH_TIMEOUT;
+                let handshake_state = QuicHandshakeState::new(stream_gate.clone(), remote_ip);
                 // Read once per QUIC connection: every stream it goes on to open
                 // is served by the generation that was current when the connection
                 // was accepted -- the resolver included, so its rules and its DNS
                 // are always from the same reload.
                 let (server_handler, resolver) = handler_slot.load();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        process_connection(resolver, server_handler, conn, metered).await
+                    if let Err(e) = process_connection(
+                        resolver,
+                        server_handler,
+                        conn,
+                        metered,
+                        handshake_state,
+                        connection_permit,
+                        pre_auth_deadline,
+                    )
+                    .await
                     {
                         error!("Connection ended with error: {e}");
                     }
@@ -141,11 +347,59 @@ async fn process_connection(
     server_handler: Arc<dyn TcpServerHandler>,
     conn: quinn::Incoming,
     metered: bool,
+    handshake_state: Arc<QuicHandshakeState>,
+    connection_permit: HandshakePermit,
+    pre_auth_deadline: Instant,
 ) -> std::io::Result<()> {
-    let connection = conn.await?;
+    // Generic QUIC has no connection-level user identity: every stream performs an
+    // independent configured-protocol handshake. Keep the separate active-transport
+    // quota until the connection ends so one cheap successful stream cannot leave an
+    // unlimited pool of empty, PING-kept-alive transports.
+    let _connection_permit = connection_permit;
+    let transport_deadline = std::cmp::min(
+        pre_auth_deadline,
+        Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
+    );
+    let connection = match timeout_at(transport_deadline, conn).await {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "generic QUIC transport handshake exceeded the pre-auth deadline",
+            ));
+        }
+    };
+
+    let mut pre_auth_completion = Box::pin(first_handshake_completed_before_deadline(
+        handshake_state.clone(),
+        pre_auth_deadline,
+    ));
+    let mut pre_auth_pending = true;
 
     loop {
-        let stream = match connection.accept_bi().await {
+        if pre_auth_pending && handshake_state.first_handshake_completed() {
+            pre_auth_pending = false;
+        }
+
+        let accepted = tokio::select! {
+            completed = &mut pre_auth_completion, if pre_auth_pending => {
+                // A stream can complete without opening another stream to wake
+                // `accept_bi`; Notify releases the admission immediately rather
+                // than retaining it until the absolute deadline.
+                if completed {
+                    pre_auth_pending = false;
+                    continue;
+                }
+                connection.close(QUIC_ERR_PRE_AUTH_TIMEOUT.into(), b"pre-auth timeout");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "generic QUIC first protocol handshake exceeded the pre-auth deadline",
+                ));
+            }
+            accepted = connection.accept_bi() => accepted,
+        };
+
+        let (mut send, mut recv) = match accepted {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
                 debug!("Connection closed");
                 break;
@@ -155,10 +409,26 @@ async fn process_connection(
             }
             Ok(s) => s,
         };
+        let Some(handshake_permit) = handshake_state.enter_stream() else {
+            debug!(
+                "refusing a stream from {}: the listener is at its pending-handshake limit",
+                connection.remote_address().ip()
+            );
+            let _ = send.reset(QUIC_ERR_HANDSHAKE_LIMIT.into());
+            let _ = recv.stop(QUIC_ERR_HANDSHAKE_LIMIT.into());
+            continue;
+        };
         let cloned_resolver = resolver.clone();
         let cloned_handler = server_handler.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_streams(cloned_resolver, cloned_handler, stream, metered).await
+            if let Err(e) = process_streams(
+                cloned_resolver,
+                cloned_handler,
+                (send, recv),
+                metered,
+                handshake_permit,
+            )
+            .await
             {
                 error!("Failed to process streams: {e}");
             }
@@ -185,18 +455,30 @@ async fn process_streams(
     server_handler: Arc<dyn TcpServerHandler>,
     (send, recv): (quinn::SendStream, quinn::RecvStream),
     metered: bool,
+    handshake_permit: QuicStreamHandshakePermit,
 ) -> std::io::Result<()> {
     let quic_stream = QuicStream::from(send, recv);
 
     if !metered {
-        return serve_stream(resolver, server_handler, Box::new(quic_stream)).await;
+        return serve_stream(
+            resolver,
+            server_handler,
+            Box::new(quic_stream),
+            handshake_permit,
+        )
+        .await;
     }
 
     let conn = ConnContext::new();
     let quic_stream = TrafficMeterStream::new(quic_stream, Arc::clone(&conn));
     scope_connection_until_cancelled(
         conn,
-        serve_stream(resolver, server_handler, Box::new(quic_stream)),
+        serve_stream(
+            resolver,
+            server_handler,
+            Box::new(quic_stream),
+            handshake_permit,
+        ),
     )
     .await
 }
@@ -205,6 +487,7 @@ async fn serve_stream(
     resolver: Arc<dyn Resolver>,
     server_handler: Arc<dyn TcpServerHandler>,
     quic_stream: Box<dyn AsyncStream>,
+    handshake_permit: QuicStreamHandshakePermit,
 ) -> std::io::Result<()> {
     let setup_server_stream_future = timeout(
         Duration::from_secs(60),
@@ -227,22 +510,33 @@ async fn serve_stream(
         }
     };
 
+    finish_stream_handshake(&setup_result, handshake_permit);
+
     match setup_result {
         TcpServerSetupResult::TcpForward {
             remote_location,
             stream: mut server_stream,
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
-            connection_success_response,
+            mut connection_success_response,
             initial_remote_data,
         } => {
+            let mut replay = initial_remote_data.map(Vec::from).unwrap_or_default();
+            let sniffed = sniff_tcp_after_success_response(
+                &mut server_stream,
+                proxy_selector.needs_tcp_sniff(),
+                &mut connection_success_response,
+                &mut replay,
+            )
+            .await?;
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_tcp_stream(
+                setup_client_tcp_stream_with_metadata(
                     &mut server_stream,
                     proxy_selector,
                     resolver,
                     remote_location.clone(),
+                    sniffed,
                 ),
             );
 
@@ -275,12 +569,11 @@ async fn serve_stream(
                 // it's needed.
             }
 
-            let client_need_initial_flush = match initial_remote_data {
-                Some(data) => {
-                    client_stream.write_all(&data).await?;
-                    true
-                }
-                None => false,
+            let client_need_initial_flush = if replay.is_empty() {
+                false
+            } else {
+                client_stream.write_all(&replay).await?;
+                true
             };
 
             let copy_result = copy_bidirectional(
@@ -353,10 +646,27 @@ async fn serve_stream(
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled => {
+        TcpServerSetupResult::AlreadyHandled
+        | TcpServerSetupResult::UnauthenticatedFallbackHandled => {
             // Connection already handled by a spawned task (e.g., Reality fallback)
             Ok(())
         }
+    }
+}
+
+fn finish_stream_handshake(
+    setup_result: &TcpServerSetupResult,
+    handshake_permit: QuicStreamHandshakePermit,
+) {
+    if setup_result.completes_protocol_handshake() {
+        // This stream completed its configured protocol handshake. Release the
+        // stream permit and notify the connection admission waiter immediately.
+        handshake_permit.complete();
+    } else {
+        // A camouflage/fallback task owns the stream after failed or deferred proxy
+        // authentication. It no longer consumes a stream-handshake slot, but it
+        // must not authenticate the whole multiplexed QUIC connection.
+        drop(handshake_permit);
     }
 }
 
@@ -374,11 +684,13 @@ pub async fn start_quic_servers(
     // a reload cannot rebuild. `check_reload` compares against these.
     let mut handle = ServerHandle::new(config.transport.clone(), cancel.clone());
     handle.record_listener_settings(&config);
+    let replay_state = handle.replay_state();
 
     let ServerConfig {
         bind_location,
         quic_settings,
         protocol,
+        sniff,
         rules,
         ..
     } = config;
@@ -441,9 +753,10 @@ pub async fn start_quic_servers(
 
     let quic_server_config = Arc::new(quic_server_config);
 
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(
+    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector_with_sniff_policy(
         rules.clone(),
         resolver.clone(),
+        sniff,
     ));
 
     // Kept for the two arms below, which record what their accept loops bake in so
@@ -550,12 +863,13 @@ pub async fn start_quic_servers(
             for bind_address in bind_addresses.into_iter() {
                 // Shares protocol state across ports without reusing an interface-specific UDP bind IP.
                 let handler_slot = handle.slot_for_ip(bind_address.ip(), &resolver, || {
-                    create_tcp_server_handler(
+                    create_tcp_server_handler_with_replay_state(
                         tcp_protocol.clone(),
                         &client_proxy_selector,
                         &resolver,
                         Some(bind_address.ip()),
                         users.as_ref(),
+                        &replay_state,
                     )
                     .into()
                 });
@@ -578,4 +892,188 @@ pub async fn start_quic_servers(
     }
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IncomingAddressAction, QUIC_ERR_HANDSHAKE_LIMIT, QUIC_ERR_PRE_AUTH_TIMEOUT,
+        QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, QuicHandshakeState,
+        finish_stream_handshake, first_handshake_completed_before_deadline,
+        incoming_address_action,
+    };
+    use crate::tcp::handshake_gate::{HandshakeGate, MAX_PENDING_PER_SOURCE};
+    use crate::tcp::tcp_handler::TcpServerSetupResult;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    use tokio::time::{Instant, advance};
+
+    fn source(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
+    }
+
+    #[test]
+    fn unvalidated_incoming_is_retried_before_admission() {
+        assert_eq!(
+            incoming_address_action(false, true),
+            IncomingAddressAction::Retry
+        );
+        assert_eq!(
+            incoming_address_action(false, false),
+            IncomingAddressAction::Refuse,
+            "an API change that makes Retry unavailable must fail closed"
+        );
+        assert_eq!(
+            incoming_address_action(true, false),
+            IncomingAddressAction::Accept
+        );
+        assert_eq!(
+            incoming_address_action(true, true),
+            IncomingAddressAction::Accept,
+            "a token already validated the address even when another Retry is legal"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_success_disarms_deadline_but_keeps_active_connection_quota() {
+        let connection_gate = HandshakeGate::new(1, 1);
+        let stream_gate = HandshakeGate::new(1, 1);
+        let ip = source(1);
+        let connection_permit = connection_gate
+            .enter(Some(ip))
+            .expect("admit the QUIC connection");
+        let state = QuicHandshakeState::new(stream_gate.clone(), ip);
+        let completion_state = state.clone();
+        let completion = tokio::spawn(first_handshake_completed_before_deadline(
+            completion_state,
+            Instant::now() + Duration::from_secs(60),
+        ));
+
+        state
+            .enter_stream()
+            .expect("the independent stream gate is available")
+            .complete();
+        assert!(
+            state.first_handshake_completed(),
+            "success disarms only the absolute pre-auth deadline"
+        );
+        assert!(
+            stream_gate.enter(Some(source(2))).is_some(),
+            "completing a stream returns its stream-handshake permit"
+        );
+        assert!(completion.await.unwrap());
+        assert!(
+            connection_gate.enter(Some(source(2))).is_none(),
+            "a stream cannot release the independent active-transport quota"
+        );
+
+        drop(connection_permit);
+        assert!(connection_gate.enter(Some(source(2))).is_some());
+    }
+
+    #[test]
+    fn a_failed_stream_releases_only_its_stream_permit() {
+        let stream_gate = HandshakeGate::new(1, 1);
+        let ip = source(1);
+        let state = QuicHandshakeState::new(stream_gate.clone(), ip);
+
+        let failed = state.enter_stream().expect("first stream");
+        assert!(stream_gate.enter(Some(source(2))).is_none());
+        drop(failed);
+        assert!(
+            !state.first_handshake_completed(),
+            "failure must not disarm the connection deadline"
+        );
+        assert!(stream_gate.enter(Some(source(2))).is_some());
+    }
+
+    #[test]
+    fn every_concurrent_stream_has_a_per_source_handshake_charge() {
+        let stream_gate = HandshakeGate::new(8, 2);
+        let ip = source(1);
+        let state = QuicHandshakeState::new(stream_gate.clone(), ip);
+
+        let first = state.enter_stream().expect("first stream");
+        let second = state.enter_stream().expect("second stream");
+        assert!(
+            state.enter_stream().is_none(),
+            "multiplexing cannot exceed the source's handshake share"
+        );
+        assert!(
+            stream_gate.enter(Some(source(2))).is_some(),
+            "one noisy QUIC peer does not consume another source's share"
+        );
+
+        second.complete();
+        assert!(state.enter_stream().is_some());
+        drop(first);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_deadline_fires_without_a_successful_stream() {
+        let state = QuicHandshakeState::new(HandshakeGate::new(1, 1), source(1));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let waiter = tokio::spawn(first_handshake_completed_before_deadline(state, deadline));
+        tokio::task::yield_now().await;
+
+        advance(Duration::from_secs(60)).await;
+        assert!(!waiter.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_success_disarms_the_absolute_deadline() {
+        let state = QuicHandshakeState::new(HandshakeGate::new(1, 1), source(1));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let waiter = tokio::spawn(first_handshake_completed_before_deadline(
+            state.clone(),
+            deadline,
+        ));
+        tokio::task::yield_now().await;
+
+        state.enter_stream().expect("stream permit").complete();
+        tokio::task::yield_now().await;
+        assert!(
+            waiter.is_finished(),
+            "completion must wake admission immediately rather than at the deadline"
+        );
+        assert!(waiter.await.unwrap());
+    }
+
+    #[test]
+    fn unauthenticated_fallback_does_not_complete_the_connection_handshake() {
+        let stream_gate = HandshakeGate::new(1, 1);
+        let state = QuicHandshakeState::new(stream_gate.clone(), source(1));
+        let permit = state.enter_stream().expect("fallback stream permit");
+
+        finish_stream_handshake(
+            &TcpServerSetupResult::UnauthenticatedFallbackHandled,
+            permit,
+        );
+
+        assert!(!state.first_handshake_completed());
+        assert!(
+            stream_gate.enter(Some(source(2))).is_some(),
+            "the handed-off stream no longer consumes a pending stream slot"
+        );
+    }
+
+    #[test]
+    fn authenticated_background_handoff_completes_the_connection_handshake() {
+        let stream_gate = HandshakeGate::new(1, 1);
+        let state = QuicHandshakeState::new(stream_gate.clone(), source(1));
+        let permit = state.enter_stream().expect("authenticated stream permit");
+
+        finish_stream_handshake(&TcpServerSetupResult::AlreadyHandled, permit);
+
+        assert!(state.first_handshake_completed());
+        assert!(stream_gate.enter(Some(source(2))).is_some());
+    }
+
+    #[test]
+    fn generic_transport_limits_use_error_codes_and_match_the_stream_share() {
+        assert_ne!(QUIC_ERR_PRE_AUTH_TIMEOUT, 0);
+        assert_ne!(QUIC_ERR_HANDSHAKE_LIMIT, 0);
+        assert_eq!(MAX_PENDING_PER_SOURCE as u32, 64);
+        assert!(QUIC_TRANSPORT_HANDSHAKE_TIMEOUT < QUIC_PRE_AUTH_TIMEOUT);
+    }
 }

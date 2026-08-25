@@ -54,9 +54,12 @@ use crate::config::{
 };
 use crate::dynamic::UserRegistry;
 use crate::resolver::Resolver;
+use crate::tcp::inbound_replay::InboundReplayState;
+#[cfg(test)]
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
 use crate::tcp::tcp_handler::TcpServerHandler;
-use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler;
+use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
 
 /// How long [`ServerHandle::shutdown`] waits for an *aborted* listener to
 /// actually stop before it gives up and returns anyway.
@@ -500,6 +503,9 @@ pub struct ServerHandle {
     /// What the *listener* baked in, which no inbound of any kind can change in
     /// place. `None` only for a handle nothing recorded settings on.
     fixed_listener: Option<FixedListener>,
+    /// Replay protection belongs to the inbound, not to one bind address or one
+    /// replaceable handler generation.
+    replay_state: InboundReplayState,
     cancel: CancellationToken,
     listeners: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -513,6 +519,7 @@ impl ServerHandle {
             selectors: Vec::new(),
             fixed: None,
             fixed_listener: None,
+            replay_state: InboundReplayState::default(),
             cancel,
             listeners: Mutex::new(Vec::new()),
         }
@@ -521,6 +528,10 @@ impl ServerHandle {
     /// The token every listener task in this handle selects on.
     pub(crate) fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
+    }
+
+    pub(crate) fn replay_state(&self) -> InboundReplayState {
+        self.replay_state.clone()
     }
 
     pub(crate) fn push_listener(&mut self, handle: JoinHandle<()>) {
@@ -713,7 +724,10 @@ impl ServerHandle {
         self.check_reload(&config)?;
 
         let ServerConfig {
-            protocol, rules, ..
+            protocol,
+            sniff,
+            rules,
+            ..
         } = config;
 
         let rules = rules.map(ConfigSelection::unwrap_config).into_vec();
@@ -721,7 +735,11 @@ impl ServerHandle {
         // Built once and shared by every handler, exactly as at start: the
         // selector is immutable, and sharing it means one rule set and one
         // routing cache per inbound rather than per bind IP.
-        let selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
+        let selector = Arc::new(create_tcp_client_proxy_selector_with_sniff_policy(
+            rules,
+            resolver.clone(),
+            sniff,
+        ));
 
         // Everything fallible is done before the first store, so a rejected reload
         // leaves every slot on its previous generation rather than half of them.
@@ -731,9 +749,15 @@ impl ServerHandle {
                 HandlerKey::Ip(ip) => Some(*ip),
                 HandlerKey::Path => None,
             };
-            let handler: Arc<dyn TcpServerHandler> =
-                create_tcp_server_handler(protocol.clone(), &selector, resolver, bind_ip, users)
-                    .into();
+            let handler: Arc<dyn TcpServerHandler> = create_tcp_server_handler_with_replay_state(
+                protocol.clone(),
+                &selector,
+                resolver,
+                bind_ip,
+                users,
+                &self.replay_state,
+            )
+            .into();
             rebuilt.push((slot, handler));
         }
 
@@ -1158,6 +1182,30 @@ mod tests {
     }
 
     #[test]
+    fn reload_swaps_sniff_policy_for_new_connections_only() {
+        let (handle, slot) = hysteria2_handle(true);
+        let in_flight = slot.load().0;
+        assert_eq!(in_flight.sniff_policy(), None);
+
+        let mut enabled = hysteria2_config(true);
+        enabled.sniff = Some(true);
+        handle
+            .reload(enabled, &resolver(), None)
+            .expect("sniff policy is selector state, not a fixed listener setting");
+        assert_eq!(slot.load().0.sniff_policy(), Some(true));
+        assert_eq!(
+            in_flight.sniff_policy(),
+            None,
+            "a connection pinned to the old selector keeps its generation"
+        );
+
+        let mut disabled = hysteria2_config(true);
+        disabled.sniff = Some(false);
+        handle.reload(disabled, &resolver(), None).unwrap();
+        assert_eq!(slot.load().0.sniff_policy(), Some(false));
+    }
+
+    #[test]
     fn a_rule_slot_refuses_a_changed_protocol_setting() {
         // `udp_enabled` is read once, before the accept loop starts. Accepting the
         // change would report success for a setting that never took effect -- and
@@ -1273,5 +1321,93 @@ mod tests {
         // before the swap still holds the marker.
         assert_eq!(name_of(&in_flight), "Marker(\"old\")");
         assert_ne!(name_of(&shared.load()), "Marker(\"old\")");
+    }
+
+    #[test]
+    fn multi_bind_reload_keeps_one_replay_scope_and_isolates_other_inbounds() {
+        let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+        for address in ["127.0.0.1:1080", "127.0.0.2:1080"] {
+            let address: SocketAddr = address.parse().unwrap();
+            handle.push_address(address);
+            handle.slot_for_ip(address.ip(), &resolver(), || marker("old"));
+        }
+
+        let vmess_filter = handle.replay_state.vmess_auth_ids();
+        let shadowsocks_filter = handle.replay_state.shadowsocks_salts();
+        assert!(vmess_filter.lock().check_and_insert(b"vmess-auth-id"));
+        assert!(
+            shadowsocks_filter
+                .lock()
+                .insert_and_check(b"shadowsocks-salt")
+        );
+
+        let vmess: ServerConfig = serde_yaml::from_str(
+            r#"address:
+  - 127.0.0.1:1080
+  - 127.0.0.2:1080
+protocol:
+  type: vmess
+  cipher: any
+  user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0
+"#,
+        )
+        .unwrap();
+        handle
+            .reload(vmess, &resolver(), None)
+            .expect("both bind handlers should rebuild");
+
+        // The handle and this local variable hold one reference each; the other
+        // two are the handlers rebuilt for the two bind IPs. If either handler had
+        // constructed a new filter, this would stay at two instead of four.
+        assert_eq!(Arc::strong_count(&vmess_filter), 4);
+        assert!(
+            !vmess_filter.lock().check_and_insert(b"vmess-auth-id"),
+            "reload must not reopen the VMess replay window"
+        );
+
+        let shadowsocks: ServerConfig = serde_yaml::from_str(
+            r#"address:
+  - 127.0.0.1:1080
+  - 127.0.0.2:1080
+protocol:
+  type: shadowsocks
+  cipher: 2022-blake3-aes-128-gcm
+  password: AAAAAAAAAAAAAAAAAAAAAA==
+"#,
+        )
+        .unwrap();
+        handle
+            .reload(shadowsocks.clone(), &resolver(), None)
+            .expect("both bind handlers should change protocol");
+        assert_eq!(Arc::strong_count(&shadowsocks_filter), 4);
+        assert!(
+            !shadowsocks_filter
+                .lock()
+                .insert_and_check(b"shadowsocks-salt"),
+            "changing handler generations must not forget Shadowsocks salts"
+        );
+
+        handle
+            .reload(shadowsocks, &resolver(), None)
+            .expect("a second reload should keep using the same filter");
+        assert_eq!(Arc::strong_count(&shadowsocks_filter), 4);
+
+        let other = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+        assert!(
+            other
+                .replay_state
+                .vmess_auth_ids()
+                .lock()
+                .check_and_insert(b"vmess-auth-id"),
+            "different inbounds must have independent VMess replay namespaces"
+        );
+        assert!(
+            other
+                .replay_state
+                .shadowsocks_salts()
+                .lock()
+                .insert_and_check(b"shadowsocks-salt"),
+            "different inbounds must have independent Shadowsocks replay namespaces"
+        );
     }
 }

@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 /// Maximum number of fragmented packets to track per session.
@@ -48,10 +48,16 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry};
+use crate::quic_server::{
+    QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, require_validated_quic_address,
+};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, ResolverCache};
 use crate::routing::protocol::sniff_tcp;
 use crate::stream_reader::StreamReader;
+use crate::tcp::handshake_gate::{
+    HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
+};
 use crate::tcp::tcp_server::setup_client_tcp_stream_with_metadata;
 use crate::util::allocate_vec;
 
@@ -106,8 +112,22 @@ async fn process_connection(
     resolver: Arc<dyn Resolver>,
     conn: quinn::Incoming,
     settings: Hysteria2ConnectionSettings,
+    handshake_permit: HandshakePermit,
+    pre_auth_deadline: Instant,
 ) -> std::io::Result<()> {
-    let connection = conn.await?;
+    let transport_deadline = std::cmp::min(
+        pre_auth_deadline,
+        Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
+    );
+    let connection = match timeout_at(transport_deadline, conn).await {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Hysteria2 QUIC handshake exceeded the pre-auth deadline",
+            ));
+        }
+    };
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
@@ -125,14 +145,37 @@ async fn process_connection(
     // instead of passing the connection to one of the two loops, incase one finishes first.
     let h3_quinn_connection = h3_quinn::Connection::new(connection.clone());
 
-    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
-        h3::server::Connection::new(h3_quinn_connection)
-            .await
-            .map_err(|e| std::io::Error::other(format!("H3 connection setup failed: {e}")))?;
+    let h3_setup_deadline = std::cmp::min(
+        pre_auth_deadline,
+        Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
+    );
+    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> = match timeout_at(
+        h3_setup_deadline,
+        h3::server::Connection::new(h3_quinn_connection),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(e)) => {
+            return Err(std::io::Error::other(format!(
+                "H3 connection setup failed: {e}"
+            )));
+        }
+        Err(_elapsed) => {
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"pre-auth timeout");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Hysteria2 H3 setup exceeded the pre-auth deadline",
+            ));
+        }
+    };
 
-    // Per sing-box reference, authentication timeout is 3 seconds
-    let meter = match timeout(
-        AUTH_TIMEOUT,
+    // Preserve the sing-box-compatible three-second application-authentication
+    // window after H3 setup, but never let it outlive the 60-second absolute outer
+    // deadline that began at gate admission.
+    let auth_deadline = std::cmp::min(pre_auth_deadline, Instant::now() + AUTH_TIMEOUT);
+    let meter = match timeout_at(
+        auth_deadline,
         auth_connection(&mut h3_conn, &connection, &settings),
     )
     .await
@@ -151,6 +194,12 @@ async fn process_connection(
             ));
         }
     };
+
+    // Hysteria2 authenticates once for the whole QUIC connection. From this point
+    // on the connection is charged to its user (when metering is enabled), so it no
+    // longer belongs in the anonymous-handshake budget. Every error above releases
+    // the permit through normal drop as well.
+    drop(handshake_permit);
 
     // The auth exchange itself goes uncounted: it rides h3's own streams, whose
     // framing and QPACK encoding quinn and h3 own between them. It is a few hundred
@@ -1124,7 +1173,7 @@ async fn process_tcp_stream(
         .map(Vec::from)
         .unwrap_or_default();
     drop(stream_reader);
-    let sniffed = if client_proxy_selector.needs_tcp_protocol_sniff() {
+    let sniffed = if client_proxy_selector.needs_tcp_sniff() {
         sniff_tcp(&mut server_stream, &mut replay).await?
     } else {
         None
@@ -1270,6 +1319,9 @@ pub async fn start_hysteria2_server(
     shutdown: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
+    // `num_endpoints` is an SO_REUSEPORT fan-out for one logical listener, not a
+    // multiplier for its unauthenticated-connection budget.
+    let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let obfs = obfs.clone();
@@ -1284,6 +1336,7 @@ pub async fn start_hysteria2_server(
         // No resolver clone: the accept loop takes it from the selector slot, so the
         // rules and the DNS a connection routes by are always one generation.
         let selector = selector.clone();
+        let handshake_gate = handshake_gate.clone();
         let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
@@ -1370,6 +1423,18 @@ pub async fn start_hysteria2_server(
                         None => break,
                     },
                 };
+                let Some(conn) = require_validated_quic_address(conn, "Hysteria2") else {
+                    continue;
+                };
+                let remote_ip = conn.remote_address().ip();
+                let Some(handshake_permit) = handshake_gate.enter(Some(remote_ip)) else {
+                    debug!(
+                        "refusing Hysteria2 peer {remote_ip}: the listener is at its pending-handshake limit"
+                    );
+                    conn.refuse();
+                    continue;
+                };
+                let pre_auth_deadline = Instant::now() + QUIC_PRE_AUTH_TIMEOUT;
                 // Loaded here rather than inside the spawned task: a connection
                 // must be pinned to the rules it was *accepted* under, not to
                 // whichever generation happened to be current when its task ran.
@@ -1383,6 +1448,8 @@ pub async fn start_hysteria2_server(
                         cloned_resolver,
                         conn,
                         connection_settings,
+                        handshake_permit,
+                        pre_auth_deadline,
                     )
                     .await
                     {

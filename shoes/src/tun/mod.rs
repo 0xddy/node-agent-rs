@@ -51,14 +51,17 @@ use std::os::unix::io::IntoRawFd;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::address::{Address, NetLocation};
-use crate::client_proxy_selector::ClientProxySelector;
+use crate::async_stream::AsyncStream;
+use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::config::TunConfig;
 use crate::config::selection::ConfigSelection;
 use crate::resolver::{NativeResolver, Resolver};
+use crate::routing::protocol::sniff_tcp;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
 use tcp_stack_direct::{NewTcpConnection, TcpStackDirect};
@@ -194,67 +197,85 @@ fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
 
 /// Handle a TCP connection by forwarding it through the proxy chain.
 async fn handle_tcp_connection(
-    mut connection: tcp_conn::TcpConnection,
+    connection: tcp_conn::TcpConnection,
     target: NetLocation,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
-    let decision = proxy_selector.judge_tcp(target.into(), &resolver).await?;
+    let mut connection: Box<dyn AsyncStream> = Box::new(connection);
+    let mut replay = Vec::new();
+    let sniffed = if proxy_selector.needs_tcp_sniff() {
+        sniff_tcp(&mut connection, &mut replay).await?
+    } else {
+        None
+    };
 
-    match decision {
-        crate::client_proxy_selector::ConnectDecision::Allow {
+    let decision = match sniffed {
+        Some(metadata) => {
+            proxy_selector
+                .judge_sniffed_tcp(target.into(), &resolver, metadata.protocol, metadata.domain)
+                .await?
+        }
+        None => proxy_selector.judge_tcp(target.into(), &resolver).await?,
+    };
+    let (chain_group, remote_location) = match decision {
+        ConnectDecision::Allow {
             chain_group,
             remote_location,
-        } => {
-            debug!(
-                "TCP: connecting to {} via chain",
+        } => (chain_group, remote_location),
+        ConnectDecision::Block => {
+            debug!("TCP connection blocked by rules");
+            return Ok(());
+        }
+    };
+
+    debug!(
+        "TCP: connecting to {} via chain",
+        remote_location.location()
+    );
+    let setup_result = chain_group
+        .connect_tcp(remote_location.clone(), &resolver)
+        .await
+        .inspect_err(|error| {
+            warn!(
+                "Failed to connect to {}: {error}",
                 remote_location.location()
             );
+        })?;
+    let mut remote = setup_result.client_stream;
+    if let Some(early_data) = setup_result.early_data {
+        connection.write_all(&early_data).await?;
+        connection.flush().await?;
+    }
 
-            match chain_group
-                .connect_tcp(remote_location.clone(), &resolver)
-                .await
-            {
-                Ok(setup_result) => {
-                    debug!(
-                        "TCP: connected to {}, starting bidirectional copy",
-                        remote_location.location()
-                    );
+    // Every byte consumed by the bounded sniffer is replayed before the normal
+    // relay starts, exactly as it is for socket and QUIC inbounds.
+    if !replay.is_empty() {
+        remote.write_all(&replay).await?;
+        remote.flush().await?;
+    }
 
-                    let mut remote = setup_result.client_stream;
-                    let result = tokio::io::copy_bidirectional(&mut connection, &mut remote).await;
-
-                    match result {
-                        Ok((client_to_remote, remote_to_client)) => {
-                            debug!(
-                                "TCP connection to {} completed: {} bytes sent, {} bytes received",
-                                remote_location.location(),
-                                client_to_remote,
-                                remote_to_client
-                            );
-                        }
-                        Err(e) => {
-                            debug!(
-                                "TCP connection to {} error: {}",
-                                remote_location.location(),
-                                e
-                            );
-                        }
-                    }
-
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("Failed to connect to {}: {}", remote_location.location(), e);
-                    Err(e)
-                }
-            }
+    debug!(
+        "TCP: connected to {}, starting bidirectional copy",
+        remote_location.location()
+    );
+    match tokio::io::copy_bidirectional(&mut connection, &mut remote).await {
+        Ok((client_to_remote, remote_to_client)) => {
+            debug!(
+                "TCP connection to {} completed: {client_to_remote} bytes sent, \
+                 {remote_to_client} bytes received",
+                remote_location.location()
+            );
         }
-        crate::client_proxy_selector::ConnectDecision::Block => {
-            debug!("TCP connection blocked by rules");
-            Ok(())
+        Err(error) => {
+            debug!(
+                "TCP connection to {} error: {error}",
+                remote_location.location()
+            );
         }
     }
+
+    Ok(())
 }
 
 /// Handle UDP packets from the stack thread.

@@ -11,7 +11,7 @@ use lru::LruCache;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::address::{Address, NetLocation};
@@ -19,10 +19,17 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserRegistry};
+use crate::quic_server::{
+    QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, require_validated_quic_address,
+};
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_single_address};
+use crate::routing::protocol::sniff_tcp;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
+use crate::tcp::handshake_gate::{
+    HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
+};
+use crate::tcp::tcp_server::setup_client_tcp_stream_with_metadata;
 use crate::util::{allocate_vec, write_all};
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
@@ -77,6 +84,14 @@ type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
 /// would not carry.
 type Meter = Option<Arc<ConnContext>>;
 
+/// The listener resources assigned to one validated but not yet authenticated TUIC
+/// peer. Keeping the permit and its absolute deadline together makes it impossible
+/// for a call site to admit a connection without also bounding its anonymous phase.
+struct TuicPreAuthAdmission {
+    permit: HandshakePermit,
+    deadline: Instant,
+}
+
 /// One client-facing QUIC stream, metered if the inbound is.
 ///
 /// TUIC uses three stream shapes and needs a different half of each: a bidirectional
@@ -122,29 +137,52 @@ async fn process_connection(
     metered: bool,
     conn: quinn::Incoming,
     zero_rtt_handshake: bool,
+    pre_auth: TuicPreAuthAdmission,
 ) -> std::io::Result<()> {
+    let TuicPreAuthAdmission {
+        permit: handshake_permit,
+        deadline: pre_auth_deadline,
+    } = pre_auth;
     // Accept the incoming connection. When 0-RTT is enabled, use into_0rtt() to
     // allow 0.5-RTT data transmission before the handshake fully completes.
     // This reduces latency at the cost of some security (0-RTT data is vulnerable
     // to replay attacks, though for incoming server connections it's 0.5-RTT which
     // is safer but still shouldn't be used for client-authenticated data).
-    let connection = if zero_rtt_handshake {
-        let connecting = conn
-            .accept()
-            .map_err(|e| std::io::Error::other(format!("QUIC accept failed: {e}")))?;
-        // For incoming connections, into_0rtt() always succeeds per quinn docs
-        let (connection, _zero_rtt_accepted) = connecting
-            .into_0rtt()
-            .map_err(|_| std::io::Error::other("failed to enable 0-RTT"))?;
-        connection
-    } else {
-        conn.await?
+    let transport_deadline = std::cmp::min(
+        pre_auth_deadline,
+        Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
+    );
+    let connection = match timeout_at(transport_deadline, async move {
+        if zero_rtt_handshake {
+            let connecting = conn
+                .accept()
+                .map_err(|e| std::io::Error::other(format!("QUIC accept failed: {e}")))?;
+            // For incoming connections, into_0rtt() always succeeds per quinn docs
+            let (connection, _zero_rtt_accepted) = connecting
+                .into_0rtt()
+                .map_err(|_| std::io::Error::other("failed to enable 0-RTT"))?;
+            Ok::<_, std::io::Error>(connection)
+        } else {
+            Ok(conn.await?)
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "TUIC QUIC handshake exceeded the pre-auth deadline",
+            ));
+        }
     };
 
-    // Authentication with timeout - per sing-box reference, default 3 seconds.
-    // This prevents malicious clients from holding connections open without authenticating.
-    let meter = match timeout(
-        AUTH_TIMEOUT,
+    // Preserve TUIC's three-second application-authentication window after the
+    // transport handshake, bounded by the absolute outer deadline that started at
+    // gate admission.
+    let auth_deadline = std::cmp::min(pre_auth_deadline, Instant::now() + AUTH_TIMEOUT);
+    let meter = match timeout_at(
+        auth_deadline,
         auth_connection(&connection, users.as_ref(), metered),
     )
     .await
@@ -163,6 +201,12 @@ async fn process_connection(
             ));
         }
     };
+
+    // TUIC's AUTHENTICATE command covers the whole multiplexed connection. Once
+    // it succeeds, the dynamic user's own connection admission replaces the
+    // anonymous listener budget. Authentication failures and dropped futures
+    // release this permit through Drop on their way out.
+    drop(handshake_permit);
 
     // The AUTHENTICATE stream itself goes uncounted. It is read before anyone knows
     // whose connection this is, so there is no user to bill it to at the time, and it
@@ -616,13 +660,25 @@ async fn process_tcp_stream(
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
+    let mut replay = stream_reader
+        .unparsed_data_owned()
+        .map(Vec::from)
+        .unwrap_or_default();
+    drop(stream_reader);
+    let sniffed = if client_proxy_selector.needs_tcp_sniff() {
+        sniff_tcp(&mut server_stream, &mut replay).await?
+    } else {
+        None
+    };
+
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream(
+        setup_client_tcp_stream_with_metadata(
             &mut server_stream,
             client_proxy_selector,
             resolver,
             remote_location.clone(),
+            sniffed,
         ),
     );
 
@@ -649,14 +705,12 @@ async fn process_tcp_stream(
         }
     };
 
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
+    let client_requires_flush = if replay.is_empty() {
         false
     } else {
-        write_all(&mut client_stream, unparsed_data).await?;
+        write_all(&mut client_stream, &replay).await?;
         true
     };
-    drop(stream_reader);
 
     // Use 32KB buffers to match reference implementations
     let copy_result = copy_bidirectional_with_sizes(
@@ -1788,12 +1842,16 @@ pub async fn start_tuic_server(
     shutdown: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
+    // All SO_REUSEPORT endpoints below form one logical listener and therefore
+    // share one pending-authentication budget.
+    let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         // No resolver clone: the accept loop takes it from the selector slot, so the
         // rules and the DNS a connection routes by are always one generation.
         let selector = selector.clone();
         let users = users.clone();
+        let handshake_gate = handshake_gate.clone();
         let shutdown = shutdown.clone();
 
         let join_handle = tokio::spawn(async move {
@@ -1849,6 +1907,21 @@ pub async fn start_tuic_server(
                         None => break,
                     },
                 };
+                let Some(conn) = require_validated_quic_address(conn, "TUIC") else {
+                    continue;
+                };
+                let remote_ip = conn.remote_address().ip();
+                let Some(handshake_permit) = handshake_gate.enter(Some(remote_ip)) else {
+                    debug!(
+                        "refusing TUIC peer {remote_ip}: the listener is at its pending-handshake limit"
+                    );
+                    conn.refuse();
+                    continue;
+                };
+                let pre_auth = TuicPreAuthAdmission {
+                    permit: handshake_permit,
+                    deadline: Instant::now() + QUIC_PRE_AUTH_TIMEOUT,
+                };
                 // Loaded here rather than inside the spawned task: a connection
                 // must be pinned to the rules it was *accepted* under, not to
                 // whichever generation happened to be current when its task ran.
@@ -1864,6 +1937,7 @@ pub async fn start_tuic_server(
                         metered,
                         conn,
                         zero_rtt_handshake,
+                        pre_auth,
                     )
                     .await
                     {

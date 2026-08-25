@@ -1,4 +1,4 @@
-//! A ceiling on the connections a listener is carrying through their handshake.
+//! A ceiling on unauthenticated work admitted by one logical listener.
 //!
 //! # What this bounds, and what it deliberately does not
 //!
@@ -6,15 +6,19 @@
 //! authenticated as. Before authentication there is no user to charge, and the
 //! window is not short: a TCP connection gets up to 60 seconds in
 //! [`process_stream`](super::tcp_server::process_stream) to complete a handshake,
-//! and until this module existed a listener would carry as many of those at once as
-//! the kernel would hand it. That is the one resource an unauthenticated peer can
+//! while native QUIC protocols have a transport handshake before their application
+//! authentication and generic QUIC performs another configured-protocol handshake
+//! on every bidi stream. Without a gate, a listener would carry as many of those as
+//! its transport would hand it. That is the resource an unauthenticated peer can
 //! consume, so it is the one this bounds.
 //!
-//! It bounds only the handshake. A connection that authenticates releases its permit
-//! and then runs for as long as it likes under the user's own ceiling. This is the
-//! whole reason the gate is a counter and not a semaphore: a semaphore holds its
-//! permit for the lifetime of whatever took it, so a pool of connections that
-//! authenticate and stay would starve new arrivals of a permit they never needed.
+//! Most gate instances bound only the handshake. A connection-authenticated protocol
+//! releases its permit and then runs under the user's own ceiling. Generic QUIC is
+//! the deliberate exception: its connection has no user identity because every
+//! stream authenticates separately, so it uses one gate for connection-lifetime
+//! permits and an independent gate for pending stream handshakes. Keeping those
+//! budgets separate prevents either an idle transport or its multiplexed streams
+//! from escaping accounting.
 //!
 //! # Refusing rather than queueing
 //!
@@ -39,11 +43,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Handshakes one listener will carry at once.
 ///
-/// Sized for the resource actually at stake: each pending handshake is a socket, a
-/// task and whatever buffers its protocol has allocated so far, held for up to the
-/// 60 second setup deadline. A thousand of those is a bad minute, not a dead host,
-/// and a listener that legitimately has a thousand handshakes in flight at one
-/// instant is under a load spike no ceiling would have helped with.
+/// Sized for the resource actually at stake: each pending handshake is a task and
+/// whatever socket, QUIC connection/stream and protocol buffers it has allocated so
+/// far. A thousand of those is a bad interval, not a dead host, and a listener that
+/// legitimately has a thousand handshakes in flight at one instant is under a load
+/// spike no ceiling would have helped with.
 pub const MAX_PENDING_HANDSHAKES: usize = 1024;
 
 /// Handshakes one source address may hold of that total.
@@ -128,9 +132,11 @@ impl HandshakeGate {
 
 /// A handshake's place in the listener's budget, released on drop.
 ///
-/// Dropped as soon as the handshake resolves, which is what keeps this a bound on
-/// handshakes rather than on connections. See
-/// [`process_stream`](super::tcp_server::process_stream).
+/// Usually dropped as soon as the handshake resolves: TCP drops it after handler
+/// setup, connection-authenticated QUIC protocols after their one auth exchange,
+/// and generic QUIC stream gates after each stream's setup. Generic QUIC's separate
+/// connection gate intentionally keeps its permit until the transport ends because
+/// the transport itself never belongs to one authenticated user.
 pub struct HandshakePermit {
     gate: Arc<HandshakeGate>,
     source: Option<IpAddr>,

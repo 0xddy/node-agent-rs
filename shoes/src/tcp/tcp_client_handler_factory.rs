@@ -388,6 +388,14 @@ pub fn create_tcp_client_proxy_selector(
     rules: Vec<RuleConfig>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientProxySelector {
+    create_tcp_client_proxy_selector_with_sniff_policy(rules, resolver, None)
+}
+
+pub fn create_tcp_client_proxy_selector_with_sniff_policy(
+    rules: Vec<RuleConfig>,
+    resolver: Arc<dyn Resolver>,
+    sniff_policy: Option<bool>,
+) -> ClientProxySelector {
     let rules = rules
         .into_iter()
         .map(|rule_config| {
@@ -423,5 +431,31 @@ pub fn create_tcp_client_proxy_selector(
             }
         })
         .collect::<Vec<_>>();
-    ClientProxySelector::new(rules)
+    ClientProxySelector::with_sniff_policy(rules, sniff_policy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolver::NativeResolver;
+
+    #[test]
+    fn selector_factory_preserves_explicit_sniff_policy() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+
+        let legacy =
+            create_tcp_client_proxy_selector(vec![RuleConfig::default()], Arc::clone(&resolver));
+        assert_eq!(legacy.sniff_policy(), None);
+        assert!(!legacy.needs_tcp_sniff());
+
+        for enabled in [true, false] {
+            let selector = create_tcp_client_proxy_selector_with_sniff_policy(
+                vec![RuleConfig::default()],
+                Arc::clone(&resolver),
+                Some(enabled),
+            );
+            assert_eq!(selector.sniff_policy(), Some(enabled));
+            assert_eq!(selector.needs_tcp_sniff(), enabled);
+        }
+    }
 }

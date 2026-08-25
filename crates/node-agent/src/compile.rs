@@ -1116,9 +1116,10 @@ fn inbound_protocol_sniff_enabled(node: &NodeInstance) -> Result<bool, CompileEr
                 })?;
             Ok(config.sniff)
         }
-        // The panel's Hysteria2 provider has no sniff option and the Go agent does
-        // not prepend a sniff action for it.
-        HYSTERIA2_SALAMANDER_ID => Ok(false),
+        // The panel's Hysteria2 provider has no sniff switch. The Rust engine
+        // performs bounded, demand-driven sniffing whenever a protocol matcher is
+        // present, so there is no provider option to gate here.
+        HYSTERIA2_SALAMANDER_ID => Ok(true),
         _ => Ok(false),
     }
 }
@@ -1187,6 +1188,7 @@ fn compile_vless(
     );
     let config = json!({
         "address": socket_address(&listen, cfg.listen_port),
+        "sniff": cfg.sniff,
         "protocol": {
             "type": "tls",
             "reality_targets": {
@@ -1523,7 +1525,7 @@ fn compile_rules_for_inbound(
             }
             if !rule.protocol.is_empty() && !sniff_enabled {
                 return Err(CompileError::new(format!(
-                    "route.rules[{index}] uses protocol matching on inbound {inbound_tag:?}, but that provider does not enable sniff; enable sniff on the VLESS inbound (Hysteria2 has no panel sniff option)"
+                    "route.rules[{index}] uses protocol matching on inbound {inbound_tag:?}, but that provider does not enable sniff; enable sniff on the VLESS inbound"
                 )));
             }
             rules.push(compile_route_rule(rule, index, outbounds, rule_sets)?);

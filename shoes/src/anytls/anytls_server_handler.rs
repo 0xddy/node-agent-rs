@@ -255,7 +255,7 @@ impl AnyTlsServerHandler {
             }
         });
 
-        Ok(TcpServerSetupResult::AlreadyHandled)
+        Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
     }
 }
 

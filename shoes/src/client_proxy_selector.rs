@@ -232,6 +232,9 @@ const CACHE_RULE_THRESHOLD: usize = 16;
 #[derive(Debug)]
 pub struct ClientProxySelector {
     rules: Vec<ConnectRule>,
+    /// Explicit inbound sniff setting. `None` is the legacy auto mode, where
+    /// protocol predicates alone decide whether application bytes are inspected.
+    sniff_policy: Option<bool>,
     /// If false, hostname rules will not trigger DNS resolution to match against IP-based
     /// destinations. This is useful when a huge blocklist or rule list is provided.
     /// However, this means that the user needs to make sure DNS resolutions are not done
@@ -256,6 +259,14 @@ pub enum ConnectDecision<'a> {
 
 impl ClientProxySelector {
     pub fn new(rules: Vec<ConnectRule>) -> Self {
+        Self::with_sniff_policy(rules, None)
+    }
+
+    /// Create a selector with an explicit inbound sniff policy.
+    ///
+    /// `None` retains legacy demand-driven sniffing, `Some(true)` enables it for
+    /// every TCP stream, and `Some(false)` disables it unconditionally.
+    pub fn with_sniff_policy(rules: Vec<ConnectRule>, sniff_policy: Option<bool>) -> Self {
         // Rich predicates that contain destination IP ranges must be able to evaluate a
         // hostname. Legacy masks retain the historical no-resolution default.
         let resolve_rule_hostnames = rules.iter().any(|rule| {
@@ -263,7 +274,12 @@ impl ClientProxySelector {
                 .as_ref()
                 .is_some_and(RoutePredicate::requires_ip)
         });
-        Self::with_options(rules, resolve_rule_hostnames)
+        Self::with_options_and_cache_size_and_sniff_policy(
+            rules,
+            resolve_rule_hostnames,
+            RoutingCache::DEFAULT_CAPACITY,
+            sniff_policy,
+        )
     }
 
     /// Create a new ClientProxySelector with configurable hostname resolution behavior.
@@ -274,10 +290,11 @@ impl ClientProxySelector {
     ///   against IP-based destinations. If false (default), hostname rules only match hostname
     ///   destinations directly. Setting this to false is more performant for large rule sets.
     pub fn with_options(rules: Vec<ConnectRule>, resolve_rule_hostnames: bool) -> Self {
-        Self::with_options_and_cache_size(
+        Self::with_options_and_cache_size_and_sniff_policy(
             rules,
             resolve_rule_hostnames,
             RoutingCache::DEFAULT_CAPACITY,
+            None,
         )
     }
 
@@ -301,6 +318,20 @@ impl ClientProxySelector {
         rules: Vec<ConnectRule>,
         resolve_rule_hostnames: bool,
         cache_capacity: usize,
+    ) -> Self {
+        Self::with_options_and_cache_size_and_sniff_policy(
+            rules,
+            resolve_rule_hostnames,
+            cache_capacity,
+            None,
+        )
+    }
+
+    fn with_options_and_cache_size_and_sniff_policy(
+        rules: Vec<ConnectRule>,
+        resolve_rule_hostnames: bool,
+        cache_capacity: usize,
+        sniff_policy: Option<bool>,
     ) -> Self {
         // Enable caching for context-free, resolution-independent selectors when
         // explicitly requested or when linear rule scans become expensive.
@@ -333,6 +364,7 @@ impl ClientProxySelector {
 
         Self {
             rules,
+            sniff_policy,
             resolve_rule_hostnames,
             cache,
         }
@@ -379,22 +411,39 @@ impl ClientProxySelector {
         protocol: RouteProtocol,
         domain: Option<String>,
     ) -> std::io::Result<ConnectDecision<'a>> {
-        self.judge_with_context(
+        // The destination-only cache key cannot distinguish two HTTP Host/TLS SNI
+        // values sharing one IP:port. Bypass it only for this metadata-bearing
+        // lookup; ordinary TCP and UDP decisions can still use the selector cache.
+        let resolved_ip = location.resolved_addr().map(|addr| ip_to_u128(addr.ip()));
+        self.judge_uncached_with_context(
             location,
+            resolved_ip,
             resolver,
             &RouteContext::sniffed_tcp(protocol, domain),
         )
         .await
     }
 
-    /// Whether any rule needs application protocol metadata. Callers use this to
-    /// avoid touching application bytes for selectors that do not contain such rules.
-    pub fn needs_tcp_protocol_sniff(&self) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.predicate
-                .as_ref()
-                .is_some_and(RoutePredicate::uses_protocol)
+    /// The inbound's explicit sniff policy, or `None` for legacy auto mode.
+    pub fn sniff_policy(&self) -> Option<bool> {
+        self.sniff_policy
+    }
+
+    /// Whether this selector should inspect application bytes on a TCP stream.
+    pub fn needs_tcp_sniff(&self) -> bool {
+        self.sniff_policy.unwrap_or_else(|| {
+            self.rules.iter().any(|rule| {
+                rule.predicate
+                    .as_ref()
+                    .is_some_and(RoutePredicate::uses_protocol)
+            })
         })
+    }
+
+    /// Compatibility alias for entry points while they migrate to
+    /// [`Self::needs_tcp_sniff`].
+    pub fn needs_tcp_protocol_sniff(&self) -> bool {
+        self.needs_tcp_sniff()
     }
 
     /// Judge a UDP destination. Built-in datagram handlers use this convenience wrapper.
@@ -2302,28 +2351,151 @@ mod tests {
     }
 
     #[test]
-    fn protocol_sniff_is_demand_driven_by_the_selector() {
-        let destination_only = ConnectRule::try_with_match_config(
-            vec![NetLocationMask::ANY],
-            RouteMatchConfig {
-                domain_suffix: vec!["example.com".into()],
-                ..Default::default()
-            },
-            ConnectAction::new_block(),
-        )
-        .unwrap();
-        assert!(!ClientProxySelector::new(vec![destination_only]).needs_tcp_protocol_sniff());
+    fn tcp_sniff_policy_distinguishes_auto_enabled_and_disabled() {
+        let destination_only = || {
+            ConnectRule::try_with_match_config(
+                vec![NetLocationMask::ANY],
+                RouteMatchConfig {
+                    domain_suffix: vec!["example.com".into()],
+                    ..Default::default()
+                },
+                ConnectAction::new_block(),
+            )
+            .unwrap()
+        };
+        let protocol = || {
+            ConnectRule::try_with_match_config(
+                vec![NetLocationMask::ANY],
+                RouteMatchConfig {
+                    protocol: vec![RouteProtocol::Tls],
+                    ..Default::default()
+                },
+                ConnectAction::new_block(),
+            )
+            .unwrap()
+        };
 
-        let protocol = ConnectRule::try_with_match_config(
+        let legacy_destination = ClientProxySelector::new(vec![destination_only()]);
+        assert_eq!(legacy_destination.sniff_policy(), None);
+        assert!(!legacy_destination.needs_tcp_sniff());
+        assert_eq!(
+            legacy_destination.needs_tcp_protocol_sniff(),
+            legacy_destination.needs_tcp_sniff()
+        );
+        assert!(ClientProxySelector::new(vec![protocol()]).needs_tcp_sniff());
+
+        let enabled = ClientProxySelector::with_sniff_policy(vec![destination_only()], Some(true));
+        assert_eq!(enabled.sniff_policy(), Some(true));
+        assert!(enabled.needs_tcp_sniff());
+        assert_eq!(
+            enabled.needs_tcp_protocol_sniff(),
+            enabled.needs_tcp_sniff()
+        );
+        assert!(ClientProxySelector::with_sniff_policy(Vec::new(), Some(true)).needs_tcp_sniff());
+
+        let disabled = ClientProxySelector::with_sniff_policy(vec![protocol()], Some(false));
+        assert_eq!(disabled.sniff_policy(), Some(false));
+        assert!(!disabled.needs_tcp_sniff());
+        assert_eq!(
+            disabled.needs_tcp_protocol_sniff(),
+            disabled.needs_tcp_sniff()
+        );
+    }
+
+    #[test]
+    fn explicitly_enabled_sniffing_keeps_cache_for_context_free_traffic() {
+        let rule = || {
+            ConnectRule::try_with_match_config(
+                vec![NetLocationMask::ANY],
+                RouteMatchConfig {
+                    domain_suffix: vec!["example.com".into()],
+                    ..Default::default()
+                },
+                ConnectAction::new_block(),
+            )
+            .unwrap()
+        };
+
+        let legacy = ClientProxySelector::with_options_and_cache_size_and_sniff_policy(
+            vec![rule()],
+            true,
+            8,
+            None,
+        );
+        assert!(legacy.cache.is_some());
+
+        let enabled = ClientProxySelector::with_options_and_cache_size_and_sniff_policy(
+            vec![rule()],
+            true,
+            8,
+            Some(true),
+        );
+        assert!(enabled.cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn sniffed_domain_routes_an_ip_destination_without_cache_cross_talk() {
+        let domain_block = ConnectRule::try_with_match_config(
             vec![NetLocationMask::ANY],
             RouteMatchConfig {
-                protocol: vec![RouteProtocol::Tls],
+                domain_suffix: vec!["blocked.example".into()],
                 ..Default::default()
             },
             ConnectAction::new_block(),
         )
         .unwrap();
-        assert!(ClientProxySelector::new(vec![protocol]).needs_tcp_protocol_sniff());
+        let selector = ClientProxySelector::with_options_and_cache_size_and_sniff_policy(
+            vec![domain_block, allow_rule(vec!["0.0.0.0/0"], "default")],
+            true,
+            8,
+            Some(true),
+        );
+        let resolver = mock_resolver();
+        let destination = || NetLocation::new(Address::Ipv4(Ipv4Addr::new(203, 0, 113, 10)), 443);
+
+        assert!(selector.cache.is_some());
+        assert!(matches!(
+            selector
+                .judge_udp(destination().into(), &resolver)
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        assert_eq!(
+            selector.cache_size(),
+            1,
+            "forced TCP sniffing must not disable caching for UDP traffic"
+        );
+
+        assert!(matches!(
+            selector
+                .judge_sniffed_tcp(
+                    destination().into(),
+                    &resolver,
+                    RouteProtocol::Tls,
+                    Some("api.blocked.example".into()),
+                )
+                .await
+                .unwrap(),
+            ConnectDecision::Block
+        ));
+        assert!(matches!(
+            selector
+                .judge_sniffed_tcp(
+                    destination().into(),
+                    &resolver,
+                    RouteProtocol::Tls,
+                    Some("allowed.example".into()),
+                )
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
+        ));
+        assert_eq!(
+            selector.cache_size(),
+            1,
+            "sniffed metadata must neither read nor write the destination-only cache"
+        );
     }
 
     #[tokio::test]

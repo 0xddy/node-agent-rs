@@ -18,9 +18,12 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::dynamic::{ConnContext, current_connection};
 use crate::resolver::Resolver;
+use crate::routing::protocol::{SniffedTcpMetadata, sniff_tcp};
 use crate::routing::{ServerStream, run_udp_routing};
+use crate::tcp::tcp_handler::TcpClientSetupResult;
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::uot::SocksPacketAddrStream;
+use crate::util::write_all;
 use crate::vless::VlessMessageStream;
 
 use super::MuxProtocol;
@@ -469,9 +472,28 @@ async fn handle_h2mux_tcp(
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> io::Result<()> {
-    let action = proxy_selector
-        .judge_tcp(destination.clone().into(), &resolver)
-        .await?;
+    // A multiplexed VLESS connection is authenticated at the outer stream, but
+    // routing is still evaluated independently for every h2mux substream.  Keep
+    // the same sniff/replay contract as a direct inbound so `protocol`, TLS SNI
+    // and HTTP Host rules cannot be bypassed merely by enabling multiplexing.
+    let (sniffed, replay) = sniff_h2mux_tcp(&mut stream, &proxy_selector).await?;
+    let action = match sniffed {
+        Some(metadata) => {
+            proxy_selector
+                .judge_sniffed_tcp(
+                    destination.clone().into(),
+                    &resolver,
+                    metadata.protocol,
+                    metadata.domain,
+                )
+                .await?
+        }
+        None => {
+            proxy_selector
+                .judge_tcp(destination.clone().into(), &resolver)
+                .await?
+        }
+    };
 
     match action {
         ConnectDecision::Allow {
@@ -480,11 +502,33 @@ async fn handle_h2mux_tcp(
         } => {
             debug!("H2MUX TCP: connecting to {} via chain", remote_location);
 
-            let client_result = chain_group.connect_tcp(remote_location, &resolver).await?;
-            let mut client_stream = client_result.client_stream;
+            let TcpClientSetupResult {
+                mut client_stream,
+                early_data,
+            } = chain_group.connect_tcp(remote_location, &resolver).await?;
+
+            // A chained HTTP CONNECT/SOCKS handshake may read target bytes in the
+            // same packet as its success response. Deliver those bytes before the
+            // relay starts; writing through H2MuxServerStream also emits the mux
+            // success status, so a server-first protocol cannot leave the client
+            // waiting forever after its banner was consumed as early data.
+            forward_client_early_data(&mut stream, early_data).await?;
+
+            let client_requires_flush = if replay.is_empty() {
+                false
+            } else {
+                write_all(&mut client_stream, &replay).await?;
+                true
+            };
 
             // Bidirectional copy
-            let result = copy_bidirectional(&mut stream, &mut *client_stream, false, false).await;
+            let result = copy_bidirectional(
+                &mut stream,
+                &mut *client_stream,
+                false,
+                client_requires_flush,
+            )
+            .await;
 
             let _ = stream.shutdown().await;
             let _ = client_stream.shutdown().await;
@@ -503,6 +547,33 @@ async fn handle_h2mux_tcp(
             ))
         }
     }
+}
+
+async fn forward_client_early_data<S>(stream: &mut S, early_data: Option<Vec<u8>>) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if let Some(data) = early_data {
+        write_all(stream, &data).await?;
+        stream.flush().await?;
+    }
+    Ok(())
+}
+
+async fn sniff_h2mux_tcp<S>(
+    stream: &mut S,
+    proxy_selector: &ClientProxySelector,
+) -> io::Result<(Option<SniffedTcpMetadata>, Vec<u8>)>
+where
+    S: AsyncRead + Unpin + ?Sized,
+{
+    let mut replay = Vec::new();
+    let sniffed = if proxy_selector.needs_tcp_sniff() {
+        sniff_tcp(stream, &mut replay).await?
+    } else {
+        None
+    };
+    Ok((sniffed, replay))
 }
 
 /// Handle UDP stream with fixed destination
@@ -572,8 +643,46 @@ async fn handle_h2mux_udp_packet_addr(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::{forward_client_early_data, sniff_h2mux_tcp};
+    use crate::client_proxy_selector::ClientProxySelector;
+    use crate::routing::predicate::RouteProtocol;
+
     #[tokio::test]
     async fn test_server_session_creation() {
         // Verifies types compile correctly; full integration tests require a matching client
+    }
+
+    #[tokio::test]
+    async fn tcp_substream_sniffs_and_replays_application_bytes() {
+        const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: mux.example\r\n\r\nbody";
+        let selector = ClientProxySelector::with_sniff_policy(Vec::new(), Some(true));
+        let (mut server, mut client) = duplex(1024);
+        let writer = tokio::spawn(async move {
+            client.write_all(REQUEST).await.unwrap();
+        });
+
+        let (metadata, replay) = sniff_h2mux_tcp(&mut server, &selector).await.unwrap();
+
+        writer.await.unwrap();
+        let metadata = metadata.expect("HTTP h2mux payload should be classified");
+        assert_eq!(metadata.protocol, RouteProtocol::Http);
+        assert_eq!(metadata.domain.as_deref(), Some("mux.example"));
+        assert_eq!(replay, REQUEST);
+    }
+
+    #[tokio::test]
+    async fn outbound_early_data_is_forwarded_instead_of_discarded() {
+        const BANNER: &[u8] = b"server-first banner";
+        let (mut server, mut client) = duplex(128);
+
+        forward_client_early_data(&mut server, Some(BANNER.to_vec()))
+            .await
+            .unwrap();
+
+        let mut received = vec![0; BANNER.len()];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, BANNER);
     }
 }

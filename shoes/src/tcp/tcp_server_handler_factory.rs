@@ -9,7 +9,7 @@ use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ClientChainHop, ClientConfig};
 use crate::config::{
-    ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
+    ConfigSelection, RealityServerConfig, RuleConfig, ServerProxyConfig, ShadowTlsServerConfig,
     ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, WebsocketServerConfig,
 };
 use crate::dynamic::{StaticUserRegistry, UserRegistry};
@@ -25,6 +25,7 @@ use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
 use crate::tcp::chain_builder::build_client_proxy_chain;
+use crate::tcp::inbound_replay::InboundReplayState;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tls_server_handler::NaiveConfig;
 use crate::tls_server_handler::{
@@ -35,7 +36,7 @@ use crate::vless::vless_server_handler::VlessTcpServerHandler;
 use crate::vmess::VmessTcpServerHandler;
 use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
-use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
+use super::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
 
 fn create_auth_credentials(
     username: Option<String>,
@@ -156,12 +157,39 @@ fn resolve_trojan_users(
 /// owns it. When it is `None`, each authenticating protocol builds an immutable
 /// registry from its own config credential; when it is `Some`, that registry is the
 /// only authority and the config credential is ignored.
+///
+/// This compatibility constructor creates a fresh replay namespace and therefore
+/// represents one standalone inbound handler. Built-in listeners use the
+/// inbound-scoped factory below so multiple bind IPs and reload generations share
+/// VMess/Shadowsocks replay protection; callers should prefer the listener APIs
+/// instead of invoking this constructor separately for one logical inbound.
 pub fn create_tcp_server_handler(
     server_proxy_config: ServerProxyConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
+) -> Box<dyn TcpServerHandler> {
+    create_tcp_server_handler_with_replay_state(
+        server_proxy_config,
+        client_proxy_selector,
+        resolver,
+        bind_ip,
+        users,
+        &InboundReplayState::default(),
+    )
+}
+
+/// Build one handler generation while retaining the replay namespace of its
+/// inbound. Startup passes the same state to every bind address and reload passes
+/// it to every replacement generation.
+pub(crate) fn create_tcp_server_handler_with_replay_state(
+    server_proxy_config: ServerProxyConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    users: Option<&Arc<dyn UserRegistry>>,
+    replay_state: &InboundReplayState,
 ) -> Box<dyn TcpServerHandler> {
     match server_proxy_config {
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
@@ -225,23 +253,27 @@ pub fn create_tcp_server_handler(
                     // inbound's own key opens the header; the session keys come from
                     // whichever user it named.
                     Some(users) => Box::new(
-                        ShadowsocksTcpHandler::new_aead2022_multi_user_server(
+                        ShadowsocksTcpHandler::new_aead2022_multi_user_server_with_replay_filter(
                             cipher,
                             &key_bytes,
                             users.clone(),
                             udp_enabled,
                             client_proxy_selector.clone(),
                             resolver.clone(),
+                            replay_state.shadowsocks_salts(),
                         )
                         .expect("Invalid multi-user shadowsocks inbound"),
                     ),
-                    None => Box::new(ShadowsocksTcpHandler::new_aead2022_server(
-                        cipher,
-                        &key_bytes,
-                        udp_enabled,
-                        client_proxy_selector.clone(),
-                        resolver.clone(),
-                    )),
+                    None => Box::new(
+                        ShadowsocksTcpHandler::new_aead2022_server_with_replay_filter(
+                            cipher,
+                            &key_bytes,
+                            udp_enabled,
+                            client_proxy_selector.clone(),
+                            resolver.clone(),
+                            replay_state.shadowsocks_salts(),
+                        ),
+                    ),
                 }
             }
         },
@@ -294,12 +326,20 @@ pub fn create_tcp_server_handler(
                             resolver,
                             bind_ip,
                             users,
+                            replay_state,
                         ),
                     )
                 })
                 .collect::<FxHashMap<String, TlsServerTarget>>();
             let default_tls_target = default_tls_target.map(|config| {
-                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip, users)
+                create_tls_server_target(
+                    *config,
+                    client_proxy_selector,
+                    resolver,
+                    bind_ip,
+                    users,
+                    replay_state,
+                )
             });
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
@@ -312,6 +352,7 @@ pub fn create_tcp_server_handler(
                             resolver,
                             bind_ip,
                             users,
+                            replay_state,
                         ),
                     )
                 })
@@ -328,6 +369,7 @@ pub fn create_tcp_server_handler(
                             resolver,
                             bind_ip,
                             users,
+                            replay_state,
                         ),
                     )
                 })
@@ -344,12 +386,13 @@ pub fn create_tcp_server_handler(
             cipher,
             user_id,
             udp_enabled,
-        } => Box::new(VmessTcpServerHandler::new(
+        } => Box::new(VmessTcpServerHandler::new_with_replay_filter(
             &cipher,
             resolve_uuid_users(users, &user_id),
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),
+            replay_state.vmess_auth_ids(),
         )),
         ServerProxyConfig::Websocket { targets } => {
             let server_targets: Vec<WebsocketServerTarget> = targets
@@ -362,6 +405,7 @@ pub fn create_tcp_server_handler(
                         resolver,
                         bind_ip,
                         users,
+                        replay_state,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -418,12 +462,25 @@ pub fn create_tcp_server_handler(
     }
 }
 
+fn create_override_selector(
+    rules: Vec<RuleConfig>,
+    parent: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+) -> Arc<ClientProxySelector> {
+    Arc::new(create_tcp_client_proxy_selector_with_sniff_policy(
+        rules,
+        resolver.clone(),
+        parent.sniff_policy(),
+    ))
+}
+
 fn create_tls_server_target(
     tls_server_config: TlsServerConfig,
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
+    replay_state: &InboundReplayState,
 ) -> TlsServerTarget {
     let TlsServerConfig {
         cert,
@@ -474,7 +531,7 @@ fn create_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(rules, client_proxy_selector, resolver)
     } else {
         client_proxy_selector.clone()
     };
@@ -513,8 +570,14 @@ fn create_tls_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler =
-            create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+        let handler = create_tcp_server_handler_with_replay_state(
+            protocol,
+            &effective_selector,
+            resolver,
+            bind_ip,
+            users,
+            replay_state,
+        );
         InnerProtocol::Normal(handler)
     };
 
@@ -531,6 +594,7 @@ fn create_shadow_tls_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
+    replay_state: &InboundReplayState,
 ) -> TlsServerTarget {
     let ShadowTlsServerConfig {
         password,
@@ -574,13 +638,19 @@ fn create_shadow_tls_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(rules, client_proxy_selector, resolver)
     } else {
         client_proxy_selector.clone()
     };
 
-    let handler =
-        create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+    let handler = create_tcp_server_handler_with_replay_state(
+        protocol,
+        &effective_selector,
+        resolver,
+        bind_ip,
+        users,
+        replay_state,
+    );
 
     TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
@@ -595,6 +665,7 @@ fn create_reality_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
+    replay_state: &InboundReplayState,
 ) -> TlsServerTarget {
     let RealityServerConfig {
         private_key,
@@ -630,7 +701,7 @@ fn create_reality_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(rules, client_proxy_selector, resolver)
     } else {
         client_proxy_selector.clone()
     };
@@ -669,8 +740,14 @@ fn create_reality_server_target(
             unreachable!("Vision requires VLESS (should be validated during config load)")
         }
     } else {
-        let handler =
-            create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+        let handler = create_tcp_server_handler_with_replay_state(
+            protocol,
+            &effective_selector,
+            resolver,
+            bind_ip,
+            users,
+            replay_state,
+        );
         InnerProtocol::Normal(handler)
     };
 
@@ -715,6 +792,7 @@ fn create_websocket_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
+    replay_state: &InboundReplayState,
 ) -> WebsocketServerTarget {
     let WebsocketServerConfig {
         matching_path,
@@ -738,13 +816,19 @@ fn create_websocket_server_target(
         let rules = override_rules
             .map(ConfigSelection::unwrap_config)
             .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(rules, client_proxy_selector, resolver)
     } else {
         client_proxy_selector.clone()
     };
 
-    let handler =
-        create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip, users);
+    let handler = create_tcp_server_handler_with_replay_state(
+        protocol,
+        &effective_selector,
+        resolver,
+        bind_ip,
+        users,
+        replay_state,
+    );
 
     WebsocketServerTarget {
         matching_path,
@@ -759,6 +843,18 @@ mod tests {
     use super::*;
     use crate::config::server::{AnyTlsUserConfig, NaiveUserConfig};
     use crate::dynamic::credential::{naive_basic_credential, password_sha256};
+    use crate::resolver::NativeResolver;
+
+    #[test]
+    fn override_rules_inherit_the_inbound_sniff_policy() {
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+
+        for policy in [None, Some(true), Some(false)] {
+            let parent = Arc::new(ClientProxySelector::with_sniff_policy(Vec::new(), policy));
+            let child = create_override_selector(vec![RuleConfig::default()], &parent, &resolver);
+            assert_eq!(child.sniff_policy(), policy);
+        }
+    }
 
     /// NOTE(shoes-engine): a user's id reaches logs and reports -- the AnyTLS handler
     /// debug-logs it on every successful authentication -- so it must never be their

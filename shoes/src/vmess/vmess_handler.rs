@@ -10,7 +10,6 @@ use aws_lc_rs::cipher::{
     AES_128, EncryptingKey as CipherEncryptingKey, EncryptionContext, UnboundCipherKey,
 };
 use bytes::BytesMut;
-use parking_lot::Mutex;
 use rand::{Rng, RngExt};
 use shake::Shake128;
 use shake::digest::{ExtendableOutput, Update};
@@ -25,9 +24,11 @@ use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::dynamic::{UserRegistry, bind_connection_user, current_connection};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
-use crate::replay_filter::ReplayFilter;
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
+use crate::tcp::inbound_replay::{
+    VMESS_AUTH_ID_WINDOW, VmessAuthIdFilter, new_vmess_auth_id_filter,
+};
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
@@ -83,10 +84,8 @@ const AUTH_ID_CLOCK_SKEW: Duration = Duration::from_secs(120);
 /// The cost of the wider window is small and bounded, because what lands in the
 /// filter is one entry per *admitted* connection rather than one per packet off the
 /// wire.
-const AUTH_ID_WINDOW: Duration = AUTH_ID_CLOCK_SKEW.saturating_mul(2);
-
 const _: () = assert!(
-    AUTH_ID_WINDOW.as_secs() == 2 * AUTH_ID_CLOCK_SKEW.as_secs(),
+    VMESS_AUTH_ID_WINDOW.as_secs() == 2 * AUTH_ID_CLOCK_SKEW.as_secs(),
     "an auth id stays admissible for two skews, so it must be remembered for two"
 );
 
@@ -96,7 +95,7 @@ pub struct VmessTcpServerHandler {
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    /// Auth ids seen inside [`AUTH_ID_WINDOW`], so a recorded one cannot be used
+    /// Auth ids seen inside [`VMESS_AUTH_ID_WINDOW`], so a recorded one cannot be used
     /// twice.
     ///
     /// Shared by every connection to this inbound, because that is the scope a
@@ -111,7 +110,7 @@ pub struct VmessTcpServerHandler {
     /// either produced by someone holding the uuid or copied from someone who did.
     /// Random bytes fail the checksum and never reach the filter, which is what
     /// separates this from a filter fed by anything off the wire.
-    auth_ids: Mutex<ReplayFilter>,
+    auth_ids: VmessAuthIdFilter,
 }
 
 impl std::fmt::Debug for VmessTcpServerHandler {
@@ -124,6 +123,11 @@ impl std::fmt::Debug for VmessTcpServerHandler {
 }
 
 impl VmessTcpServerHandler {
+    /// Create one standalone VMess inbound handler with a fresh replay namespace.
+    ///
+    /// Built-in multi-bind/reload listeners inject their inbound-scoped filter via
+    /// the internal constructor; constructing multiple public handlers does not
+    /// make them one logical replay-protection scope.
     pub fn new(
         cipher_name: &str,
         users: Arc<dyn UserRegistry>,
@@ -131,13 +135,31 @@ impl VmessTcpServerHandler {
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
+        Self::new_with_replay_filter(
+            cipher_name,
+            users,
+            udp_enabled,
+            proxy_selector,
+            resolver,
+            new_vmess_auth_id_filter(),
+        )
+    }
+
+    pub(crate) fn new_with_replay_filter(
+        cipher_name: &str,
+        users: Arc<dyn UserRegistry>,
+        udp_enabled: bool,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        auth_ids: VmessAuthIdFilter,
+    ) -> Self {
         Self {
             data_cipher: cipher_name.into(),
             users,
             udp_enabled,
             proxy_selector,
             resolver,
-            auth_ids: Mutex::new(ReplayFilter::new(AUTH_ID_WINDOW)),
+            auth_ids,
         }
     }
 }

@@ -171,6 +171,13 @@ pub struct ServerConfig {
     pub tcp_settings: Option<TcpConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_settings: Option<ServerQuicConfig>,
+    /// Application protocol sniffing policy for TCP streams.
+    ///
+    /// `None` preserves Shoes' legacy demand-driven behaviour, `Some(true)`
+    /// explicitly enables sniffing for every TCP stream, and `Some(false)`
+    /// explicitly disables it even when a route contains protocol predicates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sniff: Option<bool>,
     #[serde(
         alias = "rule",
         default = "direct_allow_rule",
@@ -203,6 +210,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "transport",
             "tcp_settings",
             "quic_settings",
+            "sniff",
             "rules",
             "rule",
             "dns",
@@ -269,6 +277,15 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid quic_settings: {e}")))?;
 
+        // Parse sniff policy (optional, skip if null). Omission deliberately has
+        // different semantics from false: it retains Shoes' legacy auto mode.
+        let sniff: Option<bool> = map
+            .get("sniff")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| Error::custom(format!("invalid sniff: {e}")))?;
+
         // Parse rules (optional, with alias "rule", default to direct_allow_rule, skip if null)
         let rules: NoneOrSome<ConfigSelection<RuleConfig>> = map
             .get("rules")
@@ -293,6 +310,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             transport,
             tcp_settings,
             quic_settings,
+            sniff,
             rules,
             dns,
         })
@@ -915,6 +933,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: Some(TcpConfig { no_delay: true }),
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -932,6 +951,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -950,6 +970,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -977,6 +998,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 1,
             }),
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -999,6 +1021,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1048,6 +1071,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1068,6 +1092,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1092,6 +1117,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1110,6 +1136,7 @@ mod tests {
             transport: Transport::Tcp,
             tcp_settings: None,
             quic_settings: None,
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1137,6 +1164,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 1,
             }),
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1161,6 +1189,7 @@ mod tests {
                 client_fingerprints: NoneOrSome::None,
                 num_endpoints: 1,
             }),
+            sniff: None,
             rules: NoneOrSome::None,
             dns: None,
         }
@@ -1178,6 +1207,31 @@ mod tests {
             deserialized.protocol,
             ServerProxyConfig::Http { .. }
         ));
+    }
+
+    #[test]
+    fn server_sniff_policy_round_trips_all_three_states() {
+        let legacy = create_test_server_config_http();
+        let yaml = serde_yaml::to_string(&legacy).unwrap();
+        assert!(!yaml.lines().any(|line| line.starts_with("sniff:")));
+        assert_eq!(
+            serde_yaml::from_str::<ServerConfig>(&yaml).unwrap().sniff,
+            None
+        );
+
+        for enabled in [true, false] {
+            let mut explicit = create_test_server_config_http();
+            explicit.sniff = Some(enabled);
+            let yaml = serde_yaml::to_string(&explicit).unwrap();
+            assert!(yaml.contains(&format!("sniff: {enabled}")));
+            assert_eq!(
+                serde_yaml::from_str::<ServerConfig>(&yaml).unwrap().sniff,
+                Some(enabled)
+            );
+        }
+
+        let invalid = "address: 127.0.0.1:8080\nprotocol:\n  type: http\nsniff: auto\n";
+        assert!(serde_yaml::from_str::<ServerConfig>(invalid).is_err());
     }
 
     #[test]

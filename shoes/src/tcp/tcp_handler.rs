@@ -12,7 +12,9 @@ pub enum TcpServerSetupResult {
         remote_location: NetLocation,
         stream: Box<dyn AsyncStream>,
         need_initial_flush: bool,
-        /// Response to write to the server stream after connection to remote location succeeds
+        /// Response normally written after the remote connection succeeds. A caller
+        /// that needs application-protocol sniffing must send and flush it first,
+        /// because response-gated clients cannot provide sniffable bytes otherwise.
         connection_success_response: Option<Box<[u8]>>,
         /// Initial data to send to the remote location
         initial_remote_data: Option<Box<[u8]>>,
@@ -41,9 +43,26 @@ pub enum TcpServerSetupResult {
     /// Connection has been fully handled (e.g., spawned as a background task).
     /// No further processing needed by the caller.
     AlreadyHandled,
+    /// The stream was handed to a probing-resistance or camouflage fallback after
+    /// proxy authentication failed (or before deferred authentication completed).
+    ///
+    /// Transport callers must stop processing this stream, but must not count it as
+    /// a successful proxy handshake for a multiplexed connection-wide auth gate.
+    UnauthenticatedFallbackHandled,
 }
 
 impl TcpServerSetupResult {
+    pub(crate) fn is_already_handled(&self) -> bool {
+        matches!(
+            self,
+            Self::AlreadyHandled | Self::UnauthenticatedFallbackHandled
+        )
+    }
+
+    pub(crate) fn completes_protocol_handshake(&self) -> bool {
+        !matches!(self, Self::UnauthenticatedFallbackHandled)
+    }
+
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
         match self {
             TcpServerSetupResult::TcpForward {
@@ -64,7 +83,8 @@ impl TcpServerSetupResult {
             } => {
                 *flush = need_initial_flush;
             }
-            TcpServerSetupResult::AlreadyHandled => {}
+            TcpServerSetupResult::AlreadyHandled
+            | TcpServerSetupResult::UnauthenticatedFallbackHandled => {}
         }
     }
 }
