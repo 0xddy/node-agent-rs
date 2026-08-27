@@ -2500,7 +2500,7 @@ fn describe_step_failure(failure: StepFailure) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{SocketAddr, TcpListener};
+    use std::net::{SocketAddr, TcpListener, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2653,6 +2653,11 @@ mod tests {
             .iter()
             .map(|listener| listener.local_addr().expect("read ephemeral port"))
             .collect()
+    }
+
+    fn free_udp_addr() -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral UDP port");
+        socket.local_addr().expect("read ephemeral UDP port")
     }
 
     fn user(id: &str, uuid: &str) -> UserSpec {
@@ -3113,7 +3118,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn hot_config_and_user_rollback_drains_under_the_published_owner() {
-        let address = free_addrs(1)[0];
+        let address = free_udp_addr();
         let runtime = runtime().await;
         let password_user = |id: &str, password: &str| UserSpec {
             id: Some(id.to_string()),
@@ -4625,9 +4630,12 @@ mod tests {
             start_rule_set_server(initial_bytes.clone()).await;
         let temporary = tempfile::tempdir().expect("create rule-set cache directory");
         let cache_path = temporary.path().join("probe-rules.json");
+        // This test exercises immutable rule-set snapshots, not host DNS
+        // discovery. An explicit loopback server keeps it deterministic on
+        // Linux CI hosts that ship resolvectl without a running resolved daemon.
         let probe_dns = json!({
-            "servers": [{"tag": "system", "url": "system"}],
-            "final": "system",
+            "servers": [{"tag": "default-dns", "url": "udp://127.0.0.1:5353"}],
+            "final": "default-dns",
             "rules": [{
                 "rule_set": [{
                     "format": "source",
