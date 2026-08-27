@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Ack, AckStatus, AckStore, Command, TopologyFetcher};
 use crate::policy::PolicyState;
-use crate::topology::manager::{TopologyError, TopologyErrorKind, TopologyManager};
+use crate::topology::MachineTopology;
+use crate::topology::manager::{
+    PublicationToken, TopologyError, TopologyErrorKind, TopologyManager,
+};
 
 pub const MAX_QUEUED_CONTROL_COMMANDS: usize = 256;
 pub const MAX_QUEUED_USER_REFRESH_COMMANDS: usize = 256;
@@ -62,6 +65,11 @@ pub struct TopologyCommandExecutor {
     policy: Arc<PolicyState>,
 }
 
+struct AuthoritativeFetch {
+    topology: MachineTopology,
+    expected_publication: PublicationToken,
+}
+
 impl TopologyCommandExecutor {
     pub fn new(manager: Arc<TopologyManager>, fetcher: Arc<dyn TopologyFetcher>) -> Self {
         Self {
@@ -83,14 +91,21 @@ impl TopologyCommandExecutor {
         }
     }
 
+    /// Fetches and applies the initial authoritative topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns a contextual message when the panel fetch fails or another
+    /// publication wins before the fetched snapshot can be committed.
     pub async fn sync_initial(&self) -> Result<String, String> {
+        let expected_publication = self.manager.publication_token();
         let topology = self
             .fetcher
             .fetch_machine_topology()
             .await
             .map_err(|error| format!("initial topology fetch: {error}"))?;
         self.manager
-            .apply_initial(topology)
+            .apply_authoritative_if_unchanged(topology, expected_publication)
             .await
             .map_err(|error| format!("initial topology apply: {error}"))
     }
@@ -169,14 +184,11 @@ impl TopologyCommandExecutor {
         })?;
         match command_type {
             ControlCommandType::TopologySnapshot => {
-                let snapshot = match command.payload.as_ref() {
-                    Some(Payload::TopologySnapshot(snapshot)) => snapshot,
-                    _ => {
-                        return Err(ApplyFailure::revision(format!(
-                            "topology revision mismatch: command revision={} snapshot revision=0",
-                            command.revision
-                        )));
-                    }
+                let Some(Payload::TopologySnapshot(snapshot)) = command.payload.as_ref() else {
+                    return Err(ApplyFailure::revision(format!(
+                        "topology revision mismatch: command revision={} snapshot revision=0",
+                        command.revision
+                    )));
                 };
                 if command.revision != snapshot.revision {
                     return Err(ApplyFailure::revision(format!(
@@ -190,18 +202,15 @@ impl TopologyCommandExecutor {
                     .map_err(Into::into)
             }
             ControlCommandType::TopologyDelta => {
-                let delta = match command.payload.as_ref() {
-                    Some(Payload::TopologyDelta(delta)) => delta,
-                    _ => {
-                        return Err(ApplyFailure::revision(format!(
-                            "topology revision mismatch: command base={} target={} delta base=0 target=0",
-                            command.base_revision, command.revision
-                        )));
-                    }
+                let Some(Payload::TopologyDelta(delta)) = command.payload.as_ref() else {
+                    return Err(ApplyFailure::revision(format!(
+                        "topology revision mismatch: command base={} target={} delta base=0 target=0",
+                        command.base_revision, command.revision
+                    )));
                 };
-                if command.base_revision != delta.base_revision
-                    || command.revision != delta.target_revision
-                {
+                let command_revisions = (command.base_revision, command.revision);
+                let delta_revisions = (delta.base_revision, delta.target_revision);
+                if command_revisions != delta_revisions {
                     return Err(ApplyFailure::revision(format!(
                         "topology revision mismatch: command base={} target={} delta base={} target={}",
                         command.base_revision,
@@ -216,14 +225,11 @@ impl TopologyCommandExecutor {
                     .map_err(Into::into)
             }
             ControlCommandType::RoutePatch => {
-                let patch = match command.payload.as_ref() {
-                    Some(Payload::TopologyRoutePatch(patch)) => patch,
-                    _ => {
-                        return Err(ApplyFailure::revision(format!(
-                            "topology revision mismatch: command revision={} route patch revision=0",
-                            command.revision
-                        )));
-                    }
+                let Some(Payload::TopologyRoutePatch(patch)) = command.payload.as_ref() else {
+                    return Err(ApplyFailure::revision(format!(
+                        "topology revision mismatch: command revision={} route patch revision=0",
+                        command.revision
+                    )));
                 };
                 if command.revision != patch.revision {
                     return Err(ApplyFailure::revision(format!(
@@ -237,14 +243,11 @@ impl TopologyCommandExecutor {
                     .map_err(Into::into)
             }
             ControlCommandType::UserMutation => {
-                let mutation = match command.payload.as_ref() {
-                    Some(Payload::UserMutation(mutation)) => mutation,
-                    _ => {
-                        return Err(ApplyFailure::revision(format!(
-                            "topology revision mismatch: command revision={} user mutation revision=0",
-                            command.revision
-                        )));
-                    }
+                let Some(Payload::UserMutation(mutation)) = command.payload.as_ref() else {
+                    return Err(ApplyFailure::revision(format!(
+                        "topology revision mismatch: command revision={} user mutation revision=0",
+                        command.revision
+                    )));
                 };
                 if command.revision != mutation.revision {
                     return Err(ApplyFailure::revision(format!(
@@ -317,9 +320,7 @@ impl TopologyCommandExecutor {
                         changes.added, changes.updated, changes.deleted, changes.applied
                     ));
                 }
-                Err(error) if error.kind() == TopologyErrorKind::UsersChangedDuringRefresh => {
-                    continue;
-                }
+                Err(error) if error.kind() == TopologyErrorKind::UsersChangedDuringRefresh => {}
                 Err(error) if error.revision_recovery_required() => {
                     return self
                         .recover_refresh_revision(command, &error, cancellation)
@@ -350,34 +351,55 @@ impl TopologyCommandExecutor {
         cause: &TopologyError,
         cancellation: &CancellationToken,
     ) -> Result<String, ApplyFailure> {
-        let (message, revision) = self.resync(cancellation).await.map_err(|error| {
+        let topology = self.fetch_resync(cancellation).await.map_err(|error| {
             ApplyFailure::plain(format!(
                 "user refresh revision resync failed after {cause}: {}",
                 error.message
             ))
         })?;
-        if revision < command.revision {
+        if topology.topology.revision < command.revision {
             return Err(ApplyFailure::plain(format!(
-                "user refresh cannot be replayed from an older authoritative snapshot: snapshot={revision} target={}",
-                command.revision
+                "user refresh cannot be replayed from an older authoritative snapshot: snapshot={} target={}",
+                topology.topology.revision, command.revision
             )));
         }
+        let (message, _) = self.apply_resync(topology).await.map_err(|error| {
+            ApplyFailure::plain(format!(
+                "user refresh revision resync failed after {cause}: {}",
+                error.message
+            ))
+        })?;
         Ok(format!("user refresh revision mismatch, {message}"))
     }
 
-    async fn resync(
+    async fn fetch_resync(
         &self,
         cancellation: &CancellationToken,
-    ) -> Result<(String, u64), ApplyFailure> {
+    ) -> Result<AuthoritativeFetch, ApplyFailure> {
+        // Capture immediately before the fetch. The fetched snapshot may have
+        // the same revision as a command applied by the other worker lane, so
+        // revision alone cannot prevent a delayed response from rolling it
+        // back.
+        let expected_publication = self.manager.publication_token();
         let topology = self
             .fetcher
             .fetch_machine_topology_cancellable(cancellation)
             .await
             .map_err(|error| ApplyFailure::plain(format!("revision resync fetch: {error}")))?;
         ensure_active(cancellation)?;
+        Ok(AuthoritativeFetch {
+            topology,
+            expected_publication,
+        })
+    }
+
+    async fn apply_resync(
+        &self,
+        fetched: AuthoritativeFetch,
+    ) -> Result<(String, u64), ApplyFailure> {
         let message = self
             .manager
-            .apply_initial(topology)
+            .apply_authoritative_if_unchanged(fetched.topology, fetched.expected_publication)
             .await
             .map_err(|error| ApplyFailure {
                 message: format!("revision resync apply: {error}"),
@@ -392,6 +414,14 @@ impl TopologyCommandExecutor {
                 ApplyFailure::plain("revision resync returned an unversioned topology")
             })?;
         Ok((format!("resynced: {message}"), revision))
+    }
+
+    async fn resync(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(String, u64), ApplyFailure> {
+        let topology = self.fetch_resync(cancellation).await?;
+        self.apply_resync(topology).await
     }
 }
 
@@ -482,6 +512,20 @@ struct WorkerLifecycle {
     cancellation: CancellationToken,
 }
 
+struct WorkerSpawnOptions {
+    regular_capacity: usize,
+    refresh_capacity: usize,
+    parent_cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+struct LaneContext {
+    executor: Arc<dyn CommandExecutor>,
+    acknowledgements: Arc<AckStore>,
+    output: mpsc::UnboundedSender<ControlAck>,
+    cancellation: CancellationToken,
+}
+
 impl Drop for WorkerLifecycle {
     fn drop(&mut self) {
         self.cancellation.cancel();
@@ -493,12 +537,14 @@ impl ControlCommandWorker {
         executor: Arc<dyn CommandExecutor>,
         acknowledgements: Arc<AckStore>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
-        Self::spawn_with_capacity_and_cancel(
+        Self::spawn_configured(
             executor,
             acknowledgements,
-            MAX_QUEUED_CONTROL_COMMANDS,
-            MAX_QUEUED_USER_REFRESH_COMMANDS,
-            CancellationToken::new(),
+            WorkerSpawnOptions {
+                regular_capacity: MAX_QUEUED_CONTROL_COMMANDS,
+                refresh_capacity: MAX_QUEUED_USER_REFRESH_COMMANDS,
+                parent_cancellation: CancellationToken::new(),
+            },
         )
     }
 
@@ -507,12 +553,14 @@ impl ControlCommandWorker {
         acknowledgements: Arc<AckStore>,
         cancellation: CancellationToken,
     ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
-        Self::spawn_with_capacity_and_cancel(
+        Self::spawn_configured(
             executor,
             acknowledgements,
-            MAX_QUEUED_CONTROL_COMMANDS,
-            MAX_QUEUED_USER_REFRESH_COMMANDS,
-            cancellation,
+            WorkerSpawnOptions {
+                regular_capacity: MAX_QUEUED_CONTROL_COMMANDS,
+                refresh_capacity: MAX_QUEUED_USER_REFRESH_COMMANDS,
+                parent_cancellation: cancellation,
+            },
         )
     }
 
@@ -522,12 +570,14 @@ impl ControlCommandWorker {
         regular_capacity: usize,
         refresh_capacity: usize,
     ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
-        Self::spawn_with_capacity_and_cancel(
+        Self::spawn_configured(
             executor,
             acknowledgements,
-            regular_capacity,
-            refresh_capacity,
-            CancellationToken::new(),
+            WorkerSpawnOptions {
+                regular_capacity,
+                refresh_capacity,
+                parent_cancellation: CancellationToken::new(),
+            },
         )
     }
 
@@ -538,6 +588,27 @@ impl ControlCommandWorker {
         refresh_capacity: usize,
         parent_cancellation: CancellationToken,
     ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+        Self::spawn_configured(
+            executor,
+            acknowledgements,
+            WorkerSpawnOptions {
+                regular_capacity,
+                refresh_capacity,
+                parent_cancellation,
+            },
+        )
+    }
+
+    fn spawn_configured(
+        executor: Arc<dyn CommandExecutor>,
+        acknowledgements: Arc<AckStore>,
+        options: WorkerSpawnOptions,
+    ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+        let WorkerSpawnOptions {
+            regular_capacity,
+            refresh_capacity,
+            parent_cancellation,
+        } = options;
         assert!(regular_capacity > 0, "regular capacity must be non-zero");
         assert!(refresh_capacity > 0, "refresh capacity must be non-zero");
         let cancellation = parent_cancellation.child_token();
@@ -547,20 +618,14 @@ impl ControlCommandWorker {
         let (regular_tx, regular_rx) = mpsc::channel(regular_capacity);
         let (refresh_tx, refresh_rx) = mpsc::channel(refresh_capacity);
         let (ack_tx, ack_rx) = mpsc::unbounded_channel();
-        spawn_lane(
-            regular_rx,
-            executor.clone(),
-            acknowledgements.clone(),
-            ack_tx.clone(),
-            cancellation.clone(),
-        );
-        spawn_lane(
-            refresh_rx,
+        let lane = LaneContext {
             executor,
             acknowledgements,
-            ack_tx.clone(),
+            output: ack_tx.clone(),
             cancellation,
-        );
+        };
+        spawn_lane(regular_rx, lane.clone());
+        spawn_lane(refresh_rx, lane);
         (
             Self {
                 regular: regular_tx,
@@ -572,6 +637,10 @@ impl ControlCommandWorker {
         )
     }
 
+    /// # Errors
+    ///
+    /// Returns [`WorkerClosed`] when cancellation or a closed command/ACK
+    /// channel prevents the command from being accepted.
     pub async fn submit(&self, command: ControlCommand) -> Result<(), WorkerClosed> {
         if self.lifecycle.cancellation.is_cancelled() {
             return Err(WorkerClosed);
@@ -625,18 +694,18 @@ impl ControlCommandWorker {
     }
 }
 
-fn spawn_lane(
-    mut commands: mpsc::Receiver<ControlCommand>,
-    executor: Arc<dyn CommandExecutor>,
-    acknowledgements: Arc<AckStore>,
-    output: mpsc::UnboundedSender<ControlAck>,
-    cancellation: CancellationToken,
-) {
+fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
     tokio::spawn(async move {
+        let LaneContext {
+            executor,
+            acknowledgements,
+            output,
+            cancellation,
+        } = lane;
         loop {
             let command = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => break,
+                () = cancellation.cancelled() => break,
                 command = commands.recv() => match command {
                     Some(command) => command,
                     None => break,
@@ -664,10 +733,13 @@ fn spawn_lane(
             .await;
             let mut result = match joined {
                 Ok(result) => result,
-                Err(error) if error.is_panic() => TerminalResult::failed(format!(
-                    "control command execution panicked: {}",
-                    panic_message(error.into_panic())
-                )),
+                Err(error) if error.is_panic() => {
+                    let payload = error.into_panic();
+                    TerminalResult::failed(format!(
+                        "control command execution panicked: {}",
+                        panic_message(payload.as_ref())
+                    ))
+                }
                 Err(error) => TerminalResult::failed(format!(
                     "control command execution task failed: {error}"
                 )),
@@ -718,9 +790,10 @@ fn command_from_proto(command: &ControlCommand) -> Command {
         node_id: command.node_id.clone(),
         revision: command.revision,
         idempotency_key: command.idempotency_key.clone(),
-        command_type: ControlCommandType::try_from(command.r#type)
-            .map(|kind| kind.as_str_name().to_string())
-            .unwrap_or_else(|_| command.r#type.to_string()),
+        command_type: ControlCommandType::try_from(command.r#type).map_or_else(
+            |_| command.r#type.to_string(),
+            |kind| kind.as_str_name().to_string(),
+        ),
         payload: command.legacy_payload.clone(),
     }
 }
@@ -747,17 +820,17 @@ fn proto_ack(
     }
 }
 
-fn uses_refresh_lane(command_type: i32) -> bool {
+const fn uses_refresh_lane(command_type: i32) -> bool {
     command_type == ControlCommandType::UserRefresh as i32
 }
 
 fn revision_fenced_command(command_type: i32) -> bool {
     matches!(
         ControlCommandType::try_from(command_type),
-        Ok(ControlCommandType::TopologyDelta)
-            | Ok(ControlCommandType::RoutePatch)
-            | Ok(ControlCommandType::UserMutation)
-            | Ok(ControlCommandType::UserRefresh)
+        Ok(ControlCommandType::TopologyDelta
+            | ControlCommandType::RoutePatch
+            | ControlCommandType::UserMutation
+            | ControlCommandType::UserRefresh)
     )
 }
 
@@ -774,16 +847,17 @@ fn rebase_control_command(command: &ControlCommand, base_revision: u64) -> Contr
     rebased
 }
 
-fn panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
+fn panic_message(payload: &(dyn std::any::Any + Send + 'static)) -> String {
+    match (
+        payload.downcast_ref::<&str>(),
+        payload.downcast_ref::<String>(),
+    ) {
+        (Some(message), _) => (*message).to_string(),
+        (_, Some(message)) => message.clone(),
+        (None, None) => "non-string panic payload".to_string(),
     }
 }
 
-fn dash_if_empty(value: &str) -> &str {
+const fn dash_if_empty(value: &str) -> &str {
     if value.is_empty() { "-" } else { value }
 }

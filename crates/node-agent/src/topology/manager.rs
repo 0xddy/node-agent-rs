@@ -569,13 +569,18 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                 Ok(_) => {
                     return Err(runtime_transaction_failure_parts(
                         &inner,
-                        "forced reload completed without a running shoes instance".into(),
-                        false,
-                        false,
-                        false,
-                        &pending.previous_plan,
-                        pending.previous_config,
-                        pending.previous_had_topology,
+                        RuntimeFailureState {
+                            operation: "forced reload completed without a running shoes instance"
+                                .into(),
+                            rolled_back: false,
+                            unchanged: false,
+                            running: false,
+                        },
+                        RuntimeRollbackTarget {
+                            port_hopping: &pending.previous_plan,
+                            config: pending.previous_config,
+                            had_topology: pending.previous_had_topology,
+                        },
                         RuntimeFailureMode::ForcedReload,
                     )
                     .await);
@@ -666,6 +671,30 @@ enum RuntimeFailureMode {
     ForcedReload,
 }
 
+struct RuntimeFailureState {
+    operation: String,
+    rolled_back: bool,
+    unchanged: bool,
+    running: bool,
+}
+
+impl From<&RuntimeError> for RuntimeFailureState {
+    fn from(error: &RuntimeError) -> Self {
+        Self {
+            operation: error.to_string(),
+            rolled_back: error.rolled_back(),
+            unchanged: error.state_unchanged(),
+            running: error.running(),
+        }
+    }
+}
+
+struct RuntimeRollbackTarget<'a> {
+    port_hopping: &'a PortHoppingPlan,
+    config: Option<RuntimeConfig>,
+    had_topology: bool,
+}
+
 async fn runtime_transaction_failure(
     inner: &AdapterInner,
     error: RuntimeError,
@@ -674,52 +703,44 @@ async fn runtime_transaction_failure(
     previous_had_topology: bool,
     mode: RuntimeFailureMode,
 ) -> TopologyError {
-    let message = error.to_string();
     runtime_transaction_failure_parts(
         inner,
-        message,
-        error.rolled_back(),
-        error.state_unchanged(),
-        error.running(),
-        previous_plan,
-        previous_config,
-        previous_had_topology,
+        RuntimeFailureState::from(&error),
+        RuntimeRollbackTarget {
+            port_hopping: previous_plan,
+            config: previous_config,
+            had_topology: previous_had_topology,
+        },
         mode,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn runtime_transaction_failure_parts(
     inner: &AdapterInner,
-    operation: String,
-    runtime_rolled_back: bool,
-    runtime_unchanged: bool,
-    runtime_running: bool,
-    previous_plan: &PortHoppingPlan,
-    previous_config: Option<RuntimeConfig>,
-    previous_had_topology: bool,
+    failure: RuntimeFailureState,
+    previous: RuntimeRollbackTarget<'_>,
     mode: RuntimeFailureMode,
 ) -> TopologyError {
     let mut rollback_errors = Vec::with_capacity(2);
-    if let Err(error) = inner.port_router.reconcile(previous_plan) {
+    if let Err(error) = inner.port_router.reconcile(previous.port_hopping) {
         rollback_errors.push(format!(
             "restore previous port hopping forwarding state: {error}"
         ));
     }
 
-    let should_restore_runtime = previous_config.is_some()
+    let should_restore_runtime = previous.config.is_some()
         && match mode {
             RuntimeFailureMode::OrdinaryApply => true,
             // `running` is only a liveness hint: a failed per-inbound rollback can
             // leave one listener alive while the topology is incoherent. Only the
             // explicit transaction classifications prove that the published Box
             // survived intact or was completely restored.
-            RuntimeFailureMode::ForcedReload => !(runtime_rolled_back || runtime_unchanged),
+            RuntimeFailureMode::ForcedReload => !(failure.rolled_back || failure.unchanged),
         };
     let mut restored_runtime = false;
-    let mut running = runtime_running;
-    if should_restore_runtime && let Some(previous_config) = previous_config {
+    let mut running = failure.running;
+    if should_restore_runtime && let Some(previous_config) = previous.config {
         match inner.runtime.apply_config(previous_config).await {
             Ok(()) => {
                 restored_runtime = true;
@@ -736,11 +757,11 @@ async fn runtime_transaction_failure_parts(
     }
 
     let runtime_restored = restored_runtime
-        || runtime_rolled_back
-        || (matches!(mode, RuntimeFailureMode::OrdinaryApply) && runtime_unchanged);
+        || failure.rolled_back
+        || (matches!(mode, RuntimeFailureMode::OrdinaryApply) && failure.unchanged);
     let restored =
-        rollback_errors.is_empty() && previous_had_topology && running && runtime_restored;
-    let mut message = format!("start/apply shoes runtime: {operation}");
+        rollback_errors.is_empty() && previous.had_topology && running && runtime_restored;
+    let mut message = format!("start/apply shoes runtime: {}", failure.operation);
     if !rollback_errors.is_empty() {
         write!(
             message,
@@ -764,6 +785,29 @@ pub struct UserRefreshChanges {
     pub updated: usize,
     pub deleted: usize,
     pub applied: bool,
+}
+
+#[derive(Clone, Copy)]
+enum UserRefreshRevision {
+    None,
+    AdvanceTo(u64),
+    Fence { base: u64, target: u64 },
+}
+
+impl UserRefreshRevision {
+    const fn target(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::AdvanceTo(target) | Self::Fence { target, .. } => target,
+        }
+    }
+}
+
+struct UserRefreshRequest {
+    node_id: String,
+    users: Vec<UserCredential>,
+    expected_current: Option<Vec<UserCredential>>,
+    revision: UserRefreshRevision,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -850,12 +894,21 @@ impl ReloadReporter {
 }
 
 /// One machine's currently published topology.
+#[derive(Default)]
+struct PublishedTopology {
+    topology: MachineTopology,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PublicationToken(u64);
+
 #[derive(Clone)]
 pub struct TopologyManager {
     machine_id: String,
     runtime: Arc<dyn TopologyRuntime>,
     operation: Arc<tokio::sync::Mutex<()>>,
-    current: Arc<RwLock<MachineTopology>>,
+    published: Arc<RwLock<PublishedTopology>>,
 }
 
 impl TopologyManager {
@@ -864,7 +917,7 @@ impl TopologyManager {
             machine_id: machine_id.into(),
             runtime,
             operation: Arc::new(tokio::sync::Mutex::new(())),
-            current: Arc::new(RwLock::new(MachineTopology::default())),
+            published: Arc::new(RwLock::new(PublishedTopology::default())),
         }
     }
 
@@ -893,29 +946,43 @@ impl TopologyManager {
         )
     }
 
-    fn read_current(&self) -> RwLockReadGuard<'_, MachineTopology> {
-        self.current
+    fn read_published(&self) -> RwLockReadGuard<'_, PublishedTopology> {
+        self.published
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn write_current(&self) -> RwLockWriteGuard<'_, MachineTopology> {
-        self.current
+    fn write_published(&self) -> RwLockWriteGuard<'_, PublishedTopology> {
+        self.published
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn publish(&self, topology: MachineTopology) {
+        let mut published = self.write_published();
+        published.topology = topology;
+        published.generation = published.generation.wrapping_add(1);
+    }
+
+    /// Returns a compare-and-swap token for an authoritative panel fetch.
+    /// Every successful topology publication advances this value, including
+    /// publications which intentionally retain the same panel revision.
+    pub(crate) fn publication_token(&self) -> PublicationToken {
+        PublicationToken(self.read_published().generation)
+    }
+
     pub fn current_revision(&self) -> Option<u64> {
-        let current = self.read_current();
+        let published = self.read_published();
+        let current = &published.topology;
         (!current.machine_id.is_empty()).then_some(current.revision)
     }
 
     pub fn current_digest(&self) -> Option<String> {
-        digest(&self.read_current())
+        digest(&self.read_published().topology)
     }
 
     pub fn current_topology(&self) -> MachineTopology {
-        self.read_current().clone()
+        self.read_published().topology.clone()
     }
 
     pub fn current_config(&self) -> Result<Vec<u8>, TopologyError> {
@@ -931,7 +998,7 @@ impl TopologyManager {
 
     pub async fn reconcile_current(&self) -> Result<(), TopologyError> {
         let _operation = self.operation.lock().await;
-        let current = self.read_current().clone();
+        let current = self.read_published().topology.clone();
         if current.machine_id.is_empty() {
             return Ok(());
         }
@@ -950,7 +1017,7 @@ impl TopologyManager {
                 "topology revision mismatch: incoming revision is zero",
             ));
         }
-        let current = self.read_current().revision;
+        let current = self.read_published().topology.revision;
         if incoming < current {
             return Err(TopologyError::new(
                 TopologyErrorKind::StaleRevision,
@@ -958,6 +1025,24 @@ impl TopologyManager {
             ));
         }
         Ok(())
+    }
+
+    /// Rejects an authoritative full snapshot that is older than the topology
+    /// already published by another operation. This must be called while the
+    /// operation lock is held because panel fetches happen outside that lock.
+    fn guard_authoritative_revision(&self, incoming: u64) -> Result<(), TopologyError> {
+        let published = self.read_published();
+        let current = &published.topology;
+        if current.machine_id.is_empty() || current.revision == 0 || incoming >= current.revision {
+            return Ok(());
+        }
+        Err(TopologyError::new(
+            TopologyErrorKind::StaleRevision,
+            format!(
+                "stale authoritative topology: incoming={incoming} current={}",
+                current.revision
+            ),
+        ))
     }
 
     /// Requires a partial command to name the exact currently loaded base.
@@ -970,7 +1055,7 @@ impl TopologyManager {
                 format!("topology revision mismatch: base={base} target={target}"),
             ));
         }
-        let current = self.read_current().revision;
+        let current = self.read_published().topology.revision;
         if base != current {
             return Err(TopologyError::new(
                 TopologyErrorKind::RevisionMismatch,
@@ -992,12 +1077,49 @@ impl TopologyManager {
         let manager = self.clone();
         tokio::spawn(async move {
             let _operation = manager.operation.lock().await;
+            manager.guard_authoritative_revision(topology.revision)?;
             manager.apply(topology).await
         })
         .await
         .map_err(|error| {
             TopologyError::runtime_state(
                 format!("initial topology transaction task failed: {error}"),
+                false,
+                false,
+            )
+        })?
+    }
+
+    /// Applies an authoritative topology only if no topology publication has
+    /// completed since the caller captured its [`PublicationToken`] immediately
+    /// before its panel fetch. Revision equality alone is not a valid fence:
+    /// one panel update may legitimately publish multiple commands at the same
+    /// revision.
+    pub(crate) async fn apply_authoritative_if_unchanged(
+        &self,
+        topology: MachineTopology,
+        expected: PublicationToken,
+    ) -> Result<String, TopologyError> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let _operation = manager.operation.lock().await;
+            manager.guard_authoritative_revision(topology.revision)?;
+            let current = manager.publication_token();
+            if current.0 != expected.0 {
+                return Err(TopologyError::new(
+                    TopologyErrorKind::StaleRevision,
+                    format!(
+                        "authoritative topology changed during fetch: expected_generation={} current_generation={}",
+                        expected.0, current.0
+                    ),
+                ));
+            }
+            manager.apply(topology).await
+        })
+        .await
+        .map_err(|error| {
+            TopologyError::runtime_state(
+                format!("authoritative topology transaction task failed: {error}"),
                 false,
                 false,
             )
@@ -1092,8 +1214,8 @@ impl TopologyManager {
             };
         }
 
-        let previous = self.read_current().clone();
-        *self.write_current() = candidate.clone();
+        let previous = self.read_published().topology.clone();
+        self.publish(candidate.clone());
         self.close_stale_users(&previous, &candidate).await;
         reporter.report(ReloadStage::Completed).await;
         let warnings = self.runtime.warnings();
@@ -1140,7 +1262,7 @@ impl TopologyManager {
         })?;
         self.guard_revision_fence(delta.base_revision, delta.target_revision)?;
 
-        let mut next = self.read_current().clone();
+        let mut next = self.read_published().topology.clone();
         if next.machine_id.is_empty() {
             next.machine_id.clone_from(&self.machine_id);
         }
@@ -1177,7 +1299,7 @@ impl TopologyManager {
         })?;
         self.guard_revision_fence(base_revision, patch.revision)?;
 
-        let mut next = self.read_current().clone();
+        let mut next = self.read_published().topology.clone();
         if next.machine_id.is_empty() {
             next.machine_id.clone_from(&self.machine_id);
         }
@@ -1206,7 +1328,7 @@ impl TopologyManager {
         })?;
         self.guard_revision_fence(base_revision, mutation.revision)?;
 
-        let mut next = self.read_current().clone();
+        let mut next = self.read_published().topology.clone();
         if next.machine_id.is_empty() {
             next.machine_id.clone_from(&self.machine_id);
         }
@@ -1227,7 +1349,13 @@ impl TopologyManager {
         node_id: &str,
         users: Vec<UserCredential>,
     ) -> Result<UserRefreshChanges, TopologyError> {
-        self.refresh(node_id, users, None, false, 0, 0).await
+        self.refresh(UserRefreshRequest {
+            node_id: node_id.to_string(),
+            users,
+            expected_current: None,
+            revision: UserRefreshRevision::None,
+        })
+        .await
     }
 
     pub async fn refresh_node_users_if_current_at_revision(
@@ -1237,14 +1365,12 @@ impl TopologyManager {
         expected_current: Vec<UserCredential>,
         target_revision: u64,
     ) -> Result<UserRefreshChanges, TopologyError> {
-        self.refresh(
-            node_id,
+        self.refresh(UserRefreshRequest {
+            node_id: node_id.to_string(),
             users,
-            Some(expected_current),
-            true,
-            0,
-            target_revision,
-        )
+            expected_current: Some(expected_current),
+            revision: UserRefreshRevision::AdvanceTo(target_revision),
+        })
         .await
     }
 
@@ -1256,48 +1382,32 @@ impl TopologyManager {
         base_revision: u64,
         target_revision: u64,
     ) -> Result<UserRefreshChanges, TopologyError> {
-        self.refresh(
-            node_id,
+        self.refresh(UserRefreshRequest {
+            node_id: node_id.to_string(),
             users,
-            Some(expected_current),
-            true,
-            base_revision,
-            target_revision,
-        )
+            expected_current: Some(expected_current),
+            revision: UserRefreshRevision::Fence {
+                base: base_revision,
+                target: target_revision,
+            },
+        })
         .await
     }
 
     async fn refresh(
         &self,
-        node_id: &str,
-        users: Vec<UserCredential>,
-        expected_current: Option<Vec<UserCredential>>,
-        require_current_match: bool,
-        base_revision: u64,
-        target_revision: u64,
+        request: UserRefreshRequest,
     ) -> Result<UserRefreshChanges, TopologyError> {
         let manager = self.clone();
-        let node_id = node_id.to_string();
-        tokio::spawn(async move {
-            manager
-                .refresh_owned(
-                    node_id,
-                    users,
-                    expected_current,
-                    require_current_match,
-                    base_revision,
-                    target_revision,
+        tokio::spawn(async move { manager.refresh_owned(request).await })
+            .await
+            .map_err(|error| {
+                TopologyError::runtime_state(
+                    format!("user refresh transaction task failed: {error}"),
+                    false,
+                    false,
                 )
-                .await
-        })
-        .await
-        .map_err(|error| {
-            TopologyError::runtime_state(
-                format!("user refresh transaction task failed: {error}"),
-                false,
-                false,
-            )
-        })?
+            })?
     }
 
     /// Runs the complete data-plane apply and manager publication in one owned
@@ -1306,13 +1416,14 @@ impl TopologyManager {
     /// users.
     async fn refresh_owned(
         &self,
-        node_id: String,
-        users: Vec<UserCredential>,
-        expected_current: Option<Vec<UserCredential>>,
-        require_current_match: bool,
-        base_revision: u64,
-        target_revision: u64,
+        request: UserRefreshRequest,
     ) -> Result<UserRefreshChanges, TopologyError> {
+        let UserRefreshRequest {
+            node_id,
+            users,
+            expected_current,
+            revision,
+        } = request;
         let _operation = self.operation.lock().await;
         if node_id.is_empty() {
             return Err(TopologyError::new(
@@ -1320,10 +1431,11 @@ impl TopologyManager {
                 "user refresh requires node_id",
             ));
         }
-        if base_revision != 0 {
-            self.guard_revision_fence(base_revision, target_revision)?;
+        if let UserRefreshRevision::Fence { base, target } = revision {
+            self.guard_revision_fence(base, target)?;
         }
-        let mut next = self.read_current().clone();
+        let target_revision = revision.target();
+        let mut next = self.read_published().topology.clone();
         let node_index = next
             .nodes
             .iter()
@@ -1335,8 +1447,7 @@ impl TopologyManager {
                 )
             })?;
 
-        if require_current_match {
-            let expected = expected_current.as_deref().unwrap_or_default();
+        if let Some(expected) = expected_current.as_deref() {
             let current_changes = compare_node_users(expected, &next.nodes[node_index].users)?;
             if current_changes.added != 0
                 || current_changes.updated != 0
@@ -1358,12 +1469,13 @@ impl TopologyManager {
         }
         if changes.added == 0 && changes.updated == 0 && changes.deleted == 0 {
             if target_revision > 0 {
-                let mut current = self.write_current();
-                if target_revision > current.revision {
-                    current.revision = target_revision;
-                    if let Some(snapshot) = current.snapshot.as_mut() {
+                let mut published = self.write_published();
+                if target_revision > published.topology.revision {
+                    published.topology.revision = target_revision;
+                    if let Some(snapshot) = published.topology.snapshot.as_mut() {
                         snapshot.revision = target_revision;
                     }
+                    published.generation = published.generation.wrapping_add(1);
                 }
             }
             return Ok(changes);
@@ -1383,7 +1495,8 @@ impl TopologyManager {
         // Match Go's `LoadedUsers`: serialize against mutations so a fetch/CAS
         // loop observes a complete manager operation, never an intermediate one.
         let _operation = self.operation.lock().await;
-        self.read_current()
+        self.read_published()
+            .topology
             .nodes
             .iter()
             .find(|node| node.node_id == node_id)
@@ -1400,9 +1513,9 @@ impl TopologyManager {
         if topology.machine_id.is_empty() {
             topology.machine_id.clone_from(&self.machine_id);
         }
-        let previous = self.read_current().clone();
+        let previous = self.read_published().topology.clone();
         self.runtime.apply(&topology).await?;
-        *self.write_current() = topology.clone();
+        self.publish(topology.clone());
         self.close_stale_users(&previous, &topology).await;
         let warnings = self.runtime.warnings();
         report_compile_warnings(&warnings);
@@ -1438,7 +1551,11 @@ impl TopologyManager {
             if mutation.node_id.is_empty() || user.user_id.is_empty() {
                 continue;
             }
-            if !topology_authorizes_user(&self.read_current(), &mutation.node_id, &user.user_id) {
+            if !topology_authorizes_user(
+                &self.read_published().topology,
+                &mutation.node_id,
+                &user.user_id,
+            ) {
                 // Generic old/new diff already closed removed/disabled users.
                 continue;
             }

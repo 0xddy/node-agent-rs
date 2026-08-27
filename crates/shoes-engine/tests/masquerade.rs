@@ -21,9 +21,10 @@ fn with_string_masquerade(address: std::net::SocketAddr, content: &str) -> serde
 
 fn with_proxy_masquerade(
     address: std::net::SocketAddr,
-    url: String,
+    url: impl Into<String>,
     rewrite_host: bool,
 ) -> serde_json::Value {
+    let url = url.into();
     let mut config = hysteria2_inbound(address, false);
     config["protocol"]["masquerade"] = json!({
         "type": "proxy",
@@ -180,12 +181,97 @@ async fn fixed_masquerade_serves_probes_and_bad_auth_without_claiming_a_user() {
     checks.finish();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_valid_password_at_its_connection_limit_receives_the_masquerade() {
+    let mut checks = Checks::new("hysteria2 admission camouflage");
+    let engine = engine().await;
+    let (origin, mut seen) = start_origin().await;
+    let address = free_addr();
+    engine
+        .add_inbound(dynamic(
+            "limited",
+            with_proxy_masquerade(address, format!("http://{origin}/"), true),
+        ))
+        .await
+        .expect("the Hysteria2 inbound should start");
+    let mut alice = password_user("alice", "alice-password");
+    alice.max_conns = Some(1);
+    engine.add_user("limited", alice).unwrap();
+    let occupied = hy2::Hysteria2Client::connect(address, "alice-password")
+        .await
+        .expect("the first connection should occupy alice's only slot");
+    checks.that(
+        "the first connection is registered",
+        wait_for("alice's Hysteria2 connection", || {
+            engine
+                .get_user("limited", "alice")
+                .is_ok_and(|user| user.conns == 1)
+        })
+        .await,
+    );
+
+    let request = |password: &'static str| {
+        hy2::request(
+            address,
+            http::Request::post("https://hysteria/auth")
+                .header("hysteria-auth", password)
+                .header("Hysteria-CC-RX", "1048576")
+                .body(Bytes::new())
+                .unwrap(),
+        )
+    };
+    let limited = request("alice-password")
+        .await
+        .expect("a valid but limited credential should be camouflaged");
+    let unknown = request("unknown-password")
+        .await
+        .expect("an unknown credential should be camouflaged");
+    checks.eq(
+        "both receive the cover status",
+        limited.status(),
+        unknown.status(),
+    );
+    checks.eq(
+        "both receive the cover body",
+        limited.body(),
+        unknown.body(),
+    );
+    checks.eq("the cover status is 201", limited.status().as_u16(), 201);
+    let limited_upstream = seen
+        .recv()
+        .await
+        .expect("the limited credential should reach the cover origin");
+    let unknown_upstream = seen
+        .recv()
+        .await
+        .expect("the unknown credential should reach the cover origin");
+    checks.that(
+        "a valid password refused by admission never reaches the cover origin",
+        limited_upstream.hysteria_headers.is_empty(),
+    );
+    checks.that(
+        "an unknown password never reaches the cover origin either",
+        unknown_upstream.hysteria_headers.is_empty(),
+    );
+    checks.eq(
+        "the refused connection was not authenticated",
+        engine
+            .get_user("limited", "alice")
+            .map(|user| user.total_conns)
+            .ok(),
+        Some(1),
+    );
+    drop(occupied);
+    checks.finish();
+}
+
 #[derive(Debug)]
 struct SeenRequest {
     method: String,
     target: String,
     host: String,
     probe: String,
+    hysteria_headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -220,12 +306,17 @@ async fn start_origin() -> (std::net::SocketAddr, mpsc::Receiver<SeenRequest>) {
                 let target = first.next().unwrap_or_default().to_string();
                 let mut host = String::new();
                 let mut probe = String::new();
+                let mut hysteria_headers = Vec::new();
                 let mut content_length = 0usize;
                 for line in lines {
                     let Some((name, value)) = line.split_once(':') else {
                         continue;
                     };
-                    match name.to_ascii_lowercase().as_str() {
+                    let name = name.to_ascii_lowercase();
+                    if name.starts_with("hysteria-") {
+                        hysteria_headers.push((name.clone(), value.trim().to_string()));
+                    }
+                    match name.as_str() {
                         "host" => host = value.trim().to_string(),
                         "x-probe" => probe = value.trim().to_string(),
                         "content-length" => content_length = value.trim().parse().unwrap(),
@@ -247,6 +338,7 @@ async fn start_origin() -> (std::net::SocketAddr, mpsc::Receiver<SeenRequest>) {
                         target,
                         host,
                         probe,
+                        hysteria_headers,
                         body,
                     })
                     .await;
@@ -391,7 +483,7 @@ async fn proxy_masquerade_rewrites_url_and_controls_the_host_header() {
     let invalid = engine
         .add_inbound(dynamic(
             "invalid",
-            with_proxy_masquerade(free_addr(), "ftp://example.com/".to_string(), true),
+            with_proxy_masquerade(free_addr(), "ftp://example.com/", true),
         ))
         .await;
     checks.detail(

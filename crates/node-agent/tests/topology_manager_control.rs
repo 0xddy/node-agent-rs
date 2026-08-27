@@ -615,6 +615,28 @@ struct QueueFetcher {
     topology_calls: AtomicUsize,
 }
 
+struct DelayedTopologyFetcher {
+    topology: Mutex<Option<MachineTopology>>,
+    started: Notify,
+    release: Semaphore,
+}
+
+#[async_trait]
+impl TopologyFetcher for DelayedTopologyFetcher {
+    async fn fetch_machine_topology(&self) -> Result<MachineTopology, FetchError> {
+        let topology = lock(&self.topology)
+            .take()
+            .ok_or_else(|| FetchError::new("no delayed topology queued"))?;
+        self.started.notify_waiters();
+        self.release.acquire().await.unwrap().forget();
+        Ok(topology)
+    }
+
+    async fn fetch_node_users(&self, _node_id: &str) -> Result<Vec<UserCredential>, FetchError> {
+        Ok(Vec::new())
+    }
+}
+
 impl QueueFetcher {
     fn new(topologies: Vec<MachineTopology>) -> Self {
         Self {
@@ -887,9 +909,186 @@ async fn newer_authoritative_snapshot_wins_without_replaying_old_command() {
 }
 
 #[tokio::test]
+async fn delayed_resync_cannot_roll_back_a_newer_snapshot_from_the_other_lane() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+    manager
+        .apply_initial(topology(100, vec![user("initial", "old")]))
+        .await
+        .unwrap();
+    let fetcher = Arc::new(DelayedTopologyFetcher {
+        topology: Mutex::new(Some(topology(150, vec![user("stale-resync", "stale")]))),
+        started: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    let fetch_started = fetcher.started.notified();
+    let (worker, mut acks) = ControlCommandWorker::spawn(
+        Arc::new(TopologyCommandExecutor::new(
+            manager.clone(),
+            fetcher.clone(),
+        )),
+        Arc::new(AckStore::new()),
+    );
+
+    worker
+        .submit(ControlCommand {
+            command_id: "refresh-stale".into(),
+            operation_id: "refresh-stale".into(),
+            machine_id: "machine-1".into(),
+            node_id: "node-1".into(),
+            base_revision: 99,
+            revision: 150,
+            r#type: ControlCommandType::UserRefresh as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ack(&mut acks).await.status,
+        ControlAckStatus::Accepted as i32
+    );
+    fetch_started.await;
+
+    let newer = topology(300, vec![user("newer", "new")]);
+    worker
+        .submit(ControlCommand {
+            command_id: "snapshot-newer".into(),
+            operation_id: "snapshot-newer".into(),
+            machine_id: "machine-1".into(),
+            revision: 300,
+            r#type: ControlCommandType::TopologySnapshot as i32,
+            payload: Some(Payload::TopologySnapshot(to_snapshot(&newer))),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ack(&mut acks).await.status,
+        ControlAckStatus::Accepted as i32
+    );
+    let applied = ack(&mut acks).await;
+    assert_eq!(applied.command_id, "snapshot-newer");
+    assert_eq!(applied.status, ControlAckStatus::Applied as i32);
+    assert_eq!(manager.current_revision(), Some(300));
+
+    fetcher.release.add_permits(1);
+    let rejected = ack(&mut acks).await;
+    assert_eq!(rejected.command_id, "refresh-stale");
+    assert_eq!(rejected.status, ControlAckStatus::Failed as i32);
+    assert!(rejected.message.contains("stale authoritative topology"));
+    assert_eq!(manager.current_revision(), Some(300));
+    assert_eq!(
+        manager.current_topology().nodes[0].users[0].user_id,
+        "newer"
+    );
+    assert_eq!(
+        lock(&runtime.applied)
+            .iter()
+            .map(|candidate| candidate.revision)
+            .collect::<Vec<_>>(),
+        vec![100, 300]
+    );
+    drop(worker);
+}
+
+#[tokio::test]
+async fn delayed_resync_cannot_roll_back_different_content_at_the_same_revision() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+    manager
+        .apply_initial(topology(100, vec![user("initial", "old")]))
+        .await
+        .unwrap();
+    let fetcher = Arc::new(DelayedTopologyFetcher {
+        topology: Mutex::new(Some(topology(150, vec![user("stale-resync", "stale")]))),
+        started: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    let fetch_started = fetcher.started.notified();
+    let (worker, mut acks) = ControlCommandWorker::spawn(
+        Arc::new(TopologyCommandExecutor::new(
+            manager.clone(),
+            fetcher.clone(),
+        )),
+        Arc::new(AckStore::new()),
+    );
+
+    worker
+        .submit(ControlCommand {
+            command_id: "refresh-stale-equal".into(),
+            operation_id: "refresh-stale-equal".into(),
+            machine_id: "machine-1".into(),
+            node_id: "node-1".into(),
+            base_revision: 99,
+            revision: 150,
+            r#type: ControlCommandType::UserRefresh as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ack(&mut acks).await.status,
+        ControlAckStatus::Accepted as i32
+    );
+    fetch_started.await;
+
+    let winner = topology(150, vec![user("same-revision-winner", "new")]);
+    worker
+        .submit(ControlCommand {
+            command_id: "snapshot-equal".into(),
+            operation_id: "snapshot-equal".into(),
+            machine_id: "machine-1".into(),
+            revision: 150,
+            r#type: ControlCommandType::TopologySnapshot as i32,
+            payload: Some(Payload::TopologySnapshot(to_snapshot(&winner))),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ack(&mut acks).await.status,
+        ControlAckStatus::Accepted as i32
+    );
+    let applied = ack(&mut acks).await;
+    assert_eq!(applied.command_id, "snapshot-equal");
+    assert_eq!(applied.status, ControlAckStatus::Applied as i32);
+
+    fetcher.release.add_permits(1);
+    let rejected = ack(&mut acks).await;
+    assert_eq!(rejected.command_id, "refresh-stale-equal");
+    assert_eq!(rejected.status, ControlAckStatus::Failed as i32);
+    assert!(
+        rejected
+            .message
+            .contains("authoritative topology changed during fetch"),
+        "{}",
+        rejected.message
+    );
+    assert_eq!(manager.current_revision(), Some(150));
+    assert_eq!(
+        manager.current_topology().nodes[0].users[0].user_id,
+        "same-revision-winner"
+    );
+    assert_eq!(
+        lock(&runtime.applied)
+            .iter()
+            .map(|candidate| (
+                candidate.revision,
+                candidate.nodes[0].users[0].user_id.clone()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (100, "initial".to_string()),
+            (150, "same-revision-winner".to_string())
+        ]
+    );
+    drop(worker);
+}
+
+#[tokio::test]
 async fn user_refresh_rejects_replay_from_older_authoritative_snapshot() {
     let runtime = Arc::new(RecordingRuntime::default());
-    let manager = Arc::new(TopologyManager::new("machine-1", runtime));
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
     manager
         .apply_initial(topology(100, vec![user("user-1", "old")]))
         .await
@@ -898,7 +1097,7 @@ async fn user_refresh_rejects_replay_from_older_authoritative_snapshot() {
         150,
         vec![user("user-1", "old")],
     )]));
-    let executor = TopologyCommandExecutor::new(manager, fetcher);
+    let executor = TopologyCommandExecutor::new(manager.clone(), fetcher);
     let result = executor
         .execute(ControlCommand {
             command_id: "refresh".into(),
@@ -911,6 +1110,8 @@ async fn user_refresh_rejects_replay_from_older_authoritative_snapshot() {
         .await;
     assert_eq!(result.status, AckStatus::Failed);
     assert!(result.message.contains("older authoritative snapshot"));
+    assert_eq!(manager.current_revision(), Some(100));
+    assert_eq!(lock(&runtime.applied).len(), 1);
 }
 
 #[tokio::test]

@@ -334,7 +334,7 @@ impl UserContext {
     /// to unregister it. A connection racing with removal is cancelled immediately
     /// and never enters the live count.
     pub(crate) fn register_connection(&self, token: CancellationToken) -> Option<u64> {
-        self.register_connection_inner(token, false)
+        self.register_connection_inner(token, false, true)
     }
 
     /// Atomically admit and register a connection after its protocol has proved the
@@ -345,13 +345,26 @@ impl UserContext {
         &self,
         token: CancellationToken,
     ) -> Option<u64> {
-        self.register_connection_inner(token, true)
+        self.register_connection_inner(token, true, true)
+    }
+
+    /// Attempt authentication for a protocol that can continue anonymously via a
+    /// fallback or masquerade when admission loses a lifecycle race or hits a
+    /// connection limit. The caller must immediately enter that unauthenticated
+    /// path on `None`; unlike the ordinary fail-closed entry point, the physical
+    /// connection token remains live so the camouflage can actually be served.
+    pub(crate) fn register_authenticated_connection_for_fallback(
+        &self,
+        token: CancellationToken,
+    ) -> Option<u64> {
+        self.register_connection_inner(token, true, false)
     }
 
     fn register_connection_inner(
         &self,
         token: CancellationToken,
         authenticated: bool,
+        cancel_on_failure: bool,
     ) -> Option<u64> {
         let id = {
             let mut connections = self.connections();
@@ -382,7 +395,7 @@ impl UserContext {
             }
         };
 
-        if id.is_none() {
+        if id.is_none() && cancel_on_failure {
             token.cancel();
         }
         id
@@ -457,9 +470,14 @@ impl UserContext {
     }
 
     /// Suspend or resume the user without discarding their counters. Established
-    /// connections are deliberately left alone; this only affects new ones.
+    /// connections are deliberately left alone; this only affects new ones. Taking
+    /// the admission lock gives disable and authentication one linearization order:
+    /// an authentication that wins first remains established, while every attempt
+    /// beginning after this method returns observes the new state.
     pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
+        let connections = self.connections();
+        self.enabled
+            .store(enabled && !connections.revoked, Ordering::Release);
     }
 
     /// Zero the traffic counters, returning what they held. Used for billing
@@ -604,6 +622,40 @@ mod tests {
         assert!(!user.note_auth());
         assert_eq!(user.total_conns(), 1);
         assert!(user.is_revoked());
+    }
+
+    #[test]
+    fn suspension_and_authentication_share_one_lifecycle_gate() {
+        let user = UserContext::new("alice");
+        let lifecycle = user.connections();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let suspended = Arc::clone(&user);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            suspended.set_enabled(false);
+            finished_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "suspension must wait for the same lifecycle gate as admission"
+        );
+        drop(lifecycle);
+        finished_rx.recv().unwrap();
+        worker.join().unwrap();
+
+        let late = CancellationToken::new();
+        assert!(
+            user.register_authenticated_connection(late.clone())
+                .is_none(),
+            "no authentication beginning after suspension returns may be admitted"
+        );
+        assert!(late.is_cancelled());
+        assert_eq!(user.total_conns(), 0);
     }
 
     #[test]

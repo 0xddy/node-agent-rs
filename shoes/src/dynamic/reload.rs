@@ -59,6 +59,7 @@ use crate::tcp::inbound_replay::{InboundReplayScope, InboundReplayState};
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
 use crate::tcp::tcp_handler::TcpServerHandler;
+use crate::tcp::tcp_server::ResolvedBind;
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
 
 /// How long [`ServerHandle::shutdown`] waits for an *aborted* listener to
@@ -724,6 +725,21 @@ impl ServerHandle {
     /// an embedder reloading several handles at once can check them all first and
     /// keep the whole reload all-or-nothing rather than half applied.
     pub fn check_reload(&self, config: &ServerConfig) -> std::io::Result<()> {
+        let resolved_bind = ResolvedBind::resolve(&config.bind_location)?;
+        self.check_reload_resolved(config, &resolved_bind)
+    }
+
+    /// Validate a reload against a listen set resolved by the caller.
+    ///
+    /// Unlike [`Self::check_reload`], this path never invokes the platform name
+    /// service. Embedders can therefore prepare the candidate before taking a
+    /// control lock, then compare the exact same addresses against the running
+    /// listeners inside their generation fence.
+    pub fn check_reload_resolved(
+        &self,
+        config: &ServerConfig,
+        resolved_bind: &ResolvedBind,
+    ) -> std::io::Result<()> {
         if config.transport != self.transport {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -783,7 +799,7 @@ impl ServerHandle {
             ));
         }
 
-        self.check_bind_location(&config.bind_location)?;
+        self.check_bind_location(&config.bind_location, resolved_bind)?;
 
         if config.rules.is_empty() {
             return Err(std::io::Error::new(
@@ -819,7 +835,23 @@ impl ServerHandle {
         resolver: &Arc<dyn Resolver>,
         users: Option<&Arc<dyn UserRegistry>>,
     ) -> std::io::Result<u64> {
-        self.check_reload(&config)?;
+        let resolved_bind = ResolvedBind::resolve(&config.bind_location)?;
+        self.reload_resolved(config, resolver, users, &resolved_bind)
+    }
+
+    /// Rebuild and publish a handler using a caller-resolved listen set.
+    ///
+    /// This is the mutation half paired with [`Self::check_reload_resolved`]. It
+    /// deliberately performs no hostname lookup, including during its defensive
+    /// recheck immediately before the swap.
+    pub fn reload_resolved(
+        &self,
+        config: ServerConfig,
+        resolver: &Arc<dyn Resolver>,
+        users: Option<&Arc<dyn UserRegistry>>,
+        resolved_bind: &ResolvedBind,
+    ) -> std::io::Result<u64> {
+        self.check_reload_resolved(&config, resolved_bind)?;
 
         let ServerConfig {
             protocol,
@@ -882,13 +914,14 @@ impl ServerHandle {
     }
 
     /// Rejects a config whose listen set is not the one this handle is serving.
-    fn check_bind_location(&self, bind_location: &BindLocation) -> std::io::Result<()> {
-        match bind_location {
-            BindLocation::Address(addresses) => {
-                let mut wanted = Vec::new();
-                for address in addresses.clone().into_vec() {
-                    wanted.extend(address.to_socket_addrs()?);
-                }
+    fn check_bind_location(
+        &self,
+        bind_location: &BindLocation,
+        resolved_bind: &ResolvedBind,
+    ) -> std::io::Result<()> {
+        match (bind_location, resolved_bind) {
+            (BindLocation::Address(_), ResolvedBind::Addresses(addresses)) => {
+                let mut wanted = addresses.clone();
                 wanted.sort();
                 wanted.dedup();
 
@@ -908,7 +941,17 @@ impl ServerHandle {
                 }
                 Ok(())
             }
-            BindLocation::Path(path) => {
+            (BindLocation::Path(path), ResolvedBind::Path(resolved_path)) => {
+                if path != resolved_path {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "resolved unix bind {} does not match configured path {}",
+                            resolved_path.display(),
+                            path.display()
+                        ),
+                    ));
+                }
                 if !self.slots.iter().any(|(key, _)| *key == HandlerKey::Path) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -932,6 +975,10 @@ impl ServerHandle {
                     None => Ok(()),
                 }
             }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resolved bind kind does not match configured bind location",
+            )),
         }
     }
 

@@ -101,15 +101,22 @@ pub struct ConnContext {
     /// Serialises the one-time bind and NaiveProxy's concurrent H2 requests. It is
     /// touched only during authentication, never by the byte-counting path.
     binding: Mutex<()>,
-    user: OnceLock<Arc<UserContext>>,
-    registration: OnceLock<u64>,
+    /// Published only after admission has registered the connection. Keeping the
+    /// user and its registration id in one cell prevents fallback paths from ever
+    /// observing a half-bound connection.
+    registration: OnceLock<ConnectionRegistration>,
     cancellation: CancellationToken,
+}
+
+struct ConnectionRegistration {
+    user: Arc<UserContext>,
+    id: u64,
 }
 
 impl std::fmt::Debug for ConnContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnContext")
-            .field("user", &self.user.get().map(|u| u.id().clone()))
+            .field("user", &self.user().map(|u| u.id().clone()))
             .field("pending", &self.pending())
             .finish()
     }
@@ -133,7 +140,6 @@ impl ConnContext {
             pending_tx: AtomicU64::new(0),
             pending_rx: AtomicU64::new(0),
             binding: Mutex::new(()),
-            user: OnceLock::new(),
             registration: OnceLock::new(),
             cancellation,
         })
@@ -142,7 +148,9 @@ impl ConnContext {
     /// The authenticated user, once a handler has bound one.
     #[inline]
     pub fn user(&self) -> Option<&Arc<UserContext>> {
-        self.user.get()
+        self.registration
+            .get()
+            .map(|registration| &registration.user)
     }
 
     /// Bytes counted so far that have not been attributed to anyone. Zero once the
@@ -165,7 +173,7 @@ impl ConnContext {
     #[cfg(test)]
     pub(crate) fn bind(&self, user: Arc<UserContext>) -> bool {
         let _binding = self.lock_binding();
-        self.bind_locked(user, false)
+        self.bind_locked(user, false, true)
     }
 
     /// Atomically count a proved authentication and bind its physical connection.
@@ -178,28 +186,52 @@ impl ConnContext {
     /// [`bind_connection_user`]: crate::dynamic::bind_connection_user
     pub fn bind_authenticated(&self, user: Arc<UserContext>) -> bool {
         let _binding = self.lock_binding();
-        self.bind_locked(user, true)
+        self.bind_locked(user, true, true)
     }
 
-    fn bind_locked(&self, user: Arc<UserContext>, authenticated: bool) -> bool {
-        if self.user.set(user).is_err() {
+    /// As [`bind_authenticated`](Self::bind_authenticated), except an admission
+    /// failure leaves the anonymous physical connection alive so the caller can
+    /// serve the same fallback or masquerade as an unknown credential.
+    pub fn bind_authenticated_for_fallback(&self, user: Arc<UserContext>) -> bool {
+        let _binding = self.lock_binding();
+        self.bind_locked(user, true, false)
+    }
+
+    fn bind_locked(
+        &self,
+        user: Arc<UserContext>,
+        authenticated: bool,
+        cancel_on_failure: bool,
+    ) -> bool {
+        if self.registration.get().is_some() {
             return false;
         }
-        let user = self.user.get().expect("just set");
         let id = if authenticated {
-            user.register_authenticated_connection(self.cancellation.clone())
+            if cancel_on_failure {
+                user.register_authenticated_connection(self.cancellation.clone())
+            } else {
+                user.register_authenticated_connection_for_fallback(self.cancellation.clone())
+            }
         } else {
             user.register_connection(self.cancellation.clone())
         };
         let Some(id) = id else {
             // Removal won the race after authentication returned this record but
-            // before the connection could bind it. The local token is already
-            // cancelled, so every wrapper around the connection will stop it.
+            // before the connection could bind it. Ordinary admission cancels the
+            // local token; fallback admission deliberately leaves it anonymous and
+            // live so the camouflage response can still be served.
             return false;
         };
-        self.registration
-            .set(id)
-            .expect("a connection is registered only by its first bind");
+
+        let registration = ConnectionRegistration { user, id };
+        if let Err(registration) = self.registration.set(registration) {
+            // The binding mutex makes this unreachable in normal operation. Keep
+            // the defensive rollback so an invariant violation cannot leak a live
+            // entry in the user's revocation set.
+            registration.user.unregister_connection(registration.id);
+            return false;
+        }
+        let user = &self.registration.get().expect("just published").user;
         user.add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
         user.add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
         true
@@ -232,11 +264,9 @@ impl ConnContext {
     pub fn bind_or_matches(&self, user: &Arc<UserContext>) -> bool {
         let _binding = self.lock_binding();
         if let Some(bound) = self.user() {
-            return self.registration.get().is_some()
-                && Arc::ptr_eq(bound, user)
-                && user.note_auth();
+            return Arc::ptr_eq(bound, user) && user.note_auth();
         }
-        self.bind_locked(Arc::clone(user), true)
+        self.bind_locked(Arc::clone(user), true, true)
     }
 
     /// Count a datagram sent to the client, for a protocol whose datagrams never
@@ -274,8 +304,8 @@ impl ConnContext {
     /// and throttling them would only slow down connection setup.
     #[inline]
     fn reserve_tx(&self, n: u64) -> Duration {
-        match self.user.get() {
-            Some(user) => user.reserve_tx(n),
+        match self.registration.get() {
+            Some(registration) => registration.user.reserve_tx(n),
             None => Duration::ZERO,
         }
     }
@@ -283,8 +313,8 @@ impl ConnContext {
     /// Claims upload allowance for `n` bytes. See [`reserve_tx`](Self::reserve_tx).
     #[inline]
     fn reserve_rx(&self, n: u64) -> Duration {
-        match self.user.get() {
-            Some(user) => user.reserve_rx(n),
+        match self.registration.get() {
+            Some(registration) => registration.user.reserve_rx(n),
             None => Duration::ZERO,
         }
     }
@@ -305,8 +335,8 @@ impl ConnContext {
         if n == 0 {
             return;
         }
-        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
-            user.add_tx(n);
+        if let Some(registration) = self.registration.get() {
+            registration.user.add_tx(n);
             return;
         }
 
@@ -314,8 +344,10 @@ impl ConnContext {
         // Authentication can publish the registration between the check and the
         // fetch_add above. Rechecking and draining closes that handover race; swaps
         // performed concurrently are harmless because exactly one observes bytes.
-        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
-            user.add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
+        if let Some(registration) = self.registration.get() {
+            registration
+                .user
+                .add_tx(self.pending_tx.swap(0, Ordering::Relaxed));
         }
     }
 
@@ -324,14 +356,16 @@ impl ConnContext {
         if n == 0 {
             return;
         }
-        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
-            user.add_rx(n);
+        if let Some(registration) = self.registration.get() {
+            registration.user.add_rx(n);
             return;
         }
 
         self.pending_rx.fetch_add(n, Ordering::Relaxed);
-        if let (Some(user), Some(_)) = (self.user.get(), self.registration.get()) {
-            user.add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
+        if let Some(registration) = self.registration.get() {
+            registration
+                .user
+                .add_rx(self.pending_rx.swap(0, Ordering::Relaxed));
         }
     }
 }
@@ -340,8 +374,8 @@ impl Drop for ConnContext {
     fn drop(&mut self) {
         // Mirrors the live-count increment performed during registration, so a
         // connection that never authenticated is not counted down.
-        if let (Some(user), Some(id)) = (self.user.get(), self.registration.get()) {
-            user.unregister_connection(*id);
+        if let Some(registration) = self.registration.get() {
+            registration.user.unregister_connection(registration.id);
         }
     }
 }
@@ -389,6 +423,15 @@ where
 pub fn bind_connection_user(user: &Arc<UserContext>) -> bool {
     METERED_CONNECTION
         .try_with(|conn| conn.bind_authenticated(Arc::clone(user)))
+        .unwrap_or_else(|_| user.admit_unmetered())
+}
+
+/// Admit an authenticated user while preserving an anonymous connection for a
+/// probe-resistant fallback when admission fails. The caller must not continue as
+/// authenticated after `false`.
+pub fn bind_connection_user_for_fallback(user: &Arc<UserContext>) -> bool {
+    METERED_CONNECTION
+        .try_with(|conn| conn.bind_authenticated_for_fallback(Arc::clone(user)))
         .unwrap_or_else(|_| user.admit_unmetered())
 }
 
@@ -789,6 +832,7 @@ mod tests {
 
         let conn = ConnContext::new();
         assert!(!conn.bind_authenticated(Arc::clone(&user)));
+        assert!(conn.user().is_none());
         assert_eq!(user.conns(), 0);
         assert_eq!(user.total_conns(), 0);
 
@@ -798,6 +842,54 @@ mod tests {
             .await
             .expect_err("a late bind inherits the already-cancelled state");
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn fallback_admission_failure_stays_anonymous_and_allows_another_user() {
+        let alice = UserContext::new("alice");
+        alice.set_max_conns(1);
+        alice.set_speed_limits(8 * 1024 * 1024, 8 * 1024 * 1024);
+        let occupied = alice
+            .register_authenticated_connection(CancellationToken::new())
+            .expect("the first connection occupies the only slot");
+        let conn = ConnContext::new();
+
+        assert!(!conn.bind_authenticated_for_fallback(Arc::clone(&alice)));
+        assert!(
+            conn.user().is_none(),
+            "a credential that failed admission must not claim the connection"
+        );
+        assert_eq!(alice.conns(), 1);
+        assert_eq!(alice.total_conns(), 1);
+        assert!(conn.registration.get().is_none());
+        assert!(!conn.cancellation.is_cancelled());
+        assert_eq!(
+            conn.reserve_rx(4 * 1024 * 1024),
+            Duration::ZERO,
+            "anonymous fallback bytes must not consume alice's rate bucket"
+        );
+
+        // A metered fallback can still move bytes, but without attributing them to
+        // the credential whose admission was refused.
+        let (mut peer, mut stream) = metered(&conn);
+        peer.write_all(b"fallback").await.unwrap();
+        let mut received = [0u8; 8];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"fallback");
+        assert_eq!(alice.rx(), 0);
+        assert_eq!(conn.pending(), (0, 8));
+
+        // Hysteria2 accepts another auth request on the same H3 connection after a
+        // camouflaged refusal. A different eligible user must still be able to bind
+        // it, and receives the anonymous bytes exactly once.
+        let bob = UserContext::new("bob");
+        assert!(conn.bind_authenticated_for_fallback(Arc::clone(&bob)));
+        assert!(conn.user().is_some_and(|user| Arc::ptr_eq(user, &bob)));
+        assert_eq!(bob.rx(), 8);
+        assert_eq!(conn.pending(), (0, 0));
+        assert_eq!(alice.rx(), 0);
+
+        alice.unregister_connection(occupied);
     }
 
     #[tokio::test]

@@ -305,6 +305,7 @@ fn rewrite_request<B>(
     let (parts, ()) = request.into_parts();
     let mut headers = parts.headers;
     remove_hop_by_hop_headers(&mut headers);
+    remove_hysteria2_protocol_headers(&mut headers);
     let host = if rewrite_host {
         target_authority(target)
     } else {
@@ -384,6 +385,23 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
         "upgrade",
     ];
     for name in NAMES {
+        headers.remove(name);
+    }
+}
+
+fn remove_hysteria2_protocol_headers(headers: &mut HeaderMap) {
+    // An auth request can reach the cover proxy both for an unknown password and
+    // for a valid password whose admission was refused. Never forward the cleartext
+    // credential -- or any of the surrounding protocol-only metadata -- to an
+    // operator-controlled camouflage origin. Header names are normalized to lower
+    // case by `http`, so the prefix check is case-insensitive in practice and also
+    // covers future Hysteria2 request headers without another deny-list update.
+    let protocol_headers: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("hysteria-"))
+        .cloned()
+        .collect();
+    for name in protocol_headers {
         headers.remove(name);
     }
 }
@@ -493,7 +511,7 @@ async fn connect_upstream(
 
 #[cfg(test)]
 mod tests {
-    use super::{joined_path_and_query, parse_proxy_url, target_authority};
+    use super::{joined_path_and_query, parse_proxy_url, rewrite_request, target_authority};
 
     #[test]
     fn reverse_proxy_joins_base_path_and_queries_like_go() {
@@ -517,5 +535,28 @@ mod tests {
             assert!(parse_proxy_url(invalid).is_err(), "accepted {invalid}");
         }
         assert!(parse_proxy_url("http://127.0.0.1:8080/base").is_ok());
+    }
+
+    #[test]
+    fn proxy_never_forwards_hysteria_credentials_or_protocol_headers() {
+        let target = parse_proxy_url("http://127.0.0.1:8080/cover").unwrap();
+        let request = http::Request::post("https://hysteria/auth")
+            .header("hysteria-auth", "live-user-password")
+            .header("Hysteria-CC-RX", "1048576")
+            .header("Hysteria-Padding", "camouflage-padding")
+            .header("x-cover-probe", "preserved")
+            .body(())
+            .unwrap();
+
+        let upstream = rewrite_request(request, &target, true, ()).unwrap();
+
+        assert!(
+            upstream
+                .headers()
+                .keys()
+                .all(|name| !name.as_str().starts_with("hysteria-")),
+            "no Hysteria2-only header may escape to the camouflage origin"
+        );
+        assert_eq!(upstream.headers()["x-cover-probe"], "preserved");
     }
 }

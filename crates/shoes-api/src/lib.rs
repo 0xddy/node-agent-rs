@@ -21,7 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -42,9 +42,9 @@ pub struct UserSpec {
     /// Stable identity for reporting, and the handle for
     /// [`Engine::remove_user`](https://docs.rs/shoes-engine). Defaults to `uuid`
     /// when one is given, since that is already how operators refer to a VLESS or
-    /// VMess user.
+    /// `VMess` user.
     ///
-    /// Normally a label and nothing more. **NaiveProxy is the exception**: its
+    /// Normally a label and nothing more. **`NaiveProxy` is the exception**: its
     /// credential is HTTP Basic, i.e. base64 of `username:password`, and this field
     /// is the username half -- so on such an inbound the id is part of the
     /// credential, and renaming a user rotates it.
@@ -52,7 +52,7 @@ pub struct UserSpec {
     pub id: Option<String>,
     /// Canonical uuid, with or without dashes.
     ///
-    /// Read by **VLESS**, **VMess** and **TUIC**. TUIC needs `password` alongside
+    /// Read by **VLESS**, **`VMess`** and **TUIC**. TUIC needs `password` alongside
     /// it: the uuid crosses the wire in cleartext and names the user, the password
     /// keys the token beside it, and a user carrying only one of the two is refused
     /// when added rather than left unable to connect.
@@ -63,8 +63,8 @@ pub struct UserSpec {
     ///
     /// - **Trojan** hashes it (SHA-224, hex) before it goes on the wire;
     /// - **Hysteria2** compares it as cleartext;
-    /// - **AnyTLS** sends raw SHA-256 of it;
-    /// - **NaiveProxy** sends it base64'd beside the user's id;
+    /// - **`AnyTLS`** sends raw SHA-256 of it;
+    /// - **`NaiveProxy`** sends it base64'd beside the user's id;
     /// - **TUIC** keys its authentication token with it;
     /// - **Shadowsocks 2022** reads it as a *base64 PSK*, not as a password, and
     ///   rejects one whose decoded length the inbound's cipher cannot use.
@@ -84,7 +84,7 @@ pub struct UserSpec {
     ///
     /// This is the only bound on what one valid credential can cost the host.
     /// Every protocol's per-connection state is a multiplier on it -- a hysteria2 or
-    /// TUIC connection may hold hundreds of UDP sessions, a NaiveProxy one hundreds
+    /// TUIC connection may hold hundreds of UDP sessions, a `NaiveProxy` one hundreds
     /// of multiplexed tunnels -- so on a shared inbound this is what stops one user
     /// exhausting sockets or memory for all the others. An inbound serving users who
     /// do not need many parallel connections is worth capping.
@@ -116,6 +116,7 @@ pub struct UserSpec {
 
 impl UserSpec {
     /// The identity this user will be reported under.
+    #[must_use]
     pub fn resolved_id(&self) -> Option<&str> {
         self.id.as_deref().or(self.uuid.as_deref())
     }

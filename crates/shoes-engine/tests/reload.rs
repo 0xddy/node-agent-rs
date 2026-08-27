@@ -452,6 +452,37 @@ async fn tcp_only_hysteria2_rules_update_remains_rcu_safe() {
     assert_eq!(after.bind, before.bind);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn path_backed_certificates_still_reload_after_lock_free_preparation() {
+    let engine = engine().await;
+    let address = free_addr();
+    let fixture = |name: &str| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let mut config = hysteria2_inbound(address, false);
+    config["quic_settings"]["cert"] = json!(fixture("test.crt"));
+    config["quic_settings"]["key"] = json!(fixture("test.key"));
+
+    engine
+        .add_inbound(dynamic("path-backed-quic", config.clone()))
+        .await
+        .expect("file-backed certificate and key should start the inbound");
+    let before = info(&engine, "path-backed-quic");
+    let after = engine
+        .update_inbound(classic("path-backed-quic", config))
+        .await
+        .expect("file-backed certificate validation should feed the ordinary reload path");
+
+    assert!(after.revision > before.revision);
+    assert_eq!(after.listeners, before.listeners);
+    assert_eq!(after.bind, before.bind);
+}
+
 /// A reload rebuilds handlers. Everything below a handler therefore cannot change,
 /// and the only honest answer to a config that changes one is to refuse it.
 ///

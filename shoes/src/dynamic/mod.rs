@@ -60,8 +60,9 @@ pub use crate::tcp::inbound_replay::{
     InboundReplayScope, InboundReplayScopeWeak, InboundReplayState,
 };
 pub use meter::{
-    ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
-    scope_connection_until_cancelled, spawn_connection_until_cancelled,
+    ConnContext, TrafficMeterStream, bind_connection_user, bind_connection_user_for_fallback,
+    current_connection, scope_connection, scope_connection_until_cancelled,
+    spawn_connection_until_cancelled,
 };
 pub use registry::{ShadowsocksIdentity, TuicIdentity, UserRegistry, VmessIdentity};
 pub use reload::{HandlerSlot, SelectorSlot, ServerHandle};

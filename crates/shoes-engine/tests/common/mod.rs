@@ -111,7 +111,9 @@ impl Checks {
 
     pub fn eq<T: PartialEq + Debug>(&mut self, label: &str, actual: T, expected: T) {
         let ok = actual == expected;
-        self.record(label, ok, format!("{actual:?}, expected {expected:?}"));
+        let detail = format!("{actual:?}, expected {expected:?}");
+        drop((actual, expected));
+        self.record(label, ok, detail);
     }
 
     /// Range assertion. The *upper* bound is the interesting half for byte
@@ -129,18 +131,18 @@ impl Checks {
     /// an upper bound is only as reliable as the runner's scheduling.
     pub fn at_least<T: PartialOrd + Debug>(&mut self, label: &str, value: T, floor: T) {
         let ok = value >= floor;
-        self.record(label, ok, format!("{value:?}, expected at least {floor:?}"));
+        let detail = format!("{value:?}, expected at least {floor:?}");
+        drop((value, floor));
+        self.record(label, ok, detail);
     }
 
     /// Asserts an upper bound. Use only where the margin is wide enough that a
     /// slow runner cannot turn a pass into a failure.
     pub fn at_most<T: PartialOrd + Debug>(&mut self, label: &str, value: T, ceiling: T) {
         let ok = value <= ceiling;
-        self.record(
-            label,
-            ok,
-            format!("{value:?}, expected at most {ceiling:?}"),
-        );
+        let detail = format!("{value:?}, expected at most {ceiling:?}");
+        drop((value, ceiling));
+        self.record(label, ok, detail);
     }
 
     /// Asserts an operation was refused, and that the reason mentions `needle`.
@@ -171,12 +173,11 @@ impl Checks {
         }
     }
 
-    fn record(&mut self, label: &str, ok: bool, detail: String) {
-        let shown = if detail.is_empty() {
-            String::new()
-        } else {
-            format!("  {detail}")
-        };
+    fn record(&mut self, label: &str, ok: bool, mut detail: String) {
+        if !detail.is_empty() {
+            detail.insert_str(0, "  ");
+        }
+        let shown = detail;
         println!("  {}  {label}{shown}", if ok { "PASS" } else { "FAIL" });
         if ok {
             self.passed += 1;
@@ -291,11 +292,13 @@ pub fn vmess_inbound(address: SocketAddr, udp_enabled: bool) -> Value {
 }
 
 pub fn vless_inbound_with_rules(address: SocketAddr, udp_enabled: bool, rules: Value) -> Value {
-    json!({
+    let config = json!({
         "address": address.to_string(),
         "protocol": {"type": "vless", "udp_enabled": udp_enabled},
         "rules": rules,
-    })
+    });
+    drop(rules);
+    config
 }
 
 /// A TLS inbound wrapping VLESS, using the bundled self-signed cert.

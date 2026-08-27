@@ -10,7 +10,8 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
 use crate::dynamic::{
-    UserRegistry, bind_connection_user, current_connection, spawn_connection_until_cancelled,
+    UserRegistry, bind_connection_user_for_fallback, current_connection,
+    spawn_connection_until_cancelled,
 };
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
 use crate::resolver::Resolver;
@@ -179,11 +180,18 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 return Err(std::io::Error::other("Unknown user id"));
             }
         };
-        if !bind_connection_user(&user) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "user could not be admitted: removed, suspended, or at their connection limit",
-            ));
+        if !bind_connection_user_for_fallback(&user) {
+            debug!("VLESS UUID resolved but the user could not be admitted");
+            if let Some(ref fallback) = self.fallback {
+                return vless_fallback_to_dest(
+                    server_stream,
+                    stream_reader,
+                    fallback,
+                    &self.resolver,
+                )
+                .await;
+            }
+            return Err(std::io::Error::other("Unknown user id"));
         }
 
         stream_reader.consume(17);
@@ -359,11 +367,12 @@ where
             return Err(std::io::Error::other("Unknown user id"));
         }
     };
-    if !bind_connection_user(&user) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "user could not be admitted: removed, suspended, or at their connection limit",
-        ));
+    if !bind_connection_user_for_fallback(&user) {
+        debug!("VLESS/Vision UUID resolved but the user could not be admitted");
+        if let Some(ref fb) = fallback {
+            return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
+        }
+        return Err(std::io::Error::other("Unknown user id"));
     }
 
     stream_reader.consume(17);
@@ -497,5 +506,162 @@ where
             std::io::ErrorKind::InvalidData,
             format!("Unknown requested protocol: {unknown_protocol_type}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::dynamic::{ConnContext, UserContext, scope_connection};
+    use crate::resolver::NativeResolver;
+
+    struct TestStream(tokio::io::DuplexStream);
+
+    impl AsyncRead for TestStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for TestStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncStream for TestStream {}
+
+    #[derive(Debug)]
+    struct OneUuidRegistry {
+        uuid: [u8; 16],
+        user: Arc<UserContext>,
+    }
+
+    impl UserRegistry for OneUuidRegistry {
+        fn find_uuid(&self, uuid: &[u8; 16]) -> Option<Arc<UserContext>> {
+            (uuid == &self.uuid).then(|| Arc::clone(&self.user))
+        }
+
+        fn user_count(&self) -> usize {
+            1
+        }
+    }
+
+    async fn fallback_round_trip(
+        users: Arc<dyn UserRegistry>,
+        uuid: [u8; 16],
+    ) -> ([u8; 17], [u8; 5]) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let fallback_address = listener.local_addr().unwrap();
+        let fallback = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; 17];
+            stream.read_exact(&mut header).await.unwrap();
+            stream.write_all(b"cover").await.unwrap();
+            stream.shutdown().await.unwrap();
+            header
+        });
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let handler = VlessTcpServerHandler::new(
+            users,
+            false,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            resolver,
+            Some(NetLocation::new(
+                Address::Ipv4(Ipv4Addr::LOCALHOST),
+                fallback_address.port(),
+            )),
+        );
+        let (mut client, server) = tokio::io::duplex(128);
+        let mut header = [0u8; 17];
+        header[1..].copy_from_slice(&uuid);
+        client.write_all(&header).await.unwrap();
+        let conn = ConnContext::new();
+        let result = scope_connection(
+            Arc::clone(&conn),
+            handler.setup_server_stream(Box::new(TestStream(server))),
+        )
+        .await
+        .unwrap();
+        let TcpServerSetupResult::UnauthenticatedFallbackHandled(completion) = result else {
+            panic!("credential rejection did not enter the VLESS fallback");
+        };
+        let mut cover = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut cover))
+            .await
+            .unwrap()
+            .unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), completion.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        (fallback.await.unwrap(), cover)
+    }
+
+    #[tokio::test]
+    async fn a_valid_uuid_at_its_connection_limit_looks_like_an_unknown_uuid() {
+        let uuid = [7u8; 16];
+        let user = UserContext::new("alice");
+        user.set_max_conns(1);
+        let occupied = user
+            .register_authenticated_connection(CancellationToken::new())
+            .unwrap();
+        let users: Arc<dyn UserRegistry> = Arc::new(OneUuidRegistry {
+            uuid,
+            user: Arc::clone(&user),
+        });
+
+        let (limited_header, limited_cover) = fallback_round_trip(users.clone(), uuid).await;
+        let unknown_uuid = [9u8; 16];
+        let (unknown_header, unknown_cover) = fallback_round_trip(users, unknown_uuid).await;
+        assert_eq!(&limited_header[1..], &uuid);
+        assert_eq!(&unknown_header[1..], &unknown_uuid);
+        assert_eq!(limited_cover, unknown_cover);
+        assert_eq!(&limited_cover, b"cover");
+        assert_eq!(user.conns(), 1);
+        assert_eq!(user.total_conns(), 1);
+        user.unregister_connection(occupied);
     }
 }

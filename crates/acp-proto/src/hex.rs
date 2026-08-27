@@ -5,6 +5,7 @@
 //! here rather than as another dependency.
 
 /// Encodes bytes as lowercase hex.
+#[must_use]
 pub fn encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -17,6 +18,7 @@ pub fn encode(bytes: &[u8]) -> String {
 
 /// Decodes lowercase or uppercase hex. Returns `None` on odd length or on any
 /// non-hex byte.
+#[must_use]
 pub fn decode(text: &str) -> Option<Vec<u8>> {
     if !text.len().is_multiple_of(2) {
         return None;
@@ -31,7 +33,7 @@ pub fn decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn nibble(byte: u8) -> Option<u8> {
+const fn nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),

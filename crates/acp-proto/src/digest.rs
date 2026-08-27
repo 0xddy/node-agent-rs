@@ -40,6 +40,7 @@ use crate::v1::TopologySnapshot;
 /// this build's `acp.proto` does not define, the two digests diverge and every
 /// reconnect re-pulls the topology. That is a performance regression, not a
 /// correctness one, and keeping `proto/acp.proto` in sync prevents it.
+#[must_use]
 pub fn sum(snapshot: Option<&TopologySnapshot>) -> String {
     let mut normalized = snapshot.cloned().unwrap_or_default();
 

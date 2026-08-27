@@ -71,6 +71,7 @@ pub struct SessionFields {
 /// Generates a fresh nonce: `len` random bytes, base64url with no padding.
 ///
 /// Uses the same thread-local CSPRNG that shoes uses for REALITY key material.
+#[must_use]
 pub fn new_nonce(len: usize) -> String {
     let mut buf = vec![0u8; len];
     rand::rng().fill_bytes(&mut buf);
@@ -117,6 +118,10 @@ fn canonical_session(fields: &SessionFields) -> String {
 }
 
 /// Signs a `Hello`. Requires a secret, a machine id, and a node id.
+///
+/// # Errors
+///
+/// Returns [`MissingField`] when the secret, machine id, or node id is empty.
 pub fn sign_hello(secret: &str, fields: &HelloFields) -> Result<String, MissingField> {
     if secret.is_empty() {
         return Err(MissingField("machine secret"));
@@ -132,6 +137,11 @@ pub fn sign_hello(secret: &str, fields: &HelloFields) -> Result<String, MissingF
 
 /// Signs an authenticated request. Requires a secret, a machine id, a session
 /// id, and a nonce.
+///
+/// # Errors
+///
+/// Returns [`MissingField`] when the secret, machine id, session id, or nonce is
+/// empty.
 pub fn sign_session(secret: &str, fields: &SessionFields) -> Result<String, MissingField> {
     if secret.is_empty() {
         return Err(MissingField("machine secret"));
@@ -153,6 +163,11 @@ pub fn sign_session(secret: &str, fields: &SessionFields) -> Result<String, Miss
 ///
 /// Order is irrelevant to HTTP/2, but keeping it makes captured traffic from the
 /// two agents line up field for field during the migration.
+///
+/// # Errors
+///
+/// Returns [`MissingField`] when any field required by [`sign_session`] is
+/// empty.
 pub fn session_metadata(
     secret: &str,
     fields: &SessionFields,

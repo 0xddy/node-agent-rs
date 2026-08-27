@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,9 +9,45 @@ use log::debug;
 use shoes::config::ServerConfig;
 use shoes::dynamic::{InboundReplayState, ServerHandle, UserRegistry};
 use shoes::resolver::Resolver;
+use shoes::tcp::tcp_server::ResolvedBind;
 use shoes_api::InboundInfo;
 
 use crate::users::MemoryUserRegistry;
+
+/// Everything needed to publish a fully started inbound.
+///
+/// Keeping these related resources in one value prevents call sites from
+/// accidentally swapping similarly shaped positional arguments as startup grows
+/// new bookkeeping state.
+pub(super) struct InboundSlotInit {
+    pub(super) info: InboundInfo,
+    pub(super) keys: Vec<BindKey>,
+    pub(super) handles: Vec<ServerHandle>,
+    pub(super) replay_state: InboundReplayState,
+    pub(super) replay_lineage: Arc<()>,
+    pub(super) users: Option<Arc<MemoryUserRegistry>>,
+}
+
+/// One listener group's fully prepared in-place reload.
+pub(super) struct ReloadCandidate {
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+    resolved_bind: ResolvedBind,
+}
+
+impl ReloadCandidate {
+    pub(super) fn new(
+        config: ServerConfig,
+        resolver: Arc<dyn Resolver>,
+        resolved_bind: ResolvedBind,
+    ) -> Self {
+        Self {
+            config,
+            resolver,
+            resolved_bind,
+        }
+    }
+}
 
 /// How long [`InboundSlot::shutdown`] waits for the accept loops to let go of
 /// their sockets before aborting them.
@@ -35,7 +72,7 @@ pub(crate) enum SocketKind {
 }
 
 impl SocketKind {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
@@ -75,7 +112,7 @@ pub(crate) enum BindTargets {
         kind: SocketKind,
     },
     /// Unix domain socket path (TCP transport only, unix only).
-    Path(String),
+    Path(PathBuf),
 }
 
 impl BindTargets {
@@ -87,7 +124,7 @@ impl BindTargets {
     }
 
     /// The socket kind, for an address-backed target that needs a pre-flight bind.
-    pub(crate) fn kind(&self) -> Option<SocketKind> {
+    pub(crate) const fn kind(&self) -> Option<SocketKind> {
         match self {
             Self::Addresses { kind, .. } => Some(*kind),
             Self::Path(_) => None,
@@ -104,14 +141,24 @@ impl BindTargets {
                 .iter()
                 .map(|address| BindKey::Socket(*address, *kind))
                 .collect(),
-            Self::Path(path) => vec![BindKey::Path(path.clone())],
+            Self::Path(path) => vec![BindKey::Path(path.display().to_string())],
         }
     }
 
     pub(crate) fn display(&self) -> Vec<String> {
         match self {
-            Self::Addresses { addresses, .. } => addresses.iter().map(|a| a.to_string()).collect(),
-            Self::Path(p) => vec![p.clone()],
+            Self::Addresses { addresses, .. } => {
+                addresses.iter().map(ToString::to_string).collect()
+            }
+            Self::Path(p) => vec![p.display().to_string()],
+        }
+    }
+
+    /// The exact plan passed to shoes' listener starter and reload checks.
+    pub(crate) fn resolved_bind(&self) -> ResolvedBind {
+        match self {
+            Self::Addresses { addresses, .. } => ResolvedBind::Addresses(addresses.clone()),
+            Self::Path(path) => ResolvedBind::Path(path.clone()),
         }
     }
 }
@@ -169,14 +216,15 @@ pub struct InboundSlot {
 }
 
 impl InboundSlot {
-    pub(crate) fn new(
-        info: InboundInfo,
-        keys: Vec<BindKey>,
-        handles: Vec<ServerHandle>,
-        replay_state: InboundReplayState,
-        replay_lineage: Arc<()>,
-        users: Option<Arc<MemoryUserRegistry>>,
-    ) -> Self {
+    pub(super) fn new(init: InboundSlotInit) -> Self {
+        let InboundSlotInit {
+            info,
+            keys,
+            handles,
+            replay_state,
+            replay_lineage,
+            users,
+        } = init;
         Self {
             protocol: ArcSwap::from_pointee(info.protocol.clone()),
             info,
@@ -186,6 +234,10 @@ impl InboundSlot {
             replay_lineage,
             users,
         }
+    }
+
+    pub(super) fn tag(&self) -> &str {
+        &self.info.tag
     }
 
     pub(crate) fn replay_state(&self) -> InboundReplayState {
@@ -252,18 +304,15 @@ impl InboundSlot {
     /// expanded configs. Changing any of those means closing and reopening sockets,
     /// which cannot be rolled back if the new bind fails, so it is left to the
     /// caller to do explicitly as a remove plus an add.
-    pub(crate) fn reload(
-        &self,
-        configs: Vec<(ServerConfig, Arc<dyn Resolver>)>,
-    ) -> std::io::Result<u64> {
-        if configs.len() != self.handles.len() {
+    pub(super) fn reload(&self, candidates: Vec<ReloadCandidate>) -> std::io::Result<u64> {
+        if candidates.len() != self.handles.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "cannot reload in place: running {} listener group(s), the new config \
                      expands to {}",
                     self.handles.len(),
-                    configs.len()
+                    candidates.len()
                 ),
             ));
         }
@@ -271,8 +320,8 @@ impl InboundSlot {
         // Check every handle before swapping any of them, so a config that one
         // group rejects leaves the whole inbound on its previous revision instead
         // of half of it on the new one.
-        for (handle, (config, _)) in self.handles.iter().zip(configs.iter()) {
-            handle.check_reload(config)?;
+        for (handle, candidate) in self.handles.iter().zip(&candidates) {
+            handle.check_reload_resolved(&candidate.config, &candidate.resolved_bind)?;
         }
 
         let users = self
@@ -280,13 +329,18 @@ impl InboundSlot {
             .clone()
             .map(|registry| registry as Arc<dyn UserRegistry>);
 
-        // Read before the configs are consumed below. The first expansion names the
+        // Read before the candidates are consumed below. The first expansion names the
         // inbound, the same way it did at creation.
-        let protocol = crate::protocol::display_name(&configs[0].0.protocol);
+        let protocol = crate::protocol::display_name(&candidates[0].config.protocol);
 
         let mut revision = 0;
-        for (handle, (config, resolver)) in self.handles.iter().zip(configs) {
-            revision = revision.max(handle.reload(config, &resolver, users.as_ref())?);
+        for (handle, candidate) in self.handles.iter().zip(candidates) {
+            revision = revision.max(handle.reload_resolved(
+                candidate.config,
+                &candidate.resolver,
+                users.as_ref(),
+                &candidate.resolved_bind,
+            )?);
         }
 
         // After the swaps, not before: until they land, the old label is the true one.
@@ -340,7 +394,7 @@ impl std::fmt::Debug for InboundSlot {
             .field("bind", &self.info.bind)
             .field("revision", &self.revision())
             .field("users", &self.users.as_ref().map(|u| u.len()))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

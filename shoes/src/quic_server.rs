@@ -36,7 +36,8 @@ use crate::tcp::tcp_handler::{
     TcpServerSetupResult, UnauthenticatedFallbackCompletion,
 };
 use crate::tcp::tcp_server::{
-    run_udp_copy, setup_client_tcp_stream_with_metadata, sniff_tcp_after_success_response,
+    ResolvedBind, run_udp_copy, setup_client_tcp_stream_with_metadata,
+    sniff_tcp_after_success_response,
 };
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
 
@@ -853,11 +854,28 @@ async fn wait_for_quic_deferred_authentication(
     }
 }
 
+/// Start QUIC listeners using the bind location carried by the config.
+///
+/// Kept as the compatibility entry point for existing shoes callers; dynamic
+/// embedders that already resolved the listen set use the sibling helper below.
+#[allow(dead_code)]
 pub async fn start_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
     replay_scope: InboundReplayScope,
+) -> std::io::Result<ServerHandle> {
+    let resolved_bind = ResolvedBind::resolve(&config.bind_location)?;
+    start_quic_servers_with_resolved_bind(config, resolver, users, replay_scope, resolved_bind)
+        .await
+}
+
+pub(crate) async fn start_quic_servers_with_resolved_bind(
+    config: ServerConfig,
+    resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
+    replay_scope: InboundReplayScope,
+    resolved_bind: ResolvedBind,
 ) -> std::io::Result<ServerHandle> {
     // One token for the whole inbound: every accept loop started below selects on
     // it, so the embedder stops all of them together.
@@ -890,18 +908,23 @@ pub async fn start_quic_servers(
     // A direct entry must always exist
     assert!(!rules.is_empty());
 
-    let bind_addresses = match bind_location {
-        // TODO: switch to non-blocking resolve?
-        BindLocation::Address(addresses) => {
-            let mut bind_addresses = Vec::new();
-            for address in addresses.into_vec() {
-                bind_addresses.extend(address.to_socket_addrs()?);
-            }
-            bind_addresses
+    let bind_addresses = match (bind_location, resolved_bind) {
+        (BindLocation::Address(_), ResolvedBind::Addresses(addresses)) if addresses.is_empty() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resolved bind contains no addresses",
+            ));
         }
-        BindLocation::Path(_) => {
+        (BindLocation::Address(_), ResolvedBind::Addresses(addresses)) => addresses,
+        (BindLocation::Path(_), ResolvedBind::Path(_)) => {
             return Err(std::io::Error::other(
                 "Cannot listen on path, QUIC does not have unix domain socket support",
+            ));
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resolved bind kind does not match configured bind location",
             ));
         }
     };

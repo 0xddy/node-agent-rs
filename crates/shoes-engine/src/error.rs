@@ -80,6 +80,33 @@ impl From<std::io::Error> for EngineError {
 }
 
 impl EngineError {
+    /// Construct a retryable update race without extending this public, historically
+    /// exhaustive enum. The dedicated source marker lets callers distinguish this
+    /// condition from an unrelated `WouldBlock` I/O failure.
+    pub(crate) fn concurrent_modification(message: impl Into<String>) -> Self {
+        Self::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            ConcurrentModificationError(message.into()),
+        ))
+    }
+
+    /// Whether this error reports that an inbound changed while an update was
+    /// being prepared outside the engine's global control lock.
+    ///
+    /// Retrying such an update is safe: its candidate failed the identity/revision
+    /// fence and was never published. This helper is intentionally more precise
+    /// than matching every [`std::io::ErrorKind::WouldBlock`] error.
+    #[must_use]
+    pub fn is_concurrent_modification(&self) -> bool {
+        match self {
+            Self::Io(error) => error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<ConcurrentModificationError>())
+                .is_some(),
+            _ => false,
+        }
+    }
+
     /// Classifies an [`std::io::Error`] that came from a *rejected request*
     /// rather than from a failed operation.
     ///
@@ -98,6 +125,62 @@ impl EngineError {
                 Self::ReloadRequired(e.to_string())
             }
             _ => Self::Io(e),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConcurrentModificationError(String);
+
+impl fmt::Display for ConcurrentModificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "inbound changed while update was being prepared: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ConcurrentModificationError {}
+
+#[cfg(test)]
+mod tests {
+    use super::EngineError;
+
+    #[test]
+    fn concurrent_modification_uses_compatible_io_variant_and_exact_marker() {
+        let error = EngineError::concurrent_modification("inbound example was replaced");
+        assert!(error.is_concurrent_modification());
+        let EngineError::Io(io) = error else {
+            panic!("the retryable race must use the pre-existing Io variant");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(io.to_string().contains("inbound example was replaced"));
+
+        let unrelated = EngineError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "ordinary backpressure",
+        ));
+        assert!(!unrelated.is_concurrent_modification());
+    }
+
+    // This intentionally lists the pre-existing public variants. Adding another
+    // one makes this crate's own compatibility guard fail to compile just as it
+    // would break an embedder's exhaustive match.
+    #[allow(dead_code)]
+    fn exhaustive_match_remains_source_compatible(error: &EngineError) {
+        match error {
+            EngineError::InvalidConfig(_)
+            | EngineError::DuplicateTag(_)
+            | EngineError::UnknownTag(_)
+            | EngineError::InvalidUser(_)
+            | EngineError::DuplicateCredential { .. }
+            | EngineError::UnknownUser { .. }
+            | EngineError::AddressInUse { .. }
+            | EngineError::Io(_)
+            | EngineError::Unsupported(_)
+            | EngineError::ReloadRequired(_) => {}
         }
     }
 }

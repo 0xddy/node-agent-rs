@@ -1,11 +1,12 @@
 //! Traffic queue, runtime counter drain, and ACP client stream.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Duration;
 
 use acp_proto::TrafficReport;
 use acp_proto::traffic_service_client::TrafficServiceClient;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
@@ -21,12 +22,38 @@ const QUEUE_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 type DrainResultSender = oneshot::Sender<Result<(), String>>;
 
+struct OutgoingReport {
+    report: TrafficReport,
+    consumed: oneshot::Sender<()>,
+}
+
+impl OutgoingReport {
+    fn acknowledge_consumption(self) -> TrafficReport {
+        // This method runs only when tonic polls and yields the request item.
+        // A successful local mpsc send is not enough to release the durable
+        // in-flight copy: the RPC may end before polling its request stream.
+        let _ = self.consumed.send(());
+        self.report
+    }
+}
+
+fn outgoing_report_stream(
+    receiver: mpsc::Receiver<OutgoingReport>,
+) -> impl tokio_stream::Stream<Item = TrafficReport> {
+    ReceiverStream::new(receiver).map(OutgoingReport::acknowledge_consumption)
+}
+
+struct TrafficConsumerState {
+    reports: Mutex<mpsc::Receiver<TrafficReport>>,
+    in_flight: StdMutex<Option<TrafficReport>>,
+    drain_requests: Mutex<mpsc::Receiver<DrainResultSender>>,
+}
+
 #[derive(Clone)]
 pub struct TrafficQueue {
     report_sender: mpsc::Sender<TrafficReport>,
-    report_receiver: Arc<Mutex<mpsc::Receiver<TrafficReport>>>,
     drain_sender: mpsc::Sender<DrainResultSender>,
-    drain_receiver: Arc<Mutex<mpsc::Receiver<DrainResultSender>>>,
+    consumer: Arc<TrafficConsumerState>,
     capacity: usize,
 }
 
@@ -46,15 +73,26 @@ impl TrafficQueue {
         let (drain_sender, drain_receiver) = mpsc::channel(1);
         Self {
             report_sender,
-            report_receiver: Arc::new(Mutex::new(report_receiver)),
             drain_sender,
-            drain_receiver: Arc::new(Mutex::new(drain_receiver)),
+            consumer: Arc::new(TrafficConsumerState {
+                reports: Mutex::new(report_receiver),
+                in_flight: StdMutex::new(None),
+                drain_requests: Mutex::new(drain_receiver),
+            }),
             capacity,
         }
     }
 
     pub fn queued_len(&self) -> usize {
         self.capacity.saturating_sub(self.report_sender.capacity())
+            + usize::from(self.in_flight().is_some())
+    }
+
+    fn in_flight(&self) -> StdMutexGuard<'_, Option<TrafficReport>> {
+        self.consumer
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Queues reports in order. If cancellation or closure stops the enqueue,
@@ -207,7 +245,7 @@ pub async fn run_traffic_stream(
     tokio::pin!(consume);
 
     let mut client = TrafficServiceClient::new(authenticator.intercepted_channel(channel));
-    let response = client.traffic_stream(ReceiverStream::new(outgoing_receiver));
+    let response = client.traffic_stream(outgoing_report_stream(outgoing_receiver));
     tokio::pin!(response);
 
     tokio::select! {
@@ -260,11 +298,52 @@ enum ConsumeStop {
 async fn consume_reports(
     cancel: CancellationToken,
     queue: TrafficQueue,
-    outgoing: mpsc::Sender<TrafficReport>,
+    outgoing: mpsc::Sender<OutgoingReport>,
 ) -> ConsumeStop {
-    let mut reports = queue.report_receiver.lock().await;
-    let mut drain_requests = queue.drain_receiver.lock().await;
+    // Holding both receiver guards gives one stream generation exclusive
+    // ownership while the Arc-backed durable slot survives reconnects.
+    let mut reports = queue.consumer.reports.lock().await;
+    let mut drain_requests = queue.consumer.drain_requests.lock().await;
     loop {
+        let pending = queue.in_flight().clone();
+        if let Some(report) = pending {
+            let (consumed_sender, consumed_receiver) = oneshot::channel();
+            let sent = tokio::select! {
+                biased;
+                () = cancel.cancelled() => false,
+                result = outgoing.send(OutgoingReport {
+                    report,
+                    consumed: consumed_sender,
+                }) => result.is_ok(),
+            };
+            if !sent {
+                return if cancel.is_cancelled() {
+                    ConsumeStop::Cancelled
+                } else {
+                    ConsumeStop::OutgoingClosed
+                };
+            }
+
+            let consumed = tokio::select! {
+                // If stream consumption and cancellation become ready
+                // together, commit the already-observed consumption. If the
+                // stream disappears before polling the item, the oneshot is
+                // closed and the durable copy remains for the next session.
+                biased;
+                result = consumed_receiver => match result {
+                    Ok(()) => true,
+                    Err(_) if cancel.is_cancelled() => return ConsumeStop::Cancelled,
+                    Err(_) => false,
+                },
+                () = cancel.cancelled() => return ConsumeStop::Cancelled,
+            };
+            if !consumed {
+                return ConsumeStop::OutgoingClosed;
+            }
+            queue.in_flight().take();
+            continue;
+        }
+
         tokio::select! {
             biased;
             () = cancel.cancelled() => return ConsumeStop::Cancelled,
@@ -275,18 +354,7 @@ async fn consume_reports(
                 let Some(report) = report else {
                     return ConsumeStop::OutgoingClosed;
                 };
-                let sent = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => false,
-                    result = outgoing.send(report) => result.is_ok(),
-                };
-                if !sent {
-                    return if cancel.is_cancelled() {
-                        ConsumeStop::Cancelled
-                    } else {
-                        ConsumeStop::OutgoingClosed
-                    };
-                }
+                *queue.in_flight() = Some(report);
             }
         }
     }
@@ -322,6 +390,19 @@ mod tests {
         }
     }
 
+    async fn receive_and_ack(receiver: &mut mpsc::Receiver<OutgoingReport>) -> TrafficReport {
+        let outgoing = receiver
+            .recv()
+            .await
+            .expect("outgoing report channel closed");
+        let report = outgoing.report;
+        outgoing
+            .consumed
+            .send(())
+            .expect("consumer stopped before consumption acknowledgement");
+        report
+    }
+
     #[test]
     fn protobuf_mapping_preserves_identity_bytes_and_timestamp() {
         let wire = report_to_proto(&report("user", 10));
@@ -353,6 +434,155 @@ mod tests {
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].user_id, "two");
         assert_eq!(queue.queued_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn outgoing_close_retains_the_dequeued_report_for_the_next_stream() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(1);
+        let cancel = CancellationToken::new();
+        let expected = report_to_proto(&report("one", 11));
+        assert_eq!(
+            queue
+                .enqueue(&cancel, &aggregator, vec![report("one", 11)])
+                .await,
+            1
+        );
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        assert!(matches!(
+            consume_reports(cancel.clone(), queue.clone(), closed_sender).await,
+            ConsumeStop::OutgoingClosed
+        ));
+        assert_eq!(queue.queued_len(), 1);
+        assert_eq!(queue.in_flight().as_ref(), Some(&expected));
+
+        let next_cancel = CancellationToken::new();
+        let (next_sender, mut next_receiver) = mpsc::channel(1);
+        let consumer = tokio::spawn(consume_reports(
+            next_cancel.clone(),
+            queue.clone(),
+            next_sender,
+        ));
+        assert_eq!(receive_and_ack(&mut next_receiver).await, expected);
+        next_cancel.cancel();
+        assert!(matches!(consumer.await.unwrap(), ConsumeStop::Cancelled));
+        assert_eq!(queue.queued_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_outgoing_is_blocked_retains_the_dequeued_report() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(1);
+        let cancel = CancellationToken::new();
+        let expected = report_to_proto(&report("one", 21));
+        assert_eq!(
+            queue
+                .enqueue(&cancel, &aggregator, vec![report("one", 21)])
+                .await,
+            1
+        );
+
+        let (blocked_sender, mut blocked_receiver) = mpsc::channel(1);
+        let (dummy_consumed, _dummy_ack) = oneshot::channel();
+        blocked_sender
+            .send(OutgoingReport {
+                report: report_to_proto(&report("already-buffered", 1)),
+                consumed: dummy_consumed,
+            })
+            .await
+            .unwrap();
+        let consumer = tokio::spawn(consume_reports(
+            cancel.clone(),
+            queue.clone(),
+            blocked_sender,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if queue.in_flight().as_ref() == Some(&expected) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("consumer did not move the report into the durable in-flight slot");
+
+        cancel.cancel();
+        assert!(matches!(consumer.await.unwrap(), ConsumeStop::Cancelled));
+        assert_eq!(queue.queued_len(), 1);
+        assert_eq!(queue.in_flight().as_ref(), Some(&expected));
+        let _ = blocked_receiver.recv().await;
+
+        let next_cancel = CancellationToken::new();
+        let (next_sender, mut next_receiver) = mpsc::channel(1);
+        let next_consumer = tokio::spawn(consume_reports(
+            next_cancel.clone(),
+            queue.clone(),
+            next_sender,
+        ));
+        assert_eq!(receive_and_ack(&mut next_receiver).await, expected);
+        next_cancel.cancel();
+        assert!(matches!(
+            next_consumer.await.unwrap(),
+            ConsumeStop::Cancelled
+        ));
+        assert_eq!(queue.queued_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn locally_buffered_but_unpolled_report_is_retried_on_the_next_stream() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(1);
+        let cancel = CancellationToken::new();
+        let expected = report_to_proto(&report("one", 31));
+        assert_eq!(
+            queue
+                .enqueue(&cancel, &aggregator, vec![report("one", 31)])
+                .await,
+            1
+        );
+
+        let (sender, receiver) = mpsc::channel(1);
+        let sender_probe = sender.clone();
+        let consumer = tokio::spawn(consume_reports(cancel.clone(), queue.clone(), sender));
+        let unpolled_stream = outgoing_report_stream(receiver);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sender_probe.capacity() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("report was not buffered in the unpolled request stream");
+
+        // Dropping the unpolled RPC stream drops the consumption acknowledgement.
+        drop(unpolled_stream);
+        assert!(matches!(
+            consumer.await.unwrap(),
+            ConsumeStop::OutgoingClosed
+        ));
+        assert_eq!(queue.queued_len(), 1);
+        assert_eq!(queue.in_flight().as_ref(), Some(&expected));
+
+        let next_cancel = CancellationToken::new();
+        let (next_sender, next_receiver) = mpsc::channel(1);
+        let next_consumer = tokio::spawn(consume_reports(
+            next_cancel.clone(),
+            queue.clone(),
+            next_sender,
+        ));
+        let mut next_stream = Box::pin(outgoing_report_stream(next_receiver));
+        assert_eq!(next_stream.next().await, Some(expected));
+        next_cancel.cancel();
+        assert!(matches!(
+            next_consumer.await.unwrap(),
+            ConsumeStop::Cancelled
+        ));
+        assert_eq!(queue.queued_len(), 0);
     }
 
     #[test]

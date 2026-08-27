@@ -494,23 +494,19 @@ async fn auth_connection(
                         // Admission and connection registration are one lifecycle
                         // operation. Do it before sending success, so remove_user
                         // cannot return while this peer is being told it authenticated.
-                        let meter = if settings.metered {
-                            if !lifecycle.bind_authenticated(user) {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    "user could not be admitted: removed, suspended, or at their connection limit",
-                                ));
-                            }
-                            Some(Arc::clone(lifecycle))
+                        let admitted = if settings.metered {
+                            lifecycle.bind_authenticated_for_fallback(user)
                         } else {
-                            if !user.admit_unmetered() {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    "user could not be admitted: removed, suspended, or at their connection limit",
-                                ));
-                            }
-                            None
+                            user.admit_unmetered()
                         };
+                        if !admitted {
+                            debug!(
+                                "Serving Hysteria2 masquerade response: credential resolved but user admission was refused"
+                            );
+                            settings.masquerade.respond(req, stream).await?;
+                            continue;
+                        }
+                        let meter = settings.metered.then(|| Arc::clone(lifecycle));
 
                         // Hysteria2's header is bytes per second despite the
                         // configuration being expressed in Mbps. Missing and

@@ -221,6 +221,21 @@ struct TrafficDrainKey {
     user_id: String,
 }
 
+#[derive(Debug)]
+struct UserConnectionTarget {
+    node_id: String,
+    user_id: String,
+}
+
+impl UserConnectionTarget {
+    fn new(node_id: &str, user_id: &str) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            user_id: user_id.to_string(),
+        }
+    }
+}
+
 impl From<&TrafficDrain> for TrafficDrainKey {
     fn from(value: &TrafficDrain) -> Self {
         Self {
@@ -498,6 +513,20 @@ struct StepFailure {
     restored: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DnsReloadContext {
+    client_rotated: bool,
+    full_reload: bool,
+}
+
+struct FailedTransaction {
+    previous: NormalizedConfig,
+    previous_replay: BTreeMap<String, InboundReplayLease>,
+    failure: StepFailure,
+    journal: Vec<Undo>,
+    dns: DnsReloadContext,
+}
+
 #[derive(Debug)]
 struct UserRemovalFailure {
     message: String,
@@ -556,7 +585,10 @@ impl ShoesRuntime {
     ) -> Result<(), RuntimeError> {
         let watcher_config = config.clone();
         let _apply = self.inner.apply.lock().await;
-        let result = self.apply_transaction_locked(config, force_reload).await;
+        // Topology changes are infrequent control-plane operations. Boxing the
+        // large transaction future here keeps its state machine from being
+        // embedded in every caller (including the public async-trait boundary).
+        let result = Box::pin(self.apply_transaction_locked(config, force_reload)).await;
         if result.is_ok() {
             self.install_rule_set_watcher_locked(watcher_config);
         }
@@ -603,7 +635,7 @@ impl ShoesRuntime {
         })?;
         desired.rule_set_digest = prepared.digest;
 
-        self.recover_if_needed().await?;
+        Box::pin(self.recover_if_needed()).await?;
         let (previous, previous_committed) = {
             let state = self.read_state();
             (
@@ -657,6 +689,10 @@ impl ShoesRuntime {
         // bootstrap placeholder has no prior client; an intentionally committed
         // empty topology is still a Box/DNS-client generation.
         let dns_client_rotated = full_dns_client_reload && previous_committed;
+        let dns = DnsReloadContext {
+            client_rotated: dns_client_rotated,
+            full_reload: full_dns_client_reload,
+        };
         if dns_client_rotated {
             let generation = self.inner.engine.rotate_dns_client_generation().await;
             log::debug!(
@@ -671,23 +707,20 @@ impl ShoesRuntime {
                 .configure_urltest_probe_dns(desired.urltest_probe_dns.as_ref())
                 .await
         {
-            return Err(self
-                .finish_failed_transaction(
-                    previous,
-                    previous_replay,
-                    StepFailure::unchanged(format!(
-                        "configure generation-global URLTest probe DNS: {error}"
-                    )),
-                    Vec::new(),
-                    dns_client_rotated,
-                    full_dns_client_reload,
-                )
-                .await);
+            return Err(Box::pin(self.finish_failed_transaction(FailedTransaction {
+                previous,
+                previous_replay,
+                failure: StepFailure::unchanged(format!(
+                    "configure generation-global URLTest probe DNS: {error}"
+                )),
+                journal: Vec::new(),
+                dns,
+            }))
+            .await);
         }
 
-        let transaction = self
-            .execute_apply(&previous, &desired, full_dns_client_reload)
-            .await;
+        let transaction =
+            Box::pin(self.execute_apply(&previous, &desired, full_dns_client_reload)).await;
 
         match transaction {
             Ok(()) => {
@@ -718,16 +751,16 @@ impl ShoesRuntime {
                 }
                 Ok(())
             }
-            Err((failure, journal)) => Err(self
-                .finish_failed_transaction(
+            Err((failure, journal)) => {
+                Err(Box::pin(self.finish_failed_transaction(FailedTransaction {
                     previous,
                     previous_replay,
                     failure,
                     journal,
-                    dns_client_rotated,
-                    full_dns_client_reload,
-                )
-                .await),
+                    dns,
+                }))
+                .await)
+            }
         }
     }
 
@@ -1005,7 +1038,7 @@ impl ShoesRuntime {
         force_config_reload: bool,
     ) -> Result<(), (StepFailure, Vec<Undo>)> {
         if force_config_reload {
-            return self.execute_full_reload(current, desired).await;
+            return Box::pin(self.execute_full_reload(current, desired)).await;
         }
 
         let diff = diff_configs(current, desired);
@@ -1115,11 +1148,12 @@ impl ShoesRuntime {
             });
         }
         for (tag, old, new, replay) in &replacements {
-            if let Err(error) = self
-                .inner
-                .engine
-                .add_inbound_with_replay(new.compiled.spec.clone(), replay)
-                .await
+            if let Err(error) = Box::pin(
+                self.inner
+                    .engine
+                    .add_inbound_with_replay(new.compiled.spec.clone(), replay),
+            )
+            .await
             {
                 return Err((
                     StepFailure::unchanged(format!("start replacement inbound {tag}: {error}")),
@@ -1244,11 +1278,8 @@ impl ShoesRuntime {
 
         for tag in &diff.added {
             let new = desired.inbounds.get(tag).expect("diff tag exists").clone();
-            if let Err(error) = self
-                .inner
-                .engine
-                .add_inbound(new.compiled.spec.clone())
-                .await
+            if let Err(error) =
+                Box::pin(self.inner.engine.add_inbound(new.compiled.spec.clone())).await
             {
                 return Err((
                     StepFailure::unchanged(format!("add inbound {tag}: {error}")),
@@ -1310,16 +1341,20 @@ impl ShoesRuntime {
         for (tag, candidate) in &desired.inbounds {
             let result = match replay_by_tag.get(tag) {
                 Some(replay) => {
-                    self.inner
-                        .engine
-                        .add_inbound_with_replay(candidate.compiled.spec.clone(), replay)
-                        .await
+                    Box::pin(
+                        self.inner
+                            .engine
+                            .add_inbound_with_replay(candidate.compiled.spec.clone(), replay),
+                    )
+                    .await
                 }
                 None => {
-                    self.inner
-                        .engine
-                        .add_inbound(candidate.compiled.spec.clone())
-                        .await
+                    Box::pin(
+                        self.inner
+                            .engine
+                            .add_inbound(candidate.compiled.spec.clone()),
+                    )
+                    .await
                 }
             };
             if let Err(error) = result {
@@ -1357,7 +1392,7 @@ impl ShoesRuntime {
                     old.compiled.spec.tag
                 ))
             })?;
-        self.replace_inbound_with_replay(old, new, &replay).await
+        Box::pin(self.replace_inbound_with_replay(old, new, &replay)).await
     }
 
     async fn replace_inbound_with_replay(
@@ -1366,8 +1401,7 @@ impl ShoesRuntime {
         new: &NormalizedInbound,
         replay: &InboundReplayLease,
     ) -> Result<(), StepFailure> {
-        self.replace_inbound_with_replay_owners(old, old, old, new, replay)
-            .await
+        Box::pin(self.replace_inbound_with_replay_owners(old, old, old, new, replay)).await
     }
 
     async fn replace_inbound_with_replay_owners(
@@ -1378,20 +1412,21 @@ impl ShoesRuntime {
         new: &NormalizedInbound,
         replay: &InboundReplayLease,
     ) -> Result<(), StepFailure> {
-        self.stop_inbound_with_owners(current, registry, accounting)
-            .await?;
-        match self
-            .inner
-            .engine
-            .add_inbound_with_replay(new.compiled.spec.clone(), replay)
-            .await
+        Box::pin(self.stop_inbound_with_owners(current, registry, accounting)).await?;
+        match Box::pin(
+            self.inner
+                .engine
+                .add_inbound_with_replay(new.compiled.spec.clone(), replay),
+        )
+        .await
         {
             Ok(_) => Ok(()),
-            Err(operation) => match self
-                .inner
-                .engine
-                .add_inbound_with_replay(current.compiled.spec.clone(), replay)
-                .await
+            Err(operation) => match Box::pin(
+                self.inner
+                    .engine
+                    .add_inbound_with_replay(current.compiled.spec.clone(), replay),
+            )
+            .await
             {
                 Ok(_) => Err(StepFailure {
                     operation: format!(
@@ -1520,26 +1555,24 @@ impl ShoesRuntime {
         errors
     }
 
-    async fn finish_failed_transaction(
-        &self,
-        previous: NormalizedConfig,
-        previous_replay: BTreeMap<String, InboundReplayLease>,
-        failure: StepFailure,
-        mut journal: Vec<Undo>,
-        dns_client_rotated: bool,
-        full_dns_client_reload: bool,
-    ) -> RuntimeError {
+    async fn finish_failed_transaction(&self, transaction: FailedTransaction) -> RuntimeError {
+        let FailedTransaction {
+            previous,
+            previous_replay,
+            failure,
+            mut journal,
+            dns,
+        } = transaction;
         // Rotating the process DNS client is itself a live state change even when
         // the first listener operation fails before it mutates anything.
-        let restoration_attempted =
-            full_dns_client_reload || failure.changed || !journal.is_empty();
+        let restoration_attempted = dns.full_reload || failure.changed || !journal.is_empty();
         let had_previous_topology = !previous.inbounds.is_empty();
         let mut rollback = failure.rollback;
         // Even the first uncommitted Box candidate can build and serve from a DNS
         // resolver before a later listener fails. It had no old generation to
         // rotate away from on entry, but its cache/policy state must still be
         // discarded before the next attempt.
-        if full_dns_client_reload {
+        if dns.full_reload {
             let generation = self.inner.engine.rotate_dns_client_generation().await;
             log::debug!(
                 "rotated DNS client state to generation {generation} before rebuilding rollback topology"
@@ -1555,7 +1588,7 @@ impl ShoesRuntime {
                 ));
             }
         }
-        let (journal_errors, recovery_live) = self.rollback_journal(&mut journal).await;
+        let (journal_errors, recovery_live) = Box::pin(self.rollback_journal(&mut journal)).await;
         rollback.extend(journal_errors);
         // `replace_inbound` may already have restored the step that failed before
         // control reached this transaction-wide rollback. Refresh every restored
@@ -1563,12 +1596,12 @@ impl ShoesRuntime {
         // new logical flows cannot retain a candidate generation's resolver/rule-
         // state graph. Prefer the RCU path here; only a listener without a reload
         // slot needs another bind cycle.
-        if dns_client_rotated && failure.restored && rollback.is_empty() {
+        if dns.client_rotated && failure.restored && rollback.is_empty() {
             for inbound in previous.inbounds.values() {
                 match self.inner.engine.update_inbound(update_spec(inbound)).await {
                     Ok(_) => {}
                     Err(EngineError::ReloadRequired(_)) => {
-                        if let Err(error) = self.replace_inbound(inbound, inbound).await {
+                        if let Err(error) = Box::pin(self.replace_inbound(inbound, inbound)).await {
                             rollback.push(format!(
                                 "rebuild rollback DNS state for {}: {}",
                                 inbound.compiled.spec.tag,
@@ -1631,15 +1664,16 @@ impl ShoesRuntime {
         while let Some(undo) = journal.pop() {
             let (result, survivor) = match undo {
                 Undo::AddInbound { inbound, replay } => {
-                    let result = self
-                        .inner
-                        .engine
-                        .add_inbound_with_replay(inbound.compiled.spec.clone(), &replay)
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| {
-                            format!("restore inbound {}: {error}", inbound.compiled.spec.tag)
-                        });
+                    let result = Box::pin(
+                        self.inner
+                            .engine
+                            .add_inbound_with_replay(inbound.compiled.spec.clone(), &replay),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!("restore inbound {}: {error}", inbound.compiled.spec.tag)
+                    });
                     if result.is_ok() {
                         recovery_live.insert(
                             inbound.compiled.spec.tag.clone(),
@@ -1669,12 +1703,11 @@ impl ShoesRuntime {
                     previous,
                     replay,
                 } => {
-                    let result = self
-                        .replace_inbound_with_replay_owners(
-                            &current, &previous, &previous, &previous, &replay,
-                        )
-                        .await
-                        .map_err(describe_step_failure);
+                    let result = Box::pin(self.replace_inbound_with_replay_owners(
+                        &current, &previous, &previous, &previous, &replay,
+                    ))
+                    .await
+                    .map_err(describe_step_failure);
                     if result.is_ok() {
                         recovery_live.insert(
                             previous.compiled.spec.tag.clone(),
@@ -1877,11 +1910,12 @@ impl ShoesRuntime {
                     false,
                 ));
             };
-            if let Err(error) = self
-                .inner
-                .engine
-                .add_inbound_with_replay(inbound.compiled.spec.clone(), lease)
-                .await
+            if let Err(error) = Box::pin(
+                self.inner
+                    .engine
+                    .add_inbound_with_replay(inbound.compiled.spec.clone(), lease),
+            )
+            .await
             {
                 return Err(RuntimeError::failed(
                     format!(
@@ -2063,18 +2097,23 @@ impl ShoesRuntime {
         if node_id.is_empty() {
             return ConnectionStats::default();
         }
-        let state = self.read_state();
-        let Some(current) = &state.current else {
-            return ConnectionStats::default();
+        let tags: Vec<String> = {
+            let state = self.read_state();
+            let Some(current) = &state.current else {
+                return ConnectionStats::default();
+            };
+            current
+                .inbounds
+                .iter()
+                .filter(|(_, inbound)| inbound.compiled.node_id == node_id)
+                .map(|(tag, _)| tag.clone())
+                .collect()
         };
 
         let mut active_connections = 0u64;
         let mut online = BTreeSet::new();
-        for (tag, inbound) in &current.inbounds {
-            if inbound.compiled.node_id != node_id {
-                continue;
-            }
-            let Ok(users) = self.inner.engine.list_users(tag) else {
+        for tag in tags {
+            let Ok(users) = self.inner.engine.list_users(&tag) else {
                 continue;
             };
             for user in users {
@@ -2090,8 +2129,8 @@ impl ShoesRuntime {
         }
     }
 
-    async fn close_user_connections_owned(&self, node_id: &str, user_id: &str) -> u64 {
-        if node_id.is_empty() || user_id.is_empty() {
+    async fn close_user_connections_owned(&self, target: &UserConnectionTarget) -> u64 {
+        if target.node_id.is_empty() || target.user_id.is_empty() {
             return 0;
         }
         let _apply = self.inner.apply.lock().await;
@@ -2102,13 +2141,28 @@ impl ShoesRuntime {
                 .as_ref()
                 .into_iter()
                 .flat_map(|current| current.inbounds.iter())
-                .filter(|(_, inbound)| inbound.compiled.node_id == node_id)
+                .filter(|(_, inbound)| inbound.compiled.node_id == target.node_id)
                 .map(|(tag, _)| tag.clone())
                 .collect()
         };
-        tags.into_iter()
-            .filter_map(|tag| self.inner.engine.kick_user(&tag, user_id).ok())
-            .fold(0u64, u64::saturating_add)
+        let mut closed = 0u64;
+        for tag in tags {
+            match self.inner.engine.kick_user(&tag, &target.user_id) {
+                Ok(count) => closed = closed.saturating_add(count),
+                // A remote disconnect may legitimately name an offline user or a
+                // classic config-credential inbound. Neither leaves a known
+                // dynamic-user session behind, so they remain quiet no-ops.
+                Err(EngineError::UnknownUser { .. } | EngineError::Unsupported(_)) => {}
+                Err(error) => {
+                    log::warn!(
+                        "close user connections for node {} user {} on inbound {tag}: {error}; stale sessions may still be active",
+                        target.node_id,
+                        target.user_id
+                    );
+                }
+            }
+        }
+        closed
     }
 
     async fn drain_traffic_owned(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
@@ -2119,7 +2173,8 @@ impl ShoesRuntime {
         // touching live counters. The returned sweep is intentionally not capped:
         // a legal topology may contain more users than the retention budget.
         let mut drained = BTreeMap::new();
-        for receipt in self.pending_traffic().drain() {
+        let pending_receipts = self.pending_traffic().drain();
+        for receipt in pending_receipts {
             merge_traffic_entry(&mut drained, receipt);
         }
         if let Some(current) = current {
@@ -2130,7 +2185,7 @@ impl ShoesRuntime {
                             merge_traffic_entry(&mut drained, traffic_drain(inbound, info));
                         }
                     }
-                    Err(EngineError::Unsupported(_)) | Err(EngineError::UnknownTag(_)) => {}
+                    Err(EngineError::Unsupported(_) | EngineError::UnknownTag(_)) => {}
                     Err(error) => {
                         // `take_inbound_traffic` fails before changing this tag's
                         // counters. Returning successful receipts from other tags
@@ -2154,8 +2209,8 @@ async fn run_rule_set_watcher(
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(interval) => {}
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(interval) => {}
         }
         let Some(inner) = weak.upgrade() else {
             return;
@@ -2217,15 +2272,12 @@ impl NodeRuntime for ShoesRuntime {
 
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64 {
         let runtime = self.clone();
-        let node_id = node_id.to_string();
-        let user_id = user_id.to_string();
-        tokio::spawn(async move {
-            runtime
-                .close_user_connections_owned(&node_id, &user_id)
-                .await
-        })
-        .await
-        .unwrap_or(0)
+        let target = Arc::new(UserConnectionTarget::new(node_id, user_id));
+        let task_target = Arc::clone(&target);
+        let result =
+            tokio::spawn(async move { runtime.close_user_connections_owned(&task_target).await })
+                .await;
+        close_user_connections_task_result(&target, result)
     }
 
     async fn drain_traffic(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
@@ -2235,6 +2287,23 @@ impl NodeRuntime for ShoesRuntime {
         // contended drops the waiter before anything is taken; detaching this work
         // would let it clear counters after its only receiver disappeared.
         self.drain_traffic_owned().await
+    }
+}
+
+fn close_user_connections_task_result(
+    target: &UserConnectionTarget,
+    result: Result<u64, tokio::task::JoinError>,
+) -> u64 {
+    match result {
+        Ok(closed) => closed,
+        Err(error) => {
+            log::warn!(
+                "close user connections task failed for node {} user {}: {error}; stale sessions may still be active",
+                target.node_id,
+                target.user_id
+            );
+            0
+        }
     }
 }
 
@@ -2267,7 +2336,7 @@ fn normalize(config: RuntimeConfig) -> Result<NormalizedConfig, String> {
         // only to validate emptiness and otherwise preserves the caller's string;
         // leaving whitespace here would make every later operation address a tag
         // that was never registered.
-        compiled.spec.tag = tag.clone();
+        compiled.spec.tag.clone_from(&tag);
 
         let dynamic_users = compiled.spec.users.is_some();
         let mut users = BTreeMap::new();
@@ -2289,7 +2358,7 @@ fn normalize(config: RuntimeConfig) -> Result<NormalizedConfig, String> {
             users,
             dynamic_users,
         };
-        if inbounds.insert(tag.to_string(), normalized).is_some() {
+        if inbounds.insert(tag.clone(), normalized).is_some() {
             return Err(format!("inbound tag {tag} is listed twice"));
         }
     }
@@ -3421,19 +3490,21 @@ mod tests {
         let before = replay.get("edge").unwrap().clone();
 
         let error = runtime
-            .finish_failed_transaction(
+            .finish_failed_transaction(FailedTransaction {
                 previous,
-                replay,
-                StepFailure {
+                previous_replay: replay,
+                failure: StepFailure {
                     operation: "candidate and local restore failed".to_string(),
                     rollback: vec!["simulated rollback failure".to_string()],
                     changed: true,
                     restored: false,
                 },
-                Vec::new(),
-                false,
-                false,
-            )
+                journal: Vec::new(),
+                dns: DnsReloadContext {
+                    client_rotated: false,
+                    full_reload: false,
+                },
+            })
             .await;
         assert!(!error.running());
 
@@ -3663,14 +3734,16 @@ mod tests {
 
         assert_eq!(runtime.engine().rotate_dns_client_generation().await, 1);
         let error = runtime
-            .finish_failed_transaction(
+            .finish_failed_transaction(FailedTransaction {
                 previous,
                 previous_replay,
-                StepFailure::unchanged("first listener rejected candidate"),
-                Vec::new(),
-                true,
-                true,
-            )
+                failure: StepFailure::unchanged("first listener rejected candidate"),
+                journal: Vec::new(),
+                dns: DnsReloadContext {
+                    client_rotated: true,
+                    full_reload: true,
+                },
+            })
             .await;
 
         assert!(error.rolled_back(), "{error}");
@@ -3945,22 +4018,24 @@ mod tests {
         }
 
         let error = runtime
-            .finish_failed_transaction(
-                NormalizedConfig::default(),
-                BTreeMap::new(),
-                StepFailure {
+            .finish_failed_transaction(FailedTransaction {
+                previous: NormalizedConfig::default(),
+                previous_replay: BTreeMap::new(),
+                failure: StepFailure {
                     operation: "later candidate failed".to_string(),
                     rollback: Vec::new(),
                     changed: true,
                     restored: true,
                 },
-                vec![Undo::RemoveInbound {
+                journal: vec![Undo::RemoveInbound {
                     accounting: ShoesRuntime::uncommitted_accounting_owner(None, &candidate),
                     live: candidate,
                 }],
-                false,
-                false,
-            )
+                dns: DnsReloadContext {
+                    client_rotated: false,
+                    full_reload: false,
+                },
+            })
             .await;
         assert!(error.rollback_error().is_some(), "{error}");
         assert!(runtime.read_state().current.is_none());
@@ -4059,16 +4134,16 @@ mod tests {
         }
 
         let error = runtime
-            .finish_failed_transaction(
+            .finish_failed_transaction(FailedTransaction {
                 previous,
                 previous_replay,
-                StepFailure {
+                failure: StepFailure {
                     operation: "later replacement failed".to_string(),
                     rollback: Vec::new(),
                     changed: true,
                     restored: true,
                 },
-                vec![
+                journal: vec![
                     Undo::AddInbound {
                         inbound: old.clone(),
                         replay: lease.clone(),
@@ -4078,9 +4153,11 @@ mod tests {
                         accounting: old,
                     },
                 ],
-                false,
-                false,
-            )
+                dns: DnsReloadContext {
+                    client_rotated: false,
+                    full_reload: false,
+                },
+            })
             .await;
         assert!(error.rollback_error().is_some(), "{error}");
         {
@@ -4407,6 +4484,24 @@ mod tests {
         assert!(fresh.bind_authenticated(fresh_user));
         drop(fresh);
         runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test]
+    async fn remote_kick_join_failure_has_an_explicit_fallback_path() {
+        let task = tokio::spawn(std::future::pending::<u64>());
+        task.abort();
+        let error = task
+            .await
+            .expect_err("aborted kick task returns a join error");
+
+        assert_eq!(
+            close_user_connections_task_result(
+                &UserConnectionTarget::new("node-a", "alice"),
+                Err(error),
+            ),
+            0,
+            "the infallible ACP boundary retains its zero fallback after warning"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

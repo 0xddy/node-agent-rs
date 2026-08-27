@@ -38,7 +38,7 @@ fn user(id: &str, uuid: &str) -> UserSpec {
 
 /// A TLS inbound with a VLESS target and one more, keyed by SNI.
 fn two_targets(address: std::net::SocketAddr, other: serde_json::Value) -> serde_json::Value {
-    json!({
+    let config = json!({
         "address": address.to_string(),
         "protocol": {
             "type": "tls",
@@ -55,7 +55,9 @@ fn two_targets(address: std::net::SocketAddr, other: serde_json::Value) -> serde
                 },
             },
         },
-    })
+    });
+    drop(other);
+    config
 }
 
 #[tokio::test(flavor = "multi_thread")]

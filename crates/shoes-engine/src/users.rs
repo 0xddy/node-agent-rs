@@ -218,6 +218,7 @@ impl CredentialKinds {
             ShadowsocksPsk::Len(_)
                 if self.trojan_password
                     || self.plain_password
+                    || self.tuic
                     || self.anytls_password
                     || self.naive_basic =>
             {
@@ -542,6 +543,19 @@ impl MemoryUserRegistry {
 
         let credentials = self.parse_credentials(&id, &spec)?;
         self.check_credentials_unclaimed(&id, &credentials)?;
+        let UserSpec {
+            id: raw_id,
+            uuid: raw_uuid,
+            password: raw_password,
+            enabled,
+            max_conns,
+            upload_limit_bps,
+            download_limit_bps,
+        } = spec;
+        // The parsed/index-ready forms above are all that survives publication.
+        // Drop caller-supplied secret strings before mutating the registry rather
+        // than retaining the whole request until this relatively long method ends.
+        drop((raw_id, raw_uuid, raw_password));
 
         // Everything past here must succeed: the table is about to change.
         let previous = self.users.get(&id).map(|entry| entry.value().clone());
@@ -550,15 +564,15 @@ impl MemoryUserRegistry {
             Some(entry) => entry.context.clone(),
             None => UserContext::new(id.clone()),
         };
-        context.set_enabled(spec.enabled);
+        context.set_enabled(enabled);
         // Applied on every upsert, so an update that omits the field clears a
         // previously set ceiling rather than silently keeping it. `UserSpec` is a
         // whole-record description, not a patch: the same reason an omitted
         // credential is rotated away above rather than preserved.
-        context.set_max_conns(spec.max_conns.unwrap_or(0));
+        context.set_max_conns(max_conns.unwrap_or(0));
         context.set_speed_limits(
-            spec.upload_limit_bps.unwrap_or(0),
-            spec.download_limit_bps.unwrap_or(0),
+            upload_limit_bps.unwrap_or(0),
+            download_limit_bps.unwrap_or(0),
         );
 
         let entry = Arc::new(Entry {
@@ -1435,6 +1449,7 @@ mod tests {
 
         let current = registry.draining.get("alice").unwrap();
         assert!(Arc::ptr_eq(current.value(), &replacement_generation));
+        drop(current);
     }
 
     #[test]
@@ -2239,6 +2254,12 @@ mod tests {
         let mut plain_and_ss = CredentialKinds::PLAIN_PASSWORD;
         plain_and_ss.merge(CredentialKinds::shadowsocks_psk(32));
         assert!(plain_and_ss.conflict().is_some());
+
+        // TUIC also consumes the same field as a cleartext password when deriving
+        // its connection-bound token; it cannot share a table with a base64 PSK.
+        let mut tuic_and_ss = CredentialKinds::TUIC;
+        tuic_and_ss.merge(CredentialKinds::shadowsocks_psk(16));
+        assert!(tuic_and_ss.conflict().is_some());
 
         // Same for two shadowsocks ciphers with different key lengths.
         let mut two_lengths = CredentialKinds::shadowsocks_psk(16);

@@ -32,6 +32,9 @@ pub mod hex;
 pub const PROTO_SHA256: &str = "631d4ccf9a5a475d6d73c6ee483680a472f75b83a7c405acd2c22191d8d35ac3";
 
 /// Generated protobuf messages and gRPC clients for `package acp.v1`.
+// Prost and Tonic own this expansion. Lint the hand-written boundary around it,
+// but do not turn generator implementation details into warnings for this crate.
+#[allow(clippy::all, clippy::pedantic, clippy::nursery)]
 pub mod v1 {
     tonic::include_proto!("acp.v1");
 }

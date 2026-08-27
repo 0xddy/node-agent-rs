@@ -30,7 +30,7 @@ use crate::dynamic::{
     ConnContext, HandlerSlot, InboundReplayScope, InboundReplayState, ServerHandle,
     TrafficMeterStream, UserRegistry, scope_connection_until_cancelled,
 };
-use crate::quic_server::start_quic_servers;
+use crate::quic_server::start_quic_servers_with_resolved_bind;
 use crate::resolver::Resolver;
 use crate::routing::protocol::{
     SniffedTcpMetadata, TcpPrefixClassification, classify_tcp_prefix, sniff_tcp,
@@ -673,6 +673,71 @@ pub async fn run_udp_copy(
     copy_result
 }
 
+/// The exact listen targets selected for one expanded server config.
+///
+/// Hostname resolution is deliberately separated from listener startup so an
+/// embedder can resolve before entering a control-plane critical section, then
+/// use the same immutable result for conflict accounting and the real bind. The
+/// ordinary [`start_servers_with_users_and_replay_scope`] entry point still
+/// resolves for config-file callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedBind {
+    Addresses(Vec<SocketAddr>),
+    Path(std::path::PathBuf),
+}
+
+impl ResolvedBind {
+    /// Resolve a config's complete listen set using the platform name service.
+    /// Callers that need lock-free resolution should invoke this before taking
+    /// their own mutation lock and pass the result to the resolved start API.
+    pub fn resolve(bind_location: &BindLocation) -> std::io::Result<Self> {
+        match bind_location {
+            BindLocation::Address(addresses) => {
+                let mut resolved = Vec::new();
+                for address in addresses.iter() {
+                    resolved.extend(address.to_socket_addrs()?);
+                }
+                if resolved.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "bind location resolved to no addresses",
+                    ));
+                }
+                Ok(Self::Addresses(resolved))
+            }
+            BindLocation::Path(path) => Ok(Self::Path(path.clone())),
+        }
+    }
+
+    fn check_matches(&self, bind_location: &BindLocation) -> std::io::Result<()> {
+        match (self, bind_location) {
+            (Self::Addresses(addresses), BindLocation::Address(_)) if addresses.is_empty() => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "resolved bind contains no addresses",
+                ))
+            }
+            (Self::Addresses(_), BindLocation::Address(_)) => Ok(()),
+            (Self::Path(resolved), BindLocation::Path(configured)) if resolved == configured => {
+                Ok(())
+            }
+            (Self::Path(resolved), BindLocation::Path(configured)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "resolved unix bind {} does not match configured path {}",
+                    resolved.display(),
+                    configured.display()
+                ),
+            )),
+            (Self::Addresses(_), BindLocation::Path(_))
+            | (Self::Path(_), BindLocation::Address(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resolved bind kind does not match configured bind location",
+            )),
+        }
+    }
+}
+
 pub async fn start_servers(
     config: Config,
     resolver: Arc<dyn Resolver>,
@@ -760,9 +825,42 @@ pub async fn start_servers_with_users_and_replay_scope(
             "TUN server is not supported on this platform",
         )),
         Config::Server(server_config) => {
-            start_tcp_or_quic_servers(server_config, resolver, users, replay_scope).await
+            start_tcp_or_quic_servers(server_config, resolver, users, replay_scope, None).await
         }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
+    }
+}
+
+/// Start one expanded server config using an already-resolved listen set.
+///
+/// The listener never consults the configured hostname on this path. This makes
+/// the supplied [`ResolvedBind`] the single source of truth for both the caller's
+/// address ownership records and the sockets that are actually opened.
+// The standalone binary includes these modules directly, while this entry point
+// is consumed through the library by shoes-engine.
+#[allow(dead_code)]
+pub async fn start_servers_with_users_and_replay_scope_resolved(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
+    replay_scope: InboundReplayScope,
+    resolved_bind: ResolvedBind,
+) -> std::io::Result<ServerHandle> {
+    match config {
+        Config::Server(server_config) => {
+            start_tcp_or_quic_servers(
+                server_config,
+                resolver,
+                users,
+                replay_scope,
+                Some(resolved_bind),
+            )
+            .await
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an explicit resolved bind can only start a server config",
+        )),
     }
 }
 
@@ -771,11 +869,28 @@ async fn start_tcp_or_quic_servers(
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
     replay_scope: InboundReplayScope,
+    resolved_bind: Option<ResolvedBind>,
 ) -> std::io::Result<ServerHandle> {
+    let resolved_bind = match resolved_bind {
+        Some(resolved) => {
+            resolved.check_matches(&config.bind_location)?;
+            resolved
+        }
+        None => ResolvedBind::resolve(&config.bind_location)?,
+    };
     let handle = match config.transport {
-        Transport::Tcp => start_tcp_servers(config.clone(), resolver, users, replay_scope).await?,
+        Transport::Tcp => {
+            start_tcp_servers(config.clone(), resolver, users, replay_scope, resolved_bind).await?
+        }
         Transport::Quic => {
-            start_quic_servers(config.clone(), resolver, users, replay_scope).await?
+            start_quic_servers_with_resolved_bind(
+                config.clone(),
+                resolver,
+                users,
+                replay_scope,
+                resolved_bind,
+            )
+            .await?
         }
         Transport::Udp => todo!(),
     };
@@ -795,6 +910,7 @@ async fn start_tcp_servers(
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
     replay_scope: InboundReplayScope,
+    resolved_bind: ResolvedBind,
 ) -> std::io::Result<ServerHandle> {
     // Recorded before the config is taken apart. These are the settings the accept
     // loop is about to bake in, and `check_reload` compares against them so that a
@@ -832,26 +948,12 @@ async fn start_tcp_servers(
         sniff,
     ));
 
-    // Resolve the complete address list and bind every socket before spawning the
-    // first accept loop. Otherwise a failure resolving or binding a later address
-    // would return `Err` after the earlier listener task had already escaped with
-    // no `ServerHandle` left for the caller to stop.
-    let prepared_tcp_listeners = match &bind_location {
-        BindLocation::Address(addresses) => {
-            let mut bind_addresses = Vec::new();
-            for address in addresses.clone().into_vec() {
-                bind_addresses.extend(address.to_socket_addrs()?);
-            }
-            Some(prepare_tcp_listeners(bind_addresses)?)
-        }
-        BindLocation::Path(_) => None,
-    };
-
-    match bind_location {
-        BindLocation::Address(_) => {
-            for (socket_addr, tcp_listener) in
-                prepared_tcp_listeners.expect("address listeners were prepared above")
-            {
+    // Bind every selected socket before spawning the first accept loop. Otherwise
+    // a failure binding a later address would return `Err` after an earlier task
+    // had escaped with no `ServerHandle` left for the caller to stop.
+    match (bind_location, resolved_bind) {
+        (BindLocation::Address(_), ResolvedBind::Addresses(bind_addresses)) => {
+            for (socket_addr, tcp_listener) in prepare_tcp_listeners(bind_addresses)? {
                 // Shares protocol state across ports without reusing an
                 // interface-specific UDP bind IP.
                 let handler_slot = handle.slot_for_ip(socket_addr.ip(), &resolver, || {
@@ -889,7 +991,7 @@ async fn start_tcp_servers(
                 handle.push_address(socket_addr);
             }
         }
-        BindLocation::Path(_path_buf) => {
+        (BindLocation::Path(_), ResolvedBind::Path(_path_buf)) => {
             #[cfg(target_family = "unix")]
             {
                 let handler_slot = handle.slot_for_path(
@@ -921,6 +1023,7 @@ async fn start_tcp_servers(
                 ));
             }
         }
+        _ => unreachable!("resolved bind shape was checked before listener startup"),
     }
 
     Ok(handle)
@@ -933,11 +1036,70 @@ mod tests {
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-    use super::{prepare_tcp_listeners, sniff_tcp_after_success_response, wait_for_tcp_fallback};
+    use super::{
+        ResolvedBind, prepare_tcp_listeners, sniff_tcp_after_success_response,
+        start_servers_with_users_and_replay_scope_resolved, wait_for_tcp_fallback,
+    };
     use crate::async_stream::{AsyncPing, AsyncStream};
+    use crate::config::{Config, ServerConfig};
+    use crate::dns::DnsRegistry;
+    use crate::dynamic::{InboundReplayScope, InboundReplayState};
     use crate::routing::predicate::RouteProtocol;
     use crate::tcp::handshake_gate::HandshakeGate;
     use crate::tcp::tcp_handler::UnauthenticatedFallbackCompletion;
+
+    #[tokio::test]
+    async fn resolved_start_and_reload_never_consult_the_configured_hostname() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+
+        let config: ServerConfig = serde_yaml::from_str(&format!(
+            r#"
+address: bind-resolution-must-not-run.invalid:{}
+protocol:
+  type: socks
+  udp_enabled: false
+rules:
+  - masks: 0.0.0.0/0
+    action: allow
+"#,
+            address.port()
+        ))
+        .expect("hostname syntax is valid even though it must never be resolved");
+        let resolved = ResolvedBind::Addresses(vec![address]);
+        let mut dns = DnsRegistry::new();
+        let resolver = dns.get_or_create_default();
+
+        let handle = start_servers_with_users_and_replay_scope_resolved(
+            Config::Server(config.clone()),
+            resolver.clone(),
+            None,
+            InboundReplayScope::new(InboundReplayState::default()),
+            resolved.clone(),
+        )
+        .await
+        .expect("the supplied literal address, not the .invalid hostname, drives the bind");
+
+        assert_eq!(handle.addresses(), &[address]);
+        let occupied = std::net::TcpListener::bind(address)
+            .expect_err("the resolved address must be held by the live listener");
+        assert!(matches!(
+            occupied.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+        ));
+
+        let generation = handle
+            .reload_resolved(config, &resolver, None, &resolved)
+            .expect("the resolved reload path must not retry the .invalid hostname");
+        assert_eq!(generation, 1);
+
+        handle
+            .hard_shutdown(std::time::Duration::from_secs(1))
+            .await;
+        std::net::TcpListener::bind(address)
+            .expect("shutdown releases the exact address supplied in ResolvedBind");
+    }
 
     #[tokio::test]
     async fn unauthenticated_tcp_fallback_holds_its_independent_admission_until_completion() {
