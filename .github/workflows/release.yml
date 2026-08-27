@@ -31,6 +31,19 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Require the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${RUN_REF}" != "${DEFAULT_BRANCH}" ]]; then
+            echo "::error::Releases must run from the default branch ${DEFAULT_BRANCH}, not ${RUN_REF}."
+            exit 1
+          fi
+
       - name: Normalize and validate version
         id: version
         shell: bash
@@ -187,6 +200,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
       TAG: ${{ needs.prepare.outputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -247,6 +261,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          encoded_default_branch="$(jq -rn --arg value "${DEFAULT_BRANCH}" '$value | @uri')"
+          default_head="$(gh api "repos/${GH_REPO}/commits/${encoded_default_branch}" --jq .sha)"
+          if [[ "${default_head}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::The default branch advanced from ${GITHUB_SHA} to ${default_head} while this run was building. Re-run the workflow from the latest ${DEFAULT_BRANCH}; publishing an older workflow-bearing commit is intentionally blocked."
+            exit 1
+          fi
 
           if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
             tagged_commit="$(git rev-list -n 1 "${TAG}")"
