@@ -67,27 +67,27 @@ jobs:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             executable: node-agent
-            archive: tar.gz
+            extension: ""
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             executable: node-agent
-            archive: tar.gz
+            extension: ""
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
             executable: node-agent.exe
-            archive: zip
+            extension: .exe
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             executable: node-agent
-            archive: tar.gz
+            extension: ""
           - runner: macos-15
             target: aarch64-apple-darwin
             executable: node-agent
-            archive: tar.gz
+            extension: ""
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
-      ASSET_NAME: node-agent-${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+      ASSET_NAME: node-agent-${{ needs.prepare.outputs.version }}-${{ matrix.target }}${{ matrix.extension }}
       NODE_AGENT_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - name: Check out source
@@ -134,37 +134,45 @@ jobs:
             throw "Expected $expected, got $actual."
           }
 
-      - name: Package release archive
+      - name: Stage release binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          package_dir="dist/${ASSET_NAME}"
+          asset="dist/${ASSET_NAME}"
 
-          mkdir -p "${package_dir}"
-          install -m 755 "target/${{ matrix.target }}/release/${{ matrix.executable }}" "${package_dir}/node-agent"
-          cp README.md "${package_dir}/README.md"
-          tar -C dist -czf "dist/${ASSET_NAME}.tar.gz" "${ASSET_NAME}"
+          mkdir -p dist
+          install -m 755 "target/${{ matrix.target }}/release/${{ matrix.executable }}" "${asset}"
 
-      - name: Package release archive
+          size="$(wc -c < "${asset}")"
+          if (( size >= 2147483648 )); then
+            echo "::error::Release assets must be smaller than 2 GiB; ${ASSET_NAME} is ${size} bytes."
+            exit 1
+          fi
+
+      - name: Stage release binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $packageDir = Join-Path "dist" $env:ASSET_NAME
-          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          $asset = Join-Path "dist" $env:ASSET_NAME
 
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" (Join-Path $packageDir "node-agent.exe")
-          Copy-Item "README.md" (Join-Path $packageDir "README.md")
-          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath "dist/$env:ASSET_NAME.zip"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" $asset
+          $size = (Get-Item $asset).Length
+          if ($size -ge 2GB) {
+            throw "Release assets must be smaller than 2 GiB; $env:ASSET_NAME is $size bytes."
+          }
 
-      - name: Upload compiled archive
+      - name: Upload compiled binary for release job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
-          path: dist/${{ env.ASSET_NAME }}.${{ matrix.archive }}
+          path: dist/${{ env.ASSET_NAME }}
           if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
+          retention-days: 1
+          # This compression is only for the short-lived cross-job artifact.
+          # The GitHub Release receives the original, uncompressed executable.
+          compression-level: 9
 
   release:
     name: Publish GitHub Release
@@ -174,6 +182,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -188,7 +197,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Download compiled archives
+      - name: Download compiled binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
@@ -201,16 +210,23 @@ jobs:
           set -euo pipefail
 
           expected_assets=(
-            "node-agent-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-            "node-agent-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
-            "node-agent-${VERSION}-x86_64-pc-windows-msvc.zip"
-            "node-agent-${VERSION}-x86_64-apple-darwin.tar.gz"
-            "node-agent-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "node-agent-${VERSION}-x86_64-unknown-linux-gnu"
+            "node-agent-${VERSION}-aarch64-unknown-linux-gnu"
+            "node-agent-${VERSION}-x86_64-pc-windows-msvc.exe"
+            "node-agent-${VERSION}-x86_64-apple-darwin"
+            "node-agent-${VERSION}-aarch64-apple-darwin"
           )
 
           for asset in "${expected_assets[@]}"; do
-            if [[ ! -f "release-assets/${asset}" ]]; then
+            path="release-assets/${asset}"
+            if [[ ! -s "${path}" ]]; then
               echo "::error::Missing release asset: ${asset}"
+              exit 1
+            fi
+
+            size="$(wc -c < "${path}")"
+            if (( size >= 2147483648 )); then
+              echo "::error::Release assets must be smaller than 2 GiB; ${asset} is ${size} bytes."
               exit 1
             fi
           done
@@ -219,6 +235,12 @@ jobs:
             cd release-assets
             sha256sum "${expected_assets[@]}" > SHA256SUMS
           )
+
+          asset_count="$(find release-assets -maxdepth 1 -type f | wc -l)"
+          if [[ "${asset_count}" -ne 6 ]]; then
+            echo "::error::Expected 5 binaries and SHA256SUMS, found ${asset_count} release assets."
+            exit 1
+          fi
 
       - name: Publish release
         id: publish
@@ -239,7 +261,14 @@ jobs:
             exit 1
           fi
 
-          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          assets=(
+            "release-assets/node-agent-${VERSION}-x86_64-unknown-linux-gnu"
+            "release-assets/node-agent-${VERSION}-aarch64-unknown-linux-gnu"
+            "release-assets/node-agent-${VERSION}-x86_64-pc-windows-msvc.exe"
+            "release-assets/node-agent-${VERSION}-x86_64-apple-darwin"
+            "release-assets/node-agent-${VERSION}-aarch64-apple-darwin"
+            "release-assets/SHA256SUMS"
+          )
 
           create_args=(
             release create "${TAG}"
@@ -247,6 +276,7 @@ jobs:
             --target "${GITHUB_SHA}"
             --title "node-agent ${TAG}"
             --generate-notes
+            --notes "Linux and macOS assets are raw executables; run chmod +x on the downloaded file before starting it."
           )
 
           if [[ "${PRERELEASE}" == "true" ]]; then
@@ -268,5 +298,38 @@ jobs:
             echo
             echo "- Release: [${TAG}](${RELEASE_URL})"
             echo "- Commit: ${GITHUB_SHA}"
-            echo "- Assets: 5 platform archives plus SHA256SUMS"
+            echo "- Assets: 5 raw platform binaries plus SHA256SUMS"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+  cleanup:
+    name: Delete temporary build artifacts
+    if: ${{ always() }}
+    needs:
+      - build
+      - release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Reclaim Actions artifact storage
+        shell: bash
+        run: |
+          set -u
+
+          if ! artifact_ids="$(
+            gh api --paginate "repos/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | select(.name | startswith("release-")) | .id'
+          )"; then
+            echo "::warning::Could not list temporary Actions artifacts; they will expire after 1 day."
+            exit 0
+          fi
+
+          while IFS= read -r artifact_id; do
+            [[ -z "${artifact_id}" ]] && continue
+            if ! gh api --method DELETE "repos/${GH_REPO}/actions/artifacts/${artifact_id}" >/dev/null; then
+              echo "::warning::Could not delete temporary Actions artifact ${artifact_id}; it will expire after 1 day."
+            fi
+          done <<< "${artifact_ids}"
