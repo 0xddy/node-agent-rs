@@ -1,8 +1,13 @@
 //! Builder functions for creating ClientProxyChain from config.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
+use sha2::{Digest as _, Sha256};
+
+use crate::client_proxy_chain::{
+    ClientChainGroup, ClientProxyChain, InitialHopEntry, current_client_chain_group_registry,
+};
 use crate::config::ConfigSelection;
 use crate::config::{ClientChainHop, ClientChainSelectionConfig, ClientConfig};
 use crate::hysteria2_client::Hysteria2SocketConnector;
@@ -150,6 +155,29 @@ pub fn build_direct_chain_group(resolver: Arc<dyn Resolver>) -> ClientChainGroup
     build_client_chain_group(crate::option_util::NoneOrSome::None, resolver)
 }
 
+/// Build a single direct chain whose TCP and UDP sockets are bound to one
+/// interface. Advanced systemd-resolved DNS uses this to match the default-link
+/// dialer semantics and to make scoped IPv6 link-local upstreams routable
+/// without leaking an interface choice into Hickory's IpAddr-only config.
+pub(crate) fn build_bound_direct_chain_group(
+    interface: String,
+    resolver: Arc<dyn Resolver>,
+) -> ClientChainGroup {
+    let config = ClientConfig {
+        bind_interface: crate::option_util::NoneOrOne::One(interface),
+        ..ClientConfig::default()
+    };
+    let chain = build_client_proxy_chain(
+        crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
+        resolver.clone(),
+    );
+    ClientChainGroup::new_with_selection(
+        vec![chain],
+        ClientChainSelectionConfig::RoundRobin,
+        resolver,
+    )
+}
+
 /// Build a ClientChainGroup from config chains.
 pub fn build_client_chain_group(
     client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
@@ -168,22 +196,72 @@ pub fn build_client_chain_group_with_selection(
     selection: ClientChainSelectionConfig,
     resolver: Arc<dyn Resolver>,
 ) -> ClientChainGroup {
-    let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
-        vec![build_client_proxy_chain(
-            crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
-                ClientConfig::default(),
-            ))),
-            resolver.clone(),
-        )]
-    } else {
-        client_chains
-            .into_vec()
-            .into_iter()
-            .map(|chain| build_client_proxy_chain(chain.hops, resolver.clone()))
-            .collect()
+    let shared_key = match &selection {
+        ClientChainSelectionConfig::UrlTest {
+            shared_id: Some(shared_id),
+            ..
+        } => current_client_chain_group_registry().map(|registry| {
+            let encoded = serde_json::to_vec(&(&client_chains, &selection))
+                .expect("validated client chains always serialize");
+            let mut digest = Sha256::new();
+            digest.update(b"shoes/client-chain-group/v1\0");
+            digest.update(shared_id.as_bytes());
+            digest.update(b"\0");
+            digest.update(encoded);
+            let mut key = String::with_capacity(shared_id.len() + 1 + 64);
+            key.push_str(shared_id);
+            key.push(':');
+            for byte in digest.finalize() {
+                write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+            }
+            (registry, key)
+        }),
+        _ => None,
+    };
+    let defer_urltest_start = shared_key.is_some();
+    let shared_probe_resolver = shared_key
+        .as_ref()
+        .map(|(registry, _)| registry.probe_resolver());
+    let shared_history_store = shared_key
+        .as_ref()
+        .map(|(registry, _)| registry.history_store());
+    let shared_probe_permits = shared_key
+        .as_ref()
+        .map(|(registry, _)| registry.probe_permits());
+
+    let build = || {
+        let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
+            vec![build_client_proxy_chain(
+                crate::option_util::OneOrSome::One(ClientChainHop::Single(
+                    ConfigSelection::Config(ClientConfig::default()),
+                )),
+                resolver.clone(),
+            )]
+        } else {
+            client_chains
+                .into_vec()
+                .into_iter()
+                .map(|chain| build_client_proxy_chain(chain.hops, resolver.clone()))
+                .collect()
+        };
+
+        if defer_urltest_start {
+            ClientChainGroup::new_with_deferred_selection(
+                chains,
+                selection,
+                shared_probe_resolver.expect("shared URLTest has a probe resolver"),
+                shared_history_store.expect("shared URLTest has a history store"),
+                shared_probe_permits.expect("shared URLTest has a probe semaphore"),
+            )
+        } else {
+            ClientChainGroup::new_with_selection(chains, selection, resolver)
+        }
     };
 
-    ClientChainGroup::new_with_selection(chains, selection, resolver)
+    match shared_key {
+        Some((registry, key)) => registry.get_or_insert_with(key, build),
+        None => build(),
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +367,14 @@ mod tests {
         let group = build_client_chain_group(NoneOrSome::None, mock_resolver());
         // Default is a single direct chain
         assert!(group.supports_udp());
+    }
+
+    #[test]
+    fn bound_direct_group_exposes_the_default_link_to_all_dns_sockets() {
+        let group = build_bound_direct_chain_group("eth-test0".to_string(), mock_resolver());
+        assert!(group.is_direct_only());
+        assert!(group.supports_udp());
+        assert_eq!(group.get_bind_interface(), Some("eth-test0"));
     }
 
     #[test]

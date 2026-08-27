@@ -7,10 +7,10 @@
 //!
 //! # The grace period is the `Arc`
 //!
-//! An accept loop reads its handler out of a [`HandlerSlot`] once per accepted
-//! connection and hands that `Arc` to the connection. Everything the connection
-//! needs afterwards -- the protocol settings, the routing rules, the TLS config --
-//! hangs off it, so the connection is pinned to the generation it started on. A
+//! An accept path reads its handler out of a [`HandlerSlot`] once per independently
+//! routed flow: a TCP connection or a generic-QUIC bidirectional stream. Everything
+//! the flow needs afterwards -- protocol settings, routing rules, TLS config --
+//! hangs off it, so the flow is pinned to the generation it started on. A
 //! [`HandlerSlot::store`] therefore cannot affect anything already running: it
 //! only changes what the *next* `load` returns. The old handler is freed when its
 //! last connection ends, which is the whole of the grace period; there is nothing
@@ -54,7 +54,7 @@ use crate::config::{
 };
 use crate::dynamic::UserRegistry;
 use crate::resolver::Resolver;
-use crate::tcp::inbound_replay::InboundReplayState;
+use crate::tcp::inbound_replay::{InboundReplayScope, InboundReplayState};
 #[cfg(test)]
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
@@ -69,7 +69,7 @@ use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler_with_repla
 /// period so much as the last chance for the runtime to run the cancellation.
 const ABORT_GRACE: Duration = Duration::from_millis(250);
 
-/// One generation of everything a connection is pinned to when it is accepted.
+/// One generation of everything a logical flow is pinned to when it is accepted.
 ///
 /// The resolver belongs here, next to the handler, and not in the accept loop. A
 /// reload rebuilds the handler *with a new resolver* -- an inbound may carry its own
@@ -102,10 +102,10 @@ impl HandlerSlot {
         })
     }
 
-    /// What a connection being accepted now runs under: its handler and the resolver
+    /// What a logical flow being accepted now runs under: its handler and the resolver
     /// that handler's rules were built against.
     ///
-    /// On the hot path, once per connection. `load` is a lock-free read; the clones
+    /// On the hot path, once per TCP connection or QUIC stream. `load` is a lock-free read; the clones
     /// are two uncontended refcount bumps, one of which the old
     /// `server_handler.clone()` already did and the other of which replaces the
     /// accept loop's own `resolver.clone()`.
@@ -146,16 +146,16 @@ impl std::fmt::Debug for HandlerSlot {
 /// [`HandlerSlot`] for protocols that never build a [`TcpServerHandler`]. Hysteria2
 /// and TUIC authenticate inside their own QUIC accept loops, so there is no handler
 /// to swap and nothing above the socket to hang rules off -- but the rules
-/// themselves are still an `Arc` read once per connection, which is the only
+/// themselves are still an `Arc` read once per new TCP flow or UDP association, which is the only
 /// property the swap needs.
 ///
-/// The safety argument is [`HandlerSlot`]'s, unchanged: the accept loop `load`s once
-/// per accepted connection and hands that `Arc` to every loop the connection fans
-/// out into, so the connection is pinned to the generation it started on and a
+/// The safety argument is [`HandlerSlot`]'s, unchanged: the protocol `load`s once
+/// per new logical flow and hands that `Arc` to every loop the flow fans out into,
+/// so the flow is pinned to the generation it started on and a
 /// [`store`](Self::store) can only change what the *next* `load` returns.
 ///
 /// The rules and the resolver they were built against, swapped as one. Same
-/// reasoning as [`HandlerCell`]: a connection must not mix generations.
+/// reasoning as [`HandlerCell`]: a logical flow must not mix generations.
 struct SelectorCell {
     selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -476,8 +476,52 @@ enum HandlerKey {
     Path,
 }
 
-/// One started inbound: its listener tasks, their handler slots, and the token
-/// that stops them.
+/// Whether an accepted physical stream can create independently routed work after
+/// its handler generation was loaded. These protocols cannot safely use a
+/// connection-level RCU swap: a long-lived mux session could keep admitting new
+/// logical flows through a retired selector and resolver indefinitely.
+fn protocol_has_post_accept_logical_flows(protocol: &ServerProxyConfig) -> bool {
+    match protocol {
+        ServerProxyConfig::Socks { udp_enabled, .. }
+        | ServerProxyConfig::Mixed { udp_enabled, .. } => *udp_enabled,
+        ServerProxyConfig::Hysteria2 { udp_enabled, .. } => *udp_enabled,
+        ServerProxyConfig::TuicV5 { .. } => true,
+        ServerProxyConfig::Shadowsocks { .. }
+        | ServerProxyConfig::Snell { .. }
+        | ServerProxyConfig::Vless { .. }
+        | ServerProxyConfig::Trojan { .. }
+        | ServerProxyConfig::Vmess { .. }
+        | ServerProxyConfig::Anytls { .. }
+        | ServerProxyConfig::Naiveproxy { .. } => true,
+        ServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            tls_targets
+                .values()
+                .any(|target| protocol_has_post_accept_logical_flows(&target.protocol))
+                || default_tls_target
+                    .as_ref()
+                    .is_some_and(|target| protocol_has_post_accept_logical_flows(&target.protocol))
+                || shadowtls_targets
+                    .values()
+                    .any(|target| protocol_has_post_accept_logical_flows(&target.protocol))
+                || reality_targets
+                    .values()
+                    .any(|target| protocol_has_post_accept_logical_flows(&target.protocol))
+        }
+        ServerProxyConfig::Websocket { targets } => targets
+            .iter()
+            .any(|target| protocol_has_post_accept_logical_flows(&target.protocol)),
+        _ => false,
+    }
+}
+
+/// One started inbound: its listener tasks, their handler slots, and the two
+/// cancellation trees that control it.
 ///
 /// Dropping this does **not** stop anything. The listeners hold their own clones
 /// of the token and the slots, so an embedder that never wants to reload or stop
@@ -503,15 +547,43 @@ pub struct ServerHandle {
     /// What the *listener* baked in, which no inbound of any kind can change in
     /// place. `None` only for a handle nothing recorded settings on.
     fixed_listener: Option<FixedListener>,
+    /// Whether this listener can produce new logical flows after physical accept.
+    post_accept_logical_flows: bool,
     /// Replay protection belongs to the inbound, not to one bind address or one
     /// replaceable handler generation.
     replay_state: InboundReplayState,
+    /// Live-generation owner retained by listeners and every handler handed to an
+    /// accepted connection. Unlike `replay_state`, rollback leases do not own this.
+    replay_scope: InboundReplayScope,
+    /// Stops only the accept loops. Cancelling it is the graceful path: established
+    /// connections are deliberately allowed to finish.
     cancel: CancellationToken,
+    /// Parents every dynamically metered connection accepted by this handle, and is
+    /// also observed by QUIC endpoints. It is intentionally independent of `cancel`
+    /// so ordinary removal does not revoke established sessions.
+    connection_cancel: CancellationToken,
     listeners: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ServerHandle {
     pub(crate) fn new(transport: Transport, cancel: CancellationToken) -> Self {
+        Self::new_with_replay_state(transport, cancel, InboundReplayState::default())
+    }
+
+    pub(crate) fn new_with_replay_state(
+        transport: Transport,
+        cancel: CancellationToken,
+        replay_state: InboundReplayState,
+    ) -> Self {
+        Self::new_with_replay_scope(transport, cancel, InboundReplayScope::new(replay_state))
+    }
+
+    pub(crate) fn new_with_replay_scope(
+        transport: Transport,
+        cancel: CancellationToken,
+        replay_scope: InboundReplayScope,
+    ) -> Self {
+        let replay_state = replay_scope.state();
         Self {
             transport,
             binds: Vec::new(),
@@ -519,8 +591,11 @@ impl ServerHandle {
             selectors: Vec::new(),
             fixed: None,
             fixed_listener: None,
-            replay_state: InboundReplayState::default(),
+            post_accept_logical_flows: false,
+            replay_state,
+            replay_scope,
             cancel,
+            connection_cancel: CancellationToken::new(),
             listeners: Mutex::new(Vec::new()),
         }
     }
@@ -530,8 +605,21 @@ impl ServerHandle {
         self.cancel.clone()
     }
 
+    /// The parent token for established connections owned by this inbound.
+    ///
+    /// A connection must take a child rather than cancel this token directly: user
+    /// revocation remains connection-local, while a hard inbound removal propagates
+    /// from this parent to every child at once.
+    pub(crate) fn connection_token(&self) -> CancellationToken {
+        self.connection_cancel.clone()
+    }
+
     pub(crate) fn replay_state(&self) -> InboundReplayState {
         self.replay_state.clone()
+    }
+
+    pub(crate) fn replay_scope(&self) -> InboundReplayScope {
+        self.replay_scope.clone()
     }
 
     pub(crate) fn push_listener(&mut self, handle: JoinHandle<()>) {
@@ -548,6 +636,7 @@ impl ServerHandle {
     /// Called by the start functions with the config they are about to start from.
     pub(crate) fn record_listener_settings(&mut self, config: &ServerConfig) {
         self.fixed_listener = Some(FixedListener::extract(config));
+        self.post_accept_logical_flows = protocol_has_post_accept_logical_flows(&config.protocol);
     }
 
     /// Record the slot serving `ip`, or return the one already recorded for it.
@@ -653,6 +742,15 @@ impl ServerHandle {
             ));
         }
 
+        if self.post_accept_logical_flows
+            || protocol_has_post_accept_logical_flows(&config.protocol)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this protocol can create new logical flows inside an accepted physical stream; replace the inbound so retired routing generations cannot keep admitting work",
+            ));
+        }
+
         // A selector slot reaches the rules and nothing else. Everything else in a
         // QUIC-native inbound's protocol object was read once, before its accept
         // loop started, so accepting a change to it here would report success for a
@@ -755,7 +853,7 @@ impl ServerHandle {
                 resolver,
                 bind_ip,
                 users,
-                &self.replay_state,
+                &self.replay_scope,
             )
             .into();
             rebuilt.push((slot, handler));
@@ -837,15 +935,6 @@ impl ServerHandle {
         }
     }
 
-    /// Stop accepting new connections, and wait for the listeners to let go of
-    /// their sockets.
-    ///
-    /// Established connections are deliberately left running: they were spawned
-    /// off the accept loop and hold their own handler, so they finish under the
-    /// rules they started with. For TCP the wait is only as long as it takes the
-    /// accept loop to notice; for QUIC it also covers the endpoint's own drain,
-    /// which is why there is a bound. A listener still running when `drain`
-    /// elapses is aborted, which for QUIC does cut its connections short.
     /// Tell the accept loops to stop, without waiting for them.
     ///
     /// The synchronous half of [`shutdown`](Self::shutdown), for a caller that has no
@@ -863,9 +952,38 @@ impl ServerHandle {
         self.cancel.cancel();
     }
 
+    /// Stop accepting and revoke the established-connection tree immediately.
+    ///
+    /// QUIC listener tasks observe the connection token themselves and close their
+    /// endpoints. Every TCP connection runs under a child context; metered fallback
+    /// tasks retain that context through their traffic stream. This synchronous half
+    /// is also used when a hard-removal future is cancelled.
+    pub fn hard_stop(&self) {
+        // Cancel connections first. If an accept races this call, the child token it
+        // creates is born cancelled and cannot escape the hard stop.
+        self.connection_cancel.cancel();
+        self.cancel.cancel();
+    }
+
+    /// Stop accepting and wait for the listeners to release their sockets.
+    ///
+    /// Established connections are deliberately left running. QUIC endpoints drain
+    /// them within the supplied bound; aborting a listener after that bound can cut
+    /// those connections short.
     pub async fn shutdown(&self, drain: Duration) {
         self.cancel.cancel();
 
+        self.join_listeners(drain).await;
+    }
+
+    /// Stop accepting, revoke established connections, and wait for the listener
+    /// tasks to release their sockets.
+    pub async fn hard_shutdown(&self, drain: Duration) {
+        self.hard_stop();
+        self.join_listeners(drain).await;
+    }
+
+    async fn join_listeners(&self, drain: Duration) {
         let mut listeners: Vec<JoinHandle<()>> = {
             let mut guard = self.listeners.lock().unwrap();
             guard.drain(..).collect()
@@ -962,6 +1080,109 @@ mod tests {
     use crate::async_stream::AsyncStream;
     use crate::tcp::tcp_handler::TcpServerSetupResult;
 
+    fn parsed_protocol(json: &str) -> ServerProxyConfig {
+        serde_yaml::from_str(json).expect("test protocol parses")
+    }
+
+    #[test]
+    fn multiplexing_protocols_require_physical_stream_replacement() {
+        for protocol in [
+            r#"{"type":"ss","cipher":"aes-256-gcm","password":"secret"}"#,
+            r#"{"type":"snell","cipher":"aes-128-gcm","password":"secret"}"#,
+            r#"{"type":"vless","user_id":"11111111-1111-4111-8111-111111111111"}"#,
+            r#"{"type":"trojan","password":"secret"}"#,
+            r#"{"type":"vmess","cipher":"any","user_id":"11111111-1111-4111-8111-111111111111"}"#,
+            r#"{"type":"anytls","users":{"password":"secret"}}"#,
+            r#"{"type":"naive","users":{"username":"u","password":"secret"}}"#,
+        ] {
+            assert!(
+                protocol_has_post_accept_logical_flows(&parsed_protocol(protocol)),
+                "{protocol}"
+            );
+        }
+        assert!(!protocol_has_post_accept_logical_flows(&parsed_protocol(
+            r#"{"type":"socks","udp_enabled":false}"#
+        )));
+    }
+
+    #[test]
+    fn socks_udp_associations_require_replacement_only_when_enabled() {
+        for protocol in [
+            r#"{"type":"socks","udp_enabled":true}"#,
+            r#"{"type":"mixed","udp_enabled":true}"#,
+        ] {
+            assert!(
+                protocol_has_post_accept_logical_flows(&parsed_protocol(protocol)),
+                "UDP ASSOCIATE outlives the physical setup future: {protocol}"
+            );
+        }
+
+        for protocol in [
+            r#"{"type":"socks","udp_enabled":false}"#,
+            r#"{"type":"mixed","udp_enabled":false}"#,
+        ] {
+            assert!(
+                !protocol_has_post_accept_logical_flows(&parsed_protocol(protocol)),
+                "TCP-only SOCKS/Mixed remains safe for handler RCU: {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_quic_udp_associations_require_listener_replacement() {
+        assert!(protocol_has_post_accept_logical_flows(&parsed_protocol(
+            r#"{"type":"hysteria2","password":"secret","udp_enabled":true}"#
+        )));
+        assert!(protocol_has_post_accept_logical_flows(&parsed_protocol(
+            r#"{"type":"tuic","uuid":"550e8400-e29b-41d4-a716-446655440000","password":"secret"}"#
+        )));
+        assert!(
+            !protocol_has_post_accept_logical_flows(&parsed_protocol(
+                r#"{"type":"hysteria2","password":"secret","udp_enabled":false}"#
+            )),
+            "TCP-only Hysteria2 loads the current selector for each new stream"
+        );
+    }
+
+    #[test]
+    fn multiplexing_classification_recurses_through_transport_wrappers() {
+        for protocol in [
+            r#"{"type":"tls","default_target":{"cert":"c","key":"k","protocol":{"type":"vless","user_id":"11111111-1111-4111-8111-111111111111"}}}"#,
+            r#"{"type":"tls","shadowtls_targets":{"x":{"password":"p","handshake":{"address":"example.com:443"},"protocol":{"type":"snell","cipher":"aes-128-gcm","password":"p"}}}}"#,
+            r#"{"type":"tls","reality_targets":{"x":{"private_key":"key","short_ids":[""],"dest":"example.com:443","protocol":{"type":"trojan","password":"p"}}}}"#,
+            r#"{"type":"websocket","targets":{"protocol":{"type":"vmess","cipher":"any","user_id":"11111111-1111-4111-8111-111111111111"}}}"#,
+            r#"{"type":"websocket","targets":{"protocol":{"type":"socks","udp_enabled":true}}}"#,
+        ] {
+            assert!(
+                protocol_has_post_accept_logical_flows(&parsed_protocol(protocol)),
+                "wrapper failed to expose multiplexing child: {protocol}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_reload_rejects_connection_multiplexing_before_any_slot_swap() {
+        let config: ServerConfig = serde_yaml::from_str(
+            r#"{
+                "address":"127.0.0.1:1080",
+                "protocol":{
+                    "type":"vless",
+                    "user_id":"11111111-1111-4111-8111-111111111111"
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+        handle.record_listener_settings(&config);
+        handle.slot_for_path_for_test(marker("old"));
+        let error = handle
+            .check_reload(&config)
+            .expect_err("VLESS can open H2MUX logical flows after physical accept");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("logical flows"));
+        assert_eq!(handle.generation(), 0);
+    }
+
     /// A handler that does nothing but say which generation it belongs to.
     ///
     /// `TcpServerHandler` requires `Debug`, so its rendering is enough to tell two
@@ -1018,6 +1239,43 @@ mod tests {
 
     fn resolver() -> Arc<dyn Resolver> {
         Arc::new(crate::resolver::NativeResolver::new())
+    }
+
+    fn multi_bind_handle_with_replay(
+        config: &ServerConfig,
+        replay_state: InboundReplayState,
+    ) -> ServerHandle {
+        let mut handle = ServerHandle::new_with_replay_state(
+            Transport::Tcp,
+            CancellationToken::new(),
+            replay_state,
+        );
+        handle.record_listener_settings(config);
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let resolver = resolver();
+        let replay_scope = handle.replay_scope();
+
+        for address in ["127.0.0.1:1080", "127.0.0.2:1080"] {
+            let address: SocketAddr = address.parse().unwrap();
+            let protocol = config.protocol.clone();
+            let selector = Arc::clone(&selector);
+            let handler_resolver = Arc::clone(&resolver);
+            let replay_scope = replay_scope.clone();
+            handle.push_address(address);
+            handle.slot_for_ip(address.ip(), &resolver, move || {
+                create_tcp_server_handler_with_replay_state(
+                    protocol,
+                    &selector,
+                    &handler_resolver,
+                    Some(address.ip()),
+                    None,
+                    &replay_scope,
+                )
+                .into()
+            });
+        }
+
+        handle
     }
 
     #[test]
@@ -1108,6 +1366,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graceful_shutdown_preserves_connections_while_hard_shutdown_revokes_them() {
+        let accept = CancellationToken::new();
+        let graceful = ServerHandle::new(Transport::Tcp, accept.clone());
+        let graceful_connection = graceful.connection_token().child_token();
+
+        graceful.shutdown(Duration::from_secs(1)).await;
+
+        assert!(accept.is_cancelled());
+        assert!(!graceful_connection.is_cancelled());
+
+        let accept = CancellationToken::new();
+        let hard = ServerHandle::new(Transport::Tcp, accept.clone());
+        let hard_connection = hard.connection_token().child_token();
+
+        hard.hard_shutdown(Duration::from_secs(1)).await;
+
+        assert!(accept.is_cancelled());
+        assert!(hard_connection.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn shutdown_aborts_a_listener_that_ignores_the_token() {
         let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
         let stuck = tokio::spawn(std::future::pending::<()>());
@@ -1138,8 +1417,11 @@ mod tests {
 
     /// A hysteria2 inbound as the QUIC start path records it: one rule slot per bind
     /// address, and the settings its accept loop baked in.
-    fn hysteria2_handle(has_registry: bool) -> (ServerHandle, Arc<SelectorSlot>) {
-        let config = hysteria2_config(true);
+    fn hysteria2_handle(
+        udp_enabled: bool,
+        has_registry: bool,
+    ) -> (ServerHandle, Arc<SelectorSlot>) {
+        let config = hysteria2_config(udp_enabled);
         let selector = Arc::new(create_tcp_client_proxy_selector(
             config
                 .rules
@@ -1168,12 +1450,15 @@ mod tests {
 
     #[test]
     fn a_rule_slot_reloads_where_a_handler_slot_would_have_nothing_to_swap() {
-        // The gap this closes: hysteria2 and TUIC used to refuse outright.
-        let (handle, slot) = hysteria2_handle(true);
+        // A TCP-only hysteria2 listener loads the selector once per accepted
+        // stream, so new streams can safely observe an RCU generation. UDP-enabled
+        // hysteria2 and TUIC are covered separately: their long-lived associations
+        // require listener replacement.
+        let (handle, slot) = hysteria2_handle(false, true);
         assert_eq!(slot.generation(), 0);
 
         let generation = handle
-            .reload(hysteria2_config(true), &resolver(), None)
+            .reload(hysteria2_config(false), &resolver(), None)
             .expect("rules should swap on a selector-only listener");
 
         assert_eq!(generation, 1);
@@ -1183,11 +1468,11 @@ mod tests {
 
     #[test]
     fn reload_swaps_sniff_policy_for_new_connections_only() {
-        let (handle, slot) = hysteria2_handle(true);
+        let (handle, slot) = hysteria2_handle(false, true);
         let in_flight = slot.load().0;
         assert_eq!(in_flight.sniff_policy(), None);
 
-        let mut enabled = hysteria2_config(true);
+        let mut enabled = hysteria2_config(false);
         enabled.sniff = Some(true);
         handle
             .reload(enabled, &resolver(), None)
@@ -1199,7 +1484,7 @@ mod tests {
             "a connection pinned to the old selector keeps its generation"
         );
 
-        let mut disabled = hysteria2_config(true);
+        let mut disabled = hysteria2_config(false);
         disabled.sniff = Some(false);
         handle.reload(disabled, &resolver(), None).unwrap();
         assert_eq!(slot.load().0.sniff_policy(), Some(false));
@@ -1210,7 +1495,7 @@ mod tests {
         // `udp_enabled` is read once, before the accept loop starts. Accepting the
         // change would report success for a setting that never took effect -- and
         // leave UDP running after an operator turned it off.
-        let (handle, slot) = hysteria2_handle(true);
+        let (handle, slot) = hysteria2_handle(true, true);
         let err = handle
             .reload(hysteria2_config(false), &resolver(), None)
             .expect_err("udp_enabled cannot change in place");
@@ -1227,7 +1512,7 @@ mod tests {
     #[test]
     fn a_rule_slot_ignores_the_credential_only_when_a_registry_supersedes_it() {
         let changed = |handle: &ServerHandle| {
-            let mut config = hysteria2_config(true);
+            let mut config = hysteria2_config(false);
             if let ServerProxyConfig::Hysteria2 { password, .. } = &mut config.protocol {
                 *password = "rotated".to_string();
             }
@@ -1236,24 +1521,24 @@ mod tests {
 
         // In dynamic mode the config password is a placeholder the control plane
         // regenerates on every call, so comparing it would refuse every reload.
-        let (dynamic, _) = hysteria2_handle(true);
+        let (dynamic, _) = hysteria2_handle(false, true);
         assert!(changed(&dynamic).is_ok());
 
         // Without a registry it is the real credential, and the accept loop already
         // turned it into a one-user registry it will not rebuild.
-        let (classic, _) = hysteria2_handle(false);
+        let (classic, _) = hysteria2_handle(false, false);
         let err = changed(&classic).expect_err("the config credential cannot change in place");
         assert!(err.to_string().contains("password"), "{err}");
     }
 
     #[test]
     fn a_rule_slot_refuses_a_different_protocol_entirely() {
-        let (handle, _) = hysteria2_handle(true);
+        let (handle, _) = hysteria2_handle(true, true);
         let config: ServerConfig = serde_yaml::from_str(
             "address: 127.0.0.1:18443\n\
              transport: quic\n\
              quic_settings:\n  cert: c\n  key: k\n\
-             protocol:\n  type: socks\n\
+             protocol:\n  type: socks\n  udp_enabled: false\n\
              rules:\n  - masks: 0.0.0.0/0\n    action: allow\n",
         )
         .unwrap();
@@ -1271,8 +1556,10 @@ mod tests {
             marker("running")
         });
 
-        let config: ServerConfig =
-            serde_yaml::from_str("address: 127.0.0.1:1081\nprotocol:\n  type: socks\n").unwrap();
+        let config: ServerConfig = serde_yaml::from_str(
+            "address: 127.0.0.1:1081\nprotocol:\n  type: socks\n  udp_enabled: false\n",
+        )
+        .unwrap();
         let err = handle
             .reload(config, &resolver(), None)
             .expect_err("the port moved");
@@ -1292,7 +1579,7 @@ mod tests {
         });
 
         let config: ServerConfig = serde_yaml::from_str(
-            "address: 127.0.0.1:1080\ntransport: quic\nprotocol:\n  type: socks\n",
+            "address: 127.0.0.1:1080\ntransport: quic\nprotocol:\n  type: socks\n  udp_enabled: false\n",
         )
         .unwrap();
         let err = handle
@@ -1310,7 +1597,7 @@ mod tests {
             handle.slot_for_ip("127.0.0.1".parse().unwrap(), &resolver(), || marker("old"));
 
         let config: ServerConfig = serde_yaml::from_str(
-            "address:\n  - 127.0.0.1:1080\n  - 127.0.0.1:1081\nprotocol:\n  type: socks\n",
+            "address:\n  - 127.0.0.1:1080\n  - 127.0.0.1:1081\nprotocol:\n  type: socks\n  udp_enabled: false\n",
         )
         .unwrap();
 
@@ -1324,23 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_bind_reload_keeps_one_replay_scope_and_isolates_other_inbounds() {
-        let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
-        for address in ["127.0.0.1:1080", "127.0.0.2:1080"] {
-            let address: SocketAddr = address.parse().unwrap();
-            handle.push_address(address);
-            handle.slot_for_ip(address.ip(), &resolver(), || marker("old"));
-        }
-
-        let vmess_filter = handle.replay_state.vmess_auth_ids();
-        let shadowsocks_filter = handle.replay_state.shadowsocks_salts();
-        assert!(vmess_filter.lock().check_and_insert(b"vmess-auth-id"));
-        assert!(
-            shadowsocks_filter
-                .lock()
-                .insert_and_check(b"shadowsocks-salt")
-        );
-
+    fn multi_bind_hard_replacement_keeps_one_replay_scope_and_isolates_other_inbounds() {
         let vmess: ServerConfig = serde_yaml::from_str(
             r#"address:
   - 127.0.0.1:1080
@@ -1352,17 +1623,28 @@ protocol:
 "#,
         )
         .unwrap();
-        handle
-            .reload(vmess, &resolver(), None)
-            .expect("both bind handlers should rebuild");
+
+        let handle = multi_bind_handle_with_replay(&vmess, InboundReplayState::default());
+        let vmess_filter = handle.replay_state.vmess_auth_ids();
+        let shadowsocks_filter = handle.replay_state.shadowsocks_salts();
+        assert!(vmess_filter.lock().check_and_insert(b"vmess-auth-id"));
+        assert!(
+            shadowsocks_filter
+                .lock()
+                .insert_and_check(b"shadowsocks-salt")
+        );
 
         // The handle and this local variable hold one reference each; the other
-        // two are the handlers rebuilt for the two bind IPs. If either handler had
+        // two are the handlers built for the two bind IPs. If either handler had
         // constructed a new filter, this would stay at two instead of four.
         assert_eq!(Arc::strong_count(&vmess_filter), 4);
+        let error = handle
+            .reload(vmess.clone(), &resolver(), None)
+            .expect_err("VMess H2MUX requires physical-stream replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
         assert!(
             !vmess_filter.lock().check_and_insert(b"vmess-auth-id"),
-            "reload must not reopen the VMess replay window"
+            "a rejected RCU reload must not reopen the VMess replay window"
         );
 
         let shadowsocks: ServerConfig = serde_yaml::from_str(
@@ -1376,21 +1658,40 @@ protocol:
 "#,
         )
         .unwrap();
-        handle
+
+        // A hard replacement carries the inbound replay lease into its new handle.
+        // Changing protocol may drop the old VMess handlers, but it must preserve
+        // both namespaces and share the SS salt filter across every new bind.
+        let replay_state = handle.replay_state();
+        drop(handle);
+        let handle = multi_bind_handle_with_replay(&shadowsocks, replay_state);
+        assert_eq!(Arc::strong_count(&shadowsocks_filter), 4);
+        assert!(
+            !vmess_filter.lock().check_and_insert(b"vmess-auth-id"),
+            "hard replacement must retain the inactive VMess replay namespace"
+        );
+        assert!(
+            !shadowsocks_filter
+                .lock()
+                .insert_and_check(b"shadowsocks-salt"),
+            "hard replacement must not forget Shadowsocks salts"
+        );
+
+        let error = handle
             .reload(shadowsocks.clone(), &resolver(), None)
-            .expect("both bind handlers should change protocol");
+            .expect_err("Shadowsocks H2MUX requires physical-stream replacement");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+
+        let replay_state = handle.replay_state();
+        drop(handle);
+        let _replacement = multi_bind_handle_with_replay(&shadowsocks, replay_state);
         assert_eq!(Arc::strong_count(&shadowsocks_filter), 4);
         assert!(
             !shadowsocks_filter
                 .lock()
                 .insert_and_check(b"shadowsocks-salt"),
-            "changing handler generations must not forget Shadowsocks salts"
+            "a second hard replacement must keep using the same filter"
         );
-
-        handle
-            .reload(shadowsocks, &resolver(), None)
-            .expect("a second reload should keep using the same filter");
-        assert_eq!(Arc::strong_count(&shadowsocks_filter), 4);
 
         let other = ServerHandle::new(Transport::Tcp, CancellationToken::new());
         assert!(

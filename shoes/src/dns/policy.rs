@@ -5,39 +5,166 @@
 //! independent from configuration parsing so callers can resolve DNS server tags
 //! first and then construct an immutable, cheaply shared resolver.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use regex::{Regex, RegexBuilder};
 
 use crate::address::NetLocation;
+use crate::dns::query_cache::DnsQueryCache;
 use crate::resolver::Resolver;
 use crate::routing::predicate::{
     RouteContext, RouteMatchConfig, RoutePredicate, RouteRuleSetConfig,
 };
 
-/// DNS response codes exposed by the ACP panel's predefined lookup action.
+/// Engine-owned mutable state shared by DNS policy graphs.
+///
+/// Rule windows and the question cache are strongly retained for one committed
+/// Go DNS-client generation. This preserves the reject flood window across an
+/// inbound remove/add gap. A full DNS-client rotation clears both kinds of
+/// state before the replacement policy graph is built.
+#[derive(Debug)]
+pub struct PolicyStateRegistry {
+    reject_flood: Mutex<HashMap<PolicyRuleStateIdentity, Arc<RejectFloodState>>>,
+    /// The Arc itself is generation-scoped. Old resolver graphs retain their
+    /// old cache exactly like a retiring Go Box retains its Client/LRU, while
+    /// replacement graphs clone the newly published empty cache.
+    query_cache: Mutex<Arc<DnsQueryCache>>,
+    generation: AtomicU64,
+}
+
+impl Default for PolicyStateRegistry {
+    fn default() -> Self {
+        Self {
+            reject_flood: Mutex::new(HashMap::new()),
+            query_cache: Mutex::new(Arc::new(DnsQueryCache::default())),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PolicyRuleStateIdentity {
+    /// Stable identity supplied by the trusted topology compiler.
+    stable_key: String,
+    /// Canonical compiled matcher bytes. Including these prevents an arbitrary
+    /// Shoes config from making a different rule collide merely by copying an
+    /// internal stable key.
+    matcher: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct RejectFloodState {
+    attempts: Mutex<VecDeque<Instant>>,
+}
+
+impl PolicyStateRegistry {
+    pub(crate) fn query_cache(&self) -> Arc<DnsQueryCache> {
+        self.query_cache.lock().clone()
+    }
+
+    /// Rotate the Go DNS-client generation. Full Box/DNS-client rebuilds create
+    /// fresh rule actions in Go, so both cached answers and reject flood windows
+    /// are reset at this boundary.
+    pub fn rotate_dns_client_generation(&self) -> u64 {
+        self.reject_flood.lock().clear();
+        *self.query_cache.lock() = Arc::new(DnsQueryCache::default());
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    pub fn query_cache_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn reject_flood_state(&self, stable_key: &str, matcher: Vec<u8>) -> Arc<RejectFloodState> {
+        let identity = PolicyRuleStateIdentity {
+            stable_key: stable_key.to_string(),
+            matcher,
+        };
+        let mut states = self.reject_flood.lock();
+        if let Some(state) = states.get(&identity) {
+            return state.clone();
+        }
+        let state = Arc::new(RejectFloodState::default());
+        states.insert(identity, state.clone());
+        state
+    }
+
+    #[cfg(test)]
+    fn retained_identity_count(&self) -> usize {
+        self.reject_flood.lock().len()
+    }
+
+    #[cfg(test)]
+    fn live_state_count(&self) -> usize {
+        self.reject_flood
+            .lock()
+            .values()
+            .filter(|state| Arc::strong_count(state) > 1)
+            .count()
+    }
+}
+
+/// DNS response codes accepted by miekg/dns for sing-box's predefined action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsRcode {
     NoError,
-    NxDomain,
-    Refused,
+    FormErr,
     ServFail,
+    NxDomain,
+    NotImp,
+    Refused,
+    YxDomain,
+    YxRrset,
+    NxRrset,
+    NotAuth,
+    NotZone,
+    DsoTypeNi,
+    BadSig,
+    BadKey,
+    BadTime,
+    BadMode,
+    BadName,
+    BadAlg,
+    BadTrunc,
+    BadCookie,
 }
 
 impl DnsRcode {
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_uppercase().as_str() {
-            "" | "NOERROR" | "SUCCESS" => Some(Self::NoError),
-            "NXDOMAIN" => Some(Self::NxDomain),
-            "REFUSED" => Some(Self::Refused),
+        match value {
+            // An omitted field deserializes to the empty string and means the
+            // DNS success code in both ACP compilers.
+            "" | "NOERROR" => Some(Self::NoError),
+            "FORMERR" => Some(Self::FormErr),
             "SERVFAIL" => Some(Self::ServFail),
+            "NXDOMAIN" => Some(Self::NxDomain),
+            "NOTIMP" | "NOTIMPL" => Some(Self::NotImp),
+            "REFUSED" => Some(Self::Refused),
+            "YXDOMAIN" => Some(Self::YxDomain),
+            "YXRRSET" => Some(Self::YxRrset),
+            "NXRRSET" => Some(Self::NxRrset),
+            "NOTAUTH" => Some(Self::NotAuth),
+            "NOTZONE" => Some(Self::NotZone),
+            "DSOTYPENI" => Some(Self::DsoTypeNi),
+            "BADSIG" => Some(Self::BadSig),
+            "BADKEY" => Some(Self::BadKey),
+            "BADTIME" => Some(Self::BadTime),
+            "BADMODE" => Some(Self::BadMode),
+            "BADNAME" => Some(Self::BadName),
+            "BADALG" => Some(Self::BadAlg),
+            "BADTRUNC" => Some(Self::BadTrunc),
+            "BADCOOKIE" => Some(Self::BadCookie),
             _ => None,
         }
     }
@@ -45,9 +172,25 @@ impl DnsRcode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NoError => "NOERROR",
-            Self::NxDomain => "NXDOMAIN",
-            Self::Refused => "REFUSED",
+            Self::FormErr => "FORMERR",
             Self::ServFail => "SERVFAIL",
+            Self::NxDomain => "NXDOMAIN",
+            Self::NotImp => "NOTIMP",
+            Self::Refused => "REFUSED",
+            Self::YxDomain => "YXDOMAIN",
+            Self::YxRrset => "YXRRSET",
+            Self::NxRrset => "NXRRSET",
+            Self::NotAuth => "NOTAUTH",
+            Self::NotZone => "NOTZONE",
+            Self::DsoTypeNi => "DSOTYPENI",
+            Self::BadSig => "BADSIG",
+            Self::BadKey => "BADKEY",
+            Self::BadTime => "BADTIME",
+            Self::BadMode => "BADMODE",
+            Self::BadName => "BADNAME",
+            Self::BadAlg => "BADALG",
+            Self::BadTrunc => "BADTRUNC",
+            Self::BadCookie => "BADCOOKIE",
         }
     }
 }
@@ -96,7 +239,7 @@ pub enum DnsPolicyFailure {
 }
 
 /// An address-resolver error that preserves DNS policy semantics for callers
-/// which need to distinguish NXDOMAIN, REFUSED, SERVFAIL, and an explicit drop.
+/// which need to distinguish the original RCODE and an explicit drop.
 #[derive(Debug)]
 pub struct DnsPolicyError {
     hostname: String,
@@ -125,14 +268,14 @@ impl DnsPolicyError {
 
     fn into_io_error(self) -> io::Error {
         let kind = match self.failure {
+            DnsPolicyFailure::ResponseCode(DnsRcode::NoError) => {
+                unreachable!("NOERROR is not a DNS policy failure")
+            }
             DnsPolicyFailure::ResponseCode(DnsRcode::NxDomain) => io::ErrorKind::NotFound,
             DnsPolicyFailure::ResponseCode(DnsRcode::Refused) | DnsPolicyFailure::Rejected(_) => {
                 io::ErrorKind::PermissionDenied
             }
-            DnsPolicyFailure::ResponseCode(DnsRcode::ServFail) => io::ErrorKind::Other,
-            DnsPolicyFailure::ResponseCode(DnsRcode::NoError) => {
-                unreachable!("NOERROR is not a DNS policy failure")
-            }
+            DnsPolicyFailure::ResponseCode(_) => io::ErrorKind::Other,
         };
         io::Error::new(kind, self)
     }
@@ -279,6 +422,9 @@ pub struct PolicyRuleSpec {
     /// together with the direct hostname category using sing-box match-state
     /// merging (including nested invert semantics).
     pub rule_set: Vec<RouteRuleSetConfig>,
+    /// Prevent the default reject action from degrading to drop after more
+    /// than 50 matching lookups in sing-box's rolling 30-second window.
+    pub no_drop: bool,
     pub action: PolicyAction,
     /// Optional timeout applied only to a matched route resolver call.
     pub timeout: Option<Duration>,
@@ -292,6 +438,7 @@ impl PolicyRuleSpec {
             keyword: Vec::new(),
             regex: Vec::new(),
             rule_set: Vec::new(),
+            no_drop: false,
             action,
             timeout: None,
         }
@@ -326,6 +473,11 @@ impl PolicyRuleSpec {
         self.timeout = (!timeout.is_zero()).then_some(timeout);
         self
     }
+
+    pub fn no_drop(mut self, no_drop: bool) -> Self {
+        self.no_drop = no_drop;
+        self
+    }
 }
 
 /// Immutable resolver that applies ordered hostname policy before its final
@@ -355,6 +507,29 @@ impl PolicyResolver {
             rules,
             PolicyLimits::default(),
             named_upstreams,
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Construct a policy whose compiler-issued rule identities share mutable
+    /// state through an engine-owned registry. The key vector is positional and
+    /// must contain one entry per rule; `None` retains the ordinary resolver-local
+    /// behavior for that rule.
+    pub(crate) fn with_named_upstreams_and_state_registry(
+        final_resolver: Arc<dyn Resolver>,
+        rules: Vec<PolicyRuleSpec>,
+        named_upstreams: impl IntoIterator<Item = (String, Arc<dyn Resolver>)>,
+        rule_state_keys: Vec<Option<String>>,
+        state_registry: &PolicyStateRegistry,
+    ) -> io::Result<Self> {
+        Self::with_limits_and_named_upstreams(
+            final_resolver,
+            rules,
+            PolicyLimits::default(),
+            named_upstreams,
+            rule_state_keys,
+            Some(state_registry),
         )
     }
 
@@ -363,7 +538,14 @@ impl PolicyResolver {
         rules: Vec<PolicyRuleSpec>,
         limits: PolicyLimits,
     ) -> io::Result<Self> {
-        Self::with_limits_and_named_upstreams(final_resolver, rules, limits, std::iter::empty())
+        Self::with_limits_and_named_upstreams(
+            final_resolver,
+            rules,
+            limits,
+            std::iter::empty(),
+            Vec::new(),
+            None,
+        )
     }
 
     fn with_limits_and_named_upstreams(
@@ -371,6 +553,8 @@ impl PolicyResolver {
         rules: Vec<PolicyRuleSpec>,
         limits: PolicyLimits,
         named_upstreams: impl IntoIterator<Item = (String, Arc<dyn Resolver>)>,
+        rule_state_keys: Vec<Option<String>>,
+        state_registry: Option<&PolicyStateRegistry>,
     ) -> io::Result<Self> {
         let limits = limits.validate()?;
         if rules.len() > limits.max_rules {
@@ -380,12 +564,32 @@ impl PolicyResolver {
                 limits.max_rules
             )));
         }
+        let rule_state_keys = if rule_state_keys.is_empty() {
+            vec![None; rules.len()]
+        } else if rule_state_keys.len() == rules.len() {
+            rule_state_keys
+        } else {
+            return Err(invalid_policy(format!(
+                "DNS policy has {} rules but {} shared-state identities",
+                rules.len(),
+                rule_state_keys.len()
+            )));
+        };
 
         let mut budget = CompileBudget::default();
         let rules = rules
             .into_iter()
+            .zip(rule_state_keys)
             .enumerate()
-            .map(|(index, spec)| PolicyRule::compile(index, spec, limits, &mut budget))
+            .map(|(index, (spec, state_key))| {
+                PolicyRule::compile(
+                    index,
+                    spec,
+                    limits,
+                    &mut budget,
+                    state_key.as_deref().zip(state_registry),
+                )
+            })
             .collect::<io::Result<Vec<_>>>()?;
 
         let mut named = HashMap::new();
@@ -432,7 +636,7 @@ impl Resolver for PolicyResolver {
             .rules
             .iter()
             .find(|rule| rule.matches(&normalized_hostname, location))
-            .map(|rule| (rule.action.clone(), rule.timeout));
+            .map(|rule| (rule.selected_action(), rule.timeout));
         let final_resolver = self.final_resolver.clone();
         let location = location.clone();
         let port = location.port();
@@ -507,6 +711,36 @@ impl Resolver for PolicyResolver {
             ))
         })
     }
+
+    fn result_cache_ttl(&self) -> Option<Duration> {
+        let mut effective = self.final_resolver.result_cache_ttl();
+        for rule in &self.rules {
+            if let PolicyAction::Route(resolver) = &rule.action {
+                let ttl = resolver.result_cache_ttl()?;
+                effective = Some(effective?.min(ttl));
+            }
+        }
+        effective
+    }
+
+    fn result_cache_ttl_for(&self, location: &NetLocation) -> Option<Duration> {
+        if location.to_socket_addr_nonblocking().is_some() {
+            return Some(Duration::from_secs(60 * 60));
+        }
+        let hostname = location.address().hostname()?;
+        let normalized_hostname = normalize_hostname(hostname);
+        match self
+            .rules
+            .iter()
+            .find(|rule| rule.matches(&normalized_hostname, location))
+            .map(|rule| &rule.action)
+        {
+            Some(PolicyAction::Route(resolver)) => resolver.result_cache_ttl_for(location),
+            Some(PolicyAction::Reject(_)) => None,
+            Some(PolicyAction::Predefined(_)) => Some(Duration::from_secs(60 * 60)),
+            None => self.final_resolver.result_cache_ttl_for(location),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -517,6 +751,7 @@ struct PolicyRule {
     regex: Box<[Regex]>,
     mixed_rule_set_matcher: Option<RoutePredicate>,
     action: PolicyAction,
+    reject_flood: Option<Arc<RejectFloodState>>,
     timeout: Option<Duration>,
 }
 
@@ -526,6 +761,7 @@ impl PolicyRule {
         spec: PolicyRuleSpec,
         limits: PolicyLimits,
         budget: &mut CompileBudget,
+        shared_state: Option<(&str, &PolicyStateRegistry)>,
     ) -> io::Result<Self> {
         let pattern_count = spec
             .exact
@@ -562,9 +798,21 @@ impl PolicyRule {
         }
 
         validate_action(index, &spec.action, limits)?;
+        if spec.no_drop && !matches!(&spec.action, PolicyAction::Reject(DnsRejectMethod::Default)) {
+            return Err(invalid_policy(format!(
+                "dns.rules[{index}] no_drop is only valid for the default reject method"
+            )));
+        }
         if spec.timeout.is_some() && !matches!(&spec.action, PolicyAction::Route(_)) {
             return Err(invalid_policy(format!(
                 "dns.rules[{index}] timeout is only valid for route actions"
+            )));
+        }
+        let reject_flood =
+            matches!(&spec.action, PolicyAction::Reject(DnsRejectMethod::Default)) && !spec.no_drop;
+        if shared_state.is_some() && !reject_flood {
+            return Err(invalid_policy(format!(
+                "dns.rules[{index}] shared reject state is only valid for default reject without no_drop"
             )));
         }
         let exact = compile_literals(index, "domain", spec.exact, limits, budget, |value| {
@@ -584,7 +832,7 @@ impl PolicyRule {
             spec.keyword,
             limits,
             budget,
-            |value| value.to_lowercase(),
+            str::to_owned,
         )?;
         let matcher_regex = spec.regex.clone();
         let mut regex = Vec::with_capacity(spec.regex.len());
@@ -596,7 +844,6 @@ impl PolicyRule {
                 )));
             }
             let compiled = RegexBuilder::new(&pattern)
-                .case_insensitive(true)
                 .size_limit(limits.regex_size_limit)
                 .dfa_size_limit(limits.regex_dfa_size_limit)
                 .build()
@@ -607,6 +854,10 @@ impl PolicyRule {
                 })?;
             regex.push(compiled);
         }
+        let shared_matcher = shared_state.map(|_| {
+            serde_json::to_vec(&(&exact, &suffix, &keyword, &matcher_regex, &spec.rule_set))
+                .expect("validated DNS policy matchers serialize to JSON")
+        });
         let mixed_rule_set_matcher = if spec.rule_set.is_empty() {
             None
         } else {
@@ -614,13 +865,7 @@ impl PolicyRule {
                 domain: exact.clone(),
                 domain_suffix: suffix.clone(),
                 domain_keyword: keyword.clone(),
-                // Policy matching has historically treated regexes as
-                // case-insensitive. Preserve that behavior in the shared
-                // category matcher while the hostname itself is normalized.
-                domain_regex: matcher_regex
-                    .into_iter()
-                    .map(|pattern| format!("(?i:{pattern})"))
-                    .collect(),
+                domain_regex: matcher_regex,
                 rule_set: spec.rule_set,
                 ..RouteMatchConfig::default()
             })
@@ -635,6 +880,16 @@ impl PolicyRule {
             Some(matcher)
         };
 
+        let reject_flood = reject_flood.then(|| {
+            if let Some((stable_key, registry)) = shared_state {
+                let matcher =
+                    shared_matcher.expect("shared state always precomputes a matcher identity");
+                registry.reject_flood_state(stable_key, matcher)
+            } else {
+                Arc::new(RejectFloodState::default())
+            }
+        });
+
         Ok(Self {
             exact: exact.into_boxed_slice(),
             suffix: suffix.into_boxed_slice(),
@@ -642,8 +897,40 @@ impl PolicyRule {
             regex: regex.into_boxed_slice(),
             mixed_rule_set_matcher,
             action: spec.action,
+            reject_flood,
             timeout: spec.timeout.filter(|timeout| !timeout.is_zero()),
         })
+    }
+
+    fn selected_action(&self) -> PolicyAction {
+        self.selected_action_at(Instant::now())
+    }
+
+    fn selected_action_at(&self, now: Instant) -> PolicyAction {
+        let Some(reject_flood) = &self.reject_flood else {
+            return self.action.clone();
+        };
+
+        let mut attempts = reject_flood.attempts.lock();
+        while attempts.front().is_some_and(|attempt| {
+            now.saturating_duration_since(*attempt) > Duration::from_secs(30)
+        }) {
+            attempts.pop_front();
+        }
+        attempts.push_back(now);
+        let should_drop = attempts.len() > 50;
+        // Once the threshold is crossed, older retained hits cannot affect any
+        // future decision: they expire no later than the newest 51 entries.
+        // Keeping only that suffix preserves the rolling-window semantics while
+        // bounding memory under a sustained reject flood.
+        while attempts.len() > 51 {
+            attempts.pop_front();
+        }
+        if should_drop {
+            PolicyAction::Reject(DnsRejectMethod::Drop)
+        } else {
+            self.action.clone()
+        }
     }
 
     fn matches(&self, hostname: &str, location: &NetLocation) -> bool {
@@ -796,6 +1083,7 @@ mod tests {
     struct StaticResolver {
         addresses: Vec<SocketAddr>,
         calls: AtomicUsize,
+        result_cache_ttl: Option<Duration>,
     }
 
     impl StaticResolver {
@@ -803,6 +1091,19 @@ mod tests {
             Arc::new(Self {
                 addresses: vec![SocketAddr::new(address, returned_port)],
                 calls: AtomicUsize::new(0),
+                result_cache_ttl: Some(Duration::from_secs(60 * 60)),
+            })
+        }
+
+        fn new_with_cache_ttl(
+            address: IpAddr,
+            returned_port: u16,
+            result_cache_ttl: Option<Duration>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                addresses: vec![SocketAddr::new(address, returned_port)],
+                calls: AtomicUsize::new(0),
+                result_cache_ttl,
             })
         }
 
@@ -819,6 +1120,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let addresses = self.addresses.clone();
             Box::pin(async move { Ok(addresses) })
+        }
+
+        fn result_cache_ttl(&self) -> Option<Duration> {
+            self.result_cache_ttl
         }
     }
 
@@ -863,7 +1168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_rules_match_all_hostname_pattern_kinds_case_insensitively() {
+    async fn ordered_rules_normalize_hostnames_before_matching() {
         let final_resolver = StaticResolver::new(v4(99), 1);
         let exact = StaticResolver::new(v4(1), 1);
         let suffix = StaticResolver::new(v4(2), 1);
@@ -874,7 +1179,7 @@ mod tests {
             vec![
                 PolicyRuleSpec::new(PolicyAction::Route(exact.clone())).exact(["Exact.Example"]),
                 PolicyRuleSpec::new(PolicyAction::Route(suffix.clone())).suffix([".Example.NET"]),
-                PolicyRuleSpec::new(PolicyAction::Route(keyword.clone())).keyword(["NeEdLe"]),
+                PolicyRuleSpec::new(PolicyAction::Route(keyword.clone())).keyword(["needle"]),
                 PolicyRuleSpec::new(PolicyAction::Route(regex.clone()))
                     .regex([r"^api[0-9]+\.example\.org$"]),
             ],
@@ -899,6 +1204,50 @@ mod tests {
         assert_eq!(keyword.calls(), 1);
         assert_eq!(regex.calls(), 1);
         assert_eq!(final_resolver.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn keyword_and_regex_patterns_keep_sing_box_case_semantics() {
+        let rule_set =
+            source_rule_set(r#"{"version":4,"rules":[{"domain_suffix":["other.example"]}]}"#);
+        let final_resolver = StaticResolver::new(v4(99), 0);
+        let direct = StaticResolver::new(v4(1), 0);
+        let mixed = StaticResolver::new(v4(2), 0);
+        let policy = PolicyResolver::new(
+            final_resolver.clone(),
+            vec![
+                PolicyRuleSpec::new(PolicyAction::Route(direct.clone()))
+                    .keyword(["NeEdLe"])
+                    .regex([r"^API[0-9]+\.example$"]),
+                PolicyRuleSpec::new(PolicyAction::Route(mixed.clone()))
+                    .keyword(["MiXeD"])
+                    .regex([r"^MIXED\.example$"])
+                    .rule_set([RouteRuleSetConfig {
+                        format: "source".to_string(),
+                        path: rule_set.path().to_path_buf(),
+                    }]),
+            ],
+        )
+        .unwrap();
+
+        for hostname in [
+            "has-needle.example",
+            "api42.example",
+            "has-mixed.example",
+            "mixed.example",
+        ] {
+            assert_eq!(
+                policy
+                    .resolve_location(&location(hostname, 53))
+                    .await
+                    .unwrap(),
+                [SocketAddr::new(v4(99), 53)],
+                "configured pattern case must remain significant for {hostname}"
+            );
+        }
+        assert_eq!(direct.calls(), 0);
+        assert_eq!(mixed.calls(), 0);
+        assert_eq!(final_resolver.calls(), 4);
     }
 
     #[tokio::test]
@@ -1087,11 +1436,322 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_reject_degrades_after_fifty_hits_unless_no_drop_is_set() {
+        let failure = |error: &io::Error| {
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<DnsPolicyError>())
+                .expect("typed DNS policy failure")
+                .failure()
+        };
+        let target = location("flood.example", 53);
+        let policy = PolicyResolver::new(
+            StaticResolver::new(v4(99), 53),
+            vec![PolicyRuleSpec::new(PolicyAction::Reject(
+                DnsRejectMethod::Default,
+            ))],
+        )
+        .unwrap();
+        for _ in 0..50 {
+            let error = policy.resolve_location(&target).await.unwrap_err();
+            assert_eq!(
+                failure(&error),
+                DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+            );
+        }
+        let error = policy.resolve_location(&target).await.unwrap_err();
+        assert_eq!(
+            failure(&error),
+            DnsPolicyFailure::Rejected(DnsRejectMethod::Drop)
+        );
+        for _ in 0..10_000 {
+            let error = policy.resolve_location(&target).await.unwrap_err();
+            assert_eq!(
+                failure(&error),
+                DnsPolicyFailure::Rejected(DnsRejectMethod::Drop)
+            );
+        }
+        assert_eq!(
+            policy.rules[0]
+                .reject_flood
+                .as_ref()
+                .expect("default reject has a flood window")
+                .attempts
+                .lock()
+                .len(),
+            51,
+            "sustained floods must not grow the rolling-window allocation"
+        );
+        let no_drop = PolicyResolver::new(
+            StaticResolver::new(v4(99), 53),
+            vec![PolicyRuleSpec::new(PolicyAction::Reject(DnsRejectMethod::Default)).no_drop(true)],
+        )
+        .unwrap();
+        for _ in 0..60 {
+            let error = no_drop.resolve_location(&target).await.unwrap_err();
+            assert_eq!(
+                failure(&error),
+                DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_rule_state_crosses_resolver_boundaries_and_rejects_forged_collisions() {
+        fn failure(error: &io::Error) -> DnsPolicyFailure {
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<DnsPolicyError>())
+                .expect("typed DNS policy failure")
+                .failure()
+        }
+
+        let state = PolicyStateRegistry::default();
+        let key =
+            "__acp_dns_reject_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let build = |matcher: &str| {
+            PolicyResolver::with_named_upstreams_and_state_registry(
+                StaticResolver::new(v4(99), 53),
+                vec![
+                    PolicyRuleSpec::new(PolicyAction::Reject(DnsRejectMethod::Default))
+                        .exact([matcher]),
+                ],
+                std::iter::empty::<(String, Arc<dyn Resolver>)>(),
+                vec![Some(key.to_string())],
+                &state,
+            )
+            .unwrap()
+        };
+
+        let first = build("flood.example");
+        let reloaded = build("flood.example");
+        assert!(Arc::ptr_eq(
+            first.rules[0].reject_flood.as_ref().unwrap(),
+            reloaded.rules[0].reject_flood.as_ref().unwrap()
+        ));
+
+        let target = location("flood.example", 53);
+        for _ in 0..50 {
+            let error = first.resolve_location(&target).await.unwrap_err();
+            assert_eq!(
+                failure(&error),
+                DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+            );
+        }
+        let error = reloaded.resolve_location(&target).await.unwrap_err();
+        assert_eq!(
+            failure(&error),
+            DnsPolicyFailure::Rejected(DnsRejectMethod::Drop)
+        );
+
+        // A hand-written config may copy an internal-looking key, but a
+        // different compiled matcher is deliberately part of the registry
+        // identity and therefore cannot inherit the first rule's flood window.
+        let forged = PolicyResolver::with_named_upstreams_and_state_registry(
+            StaticResolver::new(v4(99), 53),
+            vec![
+                PolicyRuleSpec::new(PolicyAction::Reject(DnsRejectMethod::Default))
+                    .keyword(["flood"]),
+            ],
+            std::iter::empty::<(String, Arc<dyn Resolver>)>(),
+            vec![Some(key.to_string())],
+            &state,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(
+            first.rules[0].reject_flood.as_ref().unwrap(),
+            forged.rules[0].reject_flood.as_ref().unwrap()
+        ));
+        let error = forged.resolve_location(&target).await.unwrap_err();
+        assert_eq!(
+            failure(&error),
+            DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+        );
+        assert_eq!(state.live_state_count(), 2);
+
+        drop(first);
+        drop(reloaded);
+        drop(forged);
+        assert_eq!(state.live_state_count(), 0);
+        assert_eq!(state.retained_identity_count(), 2);
+
+        // An inbound-only update can remove the last graph before adding its
+        // replacement. The generation-owned registry must preserve the flood
+        // window across that gap, just as Go keeps the same DNS rule action.
+        let resumed = build("flood.example");
+        let error = resumed.resolve_location(&target).await.unwrap_err();
+        assert_eq!(
+            failure(&error),
+            DnsPolicyFailure::Rejected(DnsRejectMethod::Drop)
+        );
+        drop(resumed);
+
+        let replacement = PolicyResolver::with_named_upstreams_and_state_registry(
+            StaticResolver::new(v4(99), 53),
+            vec![PolicyRuleSpec::new(PolicyAction::Reject(
+                DnsRejectMethod::Default,
+            ))],
+            std::iter::empty::<(String, Arc<dyn Resolver>)>(),
+            vec![Some(format!("__acp_dns_reject_v1_{}", "b".repeat(64)))],
+            &state,
+        )
+        .unwrap();
+        assert_eq!(state.live_state_count(), 1);
+        assert_eq!(state.retained_identity_count(), 3);
+        drop(replacement);
+    }
+
+    #[test]
+    fn rotating_dns_client_clears_question_cache_and_reject_flood_state() {
+        use crate::dns::{DnsCachedOutcome, DnsQuestion, DnsQuestionType};
+
+        let registry = PolicyStateRegistry::default();
+        let matcher = b"same compiled matcher".to_vec();
+        let flood = registry.reject_flood_state("stable-rule", matcher.clone());
+        let question = DnsQuestion::new("cached.example.", DnsQuestionType::A);
+        let first_cache = registry.query_cache();
+        first_cache.store(
+            question.clone(),
+            DnsCachedOutcome::NxDomain,
+            Duration::from_secs(60),
+        );
+        assert!(first_cache.load(&question).is_some());
+
+        assert_eq!(registry.rotate_dns_client_generation(), 1);
+        let second_cache = registry.query_cache();
+        assert!(!Arc::ptr_eq(&first_cache, &second_cache));
+        assert!(second_cache.load(&question).is_none());
+        assert!(
+            first_cache.load(&question).is_some(),
+            "a retiring resolver graph keeps its physically separate Go-client cache"
+        );
+        assert!(!Arc::ptr_eq(
+            &flood,
+            &registry.reject_flood_state("stable-rule", matcher)
+        ));
+    }
+
+    #[test]
+    fn default_reject_rolling_window_keeps_the_exact_thirty_second_boundary() {
+        let policy = PolicyResolver::new(
+            StaticResolver::new(v4(99), 53),
+            vec![PolicyRuleSpec::new(PolicyAction::Reject(
+                DnsRejectMethod::Default,
+            ))],
+        )
+        .unwrap();
+        let rule = &policy.rules[0];
+        let started_at = Instant::now();
+
+        for _ in 0..50 {
+            assert!(matches!(
+                rule.selected_action_at(started_at),
+                PolicyAction::Reject(DnsRejectMethod::Default)
+            ));
+        }
+        assert!(matches!(
+            rule.selected_action_at(started_at),
+            PolicyAction::Reject(DnsRejectMethod::Drop)
+        ));
+        assert!(matches!(
+            rule.selected_action_at(started_at + Duration::from_secs(30)),
+            PolicyAction::Reject(DnsRejectMethod::Drop)
+        ));
+        assert!(matches!(
+            rule.selected_action_at(started_at + Duration::from_secs(30) + Duration::from_nanos(1)),
+            PolicyAction::Reject(DnsRejectMethod::Default)
+        ));
+    }
+
+    #[test]
+    fn no_drop_is_rejected_outside_default_reject() {
+        let final_resolver = StaticResolver::new(v4(99), 53);
+        for action in [
+            PolicyAction::Reject(DnsRejectMethod::Drop),
+            PolicyAction::Route(StaticResolver::new(v4(1), 53)),
+            PolicyAction::Predefined(DnsPredefinedResponse::no_error(Vec::new())),
+        ] {
+            let error = PolicyResolver::new(
+                final_resolver.clone(),
+                vec![PolicyRuleSpec::new(action).no_drop(true)],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("no_drop"));
+        }
+    }
+
+    #[test]
+    fn policy_cache_hint_follows_the_selected_route_profile() {
+        let final_resolver =
+            StaticResolver::new_with_cache_ttl(v4(99), 53, Some(Duration::from_secs(90)));
+        let uncached = StaticResolver::new_with_cache_ttl(v4(1), 53, None);
+        let short = StaticResolver::new_with_cache_ttl(v4(2), 53, Some(Duration::from_secs(5)));
+        let policy = PolicyResolver::new(
+            final_resolver,
+            vec![
+                PolicyRuleSpec::new(PolicyAction::Route(uncached)).exact(["uncached.example"]),
+                PolicyRuleSpec::new(PolicyAction::Route(short)).exact(["short.example"]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.result_cache_ttl_for(&location("uncached.example", 53)),
+            None
+        );
+        assert_eq!(
+            policy.result_cache_ttl_for(&location("short.example", 53)),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            policy.result_cache_ttl_for(&location("other.example", 53)),
+            Some(Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn predefined_rcode_parser_matches_miekg_names_strictly() {
+        for (name, rcode, canonical) in [
+            ("NOERROR", DnsRcode::NoError, "NOERROR"),
+            ("FORMERR", DnsRcode::FormErr, "FORMERR"),
+            ("SERVFAIL", DnsRcode::ServFail, "SERVFAIL"),
+            ("NXDOMAIN", DnsRcode::NxDomain, "NXDOMAIN"),
+            ("NOTIMP", DnsRcode::NotImp, "NOTIMP"),
+            ("NOTIMPL", DnsRcode::NotImp, "NOTIMP"),
+            ("REFUSED", DnsRcode::Refused, "REFUSED"),
+            ("YXDOMAIN", DnsRcode::YxDomain, "YXDOMAIN"),
+            ("YXRRSET", DnsRcode::YxRrset, "YXRRSET"),
+            ("NXRRSET", DnsRcode::NxRrset, "NXRRSET"),
+            ("NOTAUTH", DnsRcode::NotAuth, "NOTAUTH"),
+            ("NOTZONE", DnsRcode::NotZone, "NOTZONE"),
+            ("DSOTYPENI", DnsRcode::DsoTypeNi, "DSOTYPENI"),
+            ("BADSIG", DnsRcode::BadSig, "BADSIG"),
+            ("BADKEY", DnsRcode::BadKey, "BADKEY"),
+            ("BADTIME", DnsRcode::BadTime, "BADTIME"),
+            ("BADMODE", DnsRcode::BadMode, "BADMODE"),
+            ("BADNAME", DnsRcode::BadName, "BADNAME"),
+            ("BADALG", DnsRcode::BadAlg, "BADALG"),
+            ("BADTRUNC", DnsRcode::BadTrunc, "BADTRUNC"),
+            ("BADCOOKIE", DnsRcode::BadCookie, "BADCOOKIE"),
+        ] {
+            let parsed = DnsRcode::parse(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(parsed, rcode, "{name}");
+            assert_eq!(parsed.as_str(), canonical, "{name}");
+        }
+        assert_eq!(DnsRcode::parse(""), Some(DnsRcode::NoError));
+        for invalid in ["SUCCESS", "noerror", " NOERROR", "NOERROR "] {
+            assert_eq!(DnsRcode::parse(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn predefined_response_codes_are_typed_terminal_outcomes() {
         for (rcode, kind) in [
             (DnsRcode::NxDomain, io::ErrorKind::NotFound),
             (DnsRcode::Refused, io::ErrorKind::PermissionDenied),
             (DnsRcode::ServFail, io::ErrorKind::Other),
+            (DnsRcode::FormErr, io::ErrorKind::Other),
+            (DnsRcode::BadCookie, io::ErrorKind::Other),
         ] {
             let final_resolver = StaticResolver::new(v4(99), 53);
             let policy = PolicyResolver::new(

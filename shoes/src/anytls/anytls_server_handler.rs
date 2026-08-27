@@ -17,10 +17,14 @@ use crate::anytls::anytls_server_session::AnyTlsSession;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional;
-use crate::dynamic::{UserRegistry, bind_connection_user, current_connection};
+use crate::dynamic::{
+    UserRegistry, bind_connection_user, current_connection, spawn_connection_until_cancelled,
+};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{
+    TcpServerHandler, TcpServerSetupResult, UnauthenticatedFallbackCompletion,
+};
 use crate::util::write_all;
 
 /// AnyTLS server handler implementing TcpServerHandler
@@ -236,7 +240,7 @@ impl AnyTlsServerHandler {
         // Spawn the long-running bidirectional copy as a background task.
         // This allows the setup to complete within the timeout while the actual
         // data transfer runs indefinitely.
-        tokio::spawn(async move {
+        let completion = spawn_connection_until_cancelled(async move {
             let result = copy_bidirectional(
                 &mut *client_stream,
                 &mut *dest_stream,
@@ -253,9 +257,12 @@ impl AnyTlsServerHandler {
             } else {
                 log::debug!("AnyTLS FALLBACK: Connection completed");
             }
+            Ok(())
         });
 
-        Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
+        Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled(
+            UnauthenticatedFallbackCompletion::new(completion),
+        ))
     }
 }
 

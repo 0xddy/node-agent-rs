@@ -78,11 +78,13 @@ shoes 不认识 ACP protobuf、machine/node ID 或面板资源 ID。既有 shoes
 
 VLESS provider 的 `sniff` 开关会被显式传入 shoes：`true` 与 Go 一样对每条 TCP 流执行有界嗅探，因此即使原始目标是 IP，domain-only 规则也能使用 HTTP Host / TLS SNI；`false` 明确关闭嗅探。Hysteria2 没有面板 sniff 开关，保持 shoes 的 Auto 模式，只在存在 `protocol` 规则时自动启用。嗅探限制为 300 ms / 64 KiB，读取的首包字节会完整回放；带 SNI/Host/protocol metadata 的 TCP 判定单独绕过 destination-only cache，普通 TCP/UDP 仍可缓存，因此同一 IP:port 上不同 SNI 不会串用决定，也不会让大规则集的 UDP 路由退化成全量线性扫描。
 
-SOCKS5、HTTP CONNECT、Snell 等等待隧道应答的客户端会先收到并 flush 成功应答，再读取应用首包，因而不再固定空等 300 ms。这个时序意味着：仅在确实需要继续读取首包时，客户端可能先看到隧道成功，随后因 sniff 后命中的 reject 或出站连接失败而被关闭；不需要继续读取时仍保留“出站成功后再应答”的原时序。普通 TCP、generic QUIC、Hysteria2、TUIC、TUN，以及 VLESS h2mux 的每个 TCP 子流使用相同的 metadata 与 replay 路径；h2mux 不能再绕过 `protocol` / SNI / Host 规则。
+SOCKS5、HTTP CONNECT、Snell 等等待隧道应答的客户端会先收到并 flush 成功应答，再读取应用首包，因而不再固定空等 300 ms。这个时序意味着：仅在确实需要继续读取首包时，客户端可能先看到隧道成功，随后因 sniff 后命中的 reject 或出站连接失败而被关闭；不需要继续读取时仍保留“出站成功后再应答”的原时序。普通 TCP、generic QUIC、Hysteria2、TUIC、TUN，以及 VLESS h2mux 的每个 TCP 子流使用相同的 metadata 与 replay 路径；h2mux 不能再绕过 `protocol` / SNI / Host 规则。只有不会在已接受物理连接内继续产生独立路由工作的 inbound 才使用 logical-flow RCU：新 flow 原子读取当前 selector/handler 与 resolver generation，已经运行的 flow 保持其原代直至结束。SOCKS/Mixed UDP、启用 UDP 的 Hysteria2、TUIC 以及可承载 mux 子流的协议会明确拒绝原地 reload；node-agent 随后走 hard replacement 并关闭旧 connection tree，因此旧 association 不能靠持续创建新 destination 绕过更新后的规则。
 
 QUIC 入站在占用未认证预算前要求地址已验证；首次无 token 的客户端通过标准 QUIC Retry 验证，不能用伪造源地址的 Initial 数据报耗尽全局或单源额度。Hysteria2、TUIC 和 generic QUIC 的 transport handshake 最多占用 admission 15 秒，Hysteria2 H3 setup 另有同样的短上限；整个未认证阶段仍受从入场开始计算、不会被 PING/keepalive 重置的 60 秒绝对 deadline 约束。generic QUIC 另把底层 active-connection quota 与每条 bidi stream 的 pending-handshake gate 分开：首条真正完成协议握手的流只解除 pre-auth deadline，不释放连接额度，因而“成功一条廉价流后以 PING 保持无限空连接”不能绕过 gate。认证失败后转入 VLESS/ShadowTLS/AnyTLS camouflage fallback 的流只释放自己的 stream permit，不会把整个 QUIC connection 误标为已认证；Naive 的请求级延迟认证不在面板 provider 范围内，generic QUIC + Naive 仍受该 60 秒边界。
 
-VMess auth id 与 Shadowsocks 2022 salt 的防重放状态由 inbound 生命周期持有：同一 inbound 的所有 bind IP 和热重载 handler generation 共享过滤器，不同 inbound 仍彼此隔离。频繁的面板同步不会重开 VMess ±120 秒或 Shadowsocks salt window。
+VMess auth id 与 Shadowsocks 2022 salt 的防重放状态由 inbound 生命周期持有：同一 inbound 的所有 bind IP、展开后的 listener group、热重载 handler generation，以及 Go 兼容 forced reload 真正重建出的新 listener slot 都通过绑定 tag、Engine identity 与 lineage epoch 的 replay lease 共享过滤器；不同 inbound 仍彼此隔离，陈旧或来自另一 Engine 的 lease 不能覆盖更新的命名空间。频繁的面板同步、失败回滚和后续 recovery 都不会重开 VMess ±120 秒或 Shadowsocks salt window。
+
+普通 `ApplyConfig` 的可热更部分继续使用 logical-flow RCU；forced reload、全局 DNS/route/rule-set generation 变化以及真正需要 listener replacement 的路径则按 Go 的 Box 生命周期 hard cutover：先停止完整旧 listener 集并关闭其已认证、未认证和 camouflage fallback 连接，再启动任何 candidate inbound。候选失败时先清理已启动的新代，再恢复完整旧拓扑，不会在事务窗口长期暴露 old/candidate 混合数据面。
 
 远程规则集使用不可变内容快照。下载有 64 MiB 实际读取上限，候选内容先经 shoes 同一解析器验证；只有 shoes 运行时事务成功后才推进磁盘 last-good。刷新失败、解析失败或应用失败都继续使用上一成功版本。
 
@@ -108,19 +110,22 @@ VMess auth id 与 Shadowsocks 2022 salt 的防重放状态由 inbound 生命周�
 - DNS server 的 outbound detour，以及面板生成的 Direct “同出口 DNS”拓扑；
 - DoQ / DoH3 的非直连 detour 通过 shoes 通用 QUIC datagram adapter 执行：目标地址固定，每个代理 message 对应一个 QUIC packet，并使用有界发送队列；不支持 UDP 的 chain 会在启动前拒绝，不会退回直连；
 - 每个出站独立的 `domain_resolver`，含空策略、`prefer_ipv4`、`prefer_ipv6`、`ipv4_only`、`ipv6_only`；需要不同地址族顺序时生成私有 upstream 变体，不扩大成全局 DNS 策略；
-- `predefined` 的 `NOERROR`、`NXDOMAIN`、`REFUSED`、`SERVFAIL`；非 NOERROR rcode 以可下转识别的 typed terminal outcome 保留；
+- `predefined` 严格按 Go/miekg 的大小写敏感名称支持 `NOERROR`、`FORMERR`、`SERVFAIL`、`NXDOMAIN`、`NOTIMP`（含历史别名 `NOTIMPL`）、`REFUSED`、`YXDOMAIN`、`YXRRSET`、`NXRRSET`、`NOTAUTH`、`NOTZONE`、`DSOTYPENI`、`BADSIG`、`BADKEY`、`BADTIME`、`BADMODE`、`BADNAME`、`BADALG`、`BADTRUNC`、`BADCOOKIE`；非 NOERROR rcode 以可下转识别的 typed terminal outcome 保留；不接受大小写或空白规范化，也不额外接受 `SUCCESS`；
 - reject 的 `default` 与 `method=drop`；drop 同样保留为独立 typed terminal outcome，不与普通 reject 混同；
-- `answer`、`ns`、`extra` 中 Hickory 支持的标准 zone-file 文本 RR，以及任意可解码的 base64 wire RR，均在 topology 应用前完整解析和有界校验；
-- route 动作的逐规则 Go duration 超时。
+- `answer`、`ns`、`extra` 中 Hickory 支持的标准 zone-file 文本 RR、Go/miekg 常见但 Hickory 缺失的 URI/LOC/APL/HIP 与 RFC 3597 `TYPE#### \# ...` 文本，以及任意可解码的 base64 wire RR，均在 topology 应用前完成严格、有界校验；base64 与 Go `StdEncoding` 一样只忽略 CR/LF，并按 sing-box 读取第一个完整 RR、忽略仍受输入总量上限约束的尾随字节；
+- route 动作的逐规则 Go duration 超时；
+- 规则级 `disable_cache`、`rewrite_ttl` 与 EDNS `client_subnet`：node-agent 按源 server 和查询参数生成确定性的私有 upstream 变体，但这些变体按 Go 的 `independent_cache=false` 语义共享一个 DNS-client 级 1024-question LRU，key 只有保留原始大小写的 FQDN 与 A/AAAA 类型；Hickory 自身 cache 关闭。`disable_cache` 绕过读取、singleflight 与写入；ECS 可以命中普通热缓存，冷请求会注入 EDNS subnet 但不 singleflight/写缓存；普通冷请求按“question + 原 transport tag”合并并发，leader 完成后 follower 只重查一次 cache，若 leader 因 TTL 0 或错误未留下热结果，则 follower 与 Go 一样在 singleflight 外并发重试，不把上游 I/O 串行化。`rewrite_ttl` 只作用于冷路径的可缓存响应，不改写已有热缓存；只缓存 NOERROR（含 NODATA）与 NXDOMAIN。正响应按 Answer/Authority/Additional（排除 OPT）的最小非零 TTL，负响应在存在非零 SOA-derived TTL 时精确使用；Hickory 的高层错误会丢弃无有效 SOA 响应中的任意 Answer/Additional RR，这一场景安全退化为 TTL 0、不写缓存，除非面板显式用非零 `rewrite_ttl` 覆盖。TTL 完整保留 `uint32` 范围。裸 IPv4/IPv6 ECS 规范化为 `/32`/`/128`，CIDR host bits 在发包前清零；
+- 显式 `system` DNS profile：在受支持的 Unix/Windows 平台一律构造可观察 wire TTL/RCODE、接入共享 question cache 且每五秒刷新配置的解析链；原生系统解析器只保留给“完全未配置 DNS”的隐式默认以及不支持读取系统 DNS 配置的 target，后者若请求高级 query 控制会明确拒绝。普通平台 resolver 先查 hosts，正族命中按 Go 使用 600 秒 TTL，只有另一地址族命中则返回 terminal NOERROR/NODATA TTL 0；`resolv.conf` nameserver 默认按用户顺序串行尝试，`options rotate` 才轮转起始 server，`use-vc`/`usevc`/`tcp` 强制 TCP，`trust-ad` 设置问题的 AD bit。Go 的 `ndots` clamp 为 0..15，timeout/attempts 最小为 1；Go 的 attempts 是总轮数，转换到 Hickory 时减去首次请求。Go 的 `single-request` 控制同一 DNS Exchange 内的搜索名竞速，而 Shoes 地址 Lookup 发出的每次 Exchange 已经只有一个绝对 A/AAAA question，因此没有额外可切换的并包行为。Linux 会先识别 leading systemd marker，再解析可能含 scoped link-local nameserver 的 base 配置；启用 systemd-resolved transport 时与 Go 一样绕过 hosts，只通过固定绝对路径的官方 `resolvectl` 查询 IPv4 或 IPv6 默认路由 link，严格保留 DNSEx server 顺序、显式端口和 `#server_name`，并把 direct TCP/UDP socket 绑定到该 link。有效 `DNSOverTLS=no` 使用明文 DNS（常规查询走 UDP，仅在截断/报文过大时续传同 server TCP）；`yes` 只使用 native-roots DoT；`opportunistic` 在每个 A/AAAA question 的同一个 shared-cache/singleflight 边界内，对每个 server 先 DoT，仅当传输、握手或解码失败后才尝试同 server 明文组，NXDOMAIN/NODATA/其他 DNS RCODE 不降级，两个 transport 组均失败后才进入下一个 server；每个 primary/fallback transport 自身的 Hickory attempts 固定为 0，只有外层 Ordered resolver 控制降级与下一 server，避免单个 server 被重复请求。未显式配置端口时 DoT/明文分别用 853/53，未给 TLS name 时使用去除 zone 的 IP。固定命令缺失/超时/非零退出、未知模式/输出会在首次构建时明确失败；已经确认使用 systemd-resolved 后的刷新失败会立即 fail-closed，绝不继续旧直连或退回可能吞掉 ECS/降级 DoT 的 stub，后续五秒检查成功时自动恢复；普通平台配置刷新失败才保留 last-good。scoped IPv6 link-local 上游依赖 Linux `SO_BINDTODEVICE` 在 scope-id 为零时完成路由，已保留并绑定其 link，但不宣称跨内核完全等价；当前未实现 Go 的进程内 systemd D-Bus 信号监听。Windows 只采纳 up、非 tunnel 且有 gateway 的 adapter；Hickory 的 `IpAddr` 配置无法保留 Windows IPv6 link-local ZoneId，因此这类上游会被明确过滤，若没有其他上游则拒绝构建；同时无法像 Go 的 NetworkManager 那样精确排除被系统报告为非 tunnel 且带 gateway 的 Shoes 自有虚拟网卡；
+- reject 的 `no_drop` 会按 sing-box schema 接受并做动作约束校验。Go 的地址查询走 `Router.Lookup`，其默认 reject 在同一规则的滚动 30 秒窗口内前 50 次返回 reset，第 51 次起降级为 drop；`no_drop=true` 禁止该降级。Rust 按相同的逐规则并发安全计数语义执行：inbound-only remove/add 继续使用当前 DNS-client generation 的窗口，完整 DNS/Box reload 与 rollback 重建才重置。
 
-这里的“任意 RR 支持”需要按两个真实边界理解。第一，base64 wire 形式可以承载任意 RR；文本形式使用 Hickory zone parser，覆盖面板常用记录，但 Go `miekg/dns.NewRR` 接受而 Hickory 尚不接受的部分 DNSSEC 文本与 RFC 3597 unknown `TYPE#### \# ...` 文本必须改用 base64 wire，否则 topology 会明确拒绝。第二，Go node-agent/sing-box 与 Rust 当前都通过 Router/Lookup 做地址解析，所以运行时只把 `answer` 中的 A/AAAA 投影为地址；其他 RR 以及 `ns` / `extra` 会完整解析校验，但不会进入地址结果。这与当前面板内部解析路径等价，不表示 shoes 已提供通用 DNS wire server。若未来增加 DNS Exchange/hijack 入站并要求回送完整 wire response，需要再扩展 resolver 接口。
+这里的“任意 RR 支持”需要按两个真实边界理解。第一，base64 wire 形式可以承载任意 RR；文本形式先使用 Hickory zone parser，并为 Go `miekg/dns.NewRR` 会接受而 Hickory 缺失的 URI/LOC/APL/HIP 和 RFC 3597 `TYPE#### \# ...` 提供严格兼容解析。URI 文本 target 按 miekg 的 character-string 词法限制为 255 个解码字节，但 URI wire RDATA 的 target 是剩余 octets，不套用这一文本限制。RFC 3597 的已知 TYPE 仍通过 wire decoder 做类型级校验，因此 `TYPE1`/`TYPE28` 会按 A/AAAA 投影；零 RDLENGTH 的已知 TYPE 保留为 update record，不会伪造地址；尚未纳入兼容解析的其他 miekg-only 文本类型仍可用 base64 wire 表达。第二，Go node-agent/sing-box 与 Rust 当前都通过 Router/Lookup 做地址解析，所以运行时只把 `answer` 中的 A/AAAA 投影为地址；其他 RR 以及 `ns` / `extra` 会完整解析校验，但不会进入地址结果。这与当前面板内部解析路径等价，不表示 shoes 已提供通用 DNS wire server。若未来增加 DNS Exchange/hijack 入站并要求回送完整 wire response，需要再扩展 resolver 接口。
 
-DNS route 的 `timeout` 按 Go duration 语法解析，并要求为正数且能精确表示为整毫秒；无法精确落到 shoes 超时单位的值会在应用前拒绝，不做截断或四舍五入。
+DNS route 的 `timeout` 按 Go duration 语法解析，并要求为正数且能精确表示为整毫秒；无法精确落到 shoes 超时单位的值会在应用前拒绝，不做截断或四舍五入。`rewrite_ttl` 按去空白后的十进制 `uint32` 解析，包含 `0`；非法、负数、小数和溢出值均拒绝。Shoes 当前是地址 Lookup API，没有可回送给客户端的 DNS wire RR，因此 TTL 的可观察语义是正/负结果及外层地址缓存的有效期。
 
-仍严格拒绝的 DNS 专家控制是：
+这些规则级专家字段不是纯理论选项：ACP、panel-api 的策略 `action_value`、初始 MachineConfig 与实时 route patch 都能携带它们。当前 panel-web 没有对应可见控件；已有 `rewrite_ttl`/`client_subnet` 可被 Web draft 保留，而通过 API 写入的 `disable_cache`/`no_drop` 在再次用 Web 保存策略时可能被移除。运行端仍完整支持，以保证直接 API、未来 UI 和 gRPC 下发兼容。
 
-- 规则级 `no_drop`、`disable_cache`、`rewrite_ttl`、`client_subnet`；
-- `route.default_domain_resolver` 与 `dns.final` 不同，或它携带 strategy/cache/TTL/client-subnet 控制；
+仍严格拒绝的 DNS 边界是：
+
 - plain UDP upstream 配非直连 detour，或 DoQ / DoH3 detour 没有任何 UDP-capable chain；
 - selector/urltest 自身声明 `domain_resolver`，因为这两类对象不是 sing-box dialer；
 - 未知 server、未知 rule-set、无匹配条件，以及 DNS Lookup 无法观察的 rule-set 条件。
@@ -134,10 +139,10 @@ DNS route 的 `timeout` 按 Go duration 语法解析，并要求为正数且能�
 | Trojan | TCP + 原生 UDP-over-TCP；普通 TLS | UDP-only；普通 TLS 字段以外的扩展 |
 | VLESS | TCP；legacy CommandUDP、XUDP、packetaddr；普通 TLS / Vision | UDP-only；未知 flow/packet encoding；Vision 未配 TLS |
 | Hysteria2 client | QUIC 原生 TCP stream 与 UDP datagram、H3 auth、Salamander、Brutal up/down、TLS/SNI/insecure、连接复用 | 见下方 Hysteria2 限制 |
-| selector | 静态选择 `default`，未配时选择第一个成员 | 动态切换控制面不存在，因此不做 round-robin 或伪动态选择 |
-| URLTest | 原生活性探测、延迟选择、interval/idle/tolerance，可用于 route 与 DNS detour；Trojan/VLESS 最终 hop 的计时起点对齐 Go 的首次协议写入：不计 socket、前序 hop 和最终 transport TLS/REALITY/WS/ShadowTLS 建链，计入最终协议头、目标 TLS 与 HTTP HEAD RTT。连接失败默认只清延迟历史并保留 selected（与 Go 一致）。shoes 另提供默认关闭的 `reselect_on_connection_failure` 解耦增强，node-agent 固定关闭 | nested URLTest、`interrupt_exist_connections=true`、未知字段或不能精确表示的 duration |
+| selector | 静态选择 `default`，未配时选择第一个成员；允许 Go 接受的重复成员；`interrupt_exist_connections` 保持 bool 类型校验但在静态折叠后为惰性字段；选中 URLTest 时向 route/DNS action 提升其完整 selection | 动态切换控制面不存在，因此不做 round-robin 或伪动态选择 |
+| URLTest | 原生活性探测、延迟选择、interval/idle/tolerance，可用于 route 与 DNS detour；同一逻辑 outbound 在 route、DNS、多 inbound 与 TUN 投影中共享一个 generation-scoped selection/worker，跨不同 URLTest group 的延迟历史按 Go `RealTag` 共享。周期 probe 失败删除 `RealTag` 历史，live dial 失败按 Go 的原始 member tag 删除；连接失败默认保留 selected。探测使用无 inbound context 的 generation-global DNS sidecar。HTTP HEAD wire 对齐 Go 的 Basic Auth、User-Agent、LF/CRLF/混合换行、非 101 的 1xx、累计 10 MiB header 与 transfer metadata 校验；无效 URL 在 topology ACK 后异步探测失败。Trojan/VLESS 最终 hop 的计时起点对齐 Go 的首次协议写入：不计 socket、前序 hop 和最终 transport TLS/REALITY/WS/ShadowTLS 建链，计入最终协议头、目标 TLS 与 HTTP HEAD RTT。shoes 另提供默认关闭的 `reselect_on_connection_failure` 解耦增强，node-agent 固定关闭 | nested URLTest、`interrupt_exist_connections=true`、未知字段或不能精确表示的 duration |
 
-所有代理出站均支持引用/环检测；可证明等价的 `detour` 会编译为有序多跳链。当前出站同时配置 detour 和本地 dialer 字段时会拒绝，因为 sing-box 会绕过当前出站的本地 dialer，而把这些字段套到 shoes hop zero 会改变语义。
+所有代理出站均支持引用/环检测；目录校验会线性遍历 selector 的全部成员、URLTest 的全部成员和 detour，包括运行时未选中的边，而静态 selector 投影只编译选中分支。引用 tag 使用目录中的精确字符串身份（非全空白 tag 的首尾空白不会在查找或环检测时被改写）。任意引用路径最多包含 128 个 outbound；这是 Rust 为避免控制面配置触发递归栈/资源耗尽而增加的 fail-loud 治理边界，不宣称 Go 有同一上限。一次 `RuntimeConfig` 中实际生成的 client-chain 投影还共同受 65,536 hop 和 64 MiB JSON 上限约束，累计所有 inbound 的 route、DNS detour 与 DNS profile variant 副本；active URLTest 另受每个 RuntimeConfig 最多 256 个 distinct group、合计 8,192 个 candidate 的 fail-loud 边界，同一 generation 的实际网络 probe 共享 10 个并发许可。最后一项只在大量 group 同时收敛时延后探测，不改变稳定 selection/history 语义；旧 generation 被替换时，许可排队和进行中的 probe 均可取消。URLTest 按每个直接 member 的一层 Go `RealTag`（selector 的立即 selected tag，非 selector 的自身 tag）只保留首次出现的候选，随后才为实际链递归静态折叠 selector。这使重复 member 和直接选中同一 tag 的 selector alias 共享一次 probe/history，同时保留嵌套 selector 每一层不同的 Go 身份。整次投影会对 selector 到 terminal 的路径做压缩；validated catalog 为每个 outbound 分配稳定数字身份，terminal/selected 缓存保存借用 handle，链样本与 URLTest RealTag 集按数字身份索引，因此 alias 不会复制或反复比较长 tag。adapter 对 detour 内共享 selector 的选中 handle、cache key 与 active path 也使用 catalog 数字身份，而不缓存每层完整链后缀，避免宽共享子图的重复扫描、长 tag 的重复复制/比较和深链的二次方缓存。不同 `RealTag` 即使落到同一 terminal，仍按 Go 语义分别发射并逐项计入预算；大量不同实际 member 共享深 detour 后缀时也会在最终组装 chain 前 fail-loud。该累计边界同样是 Rust 资源治理限制，不是 Go schema 限制。可证明等价的 `detour` 会编译为有序多跳链；URLTest 只能位于 action 根（允许先经过静态 selector），经 selector 或 detour 间接嵌入另一 active URLTest 仍拒绝。每个 hostname hop 使用绑定到该 hop 的命名 resolver，并依次尝试其全部地址；IP predicate 为路由判定检查全部候选并保留完整有序答案，最终 direct TCP/QUIC/UDP 拨号不会被截断成单地址。外层 hop 更换候选地址时会重新构建并重新解析完整 detour 前缀，不会复用已经失败的内层 socket。VLESS XUDP 建流时依次尝试全部候选，session 边界保留原 hostname、最终选中的候选和独立回包地址；响应帧回显原 hostname 时复用建流前已解析的固定目标，意外 hostname 会拒绝、同 session 的其他 literal IP 允许，不会逃逸到操作系统 DNS。当前出站同时配置 detour 和本地 dialer 字段时会拒绝，因为 sing-box 会绕过当前出站的本地 dialer，而把这些字段套到 shoes hop zero 会改变语义。
 
 仍拒绝的 Direct/sing-box 专家 dialer 字段包括：
 
@@ -152,7 +157,7 @@ Hysteria2 client 的严格限制是：
 
 - `server_ports` / `hop_interval` 出站端口跳跃尚未实现；
 - 自身 `detour` 不支持，因为 Hysteria2 必须拥有底层 UDP/QUIC socket 并位于链首；
-- 显式非空 `connect_timeout` 不支持。当前对 DNS 解析后的全部候选地址、QUIC + TLS + H3 认证维持一个共享 15 秒总预算，不会按地址重置成 `N × 15s`，也不能把 dial timeout 错套到整段握手；
+- 显式非空 `connect_timeout` 不支持。DNS 候选只在创建、绑定并 `connect` 实际交给 Quinn 的 UDP socket 失败时依次前进；第一个 socket 准备成功后只执行一次 QUIC + TLS + H3 认证，并共享一个 15 秒预算，握手/认证失败不会误判成地址候选失败后再试下一项；
 - `bind_address_no_port=true` 尚未落到 Hysteria2 UDP socket；
 - `brutal_debug=true` 没有 shoes 对应控制；
 - `network=udp` 的 UDP-only 模式拒绝；省略、`null`、空数组或 TCP+UDP 均按 Go 语义接受；
@@ -182,7 +187,7 @@ go test ./cmd/acp-test-panel -run '^TestRustNodeAgentCompatibility$' -count=1 -v
 
 该门禁覆盖 Hello/HMAC、digest、控制 ready 与两阶段 ACK、Config/Control/Traffic/Telemetry/Log/Remote service 以及进程优雅退出；数据面协议、路由、DNS 与事务回滚由 Rust 单元和集成测试覆盖。
 
-2026-08-26 本批代码已通过上述全部 Rust 门禁，并用刚构建的 `target/release/node-agent.exe` 通过 Go `TestRustNodeAgentCompatibility`；没有复用旧 release 结果。
+2026-08-27 本批最终源码已通过上述全部 Rust 门禁；Windows 全工作区 all-targets 中 shoes lib/bin 各 1285 项通过，Linux Docker 独立通过 workspace all-targets check、node-agent 全目标、shoes-engine 全目标及 shoes 1293 项 library tests。随后重新构建 `target/release/node-agent.exe` 并通过 Go `TestRustNodeAgentCompatibility`，没有复用旧 release 结果；最终只读多代理审计未发现可复现 P0-P2。
 
 ## 仍需真实环境验证
 

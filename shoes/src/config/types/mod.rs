@@ -31,6 +31,7 @@ pub use client::{
     TlsClientConfig, VlessPacketEncoding, WebsocketClientConfig, parse_go_duration,
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
+#[allow(unused_imports)]
 pub use dns::{
     DnsConfig, DnsConfigGroup, DnsPolicyActionConfig, DnsPolicyRuleConfig, DnsServerSpec,
     ExpandedDnsGroup, ExpandedDnsPolicyAction, ExpandedDnsPolicyRule, ExpandedDnsSpec,

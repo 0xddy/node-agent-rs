@@ -88,12 +88,11 @@ pub struct RouteMatchConfig {
     pub domain_regex: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ip_cidr: Vec<String>,
-    /// Destination address families accepted by this rule (`4` and/or `6`).
+    /// Literal destination address families accepted by this rule (`4` and/or `6`).
     ///
-    /// A hostname needs to be resolved before this category can be evaluated. This is
-    /// intentionally separate from `ip_cidr`: sing-box ANDs `ip_version` with its
-    /// destination-address matcher, which is also what the panel's single-stack Direct
-    /// guard relies on.
+    /// sing-box's route `IPVersionItem` does not inspect DNS-resolved destination
+    /// candidates. Consequently a hostname does not match this field merely because
+    /// one of its A/AAAA answers has the requested family.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ip_version: Vec<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -377,7 +376,6 @@ impl RoutePredicate {
         };
 
         let requires_ip = !ip_cidr.is_empty()
-            || !config.ip_version.is_empty()
             || any.iter().any(Self::requires_ip)
             || all.iter().any(Self::requires_ip)
             || rule_set_rules
@@ -411,11 +409,7 @@ impl RoutePredicate {
                 .iter()
                 .map(|v| normalize_domain(v).trim_start_matches('.').to_string())
                 .collect(),
-            domain_keyword: config
-                .domain_keyword
-                .iter()
-                .map(|v| v.to_lowercase())
-                .collect(),
+            domain_keyword: config.domain_keyword.clone(),
             domain_regex,
             ip_cidr,
             ip_version: config.ip_version.clone(),
@@ -601,7 +595,18 @@ impl RoutePredicate {
         resolved_ip: Option<IpAddr>,
         context: &RouteContext,
     ) -> bool {
-        self.evaluate(location, resolved_ip, context) == MatchState::NeedsIp
+        self.needs_resolved_ips(location, resolved_ip.as_slice(), context)
+    }
+
+    /// Slice-aware form of [`Self::needs_resolved_ip`]. Destination CIDR items
+    /// use sing-box's any-address semantics across the complete ordered DNS result.
+    pub fn needs_resolved_ips(
+        &self,
+        location: &NetLocation,
+        resolved_ips: &[IpAddr],
+        context: &RouteContext,
+    ) -> bool {
+        self.evaluate(location, resolved_ips, context) == MatchState::NeedsIp
     }
 
     /// Evaluate against a destination and any already-resolved IP address.
@@ -611,16 +616,28 @@ impl RoutePredicate {
         resolved_ip: Option<IpAddr>,
         context: &RouteContext,
     ) -> bool {
-        self.evaluate(location, resolved_ip, context) == MatchState::Matches
+        self.matches_resolved_ips(location, resolved_ip.as_slice(), context)
+    }
+
+    /// Slice-aware form of [`Self::matches`]. Only destination IP predicates
+    /// consume the resolved candidates; literal-only fields such as `ip_version`
+    /// retain their sing-box route semantics.
+    pub fn matches_resolved_ips(
+        &self,
+        location: &NetLocation,
+        resolved_ips: &[IpAddr],
+        context: &RouteContext,
+    ) -> bool {
+        self.evaluate(location, resolved_ips, context) == MatchState::Matches
     }
 
     fn evaluate(
         &self,
         location: &NetLocation,
-        resolved_ip: Option<IpAddr>,
+        resolved_ips: &[IpAddr],
         context: &RouteContext,
     ) -> MatchState {
-        self.evaluate_states_with_base(location, resolved_ip, context, 0)
+        self.evaluate_states_with_base(location, resolved_ips, context, 0)
             .outcome()
     }
 
@@ -633,7 +650,7 @@ impl RoutePredicate {
     fn evaluate_states_with_base(
         &self,
         location: &NetLocation,
-        resolved_ip: Option<IpAddr>,
+        resolved_ips: &[IpAddr],
         context: &RouteContext,
         inherited_base: u8,
     ) -> RuleMatchStateSet {
@@ -641,7 +658,7 @@ impl RoutePredicate {
             return self.evaluate_logical_states(
                 logical,
                 location,
-                resolved_ip,
+                resolved_ips,
                 context,
                 inherited_base,
             );
@@ -655,10 +672,10 @@ impl RoutePredicate {
                 Address::Hostname(value) => Some(normalize_domain(value)),
                 _ => None,
             });
-        let destination_ip = match location.address() {
+        let literal_destination_ip = match location.address() {
             Address::Ipv4(value) => Some(IpAddr::V4(*value)),
             Address::Ipv6(value) => Some(IpAddr::V6(*value)),
-            Address::Hostname(_) => resolved_ip,
+            Address::Hostname(_) => None,
         };
 
         let has_address_items = !self.domain.is_empty()
@@ -689,8 +706,15 @@ impl RoutePredicate {
                 MatchState::Matches
             } else if self.ip_cidr.is_empty() {
                 MatchState::DoesNotMatch
-            } else if let Some(ip) = destination_ip {
+            } else if let Some(ip) = literal_destination_ip {
                 MatchState::from_bool(self.ip_cidr.contains(ip))
+            } else if !resolved_ips.is_empty() {
+                MatchState::from_bool(
+                    resolved_ips
+                        .iter()
+                        .copied()
+                        .any(|ip| self.ip_cidr.contains(ip)),
+                )
             } else {
                 MatchState::NeedsIp
             };
@@ -699,10 +723,10 @@ impl RoutePredicate {
 
         let mut independent = MatchState::Matches;
         if !self.ip_version.is_empty() {
-            let version_match = match destination_ip {
+            let version_match = match literal_destination_ip {
                 Some(IpAddr::V4(_)) => MatchState::from_bool(self.ip_version.contains(&4)),
                 Some(IpAddr::V6(_)) => MatchState::from_bool(self.ip_version.contains(&6)),
-                None => MatchState::NeedsIp,
+                None => MatchState::DoesNotMatch,
             };
             independent = independent.and(version_match);
         }
@@ -739,13 +763,13 @@ impl RoutePredicate {
                 .any
                 .iter()
                 .fold(MatchState::DoesNotMatch, |state, child| {
-                    state.or(child.evaluate(location, resolved_ip, context))
+                    state.or(child.evaluate(location, resolved_ips, context))
                 });
             independent = independent.and(any_match);
         }
         if !self.all.is_empty() {
             let all_match = self.all.iter().fold(MatchState::Matches, |state, child| {
-                state.and(child.evaluate(location, resolved_ip, context))
+                state.and(child.evaluate(location, resolved_ips, context))
             });
             independent = independent.and(all_match);
         }
@@ -759,7 +783,7 @@ impl RoutePredicate {
         }
 
         if let Some(rules) = &self.rule_set_rules {
-            states = Self::evaluate_rule_set_states(rules, states, location, resolved_ip, context);
+            states = Self::evaluate_rule_set_states(rules, states, location, resolved_ips, context);
         }
 
         let mut required = 0;
@@ -777,7 +801,7 @@ impl RoutePredicate {
         rules: &[RoutePredicate],
         bases: RuleMatchStateSet,
         location: &NetLocation,
-        resolved_ip: Option<IpAddr>,
+        resolved_ips: &[IpAddr],
         context: &RouteContext,
     ) -> RuleMatchStateSet {
         let mut result = RuleMatchStateSet::empty();
@@ -787,7 +811,7 @@ impl RoutePredicate {
                 .fold(RuleMatchStateSet::empty(), |states, rule| {
                     states.merge(rule.evaluate_states_with_base(
                         location,
-                        resolved_ip,
+                        resolved_ips,
                         context,
                         base,
                     ))
@@ -807,7 +831,7 @@ impl RoutePredicate {
         &self,
         logical: &LogicalPredicate,
         location: &NetLocation,
-        resolved_ip: Option<IpAddr>,
+        resolved_ips: &[IpAddr],
         context: &RouteContext,
         inherited_base: u8,
     ) -> RuleMatchStateSet {
@@ -818,7 +842,7 @@ impl RoutePredicate {
                 |states, rule| {
                     states.combine(rule.evaluate_states_with_base(
                         location,
-                        resolved_ip,
+                        resolved_ips,
                         context,
                         evaluation_base,
                     ))
@@ -831,7 +855,7 @@ impl RoutePredicate {
                     .fold(RuleMatchStateSet::empty(), |states, rule| {
                         states.merge(rule.evaluate_states_with_base(
                             location,
-                            resolved_ip,
+                            resolved_ips,
                             context,
                             evaluation_base,
                         ))
@@ -1277,7 +1301,7 @@ protocol: [http, tls]
     }
 
     #[test]
-    fn ip_version_matches_literal_or_resolved_destination_family() {
+    fn ip_version_matches_only_literal_destination_family() {
         let ipv6 = RoutePredicate::compile(&RouteMatchConfig {
             ip_version: vec![6],
             ..Default::default()
@@ -1287,8 +1311,8 @@ protocol: [http, tls]
 
         assert!(ipv6.matches(&location("2001:db8::1", 443), None, &context));
         assert!(!ipv6.matches(&location("192.0.2.1", 443), None, &context));
-        assert!(ipv6.needs_resolved_ip(&location("example.com", 443), None, &context));
-        assert!(ipv6.matches(
+        assert!(!ipv6.needs_resolved_ip(&location("example.com", 443), None, &context));
+        assert!(!ipv6.matches(
             &location("example.com", 443),
             Some("2001:db8::2".parse().unwrap()),
             &context
@@ -1298,6 +1322,25 @@ protocol: [http, tls]
             Some("192.0.2.2".parse().unwrap()),
             &context
         ));
+    }
+
+    #[test]
+    fn cidr_uses_any_resolved_candidate_before_applying_invert() {
+        let config = RouteMatchConfig {
+            ip_cidr: vec!["10.0.0.0/8".into()],
+            ..Default::default()
+        };
+        let predicate = RoutePredicate::compile(&config).unwrap();
+        let inverted = RoutePredicate::compile(&RouteMatchConfig {
+            invert: true,
+            ..config
+        })
+        .unwrap();
+        let destination = location("multi.example", 443);
+        let candidates = ["192.0.2.1".parse().unwrap(), "10.1.2.3".parse().unwrap()];
+
+        assert!(predicate.matches_resolved_ips(&destination, &candidates, &RouteContext::tcp()));
+        assert!(!inverted.matches_resolved_ips(&destination, &candidates, &RouteContext::tcp()));
     }
 
     #[test]
@@ -1333,6 +1376,30 @@ network: [tcp]
             None,
             &RouteContext::udp()
         ));
+    }
+
+    #[test]
+    fn domain_keyword_and_regex_keep_configured_case() {
+        let predicate = RoutePredicate::compile(&RouteMatchConfig {
+            domain_keyword: vec!["NeEdLe".into()],
+            domain_regex: vec![r"^API[0-9]+\.example$".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let context = RouteContext::tcp();
+
+        for destination in ["has-needle.example", "api42.example", "API42.EXAMPLE"] {
+            assert!(!predicate.matches(&location(destination, 443), None, &context));
+        }
+
+        let lowercase = RoutePredicate::compile(&RouteMatchConfig {
+            domain_keyword: vec!["needle".into()],
+            domain_regex: vec![r"^api[0-9]+\.example$".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(lowercase.matches(&location("HAS-NEEDLE.EXAMPLE", 443), None, &context));
+        assert!(lowercase.matches(&location("API42.EXAMPLE", 443), None, &context));
     }
 
     #[test]
@@ -1559,6 +1626,68 @@ invert: true
         assert!(inverted.matches(
             &location("unrelated.example", 80),
             None,
+            &RouteContext::tcp()
+        ));
+    }
+
+    #[test]
+    fn multi_address_cidr_preserves_rule_set_category_and_logical_semantics() {
+        let category_set =
+            source_rule_set(r#"{"version":4,"rules":[{"ip_cidr":"10.0.0.0/8","port":443}]}"#);
+        let category = RoutePredicate::compile(&RouteMatchConfig {
+            ip_cidr: vec!["203.0.113.0/24".into()],
+            port: vec![80],
+            rule_set: vec![RouteRuleSetConfig {
+                format: "source".into(),
+                path: category_set.path().into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let candidates = ["198.51.100.7".parse().unwrap(), "10.2.3.4".parse().unwrap()];
+
+        // The direct port category and the rule-set's destination-address
+        // category may be filled by different arms. The matching CIDR is on
+        // the second DNS candidate and must still fill the shared category.
+        assert!(category.matches_resolved_ips(
+            &location("category.example", 80),
+            &candidates,
+            &RouteContext::tcp()
+        ));
+
+        let logical_set = source_rule_set(
+            r#"{
+  "version": 4,
+  "rules": [{
+    "type": "logical",
+    "mode": "and",
+    "rules": [
+      { "ip_cidr": "10.0.0.0/8", "invert": true },
+      { "port": 443 }
+    ]
+  }]
+}"#,
+        );
+        let logical = RoutePredicate::compile(&RouteMatchConfig {
+            rule_set: vec![RouteRuleSetConfig {
+                format: "source".into(),
+                path: logical_set.path().into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Inversion applies after the CIDR item checks the entire candidate
+        // set. It cannot be implemented by evaluating the whole logical rule
+        // once per address and ORing those booleans.
+        assert!(!logical.matches_resolved_ips(
+            &location("logical.example", 443),
+            &candidates,
+            &RouteContext::tcp()
+        ));
+        assert!(logical.matches_resolved_ips(
+            &location("logical.example", 443),
+            &["198.51.100.7".parse().unwrap()],
             &RouteContext::tcp()
         ));
     }

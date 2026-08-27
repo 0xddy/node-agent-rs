@@ -22,11 +22,16 @@ use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::crypto::CryptoTlsStream;
-use crate::dynamic::{ConnContext, UserContext, UserRegistry, current_connection};
+use crate::dynamic::{
+    ConnContext, UserContext, UserRegistry, current_connection, spawn_connection_until_cancelled,
+};
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks_handler::read_location_direct;
-use crate::tcp::tcp_handler::TcpServerSetupResult;
+use crate::tcp::tcp_handler::{
+    DeferredAuthenticationCompletion, DeferredAuthenticationSignal, TcpServerSetupResult,
+    UnauthenticatedFallbackCompletion,
+};
 use crate::tcp::tcp_server::run_udp_copy;
 use crate::tls_server_handler::NaiveConfig;
 use crate::uot::{UOT_V1_MAGIC_ADDRESS, UOT_V2_MAGIC_ADDRESS, UotV1ServerStream, UotV2Stream};
@@ -106,6 +111,11 @@ struct NaiveServiceConfig {
     proxy_selector: Arc<ClientProxySelector>,
     udp_enabled: bool,
     padding_enabled: bool,
+    /// Naive HTTP/2 authenticates on its first CONNECT request, after Hyper owns the
+    /// physical stream. Notify the accepting transport at that exact boundary so it
+    /// can release the pre-auth permit without treating an idle H2 connection as an
+    /// authenticated proxy.
+    authentication: Option<DeferredAuthenticationSignal>,
     /// The connection's accounting record, captured before the spawn below.
     ///
     /// Every other TCP protocol finds this through a task local, because it
@@ -154,6 +164,13 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
 ) -> io::Result<TcpServerSetupResult> {
     let io = TokioIo::new(tls_stream);
 
+    let (authentication, authentication_waiter) = if use_h2 {
+        let (signal, waiter) = DeferredAuthenticationSignal::channel();
+        (Some(signal), Some(waiter))
+    } else {
+        (None, None)
+    };
+
     let service_config = Arc::new(NaiveServiceConfig {
         users: naive_cfg.users.clone(),
         fallback_path: naive_cfg.fallback_path.clone(),
@@ -161,12 +178,15 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
         proxy_selector: effective_selector,
         udp_enabled: naive_cfg.udp_enabled,
         padding_enabled: naive_cfg.padding_enabled,
+        authentication,
         // Read here, on the accepting task, which is the last point at which the
-        // task local is still reachable. `None` for an inbound that is not metered.
+        // task local is still reachable. Ordinary TCP accepts install a context
+        // even when byte accounting is disabled, so hard inbound removal can still
+        // terminate the detached Hyper connection.
         meter: current_connection(),
     });
 
-    if use_h2 {
+    let completion = if use_h2 {
         // HTTP/2 for NaiveProxy clients
         tokio::spawn(async move {
             let removal_meter = service_config.meter.clone();
@@ -203,7 +223,7 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             let result = if let Some(meter) = removal_meter {
                 tokio::select! {
                     biased;
-                    () = meter.cancelled() => return,
+                    () = meter.cancelled() => return Ok(()),
                     result = connection => result,
                 }
             } else {
@@ -213,11 +233,12 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/2 connection error: {}", e);
             }
-        });
+            Ok(())
+        })
     } else {
         // HTTP/1.1 for browsers and censors - serve static files only, no proxy
         let fallback_path = naive_cfg.fallback_path.clone();
-        tokio::spawn(async move {
+        spawn_connection_until_cancelled(async move {
             let service = hyper::service::service_fn(move |req| {
                 let path = fallback_path.clone();
                 async move { http1_fallback_service(req, path).await }
@@ -231,13 +252,23 @@ pub(super) async fn run_naive_hyper_service<IO: AsyncStream + 'static>(
             if let Err(e) = result {
                 debug!("Naive HTTP/1.1 fallback error: {}", e);
             }
-        });
-    }
+            Ok(())
+        })
+    };
 
-    // Hyper owns the stream now, but Basic authentication happens later on an
-    // individual request. Do not let this handoff authenticate an outer QUIC
-    // transport before such a request exists.
-    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
+    // Hyper owns the stream now. HTTP/1.1 is camouflage only and remains an
+    // unauthenticated fallback. HTTP/2 is the real proxy data plane, but its Basic
+    // credential arrives on the first CONNECT request; keep the transport's pre-auth
+    // admission until `naive_service` signals that exact boundary.
+    if let Some(authentication_waiter) = authentication_waiter {
+        Ok(TcpServerSetupResult::DeferredAuthenticationHandled(
+            DeferredAuthenticationCompletion::new(completion, authentication_waiter),
+        ))
+    } else {
+        Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled(
+            UnauthenticatedFallbackCompletion::new(completion),
+        ))
+    }
 }
 
 /// HTTP/1.1 fallback service - only serves static files, no proxy functionality
@@ -339,6 +370,9 @@ async fn naive_service(
                         .status(StatusCode::BAD_REQUEST)
                         .body(empty_body())
                         .unwrap());
+                }
+                if let Some(authentication) = &config.authentication {
+                    authentication.complete();
                 }
                 user.id().to_string()
             }

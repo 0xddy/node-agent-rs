@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 
 use log::debug;
 use shoes::config::ServerConfig;
-use shoes::dynamic::{ServerHandle, UserRegistry};
+use shoes::dynamic::{InboundReplayState, ServerHandle, UserRegistry};
 use shoes::resolver::Resolver;
 use shoes_api::InboundInfo;
 
@@ -119,11 +119,10 @@ impl BindTargets {
 /// One registered inbound: its metadata plus the handles to the listeners backing
 /// it.
 ///
-/// Only *listeners* are held here. Upstream detaches every accepted connection
-/// with `tokio::spawn`, so a connection's lifetime is fully independent of the
-/// listener task that accepted it. That independence is what makes both
-/// [`InboundSlot::shutdown`] and [`InboundSlot::reload`] safe for established
-/// sessions.
+/// Listener handles and their connection-cancellation trees are held here. Upstream
+/// detaches every accepted connection with `tokio::spawn`, so graceful shutdown and
+/// reload leave those sessions independent; an explicit hard shutdown reaches them
+/// through the separate connection tree.
 pub struct InboundSlot {
     info: InboundInfo,
     /// The protocol label, which a reload can change.
@@ -148,6 +147,13 @@ pub struct InboundSlot {
     /// A reload re-expands the incoming config and pairs the result against this
     /// list positionally, which is why the order is preserved rather than keyed.
     handles: Vec<ServerHandle>,
+    /// Security state spans every expanded listener group and every replacement
+    /// generation of this one logical inbound.
+    replay_state: InboundReplayState,
+    /// Unforgeable authority for this tag's replay namespace. The engine keeps
+    /// only a `Weak` registry entry; the live slot and any explicit rollback
+    /// leases are the owners that keep the lineage admissible.
+    replay_lineage: Arc<()>,
     /// The authority for this inbound's users, when it has one.
     ///
     /// `None` means the inbound was created without a `users` list and answers
@@ -167,6 +173,8 @@ impl InboundSlot {
         info: InboundInfo,
         keys: Vec<BindKey>,
         handles: Vec<ServerHandle>,
+        replay_state: InboundReplayState,
+        replay_lineage: Arc<()>,
         users: Option<Arc<MemoryUserRegistry>>,
     ) -> Self {
         Self {
@@ -174,8 +182,18 @@ impl InboundSlot {
             info,
             keys,
             handles,
+            replay_state,
+            replay_lineage,
             users,
         }
+    }
+
+    pub(crate) fn replay_state(&self) -> InboundReplayState {
+        self.replay_state.clone()
+    }
+
+    pub(crate) fn replay_lineage(&self) -> Arc<()> {
+        Arc::clone(&self.replay_lineage)
     }
 
     /// A snapshot of this inbound, with the current protocol, user count and
@@ -279,16 +297,6 @@ impl InboundSlot {
         Ok(revision)
     }
 
-    /// Stops accepting new connections on this inbound.
-    ///
-    /// Established connections are deliberately left running to completion: they
-    /// were spawned off the accept loop and hold their own handler, so they finish
-    /// under the rules they started with. This is the "smooth handover" property.
-    ///
-    /// Awaiting matters: it is what guarantees the sockets are released by the time
-    /// this returns, so the caller can hand the same addresses to a new inbound. For
-    /// TCP that is immediate; for QUIC the endpoint first drains its live
-    /// connections, because they share the socket the port belongs to.
     /// Stop accepting, without waiting. See [`ServerHandle::stop_accepting`].
     ///
     /// For the paths that have no `await` to spend: a `Drop` cleaning up after a
@@ -299,7 +307,25 @@ impl InboundSlot {
         }
     }
 
+    /// Synchronously signal both accept loops and established connection trees.
+    pub(crate) fn hard_stop(&self) {
+        for handle in &self.handles {
+            handle.hard_stop();
+        }
+    }
+
+    /// Stop accepting and wait until every listener has released its socket.
+    /// Established connections retain the ordinary graceful semantics.
     pub(crate) async fn shutdown(&self) {
+        for handle in &self.handles {
+            handle.shutdown(LISTENER_DRAIN_TIMEOUT).await;
+        }
+    }
+
+    pub(crate) async fn hard_shutdown(&self) {
+        // Signal every expanded listener before awaiting any one of them, so a slow
+        // endpoint cannot leave another group accepting or serving connections.
+        self.hard_stop();
         for handle in &self.handles {
             handle.shutdown(LISTENER_DRAIN_TIMEOUT).await;
         }
@@ -321,10 +347,13 @@ impl std::fmt::Debug for InboundSlot {
 /// Stops listeners that will never be registered, after a failure part-way
 /// through starting an inbound.
 ///
-/// Same guarantee as [`InboundSlot::shutdown`], and the same reason to await it:
-/// the addresses have to be free again by the time the caller reports the failure,
-/// or a retry would collide with its own abandoned sockets.
+/// These listeners were never committed, so no connection accepted in their brief
+/// startup window may survive into a restored topology. Signal every connection
+/// tree first, then await socket release so a retry cannot collide with it.
 pub(crate) async fn abandon(handles: Vec<ServerHandle>) {
+    for handle in &handles {
+        handle.hard_stop();
+    }
     for handle in &handles {
         handle.shutdown(LISTENER_DRAIN_TIMEOUT).await;
     }

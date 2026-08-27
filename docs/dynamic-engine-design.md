@@ -423,14 +423,19 @@ belongs to a period.
 
 ### The grace period is the `Arc`
 
-An accept loop reads its handler out of a `HandlerSlot` **once per accepted
-connection** and hands that `Arc` to the connection. Everything the connection needs
-afterwards — protocol settings, routing rules, TLS config — hangs off it, so the
-connection is pinned to the generation it started on.
+An RCU-safe accept path reads its handler out of a `HandlerSlot` **once per
+independently routed flow** and hands that `Arc` to the flow. For TCP this is the
+accepted connection; for generic QUIC it is a bidirectional stream. Everything the
+flow needs afterwards — protocol settings, routing rules, TLS config — hangs off it,
+so the flow is pinned to the generation it started on.
 
 `HandlerSlot::store` therefore cannot affect anything already running: it only changes
-what the *next* `load` returns. The old handler is freed when its last connection ends.
-There is nothing to count, drain, or wait for.
+what the *next* `load` returns. Protocols that can create independently routed work
+after physical accept — including SOCKS/Mixed UDP associations, Hysteria2 UDP, TUIC
+and mux-capable handlers — are not eligible for that in-place swap. `check_reload`
+classifies them for hard replacement, which closes the old connection tree before a
+new generation starts. There is no window in which an old association can create a
+new destination under retired rules.
 
 ### Why the swap is at the handler, not inside the rule list
 
@@ -453,13 +458,24 @@ live connections to finish before dropping the endpoint. The bounds nest deliber
 `InboundSlot::LISTENER_DRAIN_TIMEOUT` must exceed `quic_server::QUIC_DRAIN_TIMEOUT`, or
 the abort would cut exactly the connections the drain exists to protect.
 
+That is the ordinary embedding API's graceful path. A full node-agent/Go Box reload has
+a different contract: `remove_inbound_hard` first cancels an inbound-scoped connection
+token and then releases the listener. Every TCP connection context is a child of that
+token, so the same signal reaches classic and dynamic sessions plus pre-auth handshakes;
+metered detached camouflage fallback tasks retain it through their `TrafficMeterStream`.
+Generic QUIC, Hysteria2 and TUIC close their endpoint immediately on the hard branch.
+Thus ordinary handler RCU and graceful `remove_inbound` remain non-invasive, while a
+forced Box replacement cannot leave an old connection tree alive. Listener fan-out is
+prepared completely before the first task is spawned, and an unpublished candidate is
+hard-abandoned on any later failure or cancelled add future.
+
 ### The resolver travels with the handler
 
 A reload rebuilds the handler *and its resolver* — an inbound may declare its own
 `dns` section, so the two are not independent. That means the resolver cannot live in
 the accept loop, which reads it once at startup and would otherwise hand every new
-connection one generation's rules and another's DNS. It goes in the slot instead, so a
-`load` returns both halves of one generation and a connection is pinned to both.
+flow one generation's rules and another's DNS. It goes in the slot instead, so a
+`load` returns both halves of one generation and a flow is pinned to both.
 
 ### What reload does not cover
 
@@ -739,7 +755,9 @@ For review checklists and for the next protocol conversion.
    connection's session keys from it.)
 5. Credentials never appear in an id, a log line, or a report.
 6. With no registry injected, behaviour is bit-for-bit what upstream did.
-7. A reload changes what the *next* connection sees, never a live one.
+7. A hot handler reload changes what the next logical flow sees, never a live one.
+   A full Box/forced reload instead uses the explicit hard-remove path and closes the
+   entire previous connection tree before any candidate inbound starts.
 8. `shoes/src/dynamic/` adds no dependency an *application* would need — no
    transport, no serialisation format, no store. (`arc-swap` is the one crate it did
    add, and it is a concurrency primitive.)

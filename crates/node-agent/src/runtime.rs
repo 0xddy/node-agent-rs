@@ -13,10 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use shoes_api::{InboundSpec, UserInfo, UserSpec};
-use shoes_engine::{Engine, EngineError};
+use shoes_engine::{Engine, EngineError, InboundReplayLease};
 use tokio_util::sync::CancellationToken;
 
 use crate::rule_set::{RuleSetLoader, RuleSetResource, RuleSetSource};
+
+const MAX_PENDING_TRAFFIC_KEYS: usize = 65_536;
 
 /// One shoes inbound produced by the topology compiler.
 ///
@@ -39,6 +41,13 @@ pub struct RuntimeConfig {
     pub rule_sets: Vec<RuleSetResource>,
     /// The equivalent shoes YAML shown by `SingBoxConfigRequest`.
     pub diagnostic_yaml: Vec<u8>,
+    /// Stable digest of the global DNS client/data-plane surface (DNS, route,
+    /// outbounds). Inbound/user-only changes deliberately retain the current
+    /// Go-compatible DNS client generation.
+    pub dns_client_fingerprint: [u8; 32],
+    /// One generation-global DNS graph for URLTest background probes. Unlike
+    /// ordinary inbound DNS projections, this contains no inbound context.
+    pub urltest_probe_dns: Option<serde_json::Value>,
 }
 
 /// Current connection counts for one panel node.
@@ -196,9 +205,161 @@ struct RuntimeInner {
     apply: tokio::sync::Mutex<()>,
     rule_set_watcher: Mutex<RuleSetWatcherState>,
     state: RwLock<AppliedState>,
+    /// Replay namespaces retained only while an indeterminate transaction may
+    /// need to reconstruct the last published topology.
+    recovery_replay: Mutex<BTreeMap<String, InboundReplayLease>>,
     /// Final counters from users whose registry entry no longer exists.  Keeping
     /// them here until `drain_traffic` takes them closes the remove-vs-flush hole.
-    pending_traffic: Mutex<Vec<TrafficDrain>>,
+    pending_traffic: Mutex<PendingTraffic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TrafficDrainKey {
+    inbound_tag: String,
+    node_id: String,
+    protocol: String,
+    user_id: String,
+}
+
+impl From<&TrafficDrain> for TrafficDrainKey {
+    fn from(value: &TrafficDrain) -> Self {
+        Self {
+            inbound_tag: value.inbound_tag.clone(),
+            node_id: value.node_id.clone(),
+            protocol: value.protocol.clone(),
+            user_id: value.user_id.clone(),
+        }
+    }
+}
+
+struct PendingTraffic {
+    entries: BTreeMap<TrafficDrainKey, TrafficDrain>,
+    reserved: BTreeSet<TrafficDrainKey>,
+    max_keys: usize,
+}
+
+impl PendingTraffic {
+    fn new(max_keys: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            reserved: BTreeSet::new(),
+            max_keys,
+        }
+    }
+
+    fn reserve(&mut self, key: &TrafficDrainKey) -> Result<bool, String> {
+        if self.entries.contains_key(key) {
+            return Ok(false);
+        }
+        if self.reserved.contains(key) {
+            return Err(format!(
+                "traffic key for inbound {} user {} is already reserved",
+                key.inbound_tag, key.user_id
+            ));
+        }
+        if self.entries.len().saturating_add(self.reserved.len()) >= self.max_keys {
+            return Err(format!(
+                "pending traffic key limit {} is full; drain traffic before changing users or inbounds",
+                self.max_keys
+            ));
+        }
+        self.reserved.insert(key.clone());
+        Ok(true)
+    }
+
+    fn release(&mut self, key: &TrafficDrainKey) {
+        self.reserved.remove(key);
+    }
+
+    fn merge_reserved(&mut self, drain: TrafficDrain, owns_reservation: bool) {
+        let key = TrafficDrainKey::from(&drain);
+        if owns_reservation {
+            assert!(
+                self.reserved.remove(&key),
+                "traffic reservation disappeared before its receipt committed"
+            );
+        }
+        if drain.uplink_bytes == 0 && drain.downlink_bytes == 0 {
+            return;
+        }
+        merge_traffic_entry(&mut self.entries, drain);
+        debug_assert!(self.entries.len().saturating_add(self.reserved.len()) <= self.max_keys);
+    }
+
+    #[cfg(test)]
+    fn merge(&mut self, drain: TrafficDrain) -> Result<(), String> {
+        if drain.uplink_bytes == 0 && drain.downlink_bytes == 0 {
+            return Ok(());
+        }
+        let key = TrafficDrainKey::from(&drain);
+        if !self.entries.contains_key(&key)
+            && self.entries.len().saturating_add(self.reserved.len()) >= self.max_keys
+        {
+            return Err(format!(
+                "pending traffic key limit {} is full; drain traffic before changing users or inbounds",
+                self.max_keys
+            ));
+        }
+        merge_traffic_entry(&mut self.entries, drain);
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Vec<TrafficDrain> {
+        std::mem::take(&mut self.entries).into_values().collect()
+    }
+}
+
+fn merge_traffic_entry(entries: &mut BTreeMap<TrafficDrainKey, TrafficDrain>, drain: TrafficDrain) {
+    if drain.uplink_bytes == 0 && drain.downlink_bytes == 0 {
+        return;
+    }
+    let key = TrafficDrainKey::from(&drain);
+    if let Some(existing) = entries.get_mut(&key) {
+        existing.uplink_bytes = existing.uplink_bytes.saturating_add(drain.uplink_bytes);
+        existing.downlink_bytes = existing.downlink_bytes.saturating_add(drain.downlink_bytes);
+        existing.observed_at = match (existing.observed_at, drain.observed_at) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+    } else {
+        entries.insert(key, drain);
+    }
+}
+
+struct PendingTrafficReservation {
+    inner: Arc<RuntimeInner>,
+    key: TrafficDrainKey,
+    owns_reservation: bool,
+}
+
+impl PendingTrafficReservation {
+    fn commit(mut self, drain: TrafficDrain) {
+        assert_eq!(
+            self.key,
+            TrafficDrainKey::from(&drain),
+            "traffic receipt metadata differs from its reservation"
+        );
+        let mut pending = self
+            .inner
+            .pending_traffic
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.merge_reserved(drain, self.owns_reservation);
+        self.owns_reservation = false;
+    }
+}
+
+impl Drop for PendingTrafficReservation {
+    fn drop(&mut self) {
+        if !self.owns_reservation {
+            return;
+        }
+        self.inner
+            .pending_traffic
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release(&self.key);
+    }
 }
 
 #[derive(Default)]
@@ -226,6 +387,16 @@ struct NormalizedInbound {
     dynamic_users: bool,
 }
 
+#[derive(Clone)]
+struct RetiringInbound {
+    /// The listener/user generation that is actually present in Engine.
+    live: NormalizedInbound,
+    /// The published owner to which bytes produced before transaction commit
+    /// belong. This deliberately differs from `live` for an uncommitted
+    /// replacement candidate.
+    accounting: NormalizedInbound,
+}
+
 #[derive(Clone, Default)]
 struct NormalizedConfig {
     inbounds: BTreeMap<String, NormalizedInbound>,
@@ -233,6 +404,8 @@ struct NormalizedConfig {
     /// cache paths. A content refresh must rebuild selectors even when the ACP
     /// topology JSON itself is byte-for-byte unchanged.
     rule_set_digest: [u8; 32],
+    dns_client_fingerprint: [u8; 32],
+    urltest_probe_dns: Option<serde_json::Value>,
     diagnostic_yaml: Vec<u8>,
 }
 
@@ -241,6 +414,13 @@ struct AppliedState {
     /// `recovery` before another topology can be applied.
     current: Option<NormalizedConfig>,
     recovery: Option<NormalizedConfig>,
+    /// Listener generations that survived a failed rollback, together with the
+    /// still-published accounting owner for their pre-commit tail traffic.
+    recovery_live: BTreeMap<String, RetiringInbound>,
+    /// Distinguishes the process bootstrap placeholder from an intentionally
+    /// committed empty topology. Go constructs a fresh DNS client for every
+    /// subsequent Box even when the previous Box had no inbounds.
+    committed: bool,
     closed: bool,
 }
 
@@ -249,6 +429,8 @@ impl Default for AppliedState {
         Self {
             current: Some(NormalizedConfig::default()),
             recovery: None,
+            recovery_live: BTreeMap::new(),
+            committed: false,
             closed: false,
         }
     }
@@ -278,22 +460,26 @@ struct UserDelta {
 }
 
 enum Undo {
-    AddInbound(NormalizedInbound),
-    RemoveInbound(NormalizedInbound),
+    AddInbound {
+        inbound: NormalizedInbound,
+        replay: InboundReplayLease,
+    },
+    RemoveInbound {
+        live: NormalizedInbound,
+        accounting: NormalizedInbound,
+    },
     RestoreHotConfig {
         current: NormalizedInbound,
         previous: NormalizedInbound,
-    },
-    ReplaceBack {
-        current: NormalizedInbound,
-        previous: NormalizedInbound,
+        replay: InboundReplayLease,
     },
     AddUser {
         inbound: NormalizedInbound,
         user: UserSpec,
     },
     RemoveUser {
-        inbound: NormalizedInbound,
+        live: NormalizedInbound,
+        accounting: NormalizedInbound,
         user_id: String,
     },
     RestoreUser {
@@ -303,12 +489,20 @@ enum Undo {
     },
 }
 
+#[derive(Debug)]
 struct StepFailure {
     operation: String,
     rollback: Vec<String>,
     /// Whether this step changed live state before attempting its local restore.
     changed: bool,
     restored: bool,
+}
+
+#[derive(Debug)]
+struct UserRemovalFailure {
+    message: String,
+    changed: bool,
+    missing: bool,
 }
 
 impl StepFailure {
@@ -340,7 +534,8 @@ impl ShoesRuntime {
                 apply: tokio::sync::Mutex::new(()),
                 rule_set_watcher: Mutex::new(RuleSetWatcherState::default()),
                 state: RwLock::new(AppliedState::default()),
-                pending_traffic: Mutex::new(Vec::new()),
+                recovery_replay: Mutex::new(BTreeMap::new()),
+                pending_traffic: Mutex::new(PendingTraffic::new(MAX_PENDING_TRAFFIC_KEYS)),
             }),
         }
     }
@@ -397,6 +592,9 @@ impl ShoesRuntime {
         for inbound in &mut config.inbounds {
             prepared.rewrite_config(&mut inbound.spec.config);
         }
+        if let Some(probe_dns) = &mut config.urltest_probe_dns {
+            prepared.rewrite_config(probe_dns);
+        }
         let mut desired = normalize(config).map_err(|error| {
             RuntimeError::unchanged(
                 format!("normalize runtime config: {error}"),
@@ -406,11 +604,16 @@ impl ShoesRuntime {
         desired.rule_set_digest = prepared.digest;
 
         self.recover_if_needed().await?;
-        let previous = self
-            .read_state()
-            .current
-            .clone()
-            .expect("recovery publishes a known state");
+        let (previous, previous_committed) = {
+            let state = self.read_state();
+            (
+                state
+                    .current
+                    .clone()
+                    .expect("recovery publishes a known state"),
+                state.committed,
+            )
+        };
 
         // Validate every complete desired inbound before the first destructive
         // operation.  Address conflicts remain a start-time concern, but schema,
@@ -428,15 +631,82 @@ impl ShoesRuntime {
                 ));
             }
         }
+        if let Err(error) = self
+            .inner
+            .engine
+            .validate_urltest_probe_dns(desired.urltest_probe_dns.as_ref())
+            .await
+        {
+            return Err(RuntimeError::unchanged(
+                format!("validate generation-global URLTest probe DNS: {error}"),
+                !self.inner.engine.list_inbounds().is_empty(),
+            ));
+        }
 
-        let transaction = if force_reload {
-            self.execute_reload(&previous, &desired).await
-        } else {
-            self.execute_apply(&previous, &desired).await
-        };
+        // A failed rollback may temporarily remove every listener that owned these
+        // Arcs. Retain one opaque lease per published inbound until the transaction
+        // either commits or recovery has reconstructed the previous topology.
+        let previous_replay = self.capture_replay_state(&previous)?;
+
+        let full_dns_client_reload = force_reload
+            || previous.dns_client_fingerprint != desired.dns_client_fingerprint
+            || previous.rule_set_digest != desired.rule_set_digest;
+        // Go validates before replacing Box. Rotate only after every preflight
+        // succeeded and immediately before the first full-reload mutation, so
+        // candidate bootstrap cannot read the old generation. Only the process
+        // bootstrap placeholder has no prior client; an intentionally committed
+        // empty topology is still a Box/DNS-client generation.
+        let dns_client_rotated = full_dns_client_reload && previous_committed;
+        if dns_client_rotated {
+            let generation = self.inner.engine.rotate_dns_client_generation().await;
+            log::debug!(
+                "rotated DNS client state to generation {generation} before full topology candidate"
+            );
+        }
+
+        if (full_dns_client_reload || !previous_committed)
+            && let Err(error) = self
+                .inner
+                .engine
+                .configure_urltest_probe_dns(desired.urltest_probe_dns.as_ref())
+                .await
+        {
+            return Err(self
+                .finish_failed_transaction(
+                    previous,
+                    previous_replay,
+                    StepFailure::unchanged(format!(
+                        "configure generation-global URLTest probe DNS: {error}"
+                    )),
+                    Vec::new(),
+                    dns_client_rotated,
+                    full_dns_client_reload,
+                )
+                .await);
+        }
+
+        let transaction = self
+            .execute_apply(&previous, &desired, full_dns_client_reload)
+            .await;
 
         match transaction {
             Ok(()) => {
+                // Publish the ownership boundary before any fallible durability
+                // work. `execute_apply` atomically took every pre-boundary byte
+                // under the old metadata immediately before returning.
+                {
+                    let mut state = self.write_state();
+                    state.current = Some(desired);
+                    state.recovery = None;
+                    state.recovery_live.clear();
+                    state.committed = true;
+                }
+                self.recovery_replay().clear();
+                self.inner
+                    .engine
+                    .commit_client_chain_group_generation()
+                    .await;
+
                 // Candidate selectors already point at immutable snapshots. Only
                 // now, after shoes preflight and the live transaction both
                 // succeeded, advance the restart-time stable last-good cache.
@@ -446,13 +716,17 @@ impl ShoesRuntime {
                 if let Err(error) = prepared.commit().await {
                     log::error!("commit route rule-set last-good cache: {error}");
                 }
-                let mut state = self.write_state();
-                state.current = Some(desired);
-                state.recovery = None;
                 Ok(())
             }
             Err((failure, journal)) => Err(self
-                .finish_failed_transaction(previous, failure, journal)
+                .finish_failed_transaction(
+                    previous,
+                    previous_replay,
+                    failure,
+                    journal,
+                    dns_client_rotated,
+                    full_dns_client_reload,
+                )
                 .await),
         }
     }
@@ -547,22 +821,193 @@ impl ShoesRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn pending_traffic(&self) -> MutexGuard<'_, Vec<TrafficDrain>> {
+    fn pending_traffic(&self) -> MutexGuard<'_, PendingTraffic> {
         self.inner
             .pending_traffic
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn queue_traffic(&self, inbound: &NormalizedInbound, info: UserInfo) {
-        self.pending_traffic().push(traffic_drain(inbound, info));
+    fn recovery_replay(&self) -> MutexGuard<'_, BTreeMap<String, InboundReplayLease>> {
+        self.inner
+            .recovery_replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn capture_replay_state(
+        &self,
+        config: &NormalizedConfig,
+    ) -> Result<BTreeMap<String, InboundReplayLease>, RuntimeError> {
+        let mut replay = BTreeMap::new();
+        for tag in config.inbounds.keys() {
+            let lease = self
+                .inner
+                .engine
+                .preserve_inbound_replay(tag)
+                .map_err(|error| {
+                    RuntimeError::unchanged(
+                        format!("preserve replay state for inbound {tag}: {error}"),
+                        !config.inbounds.is_empty(),
+                    )
+                })?;
+            replay.insert(tag.clone(), lease);
+        }
+        Ok(replay)
+    }
+
+    fn traffic_key(inbound: &NormalizedInbound, user_id: &str) -> TrafficDrainKey {
+        TrafficDrainKey {
+            inbound_tag: inbound.compiled.spec.tag.clone(),
+            node_id: inbound.compiled.node_id.clone(),
+            protocol: inbound.compiled.protocol.clone(),
+            user_id: user_id.to_string(),
+        }
+    }
+
+    fn uncommitted_accounting_owner(
+        published: Option<&NormalizedInbound>,
+        candidate: &NormalizedInbound,
+    ) -> NormalizedInbound {
+        if let Some(published) = published {
+            return published.clone();
+        }
+
+        // Go publishes topology traffic metadata only after Apply/Reload returns.
+        // A brand-new tag that carries bytes during a failed transaction therefore
+        // follows trafficTracker's missing-metadata fallback: node id is the inbound
+        // tag and protocol is the actual inbound type.
+        let mut fallback = candidate.clone();
+        fallback.compiled.node_id = candidate.compiled.spec.tag.clone();
+        fallback
+    }
+
+    fn reserve_traffic(
+        &self,
+        inbound: &NormalizedInbound,
+        user_id: &str,
+    ) -> Result<PendingTrafficReservation, String> {
+        let key = Self::traffic_key(inbound, user_id);
+        let owns_reservation = self.pending_traffic().reserve(&key)?;
+        Ok(PendingTrafficReservation {
+            inner: Arc::clone(&self.inner),
+            key,
+            owns_reservation,
+        })
+    }
+
+    fn queue_traffic(
+        &self,
+        reservation: PendingTrafficReservation,
+        inbound: &NormalizedInbound,
+        info: UserInfo,
+    ) {
+        reservation.commit(traffic_drain(inbound, info));
+    }
+
+    async fn remove_user_with_retry(
+        &self,
+        tag: &str,
+        user_id: &str,
+    ) -> Result<UserInfo, UserRemovalFailure> {
+        match self.inner.engine.remove_user(tag, user_id).await {
+            Ok(info) => Ok(info),
+            Err(EngineError::Io(first)) => {
+                // MemoryUserRegistry removes the user and installs its draining
+                // tombstone before awaiting a detached finalizer. A JoinError is
+                // therefore an uncertain receipt, not proof that nothing changed;
+                // the documented retry path attaches to that tombstone and collects
+                // the same final counters.
+                self.inner
+                    .engine
+                    .remove_user(tag, user_id)
+                    .await
+                    .map_err(|retry| UserRemovalFailure {
+                        message: format!(
+                            "user removal finalizer failed: {first}; retry final receipt: {retry}"
+                        ),
+                        changed: true,
+                        missing: false,
+                    })
+            }
+            Err(error) => {
+                let missing = matches!(error, EngineError::UnknownUser { .. });
+                Err(UserRemovalFailure {
+                    message: error.to_string(),
+                    changed: false,
+                    missing,
+                })
+            }
+        }
+    }
+
+    fn flush_changed_traffic_metadata(
+        &self,
+        previous: &NormalizedConfig,
+        desired: &NormalizedConfig,
+        replaced: &BTreeSet<String>,
+    ) -> Result<(), StepFailure> {
+        for (tag, old) in &previous.inbounds {
+            // Hard replacement already collected the old generation's final
+            // counters in `stop_inbound`; anything now reachable under this tag
+            // belongs to the candidate generation and its metadata.
+            if replaced.contains(tag) {
+                continue;
+            }
+            let Some(new) = desired.inbounds.get(tag) else {
+                continue;
+            };
+            if old.compiled.node_id == new.compiled.node_id
+                && old.compiled.protocol == new.compiled.protocol
+            {
+                continue;
+            }
+            let users = match self.inner.engine.list_users(tag) {
+                Ok(users) => users,
+                Err(EngineError::Unsupported(_)) => continue,
+                Err(error) => {
+                    return Err(StepFailure::unchanged(format!(
+                        "list users before changing ownership metadata for inbound {tag}: {error}"
+                    )));
+                }
+            };
+            // Reserve and take one receipt at a time. A topology with more than
+            // MAX_PENDING_TRAFFIC_KEYS zero-traffic users therefore remains legal,
+            // while every non-zero receipt is still guaranteed bounded storage
+            // before its counter is zeroed.
+            for user in users {
+                let reservation = self.reserve_traffic(old, &user.id).map_err(|error| {
+                    StepFailure::unchanged(format!(
+                        "reserve old traffic for user {} before changing ownership metadata for inbound {tag}: {error}",
+                        user.id
+                    ))
+                })?;
+                let info = self
+                    .inner
+                    .engine
+                    .take_user_traffic(tag, &user.id)
+                    .map_err(|error| {
+                        StepFailure::unchanged(format!(
+                            "take old traffic for user {} before changing ownership metadata for inbound {tag}: {error}",
+                            user.id
+                        ))
+                    })?;
+                self.queue_traffic(reservation, old, info);
+            }
+        }
+        Ok(())
     }
 
     async fn execute_apply(
         &self,
         current: &NormalizedConfig,
         desired: &NormalizedConfig,
+        force_config_reload: bool,
     ) -> Result<(), (StepFailure, Vec<Undo>)> {
+        if force_config_reload {
+            return self.execute_full_reload(current, desired).await;
+        }
+
         let diff = diff_configs(current, desired);
         let mut journal = Vec::new();
 
@@ -570,12 +1015,31 @@ impl ShoesRuntime {
         // one of their ports.  Every deletion is journalled before the next starts.
         for tag in &diff.removed {
             let old = current.inbounds.get(tag).expect("diff tag exists").clone();
+            let replay = match self.inner.engine.preserve_inbound_replay(tag) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    return Err((
+                        StepFailure::unchanged(format!(
+                            "preserve replay state for inbound {tag}: {error}"
+                        )),
+                        journal,
+                    ));
+                }
+            };
             if let Err(failure) = self.stop_inbound(&old).await {
                 return Err((failure, journal));
             }
-            journal.push(Undo::AddInbound(old));
+            journal.push(Undo::AddInbound {
+                inbound: old,
+                replay,
+            });
         }
 
+        // First distinguish true listener replacements from handler-only RCU
+        // updates. `update_inbound` is the engine's authoritative classifier: a
+        // `ReloadRequired` result is non-mutating, while success is journalled for
+        // rollback. No replacement listener is stopped during this phase.
+        let mut replacements = Vec::new();
         for delta in &diff.changed {
             let old = current
                 .inbounds
@@ -588,33 +1052,41 @@ impl ShoesRuntime {
                 .expect("diff tag exists")
                 .clone();
 
-            let mut replaced = false;
             if delta.user_mode_changed {
-                if let Err(failure) = self.replace_inbound(&old, &new).await {
-                    return Err((failure, journal));
-                }
-                journal.push(Undo::ReplaceBack {
-                    current: new.clone(),
-                    previous: old.clone(),
-                });
-                replaced = true;
+                let replay = match self.inner.engine.preserve_inbound_replay(&delta.tag) {
+                    Ok(replay) => replay,
+                    Err(error) => {
+                        return Err((
+                            StepFailure::unchanged(format!(
+                                "preserve replay state before replacing inbound {}: {error}",
+                                delta.tag
+                            )),
+                            journal,
+                        ));
+                    }
+                };
+                replacements.push((delta.tag.clone(), old, new, replay));
             } else if delta.config_changed {
+                let replay = match self.inner.engine.preserve_inbound_replay(&delta.tag) {
+                    Ok(replay) => replay,
+                    Err(error) => {
+                        return Err((
+                            StepFailure::unchanged(format!(
+                                "preserve replay state before updating inbound {}: {error}",
+                                delta.tag
+                            )),
+                            journal,
+                        ));
+                    }
+                };
                 match self.inner.engine.update_inbound(update_spec(&new)).await {
                     Ok(_) => journal.push(Undo::RestoreHotConfig {
                         current: new.clone(),
                         previous: old.clone(),
+                        replay,
                     }),
                     Err(EngineError::ReloadRequired(_)) => {
-                        // The complete candidate was already validated before the
-                        // transaction began; only binding can now fail.
-                        if let Err(failure) = self.replace_inbound(&old, &new).await {
-                            return Err((failure, journal));
-                        }
-                        journal.push(Undo::ReplaceBack {
-                            current: new.clone(),
-                            previous: old.clone(),
-                        });
-                        replaced = true;
+                        replacements.push((delta.tag.clone(), old, new, replay));
                     }
                     Err(error) => {
                         return Err((
@@ -627,21 +1099,81 @@ impl ShoesRuntime {
                     }
                 }
             }
+        }
 
-            // A replacement was created from the complete desired InboundSpec, so
-            // its registry already contains the desired user set.
-            if replaced {
+        // Listener replacements are one transaction-wide remove-all/add-all
+        // phase. This is what permits A:10001/B:10002 -> A:10002/B:10001: every
+        // old owner releases its socket before any candidate claims one. Journal
+        // ordering removes all candidates before rebuilding any old listener.
+        for (_, old, _, replay) in &replacements {
+            if let Err(failure) = self.stop_inbound(old).await {
+                return Err((failure, journal));
+            }
+            journal.push(Undo::AddInbound {
+                inbound: old.clone(),
+                replay: replay.clone(),
+            });
+        }
+        for (tag, old, new, replay) in &replacements {
+            if let Err(error) = self
+                .inner
+                .engine
+                .add_inbound_with_replay(new.compiled.spec.clone(), replay)
+                .await
+            {
+                return Err((
+                    StepFailure::unchanged(format!("start replacement inbound {tag}: {error}")),
+                    journal,
+                ));
+            }
+            journal.push(Undo::RemoveInbound {
+                live: new.clone(),
+                accounting: old.clone(),
+            });
+        }
+        let replaced: BTreeSet<String> = replacements
+            .iter()
+            .map(|(tag, _, _, _)| tag.clone())
+            .collect();
+
+        // Replacements were built from complete desired specs and already contain
+        // their final user registries. Reconcile users only on listeners that stayed
+        // live (with or without an RCU handler update).
+        for delta in &diff.changed {
+            if replaced.contains(&delta.tag) {
                 continue;
             }
+            let old = current
+                .inbounds
+                .get(&delta.tag)
+                .expect("diff tag exists")
+                .clone();
+            let new = desired
+                .inbounds
+                .get(&delta.tag)
+                .expect("diff tag exists")
+                .clone();
 
             // Retire first.  Besides making revocation immediate, this frees a
             // credential that the same transaction may intentionally assign to a
             // newly added user.
             for id in &delta.removed_users {
                 let old_user = old.users.get(id).expect("diff user exists").clone();
-                match self.inner.engine.remove_user(&delta.tag, id).await {
+                let reservation = match self.reserve_traffic(&old, id) {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        return Err((
+                            StepFailure::unchanged(format!(
+                                "reserve final traffic for user {id} on {}: {error}",
+                                delta.tag
+                            )),
+                            journal,
+                        ));
+                    }
+                };
+                match self.remove_user_with_retry(&delta.tag, id).await {
                     Ok(info) => {
-                        self.queue_traffic(&old, info);
+                        self.queue_traffic(reservation, &old, info);
                         journal.push(Undo::AddUser {
                             inbound: old.clone(),
                             user: old_user,
@@ -649,10 +1181,15 @@ impl ShoesRuntime {
                     }
                     Err(error) => {
                         return Err((
-                            StepFailure::unchanged(format!(
-                                "remove user {id} from {}: {error}",
-                                delta.tag
-                            )),
+                            StepFailure {
+                                operation: format!(
+                                    "remove user {id} from {}: {}",
+                                    delta.tag, error.message
+                                ),
+                                rollback: Vec::new(),
+                                changed: error.changed,
+                                restored: !error.changed,
+                            },
                             journal,
                         ));
                     }
@@ -673,7 +1210,8 @@ impl ShoesRuntime {
 
                 if change.added {
                     journal.push(Undo::RemoveUser {
-                        inbound: new.clone(),
+                        live: new.clone(),
+                        accounting: old.clone(),
                         user_id: change.id.clone(),
                     });
                 } else {
@@ -717,44 +1255,90 @@ impl ShoesRuntime {
                     journal,
                 ));
             }
-            journal.push(Undo::RemoveInbound(new));
+            let accounting = Self::uncommitted_accounting_owner(None, &new);
+            journal.push(Undo::RemoveInbound {
+                live: new,
+                accounting,
+            });
+        }
+
+        if let Err(failure) = self.flush_changed_traffic_metadata(current, desired, &replaced) {
+            return Err((failure, journal));
         }
 
         Ok(())
     }
 
-    async fn execute_reload(
+    /// Replace one complete Box generation, matching Go's `old.Close(); new.Start()`
+    /// boundary instead of exposing a mixture of old and candidate inbounds.
+    ///
+    /// Every old listener is stopped before the first candidate listener starts.
+    /// The undo journal therefore has two clean halves: candidate listeners are
+    /// removed first on failure, then the complete previous topology is rebuilt.
+    /// Replay leases are retained independently of listener lifetime so the hard
+    /// connection cutover cannot reopen VMess/SS replay windows.
+    async fn execute_full_reload(
         &self,
         current: &NormalizedConfig,
         desired: &NormalizedConfig,
     ) -> Result<(), (StepFailure, Vec<Undo>)> {
         let mut journal = Vec::new();
+        let mut replay_by_tag = BTreeMap::new();
 
-        // A forced reload rebuilds listeners even when the compiled values compare
-        // equal.  This is the semantic used by the remote reload operation.
-        for old in current.inbounds.values() {
+        for (tag, old) in &current.inbounds {
+            let replay = match self.inner.engine.preserve_inbound_replay(tag) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    return Err((
+                        StepFailure::unchanged(format!(
+                            "preserve replay state for inbound {tag}: {error}"
+                        )),
+                        journal,
+                    ));
+                }
+            };
             if let Err(failure) = self.stop_inbound(old).await {
                 return Err((failure, journal));
             }
-            journal.push(Undo::AddInbound(old.clone()));
+            replay_by_tag.insert(tag.clone(), replay.clone());
+            journal.push(Undo::AddInbound {
+                inbound: old.clone(),
+                replay,
+            });
         }
-        for new in desired.inbounds.values() {
-            if let Err(error) = self
-                .inner
-                .engine
-                .add_inbound(new.compiled.spec.clone())
-                .await
-            {
+
+        for (tag, candidate) in &desired.inbounds {
+            let result = match replay_by_tag.get(tag) {
+                Some(replay) => {
+                    self.inner
+                        .engine
+                        .add_inbound_with_replay(candidate.compiled.spec.clone(), replay)
+                        .await
+                }
+                None => {
+                    self.inner
+                        .engine
+                        .add_inbound(candidate.compiled.spec.clone())
+                        .await
+                }
+            };
+            if let Err(error) = result {
                 return Err((
                     StepFailure::unchanged(format!(
-                        "start reloaded inbound {}: {error}",
-                        new.compiled.spec.tag
+                        "start full-reload candidate inbound {tag}: {error}"
                     )),
                     journal,
                 ));
             }
-            journal.push(Undo::RemoveInbound(new.clone()));
+            journal.push(Undo::RemoveInbound {
+                live: candidate.clone(),
+                accounting: Self::uncommitted_accounting_owner(
+                    current.inbounds.get(tag),
+                    candidate,
+                ),
+            });
         }
+
         Ok(())
     }
 
@@ -763,18 +1347,50 @@ impl ShoesRuntime {
         old: &NormalizedInbound,
         new: &NormalizedInbound,
     ) -> Result<(), StepFailure> {
-        self.stop_inbound(old).await?;
+        let replay = self
+            .inner
+            .engine
+            .preserve_inbound_replay(&old.compiled.spec.tag)
+            .map_err(|error| {
+                StepFailure::unchanged(format!(
+                    "preserve replay state for inbound {}: {error}",
+                    old.compiled.spec.tag
+                ))
+            })?;
+        self.replace_inbound_with_replay(old, new, &replay).await
+    }
+
+    async fn replace_inbound_with_replay(
+        &self,
+        old: &NormalizedInbound,
+        new: &NormalizedInbound,
+        replay: &InboundReplayLease,
+    ) -> Result<(), StepFailure> {
+        self.replace_inbound_with_replay_owners(old, old, old, new, replay)
+            .await
+    }
+
+    async fn replace_inbound_with_replay_owners(
+        &self,
+        current: &NormalizedInbound,
+        registry: &NormalizedInbound,
+        accounting: &NormalizedInbound,
+        new: &NormalizedInbound,
+        replay: &InboundReplayLease,
+    ) -> Result<(), StepFailure> {
+        self.stop_inbound_with_owners(current, registry, accounting)
+            .await?;
         match self
             .inner
             .engine
-            .add_inbound(new.compiled.spec.clone())
+            .add_inbound_with_replay(new.compiled.spec.clone(), replay)
             .await
         {
             Ok(_) => Ok(()),
             Err(operation) => match self
                 .inner
                 .engine
-                .add_inbound(old.compiled.spec.clone())
+                .add_inbound_with_replay(current.compiled.spec.clone(), replay)
                 .await
             {
                 Ok(_) => Err(StepFailure {
@@ -793,7 +1409,7 @@ impl ShoesRuntime {
                     ),
                     rollback: vec![format!(
                         "restore inbound {}: {rollback}",
-                        old.compiled.spec.tag
+                        current.compiled.spec.tag
                     )],
                     changed: true,
                     restored: false,
@@ -806,7 +1422,19 @@ impl ShoesRuntime {
     /// counters and making the operation locally reversible if listener shutdown
     /// itself fails.
     async fn stop_inbound(&self, inbound: &NormalizedInbound) -> Result<(), StepFailure> {
-        let tag = &inbound.compiled.spec.tag;
+        self.stop_inbound_with_owners(inbound, inbound, inbound)
+            .await
+    }
+
+    async fn stop_inbound_with_owners(
+        &self,
+        listener: &NormalizedInbound,
+        registry: &NormalizedInbound,
+        accounting: &NormalizedInbound,
+    ) -> Result<(), StepFailure> {
+        debug_assert_eq!(listener.compiled.spec.tag, registry.compiled.spec.tag);
+        debug_assert_eq!(listener.compiled.spec.tag, accounting.compiled.spec.tag);
+        let tag = &listener.compiled.spec.tag;
         let live_users = match self.inner.engine.list_users(tag) {
             Ok(users) => users,
             Err(EngineError::Unsupported(_)) => Vec::new(),
@@ -818,40 +1446,58 @@ impl ShoesRuntime {
         };
 
         let mut removed = Vec::new();
-        for live in live_users {
-            let Some(spec) = inbound.users.get(&live.id).cloned() else {
+        for live_user in live_users {
+            let Some(spec) = registry.users.get(&live_user.id).cloned() else {
                 let rollback = self.restore_users(tag, &removed);
                 return Err(StepFailure {
                     operation: format!(
                         "cannot remove inbound {tag}: live user {} is absent from AppliedState",
-                        live.id
+                        live_user.id
                     ),
                     changed: !removed.is_empty(),
                     restored: rollback.is_empty(),
                     rollback,
                 });
             };
-            match self.inner.engine.remove_user(tag, &live.id).await {
-                Ok(info) => {
-                    self.queue_traffic(inbound, info);
-                    removed.push(spec);
-                }
+            let reservation = match self.reserve_traffic(accounting, &live_user.id) {
+                Ok(reservation) => reservation,
                 Err(error) => {
                     let rollback = self.restore_users(tag, &removed);
                     return Err(StepFailure {
                         operation: format!(
-                            "remove user {} before stopping inbound {tag}: {error}",
-                            live.id
+                            "reserve final traffic for user {} while stopping inbound {tag}: {error}",
+                            live_user.id
                         ),
                         changed: !removed.is_empty(),
                         restored: rollback.is_empty(),
                         rollback,
                     });
                 }
+            };
+            match self.remove_user_with_retry(tag, &live_user.id).await {
+                Ok(info) => {
+                    self.queue_traffic(reservation, accounting, info);
+                    removed.push(spec);
+                }
+                Err(error) => {
+                    let rollback = self.restore_users(tag, &removed);
+                    return Err(StepFailure {
+                        operation: format!(
+                            "remove user {} before stopping inbound {tag}: {}",
+                            live_user.id, error.message
+                        ),
+                        changed: error.changed || !removed.is_empty(),
+                        // An uncertain final receipt cannot be declared restored:
+                        // even if earlier users were re-added, its tombstone and
+                        // counters still require recovery.
+                        restored: !error.changed && rollback.is_empty(),
+                        rollback,
+                    });
+                }
             }
         }
 
-        if let Err(error) = self.inner.engine.remove_inbound(tag).await {
+        if let Err(error) = self.inner.engine.remove_inbound_hard(tag).await {
             let rollback = self.restore_users(tag, &removed);
             return Err(StepFailure {
                 operation: format!("remove inbound {tag}: {error}"),
@@ -877,109 +1523,221 @@ impl ShoesRuntime {
     async fn finish_failed_transaction(
         &self,
         previous: NormalizedConfig,
+        previous_replay: BTreeMap<String, InboundReplayLease>,
         failure: StepFailure,
         mut journal: Vec<Undo>,
+        dns_client_rotated: bool,
+        full_dns_client_reload: bool,
     ) -> RuntimeError {
-        let restoration_attempted = failure.changed || !journal.is_empty();
+        // Rotating the process DNS client is itself a live state change even when
+        // the first listener operation fails before it mutates anything.
+        let restoration_attempted =
+            full_dns_client_reload || failure.changed || !journal.is_empty();
         let had_previous_topology = !previous.inbounds.is_empty();
         let mut rollback = failure.rollback;
-        rollback.extend(self.rollback_journal(&mut journal).await);
+        // Even the first uncommitted Box candidate can build and serve from a DNS
+        // resolver before a later listener fails. It had no old generation to
+        // rotate away from on entry, but its cache/policy state must still be
+        // discarded before the next attempt.
+        if full_dns_client_reload {
+            let generation = self.inner.engine.rotate_dns_client_generation().await;
+            log::debug!(
+                "rotated DNS client state to generation {generation} before rebuilding rollback topology"
+            );
+            if let Err(error) = self
+                .inner
+                .engine
+                .configure_urltest_probe_dns(previous.urltest_probe_dns.as_ref())
+                .await
+            {
+                rollback.push(format!(
+                    "restore generation-global URLTest probe DNS: {error}"
+                ));
+            }
+        }
+        let (journal_errors, recovery_live) = self.rollback_journal(&mut journal).await;
+        rollback.extend(journal_errors);
+        // `replace_inbound` may already have restored the step that failed before
+        // control reached this transaction-wide rollback. Refresh every restored
+        // inbound once more after the rollback DNS generation was published, so
+        // new logical flows cannot retain a candidate generation's resolver/rule-
+        // state graph. Prefer the RCU path here; only a listener without a reload
+        // slot needs another bind cycle.
+        if dns_client_rotated && failure.restored && rollback.is_empty() {
+            for inbound in previous.inbounds.values() {
+                match self.inner.engine.update_inbound(update_spec(inbound)).await {
+                    Ok(_) => {}
+                    Err(EngineError::ReloadRequired(_)) => {
+                        if let Err(error) = self.replace_inbound(inbound, inbound).await {
+                            rollback.push(format!(
+                                "rebuild rollback DNS state for {}: {}",
+                                inbound.compiled.spec.tag,
+                                describe_step_failure(error)
+                            ));
+                        }
+                    }
+                    Err(error) => rollback.push(format!(
+                        "refresh rollback DNS state for {}: {error}",
+                        inbound.compiled.spec.tag
+                    )),
+                }
+            }
+        }
         let fully_restored = failure.restored && rollback.is_empty();
         let rolled_back = fully_restored && restoration_attempted && had_previous_topology;
         let state_unchanged = fully_restored && !restoration_attempted;
 
-        let mut state = self.write_state();
-        // `rolled_back` follows the ACP/Go wire meaning and is only true when a
-        // non-empty published topology had to be restored.  State bookkeeping is
-        // broader: a preflight/first-step failure and a transaction that restored
-        // an empty topology are both fully known as well.
-        if fully_restored {
-            state.current = Some(previous);
-            state.recovery = None;
-        } else {
-            state.current = None;
-            state.recovery = Some(previous);
+        {
+            let mut state = self.write_state();
+            // `rolled_back` follows the ACP/Go wire meaning and is only true when a
+            // non-empty published topology had to be restored.  State bookkeeping is
+            // broader: a preflight/first-step failure and a transaction that restored
+            // an empty topology are both fully known as well.
+            if fully_restored {
+                state.current = Some(previous);
+                state.recovery = None;
+                state.recovery_live.clear();
+            } else {
+                state.current = None;
+                state.recovery = Some(previous);
+                state.recovery_live = recovery_live;
+            }
         }
-        drop(state);
+        if fully_restored {
+            self.recovery_replay().clear();
+            self.inner
+                .engine
+                .commit_client_chain_group_generation()
+                .await;
+        } else {
+            *self.recovery_replay() = previous_replay;
+        }
 
         RuntimeError::failed(
             failure.operation,
             rollback,
             rolled_back,
             state_unchanged,
-            !self.inner.engine.list_inbounds().is_empty(),
+            fully_restored,
         )
     }
 
-    async fn rollback_journal(&self, journal: &mut Vec<Undo>) -> Vec<String> {
+    async fn rollback_journal(
+        &self,
+        journal: &mut Vec<Undo>,
+    ) -> (Vec<String>, BTreeMap<String, RetiringInbound>) {
         let mut errors = Vec::new();
+        let mut recovery_live = BTreeMap::new();
         while let Some(undo) = journal.pop() {
-            let result = match undo {
-                Undo::AddInbound(inbound) => self
-                    .inner
-                    .engine
-                    .add_inbound(inbound.compiled.spec.clone())
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| {
-                        format!("restore inbound {}: {error}", inbound.compiled.spec.tag)
-                    }),
-                Undo::RemoveInbound(inbound) => {
-                    self.stop_inbound(&inbound).await.map_err(|failure| {
-                        format!("remove candidate: {}", describe_step_failure(failure))
-                    })
-                }
-                Undo::RestoreHotConfig { current, previous } => {
-                    match self
+            let (result, survivor) = match undo {
+                Undo::AddInbound { inbound, replay } => {
+                    let result = self
                         .inner
                         .engine
-                        .update_inbound(update_spec(&previous))
+                        .add_inbound_with_replay(inbound.compiled.spec.clone(), &replay)
                         .await
-                    {
-                        Ok(_) => Ok(()),
-                        Err(EngineError::ReloadRequired(_)) => self
-                            .replace_inbound(&current, &previous)
-                            .await
-                            .map_err(describe_step_failure),
-                        Err(error) => Err(format!(
-                            "restore config for {}: {error}",
-                            previous.compiled.spec.tag
-                        )),
-                    }
-                }
-                Undo::ReplaceBack { current, previous } => self
-                    .replace_inbound(&current, &previous)
-                    .await
-                    .map_err(describe_step_failure),
-                Undo::AddUser { inbound, user } => {
-                    let id = user.resolved_id().unwrap_or("<unknown>").to_string();
-                    self.inner
-                        .engine
-                        .add_user(&inbound.compiled.spec.tag, user)
                         .map(|_| ())
                         .map_err(|error| {
-                            format!(
-                                "restore user {id} on {}: {error}",
-                                inbound.compiled.spec.tag
-                            )
-                        })
-                }
-                Undo::RemoveUser { inbound, user_id } => {
-                    match self
-                        .inner
-                        .engine
-                        .remove_user(&inbound.compiled.spec.tag, &user_id)
-                        .await
-                    {
-                        Ok(info) => {
-                            self.queue_traffic(&inbound, info);
-                            Ok(())
-                        }
-                        Err(error) => Err(format!(
-                            "remove candidate user {user_id} from {}: {error}",
-                            inbound.compiled.spec.tag
-                        )),
+                            format!("restore inbound {}: {error}", inbound.compiled.spec.tag)
+                        });
+                    if result.is_ok() {
+                        recovery_live.insert(
+                            inbound.compiled.spec.tag.clone(),
+                            RetiringInbound {
+                                live: inbound.clone(),
+                                accounting: inbound.clone(),
+                            },
+                        );
                     }
+                    (result, None)
+                }
+                Undo::RemoveInbound { live, accounting } => {
+                    let tag = live.compiled.spec.tag.clone();
+                    let result = self
+                        .stop_inbound_with_owners(&live, &live, &accounting)
+                        .await
+                        .map_err(|failure| {
+                            format!("remove candidate: {}", describe_step_failure(failure))
+                        });
+                    if result.is_ok() {
+                        recovery_live.remove(&tag);
+                    }
+                    (result, Some(RetiringInbound { live, accounting }))
+                }
+                Undo::RestoreHotConfig {
+                    current,
+                    previous,
+                    replay,
+                } => {
+                    let result = self
+                        .replace_inbound_with_replay_owners(
+                            &current, &previous, &previous, &previous, &replay,
+                        )
+                        .await
+                        .map_err(describe_step_failure);
+                    if result.is_ok() {
+                        recovery_live.insert(
+                            previous.compiled.spec.tag.clone(),
+                            RetiringInbound {
+                                live: previous.clone(),
+                                accounting: previous.clone(),
+                            },
+                        );
+                    }
+                    (
+                        result,
+                        Some(RetiringInbound {
+                            live: current,
+                            accounting: previous,
+                        }),
+                    )
+                }
+                Undo::AddUser { inbound, user } => {
+                    let id = user.resolved_id().unwrap_or("<unknown>").to_string();
+                    (
+                        self.inner
+                            .engine
+                            .add_user(&inbound.compiled.spec.tag, user)
+                            .map(|_| ())
+                            .map_err(|error| {
+                                format!(
+                                    "restore user {id} on {}: {error}",
+                                    inbound.compiled.spec.tag
+                                )
+                            }),
+                        None,
+                    )
+                }
+                Undo::RemoveUser {
+                    live,
+                    accounting,
+                    user_id,
+                } => {
+                    let reservation =
+                        self.reserve_traffic(&accounting, &user_id)
+                            .map_err(|error| {
+                                format!(
+                                    "reserve candidate user {user_id} traffic on {}: {error}",
+                                    live.compiled.spec.tag
+                                )
+                            });
+                    let result = match reservation {
+                        Err(error) => Err(error),
+                        Ok(reservation) => match self
+                            .remove_user_with_retry(&live.compiled.spec.tag, &user_id)
+                            .await
+                        {
+                            Ok(info) => {
+                                self.queue_traffic(reservation, &accounting, info);
+                                Ok(())
+                            }
+                            Err(error) => Err(format!(
+                                "remove candidate user {user_id} from {}: {}",
+                                live.compiled.spec.tag, error.message
+                            )),
+                        },
+                    };
+                    (result, Some(RetiringInbound { live, accounting }))
                 }
                 Undo::RestoreUser {
                     inbound,
@@ -987,7 +1745,8 @@ impl ShoesRuntime {
                     kick,
                 } => {
                     let id = user.resolved_id().unwrap_or("<unknown>").to_string();
-                    match self.inner.engine.add_user(&inbound.compiled.spec.tag, user) {
+                    let result = match self.inner.engine.add_user(&inbound.compiled.spec.tag, user)
+                    {
                         Err(error) => Err(format!(
                             "restore user {id} on {}: {error}",
                             inbound.compiled.spec.tag
@@ -1004,33 +1763,71 @@ impl ShoesRuntime {
                                 )
                             }),
                         Ok(_) => Ok(()),
-                    }
+                    };
+                    (result, None)
                 }
             };
             if let Err(error) = result {
+                if let Some(inbound) = survivor
+                    && self
+                        .inner
+                        .engine
+                        .get_inbound(&inbound.live.compiled.spec.tag)
+                        .is_some()
+                {
+                    recovery_live.insert(inbound.live.compiled.spec.tag.clone(), inbound);
+                }
                 errors.push(error);
             }
         }
-        errors
+        if errors.is_empty() {
+            recovery_live.clear();
+        }
+        (errors, recovery_live)
     }
 
     async fn recover_if_needed(&self) -> Result<(), RuntimeError> {
-        let recovery = {
+        let (recovery, mut recovery_live) = {
             let state = self.read_state();
             if state.current.is_some() {
                 return Ok(());
             }
-            state.recovery.clone().unwrap_or_default()
+            (
+                state.recovery.clone().unwrap_or_default(),
+                state.recovery_live.clone(),
+            )
         };
+        let replay = self.recovery_replay().clone();
 
         // A failed rollback leaves no trustworthy per-tag model.  Converge through
         // the one state we do know: stop everything the engine reports, then rebuild
         // the retained recovery configuration from complete specs.
         let mut errors = Vec::new();
-        for info in self.inner.engine.list_inbounds() {
-            let known = recovery.inbounds.get(&info.tag);
+        let live = self.inner.engine.list_inbounds();
+        let live_tags: BTreeSet<String> = live.iter().map(|info| info.tag.clone()).collect();
+        recovery_live.retain(|tag, _| live_tags.contains(tag));
+        for info in &live {
+            if !recovery_live.contains_key(&info.tag)
+                && let Some(inbound) = recovery.inbounds.get(&info.tag)
+            {
+                recovery_live.insert(
+                    info.tag.clone(),
+                    RetiringInbound {
+                        live: inbound.clone(),
+                        accounting: inbound.clone(),
+                    },
+                );
+            }
+        }
+        self.publish_recovery_live(&recovery_live);
+
+        for info in live {
+            let known = recovery_live.get(&info.tag);
             if let Err(error) = self.force_stop_tag(&info.tag, known, &info.protocol).await {
                 errors.push(error);
+            } else {
+                recovery_live.remove(&info.tag);
+                self.publish_recovery_live(&recovery_live);
             }
         }
         if !errors.is_empty() {
@@ -1043,11 +1840,47 @@ impl ShoesRuntime {
             ));
         }
 
+        // The failed rollback may have bound this generation's URLTest registry
+        // to its default system resolver after publishing the intended recovery
+        // sidecar failed. With every listener now stopped, rotate before retrying
+        // the retained sidecar so a transient bootstrap failure cannot make the
+        // fingerprint mismatch permanent until process restart.
+        let generation = self.inner.engine.rotate_dns_client_generation().await;
+        log::debug!(
+            "rotated DNS client state to generation {generation} before rebuilding recovery topology"
+        );
+        if let Err(error) = self
+            .inner
+            .engine
+            .configure_urltest_probe_dns(recovery.urltest_probe_dns.as_ref())
+            .await
+        {
+            return Err(RuntimeError::failed(
+                format!("restore generation-global URLTest probe DNS: {error}"),
+                Vec::new(),
+                false,
+                false,
+                false,
+            ));
+        }
+
         for inbound in recovery.inbounds.values() {
+            let Some(lease) = replay.get(&inbound.compiled.spec.tag) else {
+                return Err(RuntimeError::failed(
+                    format!(
+                        "restore recovery inbound {}: replay namespace was not retained",
+                        inbound.compiled.spec.tag
+                    ),
+                    Vec::new(),
+                    false,
+                    false,
+                    false,
+                ));
+            };
             if let Err(error) = self
                 .inner
                 .engine
-                .add_inbound(inbound.compiled.spec.clone())
+                .add_inbound_with_replay(inbound.compiled.spec.clone(), lease)
                 .await
             {
                 return Err(RuntimeError::failed(
@@ -1061,44 +1894,82 @@ impl ShoesRuntime {
                     !self.inner.engine.list_inbounds().is_empty(),
                 ));
             }
+            recovery_live.insert(
+                inbound.compiled.spec.tag.clone(),
+                RetiringInbound {
+                    live: inbound.clone(),
+                    accounting: inbound.clone(),
+                },
+            );
+            self.publish_recovery_live(&recovery_live);
         }
 
-        let mut state = self.write_state();
-        state.current = Some(recovery);
-        state.recovery = None;
+        {
+            let mut state = self.write_state();
+            state.current = Some(recovery);
+            state.recovery = None;
+            state.recovery_live.clear();
+        }
+        self.recovery_replay().clear();
+        self.inner
+            .engine
+            .commit_client_chain_group_generation()
+            .await;
         Ok(())
+    }
+
+    /// Keep the indeterminate-state metadata aligned with the listener generations
+    /// that actually exist after each recovery step. A later bind failure may leave
+    /// an already rebuilt previous-generation listener serving until the next retry.
+    fn publish_recovery_live(&self, recovery_live: &BTreeMap<String, RetiringInbound>) {
+        let mut state = self.write_state();
+        debug_assert!(state.current.is_none());
+        state.recovery_live = recovery_live.clone();
     }
 
     async fn force_stop_tag(
         &self,
         tag: &str,
-        known: Option<&NormalizedInbound>,
-        fallback_protocol: &str,
+        known: Option<&RetiringInbound>,
+        _fallback_protocol: &str,
     ) -> Result<(), String> {
         match self.inner.engine.list_users(tag) {
             Ok(users) => {
-                for user in users {
-                    let info =
-                        self.inner
-                            .engine
-                            .remove_user(tag, &user.id)
-                            .await
-                            .map_err(|error| {
-                                format!("remove user {} while stopping {tag}: {error}", user.id)
-                            })?;
-                    match known {
-                        Some(inbound) => self.queue_traffic(inbound, info),
-                        None => {
-                            let observed_at = traffic_observed_at(&info);
-                            self.pending_traffic().push(TrafficDrain {
-                                inbound_tag: tag.to_string(),
-                                node_id: tag.to_string(),
-                                protocol: fallback_protocol.to_string(),
-                                user_id: info.id,
-                                uplink_bytes: info.rx,
-                                downlink_bytes: info.tx,
-                                observed_at,
-                            });
+                let mut user_ids: BTreeSet<String> =
+                    users.into_iter().map(|user| user.id).collect();
+                if let Some(inbound) = known.filter(|inbound| inbound.live.dynamic_users) {
+                    // `list_users` intentionally omits draining tombstones. Include
+                    // the generation's configured ids so recovery can collect an
+                    // uncertain finalizer receipt before removing the registry.
+                    user_ids.extend(inbound.live.users.keys().cloned());
+                    user_ids.extend(inbound.accounting.users.keys().cloned());
+                }
+                if known.is_none() && !user_ids.is_empty() {
+                    return Err(format!(
+                        "cannot safely stop untracked inbound {tag}: traffic ownership metadata is unavailable"
+                    ));
+                }
+                for user_id in user_ids {
+                    let inbound =
+                        known.expect("an untracked inbound with users was rejected above");
+                    let reservation = self
+                        .reserve_traffic(&inbound.accounting, &user_id)
+                        .map_err(|error| {
+                            format!(
+                                "reserve final traffic for user {} while stopping {tag}: {error}",
+                                user_id
+                            )
+                        })?;
+                    match self.remove_user_with_retry(tag, &user_id).await {
+                        Ok(info) => self.queue_traffic(reservation, &inbound.accounting, info),
+                        // A configured id absent from both the live map and the
+                        // tombstone map was already collected by an earlier step.
+                        Err(error) if error.missing && !error.changed => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "remove user {user_id} while stopping {tag}: {}",
+                                error.message
+                            ));
                         }
                     }
                 }
@@ -1108,7 +1979,7 @@ impl ShoesRuntime {
         }
         self.inner
             .engine
-            .remove_inbound(tag)
+            .remove_inbound_hard(tag)
             .await
             .map(|_| ())
             .map_err(|error| format!("remove inbound {tag}: {error}"))
@@ -1122,20 +1993,35 @@ impl ShoesRuntime {
             let mut state = self.write_state();
             state.current = Some(NormalizedConfig::default());
             state.recovery = None;
+            state.recovery_live.clear();
+            state.committed = false;
+            drop(state);
+            self.recovery_replay().clear();
             return Ok(());
         }
 
-        let known = {
+        let (known, recovery_live) = {
             let state = self.read_state();
-            state.current.clone().or_else(|| state.recovery.clone())
+            (
+                state.current.clone().or_else(|| state.recovery.clone()),
+                state.recovery_live.clone(),
+            )
         };
         let mut errors = Vec::new();
         for info in self.inner.engine.list_inbounds() {
-            let inbound = known
-                .as_ref()
-                .and_then(|config| config.inbounds.get(&info.tag));
+            let inbound = recovery_live.get(&info.tag).cloned().or_else(|| {
+                known.as_ref().and_then(|config| {
+                    config
+                        .inbounds
+                        .get(&info.tag)
+                        .map(|inbound| RetiringInbound {
+                            live: inbound.clone(),
+                            accounting: inbound.clone(),
+                        })
+                })
+            });
             if let Err(error) = self
-                .force_stop_tag(&info.tag, inbound, &info.protocol)
+                .force_stop_tag(&info.tag, inbound.as_ref(), &info.protocol)
                 .await
             {
                 errors.push(error);
@@ -1147,16 +2033,20 @@ impl ShoesRuntime {
         if errors.is_empty() {
             state.current = Some(NormalizedConfig::default());
             state.recovery = None;
+            state.recovery_live.clear();
+            state.committed = false;
         } else {
             // Applying is permanently forbidden once close begins, but a second
             // close must still be able to retry listeners that failed to stop.  Do
             // not publish an empty snapshot while any of them remain live.
             state.current = None;
             state.recovery = known;
+            state.recovery_live = recovery_live;
         }
         drop(state);
 
         if errors.is_empty() {
+            self.recovery_replay().clear();
             Ok(())
         } else {
             Err(RuntimeError::failed(
@@ -1224,34 +2114,34 @@ impl ShoesRuntime {
     async fn drain_traffic_owned(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
         let _apply = self.inner.apply.lock().await;
         let current = self.read_state().current.clone();
-        let mut live = Vec::new();
+        // Pending receipts are already durable, so move them into this call's
+        // transient result map and free the bounded retention budget before
+        // touching live counters. The returned sweep is intentionally not capped:
+        // a legal topology may contain more users than the retention budget.
+        let mut drained = BTreeMap::new();
+        for receipt in self.pending_traffic().drain() {
+            merge_traffic_entry(&mut drained, receipt);
+        }
         if let Some(current) = current {
             for (tag, inbound) in &current.inbounds {
                 match self.inner.engine.take_inbound_traffic(tag) {
                     Ok(users) => {
-                        live.extend(users.into_iter().map(|info| traffic_drain(inbound, info)));
+                        for info in users {
+                            merge_traffic_entry(&mut drained, traffic_drain(inbound, info));
+                        }
                     }
                     Err(EngineError::Unsupported(_)) | Err(EngineError::UnknownTag(_)) => {}
                     Err(error) => {
-                        // Earlier tags were already atomically zeroed.  Queue them
-                        // before returning the error so a retry cannot lose them.
-                        self.pending_traffic().extend(live);
-                        return Err(RuntimeError::failed(
-                            format!("take traffic for inbound {tag}: {error}"),
-                            Vec::new(),
-                            false,
-                            false,
-                            !self.inner.engine.list_inbounds().is_empty(),
-                        ));
+                        // `take_inbound_traffic` fails before changing this tag's
+                        // counters. Returning successful receipts from other tags
+                        // is lossless and avoids trying to retain an arbitrarily
+                        // large topology inside the bounded pending map.
+                        log::error!("take traffic for inbound {tag}: {error}");
                     }
                 }
             }
         }
-
-        let mut pending = self.pending_traffic();
-        let mut drained = std::mem::take(&mut *pending);
-        drained.extend(live);
-        Ok(drained)
+        Ok(drained.into_values().collect())
     }
 }
 
@@ -1339,10 +2229,12 @@ impl NodeRuntime for ShoesRuntime {
     }
 
     async fn drain_traffic(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
-        let runtime = self.clone();
-        tokio::spawn(async move { runtime.drain_traffic_owned().await })
-            .await
-            .map_err(|error| self.join_error("drain runtime traffic", error))?
+        // Unlike topology mutations, the drain has no await after acquiring the
+        // apply mutex: every counter take and the final Vec construction complete
+        // in that same poll. Await it directly so cancelling while the mutex is
+        // contended drops the waiter before anything is taken; detaching this work
+        // would let it clear counters after its only receiver disappeared.
+        self.drain_traffic_owned().await
     }
 }
 
@@ -1404,6 +2296,8 @@ fn normalize(config: RuntimeConfig) -> Result<NormalizedConfig, String> {
     Ok(NormalizedConfig {
         inbounds,
         rule_set_digest: [0; 32],
+        dns_client_fingerprint: config.dns_client_fingerprint,
+        urltest_probe_dns: config.urltest_probe_dns,
         diagnostic_yaml: config.diagnostic_yaml,
     })
 }
@@ -1544,7 +2438,7 @@ mod tests {
     use serde_json::{Value, json};
     use shoes::dynamic::{ConnContext, UserRegistry};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener as TokioTcpListener;
+    use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 
     use super::*;
 
@@ -1621,16 +2515,23 @@ mod tests {
         format!(r#"{{"version":4,"rules":[{{"domain":["{domain}"]}}]}}"#).into_bytes()
     }
 
-    async fn wait_for_revision(runtime: &ShoesRuntime, tag: &str, previous: u64) -> u64 {
+    async fn wait_for_inbound_generation(
+        runtime: &ShoesRuntime,
+        tag: &str,
+        previous: &Arc<shoes_engine::InboundSlot>,
+        previous_revision: u64,
+    ) -> (Arc<shoes_engine::InboundSlot>, u64) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let revision = runtime
-                    .engine()
-                    .get_inbound(tag)
-                    .expect("watched inbound remains live")
-                    .revision();
-                if revision > previous {
-                    return revision;
+                if let Some(inbound) = runtime.engine().get_inbound(tag) {
+                    let revision = inbound.revision();
+                    // A logical-flow-only update advances the slot revision. A
+                    // rule-set content change rotates the complete DNS/Box client
+                    // and therefore publishes a new slot whose revision starts at
+                    // zero. Accept either observable generation boundary.
+                    if !Arc::ptr_eq(&inbound, previous) || revision > previous_revision {
+                        return (inbound, revision);
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1715,6 +2616,14 @@ mod tests {
         })
     }
 
+    fn socks(address: SocketAddr, sniff: bool) -> Value {
+        json!({
+            "address": address.to_string(),
+            "protocol": {"type": "socks", "udp_enabled": false},
+            "sniff": sniff,
+        })
+    }
+
     fn compiled(
         tag: &str,
         node_id: &str,
@@ -1737,6 +2646,8 @@ mod tests {
             inbounds,
             rule_sets: Vec::new(),
             diagnostic_yaml: snapshot.to_vec(),
+            dns_client_fingerprint: [0; 32],
+            urltest_probe_dns: None,
         }
     }
 
@@ -1918,6 +2829,394 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn changed_inbounds_can_swap_listen_ports_in_one_transaction() {
+        let addresses = free_addrs(2);
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"before-swap",
+                vec![
+                    compiled("a", "node-a", vless(addresses[0]), Some(vec![])),
+                    compiled("b", "node-b", vless(addresses[1]), Some(vec![])),
+                ],
+            ))
+            .await
+            .expect("start original listeners");
+        let replay_a = runtime.engine().preserve_inbound_replay("a").unwrap();
+        let replay_b = runtime.engine().preserve_inbound_replay("b").unwrap();
+
+        runtime
+            .apply_config(config(
+                b"after-swap",
+                vec![
+                    compiled("a", "node-a", vless(addresses[1]), Some(vec![])),
+                    compiled("b", "node-b", vless(addresses[0]), Some(vec![])),
+                ],
+            ))
+            .await
+            .expect("all old listeners are removed before either replacement binds");
+
+        let a = runtime.engine().get_inbound("a").unwrap();
+        let b = runtime.engine().get_inbound("b").unwrap();
+        assert!(a.describe().bind.contains(&addresses[1].to_string()));
+        assert!(b.describe().bind.contains(&addresses[0].to_string()));
+        assert_eq!(
+            replay_a,
+            runtime.engine().preserve_inbound_replay("a").unwrap()
+        );
+        assert_eq!(
+            replay_b,
+            runtime.engine().preserve_inbound_replay("b").unwrap()
+        );
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_two_phase_replacement_restores_ports_and_replay_lineages() {
+        let addresses = free_addrs(2);
+        let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let blocked = blocker.local_addr().unwrap();
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"old",
+                vec![
+                    compiled("a", "node-a", vless(addresses[0]), Some(vec![])),
+                    compiled("b", "node-b", vless(addresses[1]), Some(vec![])),
+                ],
+            ))
+            .await
+            .unwrap();
+        let replay_a = runtime.engine().preserve_inbound_replay("a").unwrap();
+        let replay_b = runtime.engine().preserve_inbound_replay("b").unwrap();
+
+        let error = runtime
+            .apply_config(config(
+                b"candidate",
+                vec![
+                    compiled("a", "node-a", vless(addresses[1]), Some(vec![])),
+                    compiled("b", "node-b", vless(blocked), Some(vec![])),
+                ],
+            ))
+            .await
+            .expect_err("the second replacement cannot claim the blocked port");
+        assert!(error.rolled_back(), "{error}");
+        assert!(error.rollback_error().is_none(), "{error}");
+        assert!(
+            runtime
+                .engine()
+                .get_inbound("a")
+                .unwrap()
+                .describe()
+                .bind
+                .contains(&addresses[0].to_string())
+        );
+        assert!(
+            runtime
+                .engine()
+                .get_inbound("b")
+                .unwrap()
+                .describe()
+                .bind
+                .contains(&addresses[1].to_string())
+        );
+        assert_eq!(
+            replay_a,
+            runtime.engine().preserve_inbound_replay("a").unwrap()
+        );
+        assert_eq!(
+            replay_b,
+            runtime.engine().preserve_inbound_replay("b").unwrap()
+        );
+        drop(blocker);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reused_tag_splits_traffic_before_node_metadata_changes() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"node-a",
+                vec![compiled(
+                    "shared-tag",
+                    "node-a",
+                    vless(address),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let registry = runtime
+            .engine()
+            .get_inbound("shared-tag")
+            .unwrap()
+            .users()
+            .unwrap()
+            .clone();
+        let alice = registry.find_uuid(&uuid_bytes(ALICE_UUID)).unwrap();
+        alice.add_rx(17);
+        alice.add_tx(19);
+
+        runtime
+            .apply_config(config(
+                b"node-b",
+                vec![compiled(
+                    "shared-tag",
+                    "node-b",
+                    vless(address),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                )],
+            ))
+            .await
+            .expect("metadata-only ownership change");
+        alice.add_rx(5);
+        alice.add_tx(7);
+
+        let drains = runtime.drain_traffic().await.unwrap();
+        let old = drains
+            .iter()
+            .find(|drain| drain.node_id == "node-a")
+            .expect("old lineage traffic");
+        let new = drains
+            .iter()
+            .find(|drain| drain.node_id == "node-b")
+            .expect("new lineage traffic");
+        assert_eq!((old.uplink_bytes, old.downlink_bytes), (17, 19));
+        assert_eq!((new.uplink_bytes, new.downlink_bytes), (5, 7));
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hot_config_rollback_hard_closes_candidate_generation_connections() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        let initial = config(
+            b"old",
+            vec![compiled("edge", "node-a", socks(address, false), None)],
+        );
+        runtime.apply_config(initial.clone()).await.unwrap();
+
+        let previous = runtime.read_state().current.clone().unwrap();
+        let mut candidate_config = initial;
+        candidate_config.inbounds[0].spec.config = socks(address, true);
+        let candidate = normalize(candidate_config).unwrap();
+        let old = previous.inbounds.get("edge").unwrap().clone();
+        let new = candidate.inbounds.get("edge").unwrap().clone();
+        let replay = runtime.engine().preserve_inbound_replay("edge").unwrap();
+        let old_slot = runtime.engine().get_inbound("edge").unwrap();
+        runtime
+            .engine()
+            .update_inbound(update_spec(&new))
+            .await
+            .expect("publish candidate handler generation");
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5]).await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.read(&mut byte))
+                .await
+                .is_err(),
+            "candidate-generation connection stays pending before rollback"
+        );
+
+        let mut journal = vec![Undo::RestoreHotConfig {
+            current: new,
+            previous: old,
+            replay,
+        }];
+        let (errors, survivors) = runtime.rollback_journal(&mut journal).await;
+        assert!(errors.is_empty());
+        assert!(survivors.is_empty());
+        let restored_slot = runtime.engine().get_inbound("edge").unwrap();
+        assert!(!Arc::ptr_eq(&old_slot, &restored_slot));
+        let closed = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("rollback must close the candidate generation promptly");
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "candidate flow survived rollback"
+        );
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hot_config_and_user_rollback_drains_under_the_published_owner() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        let password_user = |id: &str, password: &str| UserSpec {
+            id: Some(id.to_string()),
+            uuid: None,
+            password: Some(password.to_string()),
+            enabled: true,
+            max_conns: None,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+        };
+        let hysteria2 = |rules: Value| {
+            json!({
+                "address": address.to_string(),
+                "transport": "quic",
+                "quic_settings": {
+                    "cert": include_str!("../../shoes-engine/tests/fixtures/test.crt"),
+                    "key": include_str!("../../shoes-engine/tests/fixtures/test.key"),
+                    "alpn_protocols": ["h3"],
+                },
+                "protocol": {"type": "hysteria2", "udp_enabled": false},
+                "rules": rules,
+            })
+        };
+        let mut initial = config(
+            b"old",
+            vec![compiled(
+                "edge",
+                "old-node",
+                hysteria2(json!([])),
+                Some(vec![
+                    password_user("alice", "alice-password"),
+                    password_user("bob", "bob-password"),
+                ]),
+            )],
+        );
+        initial.inbounds[0].protocol = "hysteria2".to_string();
+        runtime.apply_config(initial.clone()).await.unwrap();
+
+        let previous = runtime.read_state().current.clone().unwrap();
+        let old = previous.inbounds.get("edge").unwrap().clone();
+        let registry = runtime
+            .engine()
+            .get_inbound("edge")
+            .unwrap()
+            .users()
+            .unwrap()
+            .clone();
+        let alice = registry.find_password("alice-password").unwrap();
+        let bob = registry.find_password("bob-password").unwrap();
+        alice.add_rx(17);
+        bob.add_rx(11);
+
+        let mut candidate_config = initial;
+        candidate_config.inbounds[0].node_id = "candidate-node".to_string();
+        candidate_config.inbounds[0].spec.config = hysteria2(json!([{
+            "masks": "0.0.0.0/0",
+            "action": "allow",
+        }]));
+        candidate_config.inbounds[0].spec.users =
+            Some(vec![password_user("alice", "alice-password")]);
+        let candidate = normalize(candidate_config).unwrap();
+        let new = candidate.inbounds.get("edge").unwrap().clone();
+        let replay = runtime.engine().preserve_inbound_replay("edge").unwrap();
+        runtime
+            .engine()
+            .update_inbound(update_spec(&new))
+            .await
+            .expect("publish the uncommitted handler generation");
+
+        let reservation = runtime.reserve_traffic(&old, "bob").unwrap();
+        let bob_info = runtime.remove_user_with_retry("edge", "bob").await.unwrap();
+        runtime.queue_traffic(reservation, &old, bob_info);
+        alice.add_rx(5);
+
+        let mut journal = vec![
+            Undo::RestoreHotConfig {
+                current: new,
+                previous: old.clone(),
+                replay,
+            },
+            Undo::AddUser {
+                inbound: old,
+                user: password_user("bob", "bob-password"),
+            },
+        ];
+        let (errors, survivors) = runtime.rollback_journal(&mut journal).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(survivors.is_empty());
+        assert_eq!(runtime.engine().list_users("edge").unwrap().len(), 2);
+
+        let drains = runtime.drain_traffic().await.unwrap();
+        assert!(drains.iter().all(|drain| drain.node_id == "old-node"));
+        assert_eq!(
+            drains
+                .iter()
+                .find(|drain| drain.user_id == "alice")
+                .unwrap()
+                .uplink_bytes,
+            22
+        );
+        assert_eq!(
+            drains
+                .iter()
+                .find(|drain| drain.user_id == "bob")
+                .unwrap()
+                .uplink_bytes,
+            11
+        );
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rollback_of_an_added_user_uses_the_published_inbound_owner() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"old",
+                vec![compiled(
+                    "edge",
+                    "old-node",
+                    vless(address),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let old = runtime
+            .read_state()
+            .current
+            .as_ref()
+            .unwrap()
+            .inbounds
+            .get("edge")
+            .unwrap()
+            .clone();
+        let mut candidate = old.clone();
+        candidate.compiled.node_id = "candidate-node".to_string();
+        candidate
+            .users
+            .insert("bob".to_string(), user("bob", BOB_UUID));
+        runtime
+            .engine()
+            .add_user("edge", user("bob", BOB_UUID))
+            .unwrap();
+        runtime
+            .engine()
+            .get_inbound("edge")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(BOB_UUID))
+            .unwrap()
+            .add_rx(13);
+
+        let mut journal = vec![Undo::RemoveUser {
+            live: candidate,
+            accounting: old,
+            user_id: "bob".to_string(),
+        }];
+        let (errors, survivors) = runtime.rollback_journal(&mut journal).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(survivors.is_empty());
+
+        let drains = runtime.drain_traffic().await.unwrap();
+        let bob = drains.iter().find(|drain| drain.user_id == "bob").unwrap();
+        assert_eq!(bob.node_id, "old-node");
+        assert_eq!(bob.uplink_bytes, 13);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn first_step_failure_keeps_known_state_without_claiming_rollback() {
         let address = free_addrs(1)[0];
         let runtime = runtime().await;
@@ -2004,7 +3303,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn forced_reload_rebuilds_an_identical_inbound() {
+    async fn forced_reload_replaces_an_identical_inbound_slot() {
         let address = free_addrs(1)[0];
         let runtime = runtime().await;
         let initial = config(
@@ -2040,8 +3339,346 @@ mod tests {
                 rolled_back: false
             }
         );
-        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "Go-compatible reload must rebuild the embedded listener instance"
+        );
         runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forced_reload_hard_closes_a_pre_auth_tcp_connection() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        let initial = config(
+            b"initial",
+            vec![compiled(
+                "edge",
+                "node-a",
+                vless(address),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        );
+        runtime
+            .apply_config(initial.clone())
+            .await
+            .expect("start topology");
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("connect to the old listener");
+        // VLESS version 0 followed by an incomplete UUID leaves the server inside
+        // its pre-auth read. This exercises the connection tree before any user has
+        // been bound, including the window a malicious idle peer would occupy.
+        client.write_all(&[0]).await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), client.read(&mut byte))
+                .await
+                .is_err(),
+            "the pre-auth connection must remain open before reload"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), runtime.reload_config(initial))
+            .await
+            .expect("forced reload must not hang")
+            .expect("forced reload identical topology");
+
+        let closed = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+            .await
+            .expect("the old connection must close promptly after hard cutover");
+        match closed {
+            Ok(0) | Err(_) => {}
+            Ok(read) => panic!("old generation unexpectedly returned {read} byte(s)"),
+        }
+
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(address))
+                .await
+                .expect("candidate listener connect must not hang")
+                .expect("the candidate listener owns the address"),
+        );
+        runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn indeterminate_recovery_reuses_the_published_replay_namespace() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"initial",
+                vec![compiled("edge", "node-a", vless(address), Some(vec![]))],
+            ))
+            .await
+            .unwrap();
+        let previous = runtime
+            .read_state()
+            .current
+            .clone()
+            .expect("published topology");
+        let replay = runtime.capture_replay_state(&previous).unwrap();
+        let before = replay.get("edge").unwrap().clone();
+
+        let error = runtime
+            .finish_failed_transaction(
+                previous,
+                replay,
+                StepFailure {
+                    operation: "candidate and local restore failed".to_string(),
+                    rollback: vec!["simulated rollback failure".to_string()],
+                    changed: true,
+                    restored: false,
+                },
+                Vec::new(),
+                false,
+                false,
+            )
+            .await;
+        assert!(!error.running());
+
+        runtime.recover_if_needed().await.unwrap();
+        let after = runtime.engine().preserve_inbound_replay("edge").unwrap();
+        assert_eq!(before, after);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_rotates_a_default_bound_probe_registry_before_restoring_sidecar() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"initial",
+                vec![compiled("edge", "node-a", vless(address), Some(vec![]))],
+            ))
+            .await
+            .unwrap();
+        let previous = runtime
+            .read_state()
+            .current
+            .clone()
+            .expect("published topology");
+        let replay = runtime.capture_replay_state(&previous).unwrap();
+        let mut recovery = previous.clone();
+        recovery.urltest_probe_dns = Some(json!({
+            "servers": [{"tag": "default-dns", "url": "udp://127.0.0.1:5353"}],
+            "final": "default-dns"
+        }));
+        let inbound = previous.inbounds["edge"].clone();
+        {
+            let mut state = runtime.write_state();
+            state.current = None;
+            state.recovery = Some(recovery.clone());
+            state.recovery_live = BTreeMap::from([(
+                "edge".to_string(),
+                RetiringInbound {
+                    live: inbound.clone(),
+                    accounting: inbound,
+                },
+            )]);
+        }
+        *runtime.recovery_replay() = replay;
+        let generation_before = runtime.engine().dns_cache_generation().await;
+
+        runtime
+            .recover_if_needed()
+            .await
+            .expect("recovery must replace a registry previously bound to system DNS");
+
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            generation_before + 1
+        );
+        assert_eq!(
+            runtime
+                .read_state()
+                .current
+                .as_ref()
+                .and_then(|current| current.urltest_probe_dns.as_ref()),
+            recovery.urltest_probe_dns.as_ref()
+        );
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dns_cache_generation_follows_full_box_candidate_and_rollback_boundaries() {
+        let addresses = free_addrs(3);
+        let runtime = runtime().await;
+        let mut initial = config(
+            b"initial",
+            vec![compiled(
+                "edge",
+                "node-a",
+                vless(addresses[0]),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        );
+        initial.dns_client_fingerprint = [1; 32];
+        assert_eq!(runtime.engine().dns_cache_generation().await, 0);
+        runtime
+            .apply_config(initial.clone())
+            .await
+            .expect("initial Box starts with its already-empty DNS cache");
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            0,
+            "initial bootstrap must not rotate an empty cache"
+        );
+
+        let mut users_only = initial.clone();
+        users_only.inbounds[0].spec.users =
+            Some(vec![user("alice", ALICE_UUID), user("bob", BOB_UUID)]);
+        runtime
+            .apply_config(users_only.clone())
+            .await
+            .expect("hot user update");
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            0,
+            "inbound/user-only apply retains the Go DNS client"
+        );
+
+        let mut full_candidate = users_only.clone();
+        full_candidate.dns_client_fingerprint = [2; 32];
+        runtime
+            .apply_config(full_candidate.clone())
+            .await
+            .expect("global data-plane change rebuilds Box");
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            1,
+            "rotate before candidate, with no success-tail clear"
+        );
+
+        let mut failing = config(
+            b"failing",
+            vec![
+                compiled("candidate-a", "node-b", vless(addresses[1]), Some(vec![])),
+                compiled("candidate-b", "node-c", vless(addresses[1]), Some(vec![])),
+            ],
+        );
+        failing.dns_client_fingerprint = [3; 32];
+        let error = runtime
+            .apply_config(failing)
+            .await
+            .expect_err("second candidate bind conflicts and triggers rollback");
+        assert!(error.rolled_back(), "{error}");
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            3,
+            "candidate and rollback each receive a fresh cache generation"
+        );
+        assert!(runtime.engine().get_inbound("edge").is_some());
+        runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn committed_empty_topology_is_not_mistaken_for_process_bootstrap() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        let mut dns_a = config(
+            b"dns-a",
+            vec![compiled("edge", "node-a", vless(address), Some(vec![]))],
+        );
+        dns_a.dns_client_fingerprint = [1; 32];
+        runtime.apply_config(dns_a.clone()).await.unwrap();
+        assert_eq!(runtime.engine().dns_cache_generation().await, 0);
+
+        let mut empty_dns_a = config(b"empty-dns-a", vec![]);
+        empty_dns_a.dns_client_fingerprint = [1; 32];
+        runtime.apply_config(empty_dns_a).await.unwrap();
+        assert!(runtime.engine().list_inbounds().is_empty());
+        assert_eq!(runtime.engine().dns_cache_generation().await, 0);
+
+        // This is a new Box/DNS client even though the previous committed Box
+        // had no listeners. Skipping the rotation would let a later DNS-B
+        // inbound consume DNS-A's question-only cache entries.
+        let mut empty_dns_b = config(b"empty-dns-b", vec![]);
+        empty_dns_b.dns_client_fingerprint = [2; 32];
+        runtime.apply_config(empty_dns_b.clone()).await.unwrap();
+        assert_eq!(runtime.engine().dns_cache_generation().await, 1);
+
+        let mut dns_b = config(
+            b"dns-b",
+            vec![compiled("edge", "node-a", vless(address), Some(vec![]))],
+        );
+        dns_b.dns_client_fingerprint = [2; 32];
+        runtime.apply_config(dns_b).await.unwrap();
+        assert_eq!(runtime.engine().dns_cache_generation().await, 1);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_preflight_does_not_rotate_dns_cache() {
+        let addresses = free_addrs(2);
+        let runtime = runtime().await;
+        let mut initial = config(
+            b"initial",
+            vec![compiled(
+                "edge",
+                "node-a",
+                vless(addresses[0]),
+                Some(vec![]),
+            )],
+        );
+        initial.dns_client_fingerprint = [1; 32];
+        runtime.apply_config(initial).await.unwrap();
+
+        let mut invalid = config(
+            b"invalid",
+            vec![compiled(
+                "broken",
+                "node-b",
+                json!({
+                    "address": addresses[1].to_string(),
+                    "protocol": {"type": "not-a-real-protocol"},
+                }),
+                Some(vec![]),
+            )],
+        );
+        invalid.dns_client_fingerprint = [2; 32];
+        runtime.apply_config(invalid).await.unwrap_err();
+        assert_eq!(runtime.engine().dns_cache_generation().await, 0);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dns_rotation_before_first_listener_failure_is_reported_as_rolled_back() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"initial",
+                vec![compiled("edge", "node-a", vless(address), Some(vec![]))],
+            ))
+            .await
+            .unwrap();
+        let previous = runtime
+            .read_state()
+            .current
+            .clone()
+            .expect("published topology");
+        let previous_replay = runtime.capture_replay_state(&previous).unwrap();
+
+        assert_eq!(runtime.engine().rotate_dns_client_generation().await, 1);
+        let error = runtime
+            .finish_failed_transaction(
+                previous,
+                previous_replay,
+                StepFailure::unchanged("first listener rejected candidate"),
+                Vec::new(),
+                true,
+                true,
+            )
+            .await;
+
+        assert!(error.rolled_back(), "{error}");
+        assert!(!error.state_unchanged());
+        assert!(error.running());
+        assert_eq!(runtime.engine().dns_cache_generation().await, 2);
+        assert!(runtime.engine().get_inbound("edge").is_some());
+        runtime.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2109,6 +3746,518 @@ mod tests {
                 .is_empty()
         );
         runtime.close().await.expect("close runtime");
+    }
+
+    #[test]
+    fn pending_traffic_aggregates_actual_records_and_skips_zero_records() {
+        let mut pending = PendingTraffic::new(1);
+        let record = |user: &str, up: u64, down: u64, at: u64| TrafficDrain {
+            inbound_tag: "edge".to_string(),
+            node_id: "node-a".to_string(),
+            protocol: "vless".to_string(),
+            user_id: user.to_string(),
+            uplink_bytes: up,
+            downlink_bytes: down,
+            observed_at: Some(UNIX_EPOCH + Duration::from_secs(at)),
+        };
+
+        pending.merge(record("zero", 0, 0, 1)).unwrap();
+        assert!(pending.entries.is_empty());
+        pending.merge(record("alice", 3, 4, 1)).unwrap();
+        pending.merge(record("alice", 5, 6, 2)).unwrap();
+        assert!(pending.merge(record("bob", 1, 1, 3)).is_err());
+        let drained = pending.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            (drained[0].uplink_bytes, drained[0].downlink_bytes),
+            (8, 10)
+        );
+        assert_eq!(
+            drained[0].observed_at,
+            Some(UNIX_EPOCH + Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn more_than_legacy_limit_zero_receipts_consume_no_pending_keys() {
+        let mut pending = PendingTraffic::new(MAX_PENDING_TRAFFIC_KEYS);
+        for index in 0..=65_536_u32 {
+            let drain = TrafficDrain {
+                inbound_tag: "edge".to_string(),
+                node_id: "node-a".to_string(),
+                protocol: "vless".to_string(),
+                user_id: format!("user-{index}"),
+                uplink_bytes: 0,
+                downlink_bytes: 0,
+                observed_at: None,
+            };
+            let key = TrafficDrainKey::from(&drain);
+            let owns_reservation = pending.reserve(&key).unwrap();
+            pending.merge_reserved(drain, owns_reservation);
+        }
+        assert!(pending.entries.is_empty());
+        assert!(pending.reserved.is_empty());
+        assert!(pending.drain().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retained_pending_traffic_does_not_discard_a_later_user_tail() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        let initial = config(
+            b"with-alice",
+            vec![compiled(
+                "edge",
+                "node-a",
+                vless(address),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        );
+        runtime.apply_config(initial).await.unwrap();
+        let registry = runtime.engine().get_inbound("edge").unwrap();
+        let alice = registry
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap();
+        alice.add_rx(9);
+        {
+            let mut pending = runtime.pending_traffic();
+            pending
+                .merge(TrafficDrain {
+                    inbound_tag: "historic".to_string(),
+                    node_id: "historic".to_string(),
+                    protocol: "vless".to_string(),
+                    user_id: "bob".to_string(),
+                    uplink_bytes: 1,
+                    downlink_bytes: 0,
+                    observed_at: Some(SystemTime::now()),
+                })
+                .unwrap();
+        }
+
+        runtime
+            .apply_config(config(
+                b"without-alice",
+                vec![compiled("edge", "node-a", vless(address), Some(vec![]))],
+            ))
+            .await
+            .expect("pending history must not make a destructive receipt fallible");
+        let drains = runtime.drain_traffic().await.unwrap();
+        assert_eq!(drains.len(), 2);
+        assert!(drains.iter().any(|drain| {
+            drain.inbound_tag == "edge" && drain.user_id == "alice" && drain.uplink_bytes == 9
+        }));
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_traffic_drain_while_waiting_for_apply_keeps_counters() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"initial",
+                vec![compiled(
+                    "edge",
+                    "node-a",
+                    vless(address),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                )],
+            ))
+            .await
+            .unwrap();
+        runtime
+            .engine()
+            .get_inbound("edge")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap()
+            .add_rx(29);
+
+        let apply = runtime.inner.apply.lock().await;
+        let mut cancelled = Box::pin(runtime.drain_traffic());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), cancelled.as_mut())
+                .await
+                .is_err(),
+            "the drain must still be waiting for the held apply lock"
+        );
+        drop(cancelled);
+        drop(apply);
+
+        let drains = runtime.drain_traffic().await.unwrap();
+        assert_eq!(drains.len(), 1);
+        assert_eq!(drains[0].user_id, "alice");
+        assert_eq!(drains[0].uplink_bytes, 29);
+        assert!(runtime.drain_traffic().await.unwrap().is_empty());
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_keeps_candidate_metadata_when_pending_capacity_blocks_rollback_stop() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        let candidate = normalize(config(
+            b"candidate",
+            vec![compiled(
+                "candidate",
+                "candidate-node",
+                vless(address),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        ))
+        .unwrap()
+        .inbounds
+        .remove("candidate")
+        .unwrap();
+        runtime
+            .engine()
+            .add_inbound(candidate.compiled.spec.clone())
+            .await
+            .unwrap();
+        let alice = runtime
+            .engine()
+            .get_inbound("candidate")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap();
+        alice.add_rx(41);
+
+        {
+            let mut pending = runtime.pending_traffic();
+            pending.max_keys = 1;
+            pending
+                .merge(TrafficDrain {
+                    inbound_tag: "historic".to_string(),
+                    node_id: "historic-node".to_string(),
+                    protocol: "vless".to_string(),
+                    user_id: "historic-user".to_string(),
+                    uplink_bytes: 1,
+                    downlink_bytes: 0,
+                    observed_at: Some(SystemTime::now()),
+                })
+                .unwrap();
+        }
+
+        let error = runtime
+            .finish_failed_transaction(
+                NormalizedConfig::default(),
+                BTreeMap::new(),
+                StepFailure {
+                    operation: "later candidate failed".to_string(),
+                    rollback: Vec::new(),
+                    changed: true,
+                    restored: true,
+                },
+                vec![Undo::RemoveInbound {
+                    accounting: ShoesRuntime::uncommitted_accounting_owner(None, &candidate),
+                    live: candidate,
+                }],
+                false,
+                false,
+            )
+            .await;
+        assert!(error.rollback_error().is_some(), "{error}");
+        assert!(runtime.read_state().current.is_none());
+        assert_eq!(
+            runtime
+                .read_state()
+                .recovery_live
+                .get("candidate")
+                .unwrap()
+                .live
+                .compiled
+                .node_id,
+            "candidate-node"
+        );
+
+        let historic = runtime.drain_traffic().await.unwrap();
+        assert_eq!(historic.len(), 1);
+        assert_eq!(historic[0].node_id, "historic-node");
+
+        runtime
+            .apply_config(config(b"recovered", vec![]))
+            .await
+            .expect("the next apply cleans the retained candidate after capacity is drained");
+        assert!(runtime.engine().list_inbounds().is_empty());
+        let tail = runtime.drain_traffic().await.unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].inbound_tag, "candidate");
+        assert_eq!(tail[0].node_id, "candidate");
+        assert_eq!(tail[0].user_id, "alice");
+        assert_eq!(tail[0].uplink_bytes, 41);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_tag_survivor_uses_candidate_metadata_then_restores_old_replay_lineage() {
+        let addresses = free_addrs(2);
+        let runtime = runtime().await;
+        let old_config = config(
+            b"old",
+            vec![compiled(
+                "edge",
+                "old-node",
+                vless(addresses[0]),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        );
+        runtime.apply_config(old_config.clone()).await.unwrap();
+        let previous = runtime.read_state().current.clone().unwrap();
+        let previous_replay = runtime.capture_replay_state(&previous).unwrap();
+        let lease = previous_replay.get("edge").unwrap().clone();
+        let old = previous.inbounds.get("edge").unwrap().clone();
+        runtime.stop_inbound(&old).await.unwrap();
+
+        let mut candidate = normalize(config(
+            b"candidate",
+            vec![compiled(
+                "edge",
+                "candidate-node",
+                vless(addresses[1]),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        ))
+        .unwrap()
+        .inbounds
+        .remove("edge")
+        .unwrap();
+        candidate.compiled.protocol = "candidate-protocol".to_string();
+        runtime
+            .engine()
+            .add_inbound_with_replay(candidate.compiled.spec.clone(), &lease)
+            .await
+            .unwrap();
+        runtime
+            .engine()
+            .get_inbound("edge")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap()
+            .add_rx(23);
+        {
+            let mut pending = runtime.pending_traffic();
+            pending.max_keys = 1;
+            pending
+                .merge(TrafficDrain {
+                    inbound_tag: "historic".to_string(),
+                    node_id: "historic-node".to_string(),
+                    protocol: "vless".to_string(),
+                    user_id: "historic-user".to_string(),
+                    uplink_bytes: 1,
+                    downlink_bytes: 0,
+                    observed_at: Some(SystemTime::now()),
+                })
+                .unwrap();
+        }
+
+        let error = runtime
+            .finish_failed_transaction(
+                previous,
+                previous_replay,
+                StepFailure {
+                    operation: "later replacement failed".to_string(),
+                    rollback: Vec::new(),
+                    changed: true,
+                    restored: true,
+                },
+                vec![
+                    Undo::AddInbound {
+                        inbound: old.clone(),
+                        replay: lease.clone(),
+                    },
+                    Undo::RemoveInbound {
+                        live: candidate,
+                        accounting: old,
+                    },
+                ],
+                false,
+                false,
+            )
+            .await;
+        assert!(error.rollback_error().is_some(), "{error}");
+        {
+            let state = runtime.read_state();
+            let survivor = state.recovery_live.get("edge").unwrap();
+            assert_eq!(survivor.live.compiled.node_id, "candidate-node");
+            assert_eq!(survivor.live.compiled.protocol, "candidate-protocol");
+            assert_eq!(survivor.accounting.compiled.node_id, "old-node");
+            assert_eq!(survivor.accounting.compiled.protocol, "vless");
+        }
+
+        assert_eq!(runtime.drain_traffic().await.unwrap().len(), 1);
+        runtime
+            .apply_config(old_config)
+            .await
+            .expect("draining capacity lets recovery retire the candidate and rebuild old");
+        let drains = runtime.drain_traffic().await.unwrap();
+        let tail = drains
+            .iter()
+            .find(|drain| drain.user_id == "alice")
+            .expect("candidate tail survives recovery");
+        assert_eq!(tail.node_id, "old-node");
+        assert_eq!(tail.protocol, "vless");
+        assert_eq!(tail.uplink_bytes, 23);
+        assert_eq!(
+            runtime.engine().preserve_inbound_replay("edge").unwrap(),
+            lease
+        );
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_recovery_relabels_rebuilt_listener_before_the_next_retry() {
+        let addresses = free_addrs(3);
+        let runtime = runtime().await;
+        let old_config = config(
+            b"old",
+            vec![
+                compiled(
+                    "a",
+                    "old-node-a",
+                    vless(addresses[0]),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                ),
+                compiled("b", "old-node-b", vless(addresses[1]), Some(vec![])),
+            ],
+        );
+        runtime.apply_config(old_config).await.unwrap();
+        let previous = runtime.read_state().current.clone().unwrap();
+        let replay = runtime.capture_replay_state(&previous).unwrap();
+        for inbound in previous.inbounds.values() {
+            runtime.stop_inbound(inbound).await.unwrap();
+        }
+
+        let mut candidate = normalize(config(
+            b"candidate",
+            vec![compiled(
+                "a",
+                "candidate-node-a",
+                vless(addresses[2]),
+                Some(vec![user("alice", ALICE_UUID)]),
+            )],
+        ))
+        .unwrap()
+        .inbounds
+        .remove("a")
+        .unwrap();
+        candidate.compiled.protocol = "candidate-protocol".to_string();
+        runtime
+            .engine()
+            .add_inbound_with_replay(candidate.compiled.spec.clone(), replay.get("a").unwrap())
+            .await
+            .unwrap();
+        {
+            let mut state = runtime.write_state();
+            state.current = None;
+            state.recovery = Some(previous.clone());
+            state.recovery_live = BTreeMap::from([(
+                "a".to_string(),
+                RetiringInbound {
+                    live: candidate,
+                    accounting: previous.inbounds.get("a").unwrap().clone(),
+                },
+            )]);
+        }
+        *runtime.recovery_replay() = replay;
+
+        let blocker = TcpListener::bind(addresses[1]).expect("block old inbound b");
+        runtime
+            .recover_if_needed()
+            .await
+            .expect_err("old inbound b cannot be rebuilt while its port is occupied");
+        {
+            let state = runtime.read_state();
+            let live = state.recovery_live.get("a").unwrap();
+            assert_eq!(live.live.compiled.node_id, "old-node-a");
+            assert_eq!(live.live.compiled.protocol, "vless");
+            assert_eq!(live.accounting.compiled.node_id, "old-node-a");
+        }
+
+        runtime
+            .engine()
+            .get_inbound("a")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap()
+            .add_rx(37);
+        drop(blocker);
+        runtime.recover_if_needed().await.unwrap();
+
+        let drains = runtime.drain_traffic().await.unwrap();
+        let tail = drains
+            .iter()
+            .find(|drain| drain.user_id == "alice" && drain.uplink_bytes == 37)
+            .expect("the partial recovery listener's tail is retained");
+        assert_eq!(tail.node_id, "old-node-a");
+        assert_eq!(tail.protocol, "vless");
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_stop_accepts_a_configured_id_after_its_receipt_was_collected() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"initial",
+                vec![compiled(
+                    "edge",
+                    "node-a",
+                    vless(address),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let inbound = runtime
+            .read_state()
+            .current
+            .as_ref()
+            .unwrap()
+            .inbounds
+            .get("edge")
+            .unwrap()
+            .clone();
+        let alice = runtime
+            .engine()
+            .get_inbound("edge")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap();
+        alice.add_rx(13);
+        let reservation = runtime.reserve_traffic(&inbound, "alice").unwrap();
+        let info = runtime
+            .remove_user_with_retry("edge", "alice")
+            .await
+            .unwrap();
+        runtime.queue_traffic(reservation, &inbound, info);
+        assert!(runtime.engine().list_users("edge").unwrap().is_empty());
+
+        let retiring = RetiringInbound {
+            live: inbound.clone(),
+            accounting: inbound,
+        };
+        runtime
+            .force_stop_tag("edge", Some(&retiring), "vless")
+            .await
+            .expect("known-only ids may already have a durable receipt");
+        assert!(runtime.engine().get_inbound("edge").is_none());
+        let drains = runtime.drain_traffic().await.unwrap();
+        assert_eq!(drains.len(), 1);
+        assert_eq!(drains[0].uplink_bytes, 13);
+        runtime.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2266,13 +4415,14 @@ mod tests {
         let blocker = TcpListener::bind("127.0.0.1:0").expect("hold conflict port");
         let blocked = blocker.local_addr().expect("read conflict port");
         let runtime = runtime().await;
-        let candidate = config(
+        let mut candidate = config(
             b"candidate",
             vec![
                 compiled("a", "node-a", vless(free), Some(vec![])),
                 compiled("b", "node-b", vless(blocked), Some(vec![])),
             ],
         );
+        candidate.dns_client_fingerprint = [1; 32];
 
         // a starts, b fails, and the journal removes a again.  The exact empty
         // topology is known, but Go/ACP reserves ROLLED_BACK for restoring a
@@ -2285,13 +4435,159 @@ mod tests {
         assert!(!error.state_unchanged());
         assert!(runtime.engine().list_inbounds().is_empty());
         assert!(runtime.current_config().is_empty());
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            1,
+            "the failed first Box candidate must leave behind a fresh empty DNS generation"
+        );
 
         drop(blocker);
         runtime
             .apply_config(candidate)
             .await
             .expect("known empty state accepts a later apply");
+        assert_eq!(
+            runtime.engine().dns_cache_generation().await,
+            1,
+            "the retry must use the clean generation rather than the failed candidate's state"
+        );
         runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fully_restored_outer_rollback_prunes_dormant_candidate_urltest_groups() {
+        let address = free_addrs(1)[0];
+        let blocker = TcpListener::bind("127.0.0.1:0").expect("hold conflict port");
+        let blocked = blocker.local_addr().expect("read conflict port");
+        let with_urltest = |address: SocketAddr, shared_id: &str| {
+            json!({
+                "address": address.to_string(),
+                "protocol": {"type": "vless", "udp_enabled": false},
+                "rules": [{
+                    "masks": "0.0.0.0/0",
+                    "action": "allow",
+                    "client_chains": [{"chain": ["direct"]}],
+                    "client_chain_selection": {
+                        "type": "urltest",
+                        "shared_id": shared_id,
+                        "history_keys": [shared_id],
+                        "failure_history_keys": [shared_id],
+                        "url": "http://127.0.0.1:9/generate_204",
+                        "interval_millis": 60000,
+                        "tolerance_millis": 50,
+                        "idle_timeout_millis": 1800000,
+                    },
+                }],
+            })
+        };
+
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"urltest-a",
+                vec![compiled(
+                    "edge",
+                    "node-a",
+                    with_urltest(address, "node-agent-urltest-v1:rollback-a"),
+                    Some(vec![]),
+                )],
+            ))
+            .await
+            .expect("start the published URLTest group");
+        assert_eq!(runtime.engine().client_chain_group_count().await, 1);
+
+        let error = runtime
+            .apply_config(config(
+                b"urltest-b-then-fail",
+                vec![
+                    compiled(
+                        "edge",
+                        "node-a",
+                        with_urltest(address, "node-agent-urltest-v1:rollback-b"),
+                        Some(vec![]),
+                    ),
+                    compiled("blocked", "node-b", vless(blocked), Some(vec![])),
+                ],
+            ))
+            .await
+            .expect_err("the later inbound bind must fail after publishing group B");
+        assert!(error.rolled_back(), "unexpected error: {error}");
+        assert_eq!(runtime.current_config(), b"urltest-a");
+        assert_eq!(
+            runtime.engine().client_chain_group_count().await,
+            1,
+            "outer rollback keeps restored A and prunes dormant candidate B"
+        );
+
+        drop(blocker);
+        runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn urltest_probe_dns_uses_prepared_rule_set_snapshots_on_first_apply_and_refresh() {
+        let initial_bytes = source_rule_set("first.example");
+        let (url, server_state, server_cancel, server_task) =
+            start_rule_set_server(initial_bytes.clone()).await;
+        let temporary = tempfile::tempdir().expect("create rule-set cache directory");
+        let cache_path = temporary.path().join("probe-rules.json");
+        let probe_dns = json!({
+            "servers": [{"tag": "system", "url": "system"}],
+            "final": "system",
+            "rules": [{
+                "rule_set": [{
+                    "format": "source",
+                    "path": cache_path.to_string_lossy(),
+                }],
+                "action": "reject",
+            }],
+        });
+        let candidate = |snapshot: &'static [u8]| RuntimeConfig {
+            inbounds: Vec::new(),
+            rule_sets: vec![RuleSetResource {
+                tag: "probe".into(),
+                format: "source".into(),
+                path: cache_path.clone(),
+                source: RuleSetSource::Remote { url: url.clone() },
+                update_interval: Duration::from_nanos(1),
+            }],
+            diagnostic_yaml: snapshot.to_vec(),
+            dns_client_fingerprint: [0; 32],
+            urltest_probe_dns: Some(probe_dns.clone()),
+        };
+
+        let runtime = runtime().await;
+        runtime
+            .apply_transaction_locked(candidate(b"probe-first"), false)
+            .await
+            .expect("the first probe-only rule-set uses its prepared snapshot");
+        assert_eq!(runtime.current_config(), b"probe-first");
+        assert_eq!(
+            tokio::fs::read(&cache_path)
+                .await
+                .expect("first successful apply publishes the stable cache"),
+            initial_bytes
+        );
+
+        server_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .body =
+            br#"{"version":4,"rules":[{"domain":["invalid.example"],"port":[53]}]}"#.to_vec();
+        let error = runtime
+            .apply_transaction_locked(candidate(b"probe-invalid-refresh"), false)
+            .await
+            .expect_err("probe DNS must preflight the refreshed immutable snapshot");
+        assert!(error.state_unchanged(), "unexpected error: {error}");
+        assert_eq!(runtime.current_config(), b"probe-first");
+        assert_eq!(
+            tokio::fs::read(&cache_path)
+                .await
+                .expect("failed refresh preserves the first last-good cache"),
+            source_rule_set("first.example")
+        );
+        runtime.close().await.expect("close runtime");
+        server_cancel.cancel();
+        server_task.await.expect("stop rule-set server");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2327,17 +4623,19 @@ mod tests {
             inbounds: vec![compiled("edge", "node-a", inbound_config, Some(vec![]))],
             rule_sets: vec![resource.clone()],
             diagnostic_yaml: b"watched-v1".to_vec(),
+            dns_client_fingerprint: [0; 32],
+            urltest_probe_dns: None,
         };
         let runtime = runtime().await;
         runtime
             .apply_config(watched.clone())
             .await
             .expect("start watched topology");
-        let initial_revision = runtime
+        let initial_inbound = runtime
             .engine()
             .get_inbound("edge")
-            .expect("watched inbound")
-            .revision();
+            .expect("watched inbound");
+        let initial_revision = initial_inbound.revision();
         let (initial_generation, initial_cancel) = {
             let watcher = runtime.rule_set_watcher();
             (
@@ -2364,14 +4662,12 @@ mod tests {
         };
         wait_for_request_after(&server_state, requests_before_invalid).await;
         tokio::time::sleep(interval + interval).await;
-        assert_eq!(
-            runtime
-                .engine()
-                .get_inbound("edge")
-                .expect("old inbound survives candidate parse failure")
-                .revision(),
-            initial_revision
-        );
+        let after_invalid = runtime
+            .engine()
+            .get_inbound("edge")
+            .expect("old inbound survives candidate parse failure");
+        assert!(Arc::ptr_eq(&after_invalid, &initial_inbound));
+        assert_eq!(after_invalid.revision(), initial_revision);
         assert_eq!(
             tokio::fs::read(&cache_path)
                 .await
@@ -2423,7 +4719,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .body = source_rule_set("second.example");
-        let second_revision = wait_for_revision(&runtime, "edge", initial_revision).await;
+        let (second_inbound, second_revision) =
+            wait_for_inbound_generation(&runtime, "edge", &initial_inbound, initial_revision).await;
+        assert!(
+            !Arc::ptr_eq(&second_inbound, &initial_inbound),
+            "rule-set bytes rotate the complete DNS/Box generation"
+        );
         wait_for_cache(&cache_path, &source_rule_set("second.example")).await;
         assert_eq!(
             tokio::fs::read(&cache_path)
@@ -2445,14 +4746,12 @@ mod tests {
         };
         wait_for_request_after(&server_state, requests_before_failure).await;
         tokio::time::sleep(interval + interval).await;
-        assert_eq!(
-            runtime
-                .engine()
-                .get_inbound("edge")
-                .expect("old inbound survives download failure")
-                .revision(),
-            second_revision
-        );
+        let after_download_failure = runtime
+            .engine()
+            .get_inbound("edge")
+            .expect("old inbound survives download failure");
+        assert!(Arc::ptr_eq(&after_download_failure, &second_inbound));
+        assert_eq!(after_download_failure.revision(), second_revision);
         assert_eq!(runtime.current_config(), b"watched-v1");
 
         {
@@ -2462,8 +4761,12 @@ mod tests {
             state.body = source_rule_set("third.example");
             state.fail = false;
         }
-        let third_revision = wait_for_revision(&runtime, "edge", second_revision).await;
-        assert!(third_revision > second_revision);
+        let (third_inbound, _third_revision) =
+            wait_for_inbound_generation(&runtime, "edge", &second_inbound, second_revision).await;
+        assert!(
+            !Arc::ptr_eq(&third_inbound, &second_inbound),
+            "the next rule-set content change publishes another complete Box"
+        );
         wait_for_cache(&cache_path, &source_rule_set("third.example")).await;
         assert_eq!(
             tokio::fs::read(&cache_path)

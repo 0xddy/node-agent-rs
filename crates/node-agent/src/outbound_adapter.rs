@@ -36,12 +36,23 @@ use std::net::IpAddr;
 
 use serde_json::{Map, Value, json};
 
+/// Maximum number of outbounds on any selector, URLTest, or detour reference path.
+///
+/// This is a local fail-loud resource-governance boundary, not a claim that Go
+/// imposes the same limit. Catalog validation enforces it across inactive
+/// references, while the adapter keeps its own guard because it is also exposed
+/// as a standalone API.
+pub const MAX_OUTBOUND_REFERENCE_DEPTH: usize = 128;
+
 /// A borrowed outbound returned by an [`OutboundCatalog`].
 #[derive(Debug, Clone, Copy)]
 pub struct OutboundRef<'a> {
+    /// Stable identity within the immutable catalog that produced this handle.
+    pub id: usize,
     pub kind: &'a str,
     pub tag: &'a str,
     pub options: &'a Value,
+    pub dns_resolver: Option<&'a str>,
 }
 
 /// Lookup used to resolve selector members and detours.
@@ -80,9 +91,11 @@ impl OutboundDefinition {
 impl OutboundCatalog for BTreeMap<String, OutboundDefinition> {
     fn resolve(&self, tag: &str) -> Option<OutboundRef<'_>> {
         self.get(tag).map(|outbound| OutboundRef {
+            id: std::ptr::from_ref(outbound).addr(),
             kind: &outbound.kind,
             tag: &outbound.tag,
             options: &outbound.options,
+            dns_resolver: None,
         })
     }
 }
@@ -116,12 +129,70 @@ pub fn compile_client_chains<C: OutboundCatalog + ?Sized>(
     options: &Value,
     catalog: &C,
 ) -> Result<Value, OutboundAdapterError> {
+    let mut cache = SelectorProjectionCache::default();
+    compile_client_chains_cached(kind, tag, options, catalog, &mut cache)
+}
+
+/// Static selector choices reusable while projecting one already-validated,
+/// immutable outbound catalog.
+///
+/// This is crate-visible so the topology compiler can share work across route,
+/// DNS, URLTest, and detour projections. Only the selected outbound handle is cached: full
+/// chain suffixes are deliberately not retained at every recursive node because
+/// that would consume quadratic memory for a deep chain with large hop options.
+/// The public standalone entry point above creates a fresh cache for each call.
+#[derive(Debug, Default)]
+pub(crate) struct SelectorProjectionCache<'a> {
+    selected: BTreeMap<usize, OutboundRef<'a>>,
+}
+
+impl<'a> SelectorProjectionCache<'a> {
+    pub(crate) fn selected(&self, id: usize) -> Option<OutboundRef<'a>> {
+        self.selected.get(&id).copied()
+    }
+
+    pub(crate) fn remember(&mut self, id: usize, selected: OutboundRef<'a>) {
+        self.selected.insert(id, selected);
+    }
+}
+
+pub(crate) fn compile_client_chains_cached<'a, C: OutboundCatalog + ?Sized>(
+    kind: &str,
+    tag: &str,
+    options: &Value,
+    catalog: &'a C,
+    cache: &mut SelectorProjectionCache<'a>,
+) -> Result<Value, OutboundAdapterError> {
     let mut adapter = Adapter {
         catalog,
-        active_tags: Vec::new(),
+        active_ids: Vec::new(),
+        follow_references: true,
+        selector_cache: cache,
     };
     let hops = adapter.compile(kind, tag, options)?;
     Ok(Value::Array(vec![json!({ "chain": hops.into_values() })]))
+}
+
+/// Validate one outbound's local options and immediate references without
+/// recursively compiling the referenced graph.
+///
+/// Callers that own the complete catalog must separately validate graph cycles
+/// and depth.  Keeping this pass shallow lets a catalog validate every outbound
+/// exactly once, including inactive selector members.
+pub fn validate_client_outbound<C: OutboundCatalog + ?Sized>(
+    kind: &str,
+    tag: &str,
+    options: &Value,
+    catalog: &C,
+) -> Result<(), OutboundAdapterError> {
+    let mut selector_cache = SelectorProjectionCache::default();
+    let mut adapter = Adapter {
+        catalog,
+        active_ids: Vec::new(),
+        follow_references: false,
+        selector_cache: &mut selector_cache,
+    };
+    adapter.compile(kind, tag, options).map(drop)
 }
 
 #[derive(Debug, Clone)]
@@ -141,59 +212,138 @@ impl Chain {
     }
 }
 
-struct Adapter<'a, C: OutboundCatalog + ?Sized> {
-    catalog: &'a C,
-    active_tags: Vec<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveOutboundIdentity {
+    Root,
+    Catalog(usize),
 }
 
-impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
+struct Adapter<'catalog, 'cache, C: OutboundCatalog + ?Sized> {
+    catalog: &'catalog C,
+    active_ids: Vec<ActiveOutboundIdentity>,
+    follow_references: bool,
+    selector_cache: &'cache mut SelectorProjectionCache<'catalog>,
+}
+
+impl<'catalog, C: OutboundCatalog + ?Sized> Adapter<'catalog, '_, C> {
     fn compile(
         &mut self,
         kind: &str,
         tag: &str,
         options: &Value,
     ) -> Result<Chain, OutboundAdapterError> {
+        let catalog = self.catalog;
+        let identity = catalog
+            .resolve(tag)
+            .filter(|outbound| {
+                outbound.tag == tag
+                    && outbound.kind == kind
+                    && std::ptr::eq(outbound.options, options)
+            })
+            .map_or(ActiveOutboundIdentity::Root, |outbound| {
+                ActiveOutboundIdentity::Catalog(outbound.id)
+            });
+        self.compile_with_dns(
+            identity,
+            kind,
+            tag,
+            options,
+            catalog.dns_resolver(tag),
+            true,
+        )
+    }
+
+    fn compile_outbound_ref(
+        &mut self,
+        outbound: OutboundRef<'catalog>,
+    ) -> Result<Chain, OutboundAdapterError> {
+        self.compile_with_dns(
+            ActiveOutboundIdentity::Catalog(outbound.id),
+            outbound.kind,
+            outbound.tag,
+            outbound.options,
+            outbound.dns_resolver,
+            true,
+        )
+    }
+
+    fn compile_cached_outbound_ref(
+        &mut self,
+        outbound: OutboundRef<'catalog>,
+    ) -> Result<Chain, OutboundAdapterError> {
+        self.compile_with_dns(
+            ActiveOutboundIdentity::Catalog(outbound.id),
+            outbound.kind,
+            outbound.tag,
+            outbound.options,
+            outbound.dns_resolver,
+            false,
+        )
+    }
+
+    fn compile_with_dns(
+        &mut self,
+        identity: ActiveOutboundIdentity,
+        kind: &str,
+        tag: &str,
+        options: &Value,
+        dns_resolver: Option<&str>,
+        validate_tag: bool,
+    ) -> Result<Chain, OutboundAdapterError> {
         let kind = kind.trim();
-        let tag = tag.trim();
         if kind.is_empty() {
             return Err(OutboundAdapterError::new("outbound type is required"));
         }
-        if tag.is_empty() {
+        if validate_tag && tag.trim().is_empty() {
             return Err(OutboundAdapterError::new(format!(
                 "outbound {kind:?} tag is required"
             )));
         }
-        if let Some(cycle_start) = self.active_tags.iter().position(|active| active == tag) {
-            let mut cycle = self.active_tags[cycle_start..].to_vec();
-            cycle.push(tag.to_string());
+        if self.active_ids.contains(&identity) {
             return Err(OutboundAdapterError::new(format!(
-                "outbound reference cycle: {}",
-                cycle.join(" -> ")
+                "outbound reference cycle at outbound {tag:?}"
             )));
         }
-
+        if self.active_ids.len() >= MAX_OUTBOUND_REFERENCE_DEPTH {
+            return Err(OutboundAdapterError::new(format!(
+                "outbound reference depth exceeds maximum {MAX_OUTBOUND_REFERENCE_DEPTH} at outbound {tag:?}"
+            )));
+        }
+        if self.follow_references
+            && kind == "selector"
+            && let ActiveOutboundIdentity::Catalog(id) = identity
+            && let Some(selected) = self.selector_cache.selected(id)
+        {
+            self.active_ids.push(identity);
+            // Cache entries are installed only after a successful recursive
+            // compile (or by the validated topology compiler), so their tag
+            // shape need not be rescanned on every shared-suffix hit.
+            let result = self.compile_cached_outbound_ref(selected);
+            self.active_ids.pop();
+            return result;
+        }
         let fields = options.as_object().ok_or_else(|| {
             OutboundAdapterError::new(format!(
                 "outbound {tag:?} ({kind}) options must be a JSON object"
             ))
         })?;
 
-        self.active_tags.push(tag.to_string());
+        self.active_ids.push(identity);
         let result = match kind {
-            "direct" => self.compile_direct(tag, fields),
-            "shadowsocks" => self.compile_shadowsocks(tag, fields),
-            "trojan" => self.compile_trojan(tag, fields),
-            "vless" => self.compile_vless(tag, fields),
-            "selector" => self.compile_selector(tag, fields),
+            "direct" => self.compile_direct(tag, fields, dns_resolver),
+            "shadowsocks" => self.compile_shadowsocks(tag, fields, dns_resolver),
+            "trojan" => self.compile_trojan(tag, fields, dns_resolver),
+            "vless" => self.compile_vless(tag, fields, dns_resolver),
+            "selector" => self.compile_selector(identity, tag, fields),
             "urltest" => Err(OutboundAdapterError::new(format!(
                 "outbound {tag:?} uses urltest; shoes has no equivalent active health-check and latency-selection client"
             ))),
-            "hysteria2" => self.compile_hysteria2(tag, fields),
+            "hysteria2" => self.compile_hysteria2(tag, fields, dns_resolver),
             other => Err(OutboundAdapterError::new(format!(
                 "outbound {tag:?} has unsupported type {other:?}"
             ))),
         };
-        self.active_tags.pop();
+        self.active_ids.pop();
         result
     }
 
@@ -201,6 +351,7 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
         &mut self,
         tag: &str,
         fields: &Map<String, Value>,
+        dns_resolver: Option<&str>,
     ) -> Result<Chain, OutboundAdapterError> {
         reject_unknown_fields(tag, "direct", fields, DIALER_FIELD_NAMES)?;
         let dialer = DialerProjection::parse(tag, fields)?;
@@ -208,7 +359,7 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
             None,
             json!({ "type": "direct" }),
             &dialer,
-            self.catalog.dns_resolver(tag),
+            dns_resolver,
         )))
     }
 
@@ -216,6 +367,7 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
         &mut self,
         tag: &str,
         fields: &Map<String, Value>,
+        dns_resolver: Option<&str>,
     ) -> Result<Chain, OutboundAdapterError> {
         reject_unknown_fields(
             tag,
@@ -263,13 +415,14 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
         if native_udp {
             protocol["udp_mode"] = Value::String("native".into());
         }
-        self.compile_proxy_chain(tag, fields, address, protocol)
+        self.compile_proxy_chain(tag, fields, address, protocol, dns_resolver)
     }
 
     fn compile_trojan(
         &mut self,
         tag: &str,
         fields: &Map<String, Value>,
+        dns_resolver: Option<&str>,
     ) -> Result<Chain, OutboundAdapterError> {
         reject_unknown_fields(
             tag,
@@ -304,13 +457,14 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
             "udp_enabled": network == NetworkMode::Both,
         });
         let protocol = wrap_tls(tag, fields.get("tls"), false, inner)?;
-        self.compile_proxy_chain(tag, fields, address, protocol)
+        self.compile_proxy_chain(tag, fields, address, protocol, dns_resolver)
     }
 
     fn compile_vless(
         &mut self,
         tag: &str,
         fields: &Map<String, Value>,
+        dns_resolver: Option<&str>,
     ) -> Result<Chain, OutboundAdapterError> {
         reject_unknown_fields(
             tag,
@@ -381,13 +535,14 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
             }
         }
         let protocol = wrap_tls(tag, fields.get("tls"), vision, inner)?;
-        self.compile_proxy_chain(tag, fields, address, protocol)
+        self.compile_proxy_chain(tag, fields, address, protocol, dns_resolver)
     }
 
     fn compile_hysteria2(
         &mut self,
         tag: &str,
         fields: &Map<String, Value>,
+        dns_resolver: Option<&str>,
     ) -> Result<Chain, OutboundAdapterError> {
         reject_unknown_fields(
             tag,
@@ -464,12 +619,7 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
             protocol["obfs"] = obfs;
         }
 
-        let mut config = client_config(
-            Some(address),
-            protocol,
-            &dialer,
-            self.catalog.dns_resolver(tag),
-        );
+        let mut config = client_config(Some(address), protocol, &dialer, dns_resolver);
         config["transport"] = Value::String("quic".to_string());
         config["quic_settings"] = quic_settings;
         Ok(Chain::one(config))
@@ -477,10 +627,20 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
 
     fn compile_selector(
         &mut self,
+        identity: ActiveOutboundIdentity,
         tag: &str,
         fields: &Map<String, Value>,
     ) -> Result<Chain, OutboundAdapterError> {
-        reject_unknown_fields(tag, "selector", fields, &["outbounds", "default"])?;
+        reject_unknown_fields(
+            tag,
+            "selector",
+            fields,
+            &["outbounds", "default", "interrupt_exist_connections"],
+        )?;
+        // This node-agent has no selector switching control plane, so the field
+        // is inert after static folding. Its type remains part of strict Go
+        // option decoding even though either boolean value has the same output.
+        let _ = optional_bool(tag, fields, "interrupt_exist_connections")?;
         let members = required_string_array(tag, fields, "outbounds")?;
         if members.is_empty() {
             return Err(OutboundAdapterError::new(format!(
@@ -489,11 +649,7 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
         }
         let mut seen = BTreeSet::new();
         for member in &members {
-            if !seen.insert(member.as_str()) {
-                return Err(OutboundAdapterError::new(format!(
-                    "selector outbound {tag:?} contains duplicate member {member:?}"
-                )));
-            }
+            seen.insert(member.as_str());
         }
 
         let default = optional_nonempty_string(tag, fields, "default")?;
@@ -526,15 +682,41 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
         // other selector-switching control plane. It therefore selects `default`, or
         // the first member when `default` is absent. A shoes round-robin pool would
         // change that behavior on every connection and is intentionally not used.
+        // Full-catalog validation checks every member independently, including
+        // inactive edges and cycles. Runtime projection only follows the static
+        // selection so an inactive URLTest does not become an active health-check.
         let selected = default.unwrap_or(&members[0]);
-        let outbound = self
-            .catalog
-            .resolve(selected)
-            .expect("all selector members were validated above");
-        let kind = outbound.kind.to_string();
-        let resolved_tag = outbound.tag.to_string();
-        let options = outbound.options.clone();
-        self.compile(&kind, &resolved_tag, &options)
+        if !self.follow_references {
+            return Ok(Chain(Vec::new()));
+        }
+        self.compile_selector_target(identity, tag, selected)
+    }
+
+    fn compile_selector_target(
+        &mut self,
+        identity: ActiveOutboundIdentity,
+        tag: &str,
+        selected: &str,
+    ) -> Result<Chain, OutboundAdapterError> {
+        let catalog = self.catalog;
+        let outbound = catalog.resolve(selected).ok_or_else(|| {
+            OutboundAdapterError::new(format!(
+                "selector outbound {tag:?} references unknown member {selected:?}"
+            ))
+        })?;
+        if outbound.tag != selected {
+            return Err(OutboundAdapterError::new(format!(
+                "outbound catalog resolved {selected:?} as mismatched tag {:?}",
+                outbound.tag
+            )));
+        }
+        let result = self.compile_outbound_ref(outbound);
+        if result.is_ok()
+            && let ActiveOutboundIdentity::Catalog(id) = identity
+        {
+            self.selector_cache.remember(id, outbound);
+        }
+        result
     }
 
     fn compile_proxy_chain(
@@ -543,6 +725,7 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
         fields: &Map<String, Value>,
         address: String,
         protocol: Value,
+        dns_resolver: Option<&str>,
     ) -> Result<Chain, OutboundAdapterError> {
         let detour = optional_nonempty_string(tag, fields, "detour")?;
         let dialer = DialerProjection::parse(tag, fields)?;
@@ -552,17 +735,13 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
                 dialer.effective_field_names().join(", ")
             )));
         }
-        let current = client_config(
-            Some(address),
-            protocol,
-            &dialer,
-            self.catalog.dns_resolver(tag),
-        );
+        let current = client_config(Some(address), protocol, &dialer, dns_resolver);
         let Some(detour) = detour else {
             return Ok(Chain::one(current));
         };
 
-        let outbound = self.catalog.resolve(detour).ok_or_else(|| {
+        let catalog = self.catalog;
+        let outbound = catalog.resolve(detour).ok_or_else(|| {
             OutboundAdapterError::new(format!(
                 "outbound {tag:?} references unknown detour {detour:?}"
             ))
@@ -573,10 +752,10 @@ impl<C: OutboundCatalog + ?Sized> Adapter<'_, C> {
                 outbound.tag
             )));
         }
-        let kind = outbound.kind.to_string();
-        let resolved_tag = outbound.tag.to_string();
-        let options = outbound.options.clone();
-        let mut chain = self.compile(&kind, &resolved_tag, &options)?;
+        if !self.follow_references {
+            return Ok(Chain::one(current));
+        }
+        let mut chain = self.compile_outbound_ref(outbound)?;
         chain.append(current);
         Ok(chain)
     }
@@ -1131,6 +1310,8 @@ fn required_string_array(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
     fn catalog(entries: Vec<OutboundDefinition>) -> BTreeMap<String, OutboundDefinition> {
@@ -1138,6 +1319,33 @@ mod tests {
             .into_iter()
             .map(|entry| (entry.tag.clone(), entry))
             .collect()
+    }
+
+    struct CountingCatalog {
+        entries: BTreeMap<String, OutboundDefinition>,
+        resolve_calls: Cell<usize>,
+    }
+
+    impl CountingCatalog {
+        fn new(entries: Vec<OutboundDefinition>) -> Self {
+            Self {
+                entries: catalog(entries),
+                resolve_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl OutboundCatalog for CountingCatalog {
+        fn resolve(&self, tag: &str) -> Option<OutboundRef<'_>> {
+            self.resolve_calls.set(self.resolve_calls.get() + 1);
+            self.entries.get(tag).map(|outbound| OutboundRef {
+                id: std::ptr::from_ref(outbound).addr(),
+                kind: &outbound.kind,
+                tag: &outbound.tag,
+                options: &outbound.options,
+                dns_resolver: None,
+            })
+        }
     }
 
     fn assert_shoes_rule_accepts(client_chains: Value) {
@@ -1549,6 +1757,90 @@ mod tests {
     }
 
     #[test]
+    fn selector_does_not_compile_an_invalid_non_default_member() {
+        let members = catalog(vec![
+            OutboundDefinition::new("direct", "direct", json!({})),
+            OutboundDefinition::new(
+                "trojan",
+                "inactive",
+                json!({
+                    "server": "edge.example.com",
+                    "server_port": 443,
+                    "password": "secret",
+                    "bogus": true,
+                }),
+            ),
+        ]);
+
+        let chains = compile_client_chains(
+            "selector",
+            "manual",
+            &json!({ "outbounds": ["direct", "inactive"], "default": "direct" }),
+            &members,
+        )
+        .expect("standalone projection only compiles the static selection");
+        assert_eq!(chains[0]["chain"][0]["protocol"]["type"], "direct");
+    }
+
+    #[test]
+    fn selector_compiles_nested_members_and_rejects_selected_cycles() {
+        let nested = catalog(vec![
+            OutboundDefinition::new("direct", "direct", json!({})),
+            OutboundDefinition::new(
+                "selector",
+                "inner",
+                json!({ "outbounds": ["direct"], "default": "direct" }),
+            ),
+        ]);
+        let chains = compile_client_chains(
+            "selector",
+            "outer",
+            &json!({ "outbounds": ["direct", "inner"], "default": "direct" }),
+            &nested,
+        )
+        .expect("a valid inactive nested selector is still accepted");
+        assert_eq!(chains[0]["chain"][0]["protocol"]["type"], "direct");
+
+        let cyclic = catalog(vec![
+            OutboundDefinition::new("direct", "direct", json!({})),
+            OutboundDefinition::new(
+                "selector",
+                "a",
+                json!({ "outbounds": ["direct", "b"], "default": "b" }),
+            ),
+            OutboundDefinition::new(
+                "selector",
+                "b",
+                json!({ "outbounds": ["direct", "a"], "default": "a" }),
+            ),
+        ]);
+        let a = cyclic.get("a").unwrap();
+        let error = compile_client_chains(&a.kind, &a.tag, &a.options, &cyclic)
+            .expect_err("a selected selector cycle must be rejected by the adapter");
+        assert!(
+            error.to_string().contains("cycle at outbound \"a\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reference_identity_preserves_nonempty_tag_whitespace() {
+        let members = catalog(vec![OutboundDefinition::new("direct", " a ", json!({}))]);
+        let chains = compile_client_chains(
+            "selector",
+            "a",
+            &json!({ "outbounds": [" a "], "default": " a " }),
+            &members,
+        )
+        .expect("catalog references use exact tags instead of trimmed identities");
+        assert_eq!(chains[0]["chain"][0]["protocol"]["type"], "direct");
+
+        let error = compile_client_chains("direct", "   ", &json!({}), &members)
+            .expect_err("an all-whitespace tag is still empty");
+        assert!(error.to_string().contains("tag is required"), "{error}");
+    }
+
+    #[test]
     fn detour_builds_ordered_chain_and_cycles_are_rejected() {
         let entries = catalog(vec![
             OutboundDefinition::new(
@@ -1602,7 +1894,116 @@ mod tests {
         ]);
         let a = cyclic.get("a").unwrap();
         let error = compile_client_chains(&a.kind, &a.tag, &a.options, &cyclic).unwrap_err();
-        assert!(error.to_string().contains("a -> b -> a"), "{error}");
+        assert!(
+            error.to_string().contains("cycle at outbound \"a\""),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shared_wide_selector_suffix_is_parsed_once_across_cached_detours() {
+        const MEMBER_COUNT: usize = 4_096;
+        const CACHED_DETOUR_COUNT: usize = 512;
+
+        let members = vec!["terminal"; MEMBER_COUNT];
+        let catalog = CountingCatalog::new(vec![
+            OutboundDefinition::new("direct", "terminal", json!({})),
+            OutboundDefinition::new(
+                "selector",
+                "shared",
+                json!({"outbounds": members, "default": "terminal"}),
+            ),
+        ]);
+        let proxy_options = |address: &str| {
+            json!({
+                "server": address,
+                "server_port": 8388,
+                "method": "aes-128-gcm",
+                "password": "secret",
+                "network": "tcp",
+                "detour": "shared",
+            })
+        };
+        let mut cache = SelectorProjectionCache::default();
+
+        compile_client_chains_cached(
+            "shadowsocks",
+            "first",
+            &proxy_options("192.0.2.1"),
+            &catalog,
+            &mut cache,
+        )
+        .unwrap();
+        let after_first = catalog.resolve_calls.get();
+        assert_eq!(after_first, MEMBER_COUNT + 3);
+
+        for index in 0..CACHED_DETOUR_COUNT {
+            compile_client_chains_cached(
+                "shadowsocks",
+                &format!("cached-{index:03}"),
+                &proxy_options("192.0.2.2"),
+                &catalog,
+                &mut cache,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            catalog.resolve_calls.get() - after_first,
+            CACHED_DETOUR_COUNT * 2,
+            "each new root performs only its root and detour lookups; the cached selector neither rescans members nor resolves the terminal"
+        );
+    }
+
+    #[test]
+    fn cached_selector_identity_does_not_rescan_or_copy_a_long_terminal_tag() {
+        const LONG_TAG_BYTES: usize = 64 * 1024;
+        const CACHED_DETOUR_COUNT: usize = 4_096;
+
+        let terminal_tag = format!("terminal-{}", "x".repeat(LONG_TAG_BYTES));
+        let catalog = CountingCatalog::new(vec![
+            OutboundDefinition::new("direct", &terminal_tag, json!({})),
+            OutboundDefinition::new(
+                "selector",
+                "shared",
+                json!({"outbounds": [&terminal_tag], "default": &terminal_tag}),
+            ),
+        ]);
+        let proxy_options = json!({
+            "server": "192.0.2.1",
+            "server_port": 8388,
+            "method": "aes-128-gcm",
+            "password": "secret",
+            "network": "tcp",
+            "detour": "shared",
+        });
+        let mut cache = SelectorProjectionCache::default();
+
+        compile_client_chains_cached("shadowsocks", "first", &proxy_options, &catalog, &mut cache)
+            .unwrap();
+        let after_first = catalog.resolve_calls.get();
+        assert_eq!(after_first, 4);
+
+        let shared = catalog.entries.get("shared").unwrap();
+        let shared_id = std::ptr::from_ref(shared).addr();
+        let terminal = catalog.entries.get(&terminal_tag).unwrap();
+        let cached_terminal = cache.selected(shared_id).unwrap();
+        assert!(std::ptr::eq(cached_terminal.options, &terminal.options));
+
+        for index in 0..CACHED_DETOUR_COUNT {
+            compile_client_chains_cached(
+                "shadowsocks",
+                &format!("cached-{index:04}"),
+                &proxy_options,
+                &catalog,
+                &mut cache,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            catalog.resolve_calls.get() - after_first,
+            CACHED_DETOUR_COUNT * 2,
+            "cached calls perform only root and detour lookup, never a long-tag terminal lookup"
+        );
     }
 
     #[test]

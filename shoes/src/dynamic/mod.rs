@@ -53,9 +53,15 @@ mod reload;
 mod static_registry;
 mod user;
 
+pub use crate::client_proxy_chain::{
+    ClientChainGroupRegistry, ClientChainGroupTransaction, with_client_chain_group_registry,
+};
+pub use crate::tcp::inbound_replay::{
+    InboundReplayScope, InboundReplayScopeWeak, InboundReplayState,
+};
 pub use meter::{
     ConnContext, TrafficMeterStream, bind_connection_user, current_connection, scope_connection,
-    scope_connection_until_cancelled,
+    scope_connection_until_cancelled, spawn_connection_until_cancelled,
 };
 pub use registry::{ShadowsocksIdentity, TuicIdentity, UserRegistry, VmessIdentity};
 pub use reload::{HandlerSlot, SelectorSlot, ServerHandle};

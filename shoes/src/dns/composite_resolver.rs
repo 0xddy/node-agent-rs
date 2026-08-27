@@ -5,6 +5,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::address::NetLocation;
 use crate::resolver::Resolver;
@@ -77,5 +78,14 @@ impl Resolver for CompositeResolver {
 
             Err(last_error.unwrap_or_else(|| std::io::Error::other("no DNS resolvers configured")))
         })
+    }
+
+    fn result_cache_ttl(&self) -> Option<Duration> {
+        let mut effective = None;
+        for resolver in &self.resolvers {
+            let ttl = resolver.result_cache_ttl()?;
+            effective = Some(effective.map_or(ttl, |current: Duration| current.min(ttl)));
+        }
+        effective.or(Some(Duration::from_secs(60 * 60)))
     }
 }

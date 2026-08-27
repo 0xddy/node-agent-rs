@@ -88,22 +88,29 @@ mod inbound;
 mod protocol;
 mod users;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use log::{debug, info, warn};
+use sha2::{Digest as _, Sha256};
 use tokio::task::{JoinError, JoinHandle};
 
 use shoes::config::{
     BindLocation, Config, ExpandedDnsGroup, ServerConfig, Transport, ValidatedConfigs,
     convert_cert_paths,
 };
-use shoes::dns::{DnsRegistry, build_dns_registry};
-use shoes::dynamic::{ServerHandle, UserRegistry};
+#[cfg(test)]
+use shoes::dns::build_dns_registry;
+use shoes::dns::{DnsRegistry, PolicyStateRegistry, build_dns_registry_with_policy_state};
+use shoes::dynamic::{
+    ClientChainGroupRegistry, InboundReplayScope, InboundReplayScopeWeak, InboundReplayState,
+    ServerHandle, UserRegistry,
+};
 use shoes::resolver::Resolver;
-use shoes::tcp::tcp_server::start_servers_with_users;
+use shoes::tcp::tcp_server::start_servers_with_users_and_replay_scope;
 
 pub use error::{EngineError, EngineResult};
 pub use inbound::InboundSlot;
@@ -123,6 +130,38 @@ use inbound::{BindKey, BindTargets, SocketKind};
 ///
 /// See [`InboundSlot::take_dead_listener`] for why this probe is needed at all.
 const LISTENER_HEALTH_GRACE: Duration = Duration::from_millis(50);
+const MAX_REPLAY_LINEAGES: usize = 65_536;
+
+type InlineDnsCacheKey = [u8; 32];
+
+/// Opaque proof that a replacement belongs to the same replay-protection
+/// namespace as the running inbound named by `tag`.
+#[derive(Clone)]
+pub struct InboundReplayLease {
+    tag: String,
+    engine_identity: Arc<()>,
+    lineage: Arc<()>,
+    state: InboundReplayState,
+}
+
+impl PartialEq for InboundReplayLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag
+            && Arc::ptr_eq(&self.engine_identity, &other.engine_identity)
+            && Arc::ptr_eq(&self.lineage, &other.lineage)
+            && self.state == other.state
+    }
+}
+
+impl Eq for InboundReplayLease {}
+
+impl std::fmt::Debug for InboundReplayLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundReplayLease")
+            .field("tag", &self.tag)
+            .finish_non_exhaustive()
+    }
+}
 
 /// State that may only be touched by one control-plane operation at a time.
 ///
@@ -130,11 +169,44 @@ const LISTENER_HEALTH_GRACE: Duration = Duration::from_millis(50);
 /// as authoritative: two concurrent `add_inbound` calls can never both pass the
 /// conflict check for the same port.
 struct ControlState {
+    /// One logical URLTest state per compiled outbound for the current global
+    /// data-plane generation. Repeated route/DNS/inbound references reuse it.
+    client_chain_groups: ClientChainGroupRegistry,
     /// Shared resolver registry for inbounds that do not declare their own DNS.
     dns: DnsRegistry,
+    /// Identical inline DNS sections share one policy/upstream graph across
+    /// inbounds, matching sing-box's process-wide DNS router and cache.
+    inline_dns: HashMap<InlineDnsCacheKey, Weak<dyn Resolver>>,
+    /// Process-wide mutable DNS rule state, strongly retained for the current
+    /// DNS-client generation so inbound-only remove/add updates preserve rule
+    /// windows.
+    dns_policy_state: PolicyStateRegistry,
+    /// Currently owned replay authority for each tag. The registry is weak so a
+    /// removed inbound which has no retained rollback lease can be reclaimed; a
+    /// live slot or lease keeps its entry admissible. Publishing a fresh authority
+    /// under the same tag invalidates every older lease by pointer identity.
+    replay_lineages: HashMap<String, ReplayLineageEntry>,
+}
+
+struct ReplayLineageEntry {
+    /// Lease authority. Both a live scope and an explicit rollback lease retain it.
+    authority: Weak<()>,
+    /// Only listener/handler generations retain this owner. A lease deliberately
+    /// does not, so a hard-removed tag can start a genuinely fresh generation.
+    live: InboundReplayScopeWeak,
+}
+
+impl ControlState {
+    fn prune_inline_dns(&mut self) {
+        self.inline_dns
+            .retain(|_, candidate| candidate.strong_count() != 0);
+    }
 }
 
 struct EngineInner {
+    /// Unique authority carried by replay leases. It is deliberately separate from
+    /// the EngineInner Arc so retaining a lease cannot keep listeners alive.
+    replay_identity: Arc<()>,
     control: tokio::sync::Mutex<ControlState>,
     /// tag -> inbound. Read-mostly and lock-free, so `list_inbounds` never
     /// contends with an in-flight reload.
@@ -167,6 +239,68 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundRemovalMode {
+    Graceful,
+    Hard,
+}
+
+enum ReplayAdmission {
+    Fresh,
+    Preserved {
+        state: InboundReplayState,
+        lineage: Arc<()>,
+    },
+}
+
+fn prepare_replay_admission(
+    replay_lineages: &mut HashMap<String, ReplayLineageEntry>,
+    tag: &str,
+    replay: ReplayAdmission,
+    max_lineages: usize,
+) -> EngineResult<(InboundReplayState, Arc<()>, InboundReplayScope)> {
+    replay_lineages.retain(|_, entry| entry.authority.strong_count() != 0);
+    match replay {
+        ReplayAdmission::Fresh => {
+            if let Some(scope) = replay_lineages
+                .get(tag)
+                .and_then(|entry| entry.live.upgrade())
+            {
+                return Ok((scope.state(), scope.lineage(), scope));
+            }
+            if !replay_lineages.contains_key(tag) && replay_lineages.len() >= max_lineages {
+                return Err(EngineError::InvalidConfig(format!(
+                    "replay lineage limit {max_lineages} is full; cannot admit new inbound tag {tag:?}"
+                )));
+            }
+            let state = InboundReplayState::default();
+            let scope = InboundReplayScope::new(state.clone());
+            Ok((state, scope.lineage(), scope))
+        }
+        ReplayAdmission::Preserved { state, lineage } => {
+            let current = replay_lineages
+                .get(tag)
+                .and_then(|entry| entry.authority.upgrade());
+            if !current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &lineage))
+            {
+                return Err(EngineError::InvalidConfig(format!(
+                    "replay lease for inbound {tag} is stale"
+                )));
+            }
+            let scope = replay_lineages
+                .get(tag)
+                .and_then(|entry| entry.live.upgrade())
+                .filter(|scope| Arc::ptr_eq(&scope.lineage(), &lineage))
+                .unwrap_or_else(|| {
+                    InboundReplayScope::with_lineage(state.clone(), Arc::clone(&lineage))
+                });
+            Ok((state, lineage, scope))
+        }
+    }
+}
+
 impl Engine {
     /// Brings up the engine with no inbounds, no users, and no config file.
     ///
@@ -185,15 +319,24 @@ impl Engine {
                 .unwrap_or(1),
         ));
 
-        // An empty group list yields an empty registry that lazily creates the
-        // default system resolver on first use (`dns/builder.rs:47`).
-        let dns = build_dns_registry(vec![]).await?;
+        // The DNS client owns both long-lived policy windows and one
+        // generation-scoped question cache. Build the default registry from
+        // that same state so configured and implicit resolvers share it.
+        let dns_policy_state = PolicyStateRegistry::default();
+        let dns = build_dns_registry_with_policy_state(vec![], &dns_policy_state).await?;
 
         info!("engine bootstrapped with 0 inbounds");
 
         Ok(Self {
             inner: Arc::new(EngineInner {
-                control: tokio::sync::Mutex::new(ControlState { dns }),
+                replay_identity: Arc::new(()),
+                control: tokio::sync::Mutex::new(ControlState {
+                    client_chain_groups: ClientChainGroupRegistry::default(),
+                    dns,
+                    inline_dns: HashMap::new(),
+                    dns_policy_state,
+                    replay_lineages: HashMap::new(),
+                }),
                 inbounds: DashMap::new(),
                 bound: DashMap::new(),
             }),
@@ -216,6 +359,68 @@ impl Engine {
         }
     }
 
+    /// Rotate the process-client DNS generation before a full topology rebuild.
+    /// Cached questions and generation-scoped DNS rule state are both cleared.
+    pub async fn rotate_dns_client_generation(&self) -> u64 {
+        let mut control = self.inner.control.lock().await;
+        // A still-running connection can keep an old inline resolver graph
+        // alive after its listener is retired. Do not let a full rebuild adopt
+        // that graph, because it embeds the previous generation's rule state.
+        control.inline_dns.clear();
+        control.client_chain_groups = ClientChainGroupRegistry::default();
+        let generation = control.dns_policy_state.rotate_dns_client_generation();
+        control.dns = DnsRegistry::with_policy_state(&control.dns_policy_state);
+        generation
+    }
+
+    /// Current Go-compatible DNS client cache generation. Exposed for runtime
+    /// diagnostics and transaction-boundary verification.
+    pub async fn dns_cache_generation(&self) -> u64 {
+        let control = self.inner.control.lock().await;
+        control.dns_policy_state.query_cache_generation()
+    }
+
+    /// Validate the generation-global DNS graph used by URLTest background
+    /// probes without publishing it.
+    pub async fn validate_urltest_probe_dns(
+        &self,
+        dns: Option<&serde_json::Value>,
+    ) -> EngineResult<()> {
+        let _ = validate_urltest_probe_dns_config(dns).await?;
+        Ok(())
+    }
+
+    /// Publish the generation-global, no-inbound-context resolver used by every
+    /// shared URLTest worker. The same graph is idempotent; changing it requires
+    /// [`Self::rotate_dns_client_generation`].
+    pub async fn configure_urltest_probe_dns(
+        &self,
+        dns: Option<&serde_json::Value>,
+    ) -> EngineResult<()> {
+        let probe = validate_urltest_probe_dns_config(dns).await?;
+        let mut control = self.inner.control.lock().await;
+        control.prune_inline_dns();
+        let registry = control.client_chain_groups.clone();
+        Self::ensure_urltest_probe_resolver(&mut control, &registry, probe.as_ref()).await
+    }
+
+    /// Release URLTest groups that are no longer reachable from the topology
+    /// published by the embedder. This must be called only after the embedder's
+    /// complete multi-inbound transaction commits: an individual Shoes listener
+    /// commit may still be followed by an outer rollback that needs the old
+    /// group's selection and worker state.
+    pub async fn commit_client_chain_group_generation(&self) {
+        let control = self.inner.control.lock().await;
+        control.client_chain_groups.prune_dormant_committed();
+    }
+
+    /// Number of URLTest groups retained by the active client-chain generation.
+    /// Exposed for runtime governance diagnostics and transaction tests.
+    pub async fn client_chain_group_count(&self) -> usize {
+        let control = self.inner.control.lock().await;
+        control.client_chain_groups.active_group_count()
+    }
+
     pub fn list_inbounds(&self) -> Vec<InboundInfo> {
         let mut infos: Vec<InboundInfo> = self
             .inner
@@ -229,6 +434,22 @@ impl Engine {
 
     pub fn get_inbound(&self, tag: &str) -> Option<Arc<InboundSlot>> {
         self.inner.inbounds.get(tag).map(|e| e.value().clone())
+    }
+
+    /// Retain the replay namespace while the same tagged inbound is explicitly
+    /// stopped and rebuilt.
+    pub fn preserve_inbound_replay(&self, tag: &str) -> EngineResult<InboundReplayLease> {
+        let slot = self
+            .inner
+            .inbounds
+            .get(tag)
+            .ok_or_else(|| EngineError::UnknownTag(tag.to_string()))?;
+        Ok(InboundReplayLease {
+            tag: tag.to_string(),
+            engine_identity: Arc::clone(&self.inner.replay_identity),
+            lineage: slot.replay_lineage(),
+            state: slot.replay_state(),
+        })
     }
 
     /// Validates a complete inbound payload without opening sockets or changing
@@ -300,6 +521,45 @@ impl Engine {
     /// Driving this future to completion and calling [`Engine::remove_inbound`]
     /// avoids the question.
     pub async fn add_inbound(&self, spec: InboundSpec) -> EngineResult<InboundInfo> {
+        self.add_inbound_inner(spec, ReplayAdmission::Fresh).await
+    }
+
+    /// Start a replacement listener without reopening the VMess/SS replay window.
+    ///
+    /// The lease is tag-bound, so it cannot accidentally merge the security
+    /// namespaces of two independently configured inbounds.
+    pub async fn add_inbound_with_replay(
+        &self,
+        spec: InboundSpec,
+        replay: &InboundReplayLease,
+    ) -> EngineResult<InboundInfo> {
+        if spec.tag != replay.tag {
+            return Err(EngineError::InvalidConfig(format!(
+                "replay lease for inbound {} cannot start inbound {}",
+                replay.tag, spec.tag
+            )));
+        }
+        if !Arc::ptr_eq(&self.inner.replay_identity, &replay.engine_identity) {
+            return Err(EngineError::InvalidConfig(format!(
+                "replay lease for inbound {} belongs to another engine",
+                replay.tag
+            )));
+        }
+        self.add_inbound_inner(
+            spec,
+            ReplayAdmission::Preserved {
+                state: replay.state.clone(),
+                lineage: Arc::clone(&replay.lineage),
+            },
+        )
+        .await
+    }
+
+    async fn add_inbound_inner(
+        &self,
+        spec: InboundSpec,
+        replay: ReplayAdmission,
+    ) -> EngineResult<InboundInfo> {
         let InboundSpec {
             tag,
             mut config,
@@ -323,18 +583,27 @@ impl Engine {
         let ValidatedInbound {
             configs: server_configs,
             dns_groups,
+            dns_cache_key,
         } = validate_inbound_config(config).await?;
 
         let registry = match users {
             Some(users) => Some(Self::build_user_registry(&server_configs, users)?),
             None => None,
         };
-
         let mut control = self.inner.control.lock().await;
+        control.prune_inline_dns();
+        let client_chain_groups = control.client_chain_groups.clone();
 
         if self.inner.inbounds.contains_key(&tag) {
             return Err(EngineError::DuplicateTag(tag));
         }
+
+        let (replay_state, replay_lineage, replay_scope) = prepare_replay_admission(
+            &mut control.replay_lineages,
+            &tag,
+            replay,
+            MAX_REPLAY_LINEAGES,
+        )?;
 
         // Resolve every listen target up front so conflicts are caught before a
         // single socket is opened.
@@ -382,6 +651,10 @@ impl Engine {
         let protocol = protocol::display_name(&server_configs[0].protocol);
         let transport = transport_name(&server_configs[0].transport).to_string();
 
+        Self::ensure_default_urltest_probe_resolver(&mut control, &client_chain_groups).await?;
+        let client_chain_transaction = client_chain_groups.transaction();
+        let mut pending_inline_dns = HashMap::new();
+
         // Listeners are live from the moment `start_servers_with_users` returns, but
         // this inbound is not registered until the health probe below passes -- and
         // in between there are awaits. A caller whose request is cancelled there (a
@@ -392,26 +665,43 @@ impl Engine {
         let mut bind_display: Vec<String> = Vec::new();
 
         for (server_config, target) in server_configs.into_iter().zip(targets.iter()) {
-            let resolver = match Self::resolver_for(&mut control, &server_config, &dns_groups).await
+            let resolver = match client_chain_transaction
+                .scope(Self::resolver_for_candidate(
+                    &mut control,
+                    &server_config,
+                    &dns_groups,
+                    dns_cache_key.as_ref(),
+                    &mut pending_inline_dns,
+                ))
+                .await
             {
                 Ok(resolver) => resolver,
                 Err(e) => {
                     inbound::abandon(started.disarm()).await;
+                    control.prune_inline_dns();
                     return Err(e);
                 }
             };
-
             // `Arc<MemoryUserRegistry>` is cloned per listener, so every handler
             // built from this spec authenticates against the one same table.
             let registry_ref = registry.clone().map(|r| r as Arc<dyn UserRegistry>);
 
-            match start_servers_with_users(Config::Server(server_config), resolver, registry_ref)
+            match client_chain_transaction
+                .scope(start_servers_with_users_and_replay_scope(
+                    Config::Server(server_config),
+                    resolver,
+                    registry_ref,
+                    replay_scope.clone(),
+                ))
                 .await
             {
-                Ok(handle) => started.push(handle),
+                Ok(handle) => {
+                    started.push(handle);
+                }
                 Err(e) => {
                     // Roll back anything already started under this tag.
                     inbound::abandon(started.disarm()).await;
+                    control.prune_inline_dns();
                     return Err(EngineError::Io(e));
                 }
             }
@@ -437,6 +727,7 @@ impl Engine {
         if let Some(dead) = started.take_dead_listener() {
             let reason = describe_dead_listener(dead).await;
             inbound::abandon(started.disarm()).await;
+            control.prune_inline_dns();
             return Err(EngineError::Io(std::io::Error::other(format!(
                 "inbound {tag} failed to start: {reason}"
             ))));
@@ -453,6 +744,8 @@ impl Engine {
             info.clone(),
             claimed.clone(),
             started.disarm(),
+            replay_state,
+            Arc::clone(&replay_lineage),
             registry,
         ));
 
@@ -461,7 +754,19 @@ impl Engine {
         for key in &claimed {
             self.inner.bound.insert(key.clone(), tag.clone());
         }
+        // Publish only after every fallible startup/health step. This also refreshes
+        // the weak live owner after a preserved hard replacement. Do it before the
+        // slot so lock-free lease capture cannot observe an authority absent here.
+        control.replay_lineages.insert(
+            tag.clone(),
+            ReplayLineageEntry {
+                authority: Arc::downgrade(&replay_lineage),
+                live: replay_scope.downgrade(),
+            },
+        );
         self.inner.inbounds.insert(tag.clone(), slot);
+        client_chain_transaction.commit_and_start();
+        Self::publish_inline_dns(&mut control, pending_inline_dns);
 
         info!(
             "inbound {} started: {} over {} on {} ({})",
@@ -529,6 +834,8 @@ impl Engine {
         // running inbound is in dynamic mode, and reading that outside the lock
         // would let a concurrent remove-and-re-add change the answer underneath.
         let mut control = self.inner.control.lock().await;
+        control.prune_inline_dns();
+        let client_chain_groups = control.client_chain_groups.clone();
 
         let slot = self
             .inner
@@ -547,6 +854,7 @@ impl Engine {
         let ValidatedInbound {
             configs: server_configs,
             dns_groups,
+            dns_cache_key,
         } = validate_inbound_config(config).await?;
 
         // A reload rebuilds the handlers from this config and hands them the registry
@@ -574,15 +882,39 @@ impl Engine {
             }
         }
 
+        Self::ensure_default_urltest_probe_resolver(&mut control, &client_chain_groups).await?;
+        let client_chain_transaction = client_chain_groups.transaction();
+        let mut pending_inline_dns = HashMap::new();
+
         let mut paired = Vec::with_capacity(server_configs.len());
         for server_config in server_configs {
-            let resolver = Self::resolver_for(&mut control, &server_config, &dns_groups).await?;
+            let resolver = client_chain_transaction
+                .scope(Self::resolver_for_candidate(
+                    &mut control,
+                    &server_config,
+                    &dns_groups,
+                    dns_cache_key.as_ref(),
+                    &mut pending_inline_dns,
+                ))
+                .await?;
             paired.push((server_config, resolver));
         }
 
-        let revision = slot
-            .reload(paired)
-            .map_err(EngineError::from_reload_rejection)?;
+        let revision = match client_chain_transaction
+            .scope(async { slot.reload(paired) })
+            .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                // A rejected reload may have constructed a resolver which is no
+                // longer owned once `reload` returns its error.
+                control.prune_inline_dns();
+                return Err(EngineError::from_reload_rejection(error));
+            }
+        };
+        client_chain_transaction.commit_and_start();
+        Self::publish_inline_dns(&mut control, pending_inline_dns);
+        control.prune_inline_dns();
 
         let info = slot.describe();
         info!(
@@ -615,7 +947,27 @@ impl Engine {
     /// address immediately afterwards may lose a race with a QUIC endpoint still
     /// finishing its connections.
     pub async fn remove_inbound(&self, tag: &str) -> EngineResult<InboundInfo> {
-        let _control = self.inner.control.lock().await;
+        self.remove_inbound_inner(tag, InboundRemovalMode::Graceful)
+            .await
+    }
+
+    /// Unregisters `tag`, stops accepting, and forcibly closes its established
+    /// connection tree.
+    ///
+    /// Use this for a full listener replacement whose old generation must not remain
+    /// connected. [`Engine::remove_inbound`] remains the smooth-handover API.
+    pub async fn remove_inbound_hard(&self, tag: &str) -> EngineResult<InboundInfo> {
+        self.remove_inbound_inner(tag, InboundRemovalMode::Hard)
+            .await
+    }
+
+    async fn remove_inbound_inner(
+        &self,
+        tag: &str,
+        mode: InboundRemovalMode,
+    ) -> EngineResult<InboundInfo> {
+        let mut control = self.inner.control.lock().await;
+        control.prune_inline_dns();
 
         let (_, slot) = self
             .inner
@@ -631,16 +983,28 @@ impl Engine {
         let release = ReleaseOnDrop {
             inner: Arc::clone(&self.inner),
             slot: Arc::clone(&slot),
+            hard: mode == InboundRemovalMode::Hard,
         };
 
-        slot.shutdown().await;
+        match mode {
+            InboundRemovalMode::Graceful => slot.shutdown().await,
+            InboundRemovalMode::Hard => slot.hard_shutdown().await,
+        }
         drop(release);
 
         let info = slot.describe();
-        info!(
-            "inbound {} stopped; established connections continue to drain",
-            info.tag
-        );
+        drop(slot);
+        control.prune_inline_dns();
+        match mode {
+            InboundRemovalMode::Graceful => info!(
+                "inbound {} stopped; established connections continue to drain",
+                info.tag
+            ),
+            InboundRemovalMode::Hard => info!(
+                "inbound {} stopped; established connections were closed",
+                info.tag
+            ),
+        }
 
         Ok(info)
     }
@@ -821,22 +1185,54 @@ impl Engine {
 
     /// Picks the resolver for one server config, mirroring `main.rs`.
     ///
-    /// Inbounds without a `dns` section share the engine-wide registry, so they
-    /// share one resolver and its cache. An inbound that declares its own DNS
-    /// gets a registry built just for it; the returned `Arc<dyn Resolver>` keeps
-    /// it alive after the registry itself is dropped.
+    /// Inbounds without a `dns` section share the engine-wide registry. Inbounds
+    /// with an identical inline DNS section also share its resolver graph, cache,
+    /// and per-rule state; distinct policies remain isolated.
     ///
     /// Takes `&mut ControlState` rather than `&self` because the caller already
     /// holds the control lock -- `tokio::sync::Mutex` is not reentrant.
+    #[cfg(test)]
     async fn resolver_for(
         control: &mut ControlState,
         server_config: &ServerConfig,
         dns_groups: &[ExpandedDnsGroup],
+        dns_cache_key: Option<&InlineDnsCacheKey>,
+    ) -> EngineResult<Arc<dyn Resolver>> {
+        let mut pending = HashMap::new();
+        let resolver = Self::resolver_for_candidate(
+            control,
+            server_config,
+            dns_groups,
+            dns_cache_key,
+            &mut pending,
+        )
+        .await?;
+        Self::publish_inline_dns(control, pending);
+        Ok(resolver)
+    }
+
+    async fn resolver_for_candidate(
+        control: &mut ControlState,
+        server_config: &ServerConfig,
+        dns_groups: &[ExpandedDnsGroup],
+        dns_cache_key: Option<&InlineDnsCacheKey>,
+        pending: &mut HashMap<InlineDnsCacheKey, Arc<dyn Resolver>>,
     ) -> EngineResult<Arc<dyn Resolver>> {
         let dns_ref = server_config.dns.as_ref();
 
         if dns_ref.is_none() {
             return Ok(control.dns.get_for_server(None));
+        }
+
+        if let Some(shared) = dns_cache_key.and_then(|key| pending.get(key).cloned()) {
+            return Ok(shared);
+        }
+
+        if let Some(shared) = dns_cache_key
+            .and_then(|key| control.inline_dns.get(key))
+            .and_then(Weak::upgrade)
+        {
+            return Ok(shared);
         }
 
         // The groups come from the *same* expansion that produced `server_config`,
@@ -846,8 +1242,81 @@ impl Engine {
         // nothing inline left to extract, so the reference dangles and every inbound
         // carrying a `dns` section was rejected with the name of a group its author
         // never wrote.
-        let mut registry = build_dns_registry(dns_groups.to_vec()).await?;
-        Ok(registry.get_for_server(dns_ref))
+        let mut registry =
+            build_dns_registry_with_policy_state(dns_groups.to_vec(), &control.dns_policy_state)
+                .await?;
+        let resolver = registry.get_for_server(dns_ref);
+        if let Some(key) = dns_cache_key {
+            pending.insert(*key, resolver.clone());
+        }
+        Ok(resolver)
+    }
+
+    fn publish_inline_dns(
+        control: &mut ControlState,
+        pending: HashMap<InlineDnsCacheKey, Arc<dyn Resolver>>,
+    ) {
+        control.prune_inline_dns();
+        for (key, resolver) in pending {
+            control.inline_dns.insert(key, Arc::downgrade(&resolver));
+        }
+    }
+
+    async fn ensure_default_urltest_probe_resolver(
+        control: &mut ControlState,
+        registry: &ClientChainGroupRegistry,
+    ) -> EngineResult<()> {
+        if registry.probe_resolver_is_bound() {
+            return Ok(());
+        }
+        Self::ensure_urltest_probe_resolver(control, registry, None).await
+    }
+
+    async fn ensure_urltest_probe_resolver(
+        control: &mut ControlState,
+        registry: &ClientChainGroupRegistry,
+        probe: Option<&ValidatedUrlTestProbe>,
+    ) -> EngineResult<()> {
+        let fingerprint = probe
+            .map(|probe| probe.fingerprint)
+            .unwrap_or_else(|| Sha256::digest(b"shoes/urltest-probe/system/v1").into());
+        if registry
+            .probe_resolver_matches(fingerprint)
+            .map_err(EngineError::Io)?
+        {
+            return Ok(());
+        }
+
+        // The global DNS graph may itself dial through a shared URLTest outbound.
+        // Build it with the same registry while the registry's probe resolver is
+        // still unbound, then connect the late back-reference and publish all
+        // groups together. This is independent of any one listener transaction:
+        // Go's global outbounds exist for the whole Box generation as well.
+        let transaction = registry.transaction();
+        let mut pending_inline_dns = HashMap::new();
+        let resolver = match probe {
+            Some(probe) => {
+                transaction
+                    .scope_without_probe_generation(Self::resolver_for_candidate(
+                        control,
+                        &probe.server_config,
+                        &probe.dns_groups,
+                        probe.dns_cache_key.as_ref(),
+                        &mut pending_inline_dns,
+                    ))
+                    .await?
+            }
+            None => control.dns.get_for_server(None),
+        };
+        registry
+            .bind_probe_resolver(fingerprint, resolver)
+            .map_err(EngineError::Io)?;
+        transaction.commit_and_start();
+        // This canonical graph was intentionally built without a probe-generation
+        // lease to avoid a resolver/group reference cycle. Never publish it into
+        // the ordinary inbound cache: a matching inbound must build a leased
+        // wrapper that keeps this generation alive until its slot is dropped.
+        Ok(())
     }
 }
 
@@ -872,6 +1341,14 @@ impl Engine {
 pub(crate) struct ValidatedInbound {
     configs: Vec<ServerConfig>,
     dns_groups: Vec<ExpandedDnsGroup>,
+    dns_cache_key: Option<InlineDnsCacheKey>,
+}
+
+struct ValidatedUrlTestProbe {
+    server_config: ServerConfig,
+    dns_groups: Vec<ExpandedDnsGroup>,
+    dns_cache_key: Option<InlineDnsCacheKey>,
+    fingerprint: InlineDnsCacheKey,
 }
 
 async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<ValidatedInbound> {
@@ -881,6 +1358,50 @@ async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vali
         ));
     }
 
+    let dns_cache_key = inline_dns_cache_key(&config)?;
+    let (server_configs, dns_groups) = validate_server_config_payload(config).await?;
+
+    Ok(ValidatedInbound {
+        configs: server_configs,
+        dns_groups,
+        dns_cache_key,
+    })
+}
+
+async fn validate_urltest_probe_dns_config(
+    dns: Option<&serde_json::Value>,
+) -> EngineResult<Option<ValidatedUrlTestProbe>> {
+    let Some(dns) = dns.filter(|dns| !dns.is_null()) else {
+        return Ok(None);
+    };
+    let encoded = serde_json::to_vec(dns).map_err(|error| {
+        EngineError::InvalidConfig(format!(
+            "could not encode URLTest probe DNS section: {error}"
+        ))
+    })?;
+    let fingerprint = Sha256::digest(encoded).into();
+    let payload = serde_json::json!({
+        "address": "127.0.0.1:0",
+        "protocol": {"type": "socks", "udp_enabled": false},
+        "rules": [{"masks": "0.0.0.0/0", "action": "allow"}],
+        "dns": dns,
+    });
+    let (mut configs, dns_groups) = validate_server_config_payload(payload).await?;
+    let server_config = configs
+        .drain(..)
+        .next()
+        .expect("validated URLTest probe payload is non-empty");
+    Ok(Some(ValidatedUrlTestProbe {
+        server_config,
+        dns_groups,
+        dns_cache_key: Some(fingerprint),
+        fingerprint,
+    }))
+}
+
+async fn validate_server_config_payload(
+    config: serde_json::Value,
+) -> EngineResult<(Vec<ServerConfig>, Vec<ExpandedDnsGroup>)> {
     let json_text = serde_json::to_string(&config)
         .map_err(|e| EngineError::InvalidConfig(format!("could not re-encode payload: {e}")))?;
 
@@ -937,10 +1458,16 @@ async fn validate_inbound_config(config: serde_json::Value) -> EngineResult<Vali
         ));
     }
 
-    Ok(ValidatedInbound {
-        configs: server_configs,
-        dns_groups,
-    })
+    Ok((server_configs, dns_groups))
+}
+
+fn inline_dns_cache_key(config: &serde_json::Value) -> EngineResult<Option<InlineDnsCacheKey>> {
+    let Some(dns) = config.get("dns").filter(|dns| !dns.is_null()) else {
+        return Ok(None);
+    };
+    let encoded = serde_json::to_vec(dns)
+        .map_err(|e| EngineError::InvalidConfig(format!("could not encode DNS section: {e}")))?;
+    Ok(Some(Sha256::digest(encoded).into()))
 }
 
 fn resolve_bind_targets(
@@ -993,12 +1520,19 @@ fn socket_kind(transport: &Transport) -> SocketKind {
 struct ReleaseOnDrop {
     inner: Arc<EngineInner>,
     slot: Arc<InboundSlot>,
+    /// Preserve hard-removal semantics even if the caller drops the future while
+    /// its listeners are releasing their sockets.
+    hard: bool,
 }
 
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
-        // Cheap insurance on the cancelled path: `shutdown` may not have run at all.
-        self.slot.stop_accepting();
+        // Cheap insurance on the cancelled path: shutdown may not have run at all.
+        if self.hard {
+            self.slot.hard_stop();
+        } else {
+            self.slot.stop_accepting();
+        }
         for key in self.slot.keys() {
             self.inner.bound.remove(key);
         }
@@ -1013,11 +1547,9 @@ impl Drop for ReleaseOnDrop {
 /// serving with nothing left that names them: no tag to remove, no handle to stop,
 /// and the port held until the process ends.
 ///
-/// `Drop` cannot await, so this cancels the accept loops synchronously and leaves the
-/// drain to whatever runtime is still there. That is weaker than
-/// [`InboundSlot::shutdown`], which every non-cancelled path still uses: the sockets
-/// are released shortly after rather than by the time anything returns. It is the
-/// difference between a port that frees itself and one that never does.
+/// `Drop` cannot await, so this cancels both accepts and the uncommitted connection
+/// trees synchronously and leaves socket cleanup to the runtime. No candidate flow
+/// is allowed to outlive an add future that never published its inbound.
 struct AbandonOnDrop {
     handles: Vec<ServerHandle>,
 }
@@ -1070,7 +1602,7 @@ impl Drop for AbandonOnDrop {
             self.handles.len()
         );
         for handle in &self.handles {
-            handle.stop_accepting();
+            handle.hard_stop();
         }
     }
 }
@@ -1128,5 +1660,598 @@ fn panic_message(error: JoinError) -> String {
     } else {
         warn!("listener task panicked with an unknown payload type");
         "listener task panicked".to_string()
+    }
+}
+
+#[cfg(test)]
+mod dns_sharing_tests {
+    use super::*;
+    use serde_json::json;
+    use shoes::dns::{DnsPolicyError, DnsPolicyFailure, DnsRejectMethod};
+    use shoes::resolver::{Address, NetLocation};
+
+    #[test]
+    fn replay_lineage_limit_counts_only_live_authorities() {
+        let mut lineages = HashMap::new();
+        let (_, first, first_scope) =
+            prepare_replay_admission(&mut lineages, "a", ReplayAdmission::Fresh, 1).unwrap();
+        lineages.insert(
+            "a".to_string(),
+            ReplayLineageEntry {
+                authority: Arc::downgrade(&first),
+                live: first_scope.downgrade(),
+            },
+        );
+
+        let error = match prepare_replay_admission(&mut lineages, "b", ReplayAdmission::Fresh, 1) {
+            Ok(_) => panic!("a retained authority must consume the bounded registry"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("lineage limit"));
+
+        drop(first);
+        drop(first_scope);
+        let (_, second, second_scope) =
+            prepare_replay_admission(&mut lineages, "b", ReplayAdmission::Fresh, 1)
+                .expect("an unowned removed lineage must be reclaimed before the capacity check");
+        assert_eq!(lineages.len(), 0, "dead weak entries were pruned");
+        drop(second);
+        drop(second_scope);
+    }
+
+    #[test]
+    fn fresh_reuses_live_scope_but_invalidates_a_lease_only_lineage() {
+        let mut lineages = HashMap::new();
+        let (old_state, old, old_scope) =
+            prepare_replay_admission(&mut lineages, "same-tag", ReplayAdmission::Fresh, 1).unwrap();
+        lineages.insert(
+            "same-tag".to_string(),
+            ReplayLineageEntry {
+                authority: Arc::downgrade(&old),
+                live: old_scope.downgrade(),
+            },
+        );
+
+        let (reused_state, reused, reused_scope) =
+            prepare_replay_admission(&mut lineages, "same-tag", ReplayAdmission::Fresh, 1)
+                .expect("a live retired handler makes a fresh add reuse its namespace");
+        assert!(old_state == reused_state);
+        assert!(Arc::ptr_eq(&old, &reused));
+        assert!(Arc::ptr_eq(&old_scope.lineage(), &reused_scope.lineage()));
+
+        // A hard removal leaves only the explicit lease. That must not make a
+        // normal add look like an old handler is still able to authenticate.
+        drop(old_scope);
+        drop(reused_scope);
+        let (fresh_state, fresh, fresh_scope) =
+            prepare_replay_admission(&mut lineages, "same-tag", ReplayAdmission::Fresh, 1)
+                .expect("a lease-only lineage can be superseded without growing the registry");
+        assert!(old_state != fresh_state);
+        lineages.insert(
+            "same-tag".to_string(),
+            ReplayLineageEntry {
+                authority: Arc::downgrade(&fresh),
+                live: fresh_scope.downgrade(),
+            },
+        );
+
+        let stale = match prepare_replay_admission(
+            &mut lineages,
+            "same-tag",
+            ReplayAdmission::Preserved {
+                state: old_state,
+                lineage: old,
+            },
+            1,
+        ) {
+            Ok(_) => panic!("fresh publication must make every older lease stale"),
+            Err(error) => error,
+        };
+        assert!(stale.to_string().contains("stale"));
+
+        let (admitted_state, admitted, admitted_scope) = prepare_replay_admission(
+            &mut lineages,
+            "same-tag",
+            ReplayAdmission::Preserved {
+                state: fresh_state.clone(),
+                lineage: Arc::clone(&fresh),
+            },
+            1,
+        )
+        .expect("the currently published lineage remains admissible");
+        assert!(Arc::ptr_eq(&admitted, &fresh));
+        assert!(admitted_state == fresh_state);
+        assert!(Arc::ptr_eq(
+            &admitted_scope.lineage(),
+            &fresh_scope.lineage()
+        ));
+    }
+
+    fn inbound_with_dns(server: &str) -> serde_json::Value {
+        inbound_with_dns_rules(server, json!([{"action": "reject"}]))
+    }
+
+    fn inbound_with_dns_rules(server: &str, rules: serde_json::Value) -> serde_json::Value {
+        json!({
+            "address": "127.0.0.1:0",
+            "protocol": {
+                "type": "socks",
+                "udp_enabled": false
+            },
+            "rules": [{"masks": "0.0.0.0/0", "action": "allow"}],
+            "dns": {
+                "servers": [{"tag": "default-dns", "url": server}],
+                "rules": rules
+            }
+        })
+    }
+
+    fn inbound_with_shared_urltest(port: u16, shared_id: &str) -> serde_json::Value {
+        json!({
+            "address": format!("127.0.0.1:{port}"),
+            "protocol": {
+                "type": "socks",
+                "udp_enabled": false
+            },
+            "rules": [{
+                "masks": "0.0.0.0/0",
+                "action": "allow",
+                "client_chains": [
+                    {"chain": ["direct"]},
+                    {"chain": ["direct"]}
+                ],
+                "client_chain_selection": {
+                    "type": "urltest",
+                    "shared_id": shared_id,
+                    "url": "http://127.0.0.1:9/generate_204",
+                    "interval_millis": 60000,
+                    "tolerance_millis": 50,
+                    "idle_timeout_millis": 1800000
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn repeated_inbounds_share_one_generation_scoped_urltest_group() {
+        let reserve_port = || {
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .expect("reserve test port");
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            port
+        };
+        let first_port = reserve_port();
+        let mut second_port = reserve_port();
+        while second_port == first_port {
+            second_port = reserve_port();
+        }
+        let engine = Engine::bootstrap().await.unwrap();
+        let shared_id = "node-agent-urltest-v1:engine-shared";
+
+        for (tag, port) in [("first", first_port), ("second", second_port)] {
+            engine
+                .add_inbound(InboundSpec {
+                    tag: tag.to_string(),
+                    config: inbound_with_shared_urltest(port, shared_id),
+                    users: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        {
+            let control = engine.inner.control.lock().await;
+            assert_eq!(control.client_chain_groups.active_group_count(), 1);
+        }
+        engine.remove_inbound_hard("first").await.unwrap();
+        engine.remove_inbound_hard("second").await.unwrap();
+        {
+            let control = engine.inner.control.lock().await;
+            assert_eq!(
+                control.client_chain_groups.active_group_count(),
+                1,
+                "a remove/add gap must not reset global URLTest state"
+            );
+        }
+
+        engine.rotate_dns_client_generation().await;
+        let control = engine.inner.control.lock().await;
+        assert_eq!(control.client_chain_groups.active_group_count(), 0);
+    }
+
+    #[test]
+    fn inline_dns_cache_key_is_a_fixed_sha256_digest_without_raw_secrets() {
+        let secret = "dns-proxy-password-that-must-not-be-retained";
+        let config = json!({
+            "dns": {
+                "servers": [{
+                    "tag": "private",
+                    "url": "tls://resolver.example",
+                    "client_chain": [{
+                        "protocol": {"type": "trojan", "password": secret}
+                    }]
+                }],
+                "final": "private"
+            }
+        });
+        let key = inline_dns_cache_key(&config).unwrap().unwrap();
+        let encoded = serde_json::to_vec(&config["dns"]).unwrap();
+        let expected: InlineDnsCacheKey = Sha256::digest(encoded).into();
+
+        assert_eq!(std::mem::size_of_val(&key), 32);
+        assert_eq!(key, expected);
+        assert!(!format!("{key:?}").contains(secret));
+        assert_eq!(inline_dns_cache_key(&json!({})).unwrap(), None);
+        assert_eq!(inline_dns_cache_key(&json!({"dns": null})).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn identical_inline_dns_sections_share_one_resolver_graph() {
+        let first = validate_inbound_config(inbound_with_dns("udp://127.0.0.1:5353"))
+            .await
+            .unwrap();
+        let second = validate_inbound_config(inbound_with_dns("udp://127.0.0.1:5353"))
+            .await
+            .unwrap();
+        let dns = build_dns_registry(Vec::new()).await.unwrap();
+        let mut control = ControlState {
+            client_chain_groups: ClientChainGroupRegistry::default(),
+            dns,
+            inline_dns: HashMap::new(),
+            dns_policy_state: PolicyStateRegistry::default(),
+            replay_lineages: HashMap::new(),
+        };
+
+        let first_resolver = Engine::resolver_for(
+            &mut control,
+            &first.configs[0],
+            &first.dns_groups,
+            first.dns_cache_key.as_ref(),
+        )
+        .await
+        .unwrap();
+        let second_resolver = Engine::resolver_for(
+            &mut control,
+            &second.configs[0],
+            &second.dns_groups,
+            second.dns_cache_key.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&first_resolver, &second_resolver));
+        assert_eq!(control.inline_dns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_urltest_probe_dns_is_not_reused_as_an_unleased_inbound_graph() {
+        let probe = validate_urltest_probe_dns_config(Some(&json!({
+            "servers": [{"tag": "default-dns", "url": "udp://127.0.0.1:5353"}],
+            "final": "default-dns"
+        })))
+        .await
+        .unwrap()
+        .unwrap();
+        let dns = build_dns_registry(Vec::new()).await.unwrap();
+        let registry = ClientChainGroupRegistry::default();
+        let mut control = ControlState {
+            client_chain_groups: registry.clone(),
+            dns,
+            inline_dns: HashMap::new(),
+            dns_policy_state: PolicyStateRegistry::default(),
+            replay_lineages: HashMap::new(),
+        };
+
+        Engine::ensure_urltest_probe_resolver(&mut control, &registry, Some(&probe))
+            .await
+            .unwrap();
+
+        assert!(control.inline_dns.is_empty());
+        assert!(registry.probe_resolver_is_bound());
+    }
+
+    #[tokio::test]
+    async fn update_and_remove_prune_dead_inline_dns_entries() {
+        let engine = Engine::bootstrap().await.unwrap();
+        let initial_config = inbound_with_dns("udp://127.0.0.1:5353");
+        let initial_key = inline_dns_cache_key(&initial_config).unwrap().unwrap();
+        engine
+            .add_inbound(InboundSpec {
+                tag: "dns-cache-prune".to_string(),
+                config: initial_config,
+                users: None,
+            })
+            .await
+            .unwrap();
+        {
+            let control = engine.inner.control.lock().await;
+            assert_eq!(control.inline_dns.len(), 1);
+            assert_eq!(
+                std::mem::size_of_val(control.inline_dns.keys().next().unwrap()),
+                32
+            );
+            assert!(control.inline_dns.contains_key(&initial_key));
+        }
+
+        let updated_config = inbound_with_dns("udp://127.0.0.1:5354");
+        let updated_key = inline_dns_cache_key(&updated_config).unwrap().unwrap();
+        engine
+            .update_inbound(InboundSpec {
+                tag: "dns-cache-prune".to_string(),
+                config: updated_config,
+                users: None,
+            })
+            .await
+            .unwrap();
+        {
+            let control = engine.inner.control.lock().await;
+            assert_eq!(control.inline_dns.len(), 1);
+            assert!(!control.inline_dns.contains_key(&initial_key));
+            assert!(control.inline_dns.contains_key(&updated_key));
+        }
+
+        engine.remove_inbound("dns-cache-prune").await.unwrap();
+        let control = engine.inner.control.lock().await;
+        assert!(control.inline_dns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compiler_key_shares_reject_flood_state_across_distinct_inline_dns_graphs() {
+        let key = format!("__acp_dns_reject_v1_{}", "a".repeat(64));
+        let first = validate_inbound_config(inbound_with_dns_rules(
+            "udp://127.0.0.1:5353",
+            json!([{
+                "action": "reject",
+                "__acp_reject_flood_key": key,
+            }]),
+        ))
+        .await
+        .unwrap();
+        let second = validate_inbound_config(inbound_with_dns_rules(
+            "udp://127.0.0.1:5353",
+            json!([
+                {
+                    "domain": ["other.example"],
+                    "action": "predefined",
+                    "answer": ["192.0.2.7"],
+                },
+                {
+                    "action": "reject",
+                    "__acp_reject_flood_key": key,
+                }
+            ]),
+        ))
+        .await
+        .unwrap();
+        assert_ne!(first.dns_cache_key, second.dns_cache_key);
+
+        let dns = build_dns_registry(Vec::new()).await.unwrap();
+        let mut control = ControlState {
+            client_chain_groups: ClientChainGroupRegistry::default(),
+            dns,
+            inline_dns: HashMap::new(),
+            dns_policy_state: PolicyStateRegistry::default(),
+            replay_lineages: HashMap::new(),
+        };
+        let first_resolver = Engine::resolver_for(
+            &mut control,
+            &first.configs[0],
+            &first.dns_groups,
+            first.dns_cache_key.as_ref(),
+        )
+        .await
+        .unwrap();
+        let second_resolver = Engine::resolver_for(
+            &mut control,
+            &second.configs[0],
+            &second.dns_groups,
+            second.dns_cache_key.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first_resolver, &second_resolver));
+
+        let target = NetLocation::new(Address::Hostname("blocked.example".to_string()), 53);
+        for _ in 0..50 {
+            let error = first_resolver.resolve_location(&target).await.unwrap_err();
+            let failure = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<DnsPolicyError>())
+                .unwrap()
+                .failure();
+            assert_eq!(
+                failure,
+                DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+            );
+        }
+        let error = second_resolver.resolve_location(&target).await.unwrap_err();
+        let failure = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<DnsPolicyError>())
+            .unwrap()
+            .failure();
+        assert_eq!(failure, DnsPolicyFailure::Rejected(DnsRejectMethod::Drop));
+    }
+
+    #[tokio::test]
+    async fn dns_client_rotation_does_not_reuse_a_live_inline_resolver_graph() {
+        let key = format!("__acp_dns_reject_v1_{}", "c".repeat(64));
+        let validated = validate_inbound_config(inbound_with_dns_rules(
+            "udp://127.0.0.1:5353",
+            json!([{
+                "action": "reject",
+                "__acp_reject_flood_key": key,
+            }]),
+        ))
+        .await
+        .unwrap();
+        let engine = Engine::bootstrap().await.unwrap();
+        let first_resolver = {
+            let mut control = engine.inner.control.lock().await;
+            Engine::resolver_for(
+                &mut control,
+                &validated.configs[0],
+                &validated.dns_groups,
+                validated.dns_cache_key.as_ref(),
+            )
+            .await
+            .unwrap()
+        };
+        let target = NetLocation::new(Address::Hostname("blocked.example".to_string()), 53);
+        for _ in 0..50 {
+            let error = first_resolver.resolve_location(&target).await.unwrap_err();
+            let failure = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<DnsPolicyError>())
+                .unwrap()
+                .failure();
+            assert_eq!(
+                failure,
+                DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+            );
+        }
+
+        assert_eq!(engine.rotate_dns_client_generation().await, 1);
+        let second_resolver = {
+            let mut control = engine.inner.control.lock().await;
+            Engine::resolver_for(
+                &mut control,
+                &validated.configs[0],
+                &validated.dns_groups,
+                validated.dns_cache_key.as_ref(),
+            )
+            .await
+            .unwrap()
+        };
+        assert!(!Arc::ptr_eq(&first_resolver, &second_resolver));
+        let error = second_resolver.resolve_location(&target).await.unwrap_err();
+        let failure = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<DnsPolicyError>())
+            .unwrap()
+            .failure();
+        assert_eq!(
+            failure,
+            DnsPolicyFailure::Rejected(DnsRejectMethod::Default)
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_lease_survives_candidate_and_rollback_and_is_tag_bound() {
+        let engine = Engine::bootstrap().await.unwrap();
+        let spec = InboundSpec {
+            tag: "replay-replacement".to_string(),
+            config: inbound_with_dns("udp://127.0.0.1:5353"),
+            users: None,
+        };
+        engine.add_inbound(spec.clone()).await.unwrap();
+        let before = engine
+            .preserve_inbound_replay(&spec.tag)
+            .expect("running inbound has replay state");
+
+        engine.remove_inbound(&spec.tag).await.unwrap();
+        engine
+            .add_inbound_with_replay(spec.clone(), &before)
+            .await
+            .unwrap();
+        let after = engine
+            .preserve_inbound_replay(&spec.tag)
+            .expect("replacement has replay state");
+        assert_eq!(before, after);
+
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+        engine
+            .add_inbound_with_replay(spec.clone(), &before)
+            .await
+            .expect("the same lineage lease remains valid for rollback");
+        assert_eq!(before, engine.preserve_inbound_replay(&spec.tag).unwrap());
+
+        let mut wrong_tag = spec.clone();
+        wrong_tag.tag = "another-inbound".to_string();
+        let error = engine
+            .add_inbound_with_replay(wrong_tag, &before)
+            .await
+            .expect_err("a replay lease must not cross inbound tags");
+        assert!(error.to_string().contains("cannot start inbound"));
+
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_lease_cannot_cross_engine_identity() {
+        let first = Engine::bootstrap().await.unwrap();
+        let second = Engine::bootstrap().await.unwrap();
+        let spec = InboundSpec {
+            tag: "engine-bound-replay".to_string(),
+            config: inbound_with_dns("udp://127.0.0.1:5353"),
+            users: None,
+        };
+        first.add_inbound(spec.clone()).await.unwrap();
+        let lease = first.preserve_inbound_replay(&spec.tag).unwrap();
+
+        let error = second
+            .add_inbound_with_replay(spec.clone(), &lease)
+            .await
+            .expect_err("another engine must reject the lease");
+        assert!(error.to_string().contains("another engine"));
+
+        first.remove_inbound_hard(&spec.tag).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_readd_invalidates_an_older_replay_lease() {
+        let engine = Engine::bootstrap().await.unwrap();
+        let spec = InboundSpec {
+            tag: "fresh-replay-lineage".to_string(),
+            config: inbound_with_dns("udp://127.0.0.1:5353"),
+            users: None,
+        };
+        engine.add_inbound(spec.clone()).await.unwrap();
+        let old = engine.preserve_inbound_replay(&spec.tag).unwrap();
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+
+        engine
+            .add_inbound(spec.clone())
+            .await
+            .expect("a normal add creates a fresh security lineage");
+        let fresh = engine.preserve_inbound_replay(&spec.tag).unwrap();
+        assert_ne!(old, fresh);
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+
+        let error = engine
+            .add_inbound_with_replay(spec.clone(), &old)
+            .await
+            .expect_err("a superseded lease must stay stale after removal");
+        assert!(error.to_string().contains("is stale"));
+
+        engine
+            .add_inbound_with_replay(spec.clone(), &fresh)
+            .await
+            .expect("the current lineage lease remains recoverable");
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_fresh_add_does_not_advance_replay_lineage() {
+        let engine = Engine::bootstrap().await.unwrap();
+        let spec = InboundSpec {
+            tag: "failed-fresh-replay".to_string(),
+            config: inbound_with_dns("udp://127.0.0.1:5353"),
+            users: None,
+        };
+        engine.add_inbound(spec.clone()).await.unwrap();
+        let lease = engine.preserve_inbound_replay(&spec.tag).unwrap();
+
+        engine
+            .add_inbound(spec.clone())
+            .await
+            .expect_err("duplicate fresh add fails before publishing a lineage");
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+        engine
+            .add_inbound_with_replay(spec.clone(), &lease)
+            .await
+            .expect("the failed fresh add must not invalidate the retained lease");
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
     }
 }

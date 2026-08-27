@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
+use crate::dynamic::spawn_connection_until_cancelled;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socks5_udp_relay::Socks5UdpRelayStream;
@@ -409,13 +410,14 @@ async fn handle_udp_associate(
     let proxy_selector = proxy_selector.clone();
     let resolver = resolver.clone();
 
-    tokio::spawn(async move {
+    std::mem::drop(spawn_connection_until_cancelled(async move {
         if let Err(e) =
             run_udp_associate(server_stream, relay_stream, proxy_selector, resolver).await
         {
             log::debug!("SOCKS5 UDP ASSOCIATE ended: {}", e);
         }
-    });
+        Ok(())
+    }));
 
     Ok(TcpServerSetupResult::AlreadyHandled)
 }
@@ -778,4 +780,143 @@ pub fn write_location_to_vec(location: &NetLocation) -> Vec<u8> {
     vec.push((port >> 8) as u8);
     vec.push((port & 0xff) as u8);
     vec
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::async_stream::AsyncPing;
+    use crate::dynamic::{ConnContext, scope_connection_until_cancelled};
+    use crate::resolver::NativeResolver;
+
+    struct TestDuplexStream(tokio::io::DuplexStream);
+
+    impl AsyncRead for TestDuplexStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestDuplexStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl AsyncPing for TestDuplexStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            unreachable!("test stream does not support ping")
+        }
+    }
+
+    impl AsyncStream for TestDuplexStream {}
+
+    #[tokio::test]
+    async fn hard_stop_terminates_a_detached_socks_udp_association() {
+        let (server_stream, mut client_stream) = tokio::io::duplex(4096);
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let handler = SocksTcpServerHandler::new(
+            None,
+            true,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            selector,
+            resolver,
+        );
+        let parent = CancellationToken::new();
+        let conn = ConnContext::new_child(&parent);
+        let weak = Arc::downgrade(&conn);
+
+        let setup = tokio::spawn(scope_connection_until_cancelled(conn, async move {
+            let result = handler
+                .setup_server_stream(Box::new(TestDuplexStream(server_stream)))
+                .await?;
+            assert!(matches!(result, TcpServerSetupResult::AlreadyHandled));
+            Ok(())
+        }));
+
+        // Method negotiation followed by UDP ASSOCIATE with an ignored 0.0.0.0:0
+        // client hint. The IPv4 response is two method bytes plus ten command bytes.
+        client_stream
+            .write_all(&[
+                VER_SOCKS5,
+                1,
+                METHOD_NONE,
+                VER_SOCKS5,
+                CMD_UDP_ASSOCIATE,
+                0,
+                ADDR_TYPE_IPV4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ])
+            .await
+            .unwrap();
+        let mut response = [0u8; 12];
+        client_stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response[..2], &[VER_SOCKS5, METHOD_NONE]);
+        assert_eq!(response[2], VER_SOCKS5);
+        assert_eq!(response[3], REPLY_SUCCESS);
+
+        setup
+            .await
+            .expect("setup task must not panic")
+            .expect("association setup must succeed");
+        assert!(
+            weak.upgrade().is_some(),
+            "the detached relay must retain its connection context"
+        );
+
+        parent.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hard stop must drop the detached relay context");
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client_stream.read(&mut byte))
+            .await
+            .expect("hard stop must close the SOCKS TCP control stream")
+            .expect("duplex peer closure is an EOF, not an I/O error");
+        assert_eq!(read, 0);
+    }
 }

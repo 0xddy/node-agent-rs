@@ -40,6 +40,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// Handshakes one listener will carry at once.
 ///
@@ -57,6 +58,19 @@ pub const MAX_PENDING_HANDSHAKES: usize = 1024;
 /// from one address is already far past what a client opening connections in a burst
 /// produces -- while capping any single address at a sixteenth of the listener.
 pub const MAX_PENDING_PER_SOURCE: usize = 64;
+
+/// Accepted camouflage/fallback connections get their own budget so a long-lived
+/// decoy response cannot consume every slot needed by real protocol handshakes.
+///
+/// The values intentionally match the handshake budget: this keeps the total
+/// resource ceiling explicit without coupling the two failure domains.
+pub const MAX_ACTIVE_FALLBACKS: usize = 1024;
+pub const MAX_ACTIVE_FALLBACKS_PER_SOURCE: usize = 64;
+
+/// Maximum time a background protocol may wait for its first authenticated logical
+/// request. Once authentication succeeds, normal connection and user accounting own
+/// the task instead of this pre-authentication deadline.
+pub const DEFERRED_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct GateState {

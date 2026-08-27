@@ -12,6 +12,7 @@ use http::Response;
 use log::{debug, info};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
@@ -64,6 +65,10 @@ pub struct H2MuxServerSession {
     /// Session closed flag (shared with accept loop)
     #[allow(dead_code)]
     is_closed: Arc<AtomicBool>,
+    /// Owns the HTTP/2 connection and therefore the physical stream. Aborting it
+    /// on session drop is what makes a hard inbound stop release an idle mux rather
+    /// than merely dropping the channel used to publish new logical streams.
+    accept_task: JoinHandle<()>,
     /// Session protocol
     protocol: MuxProtocol,
     /// Padding enabled
@@ -143,13 +148,14 @@ impl H2MuxServerSession {
 
         // Spawn acceptor task with idle timeout monitoring
         let is_closed_clone = Arc::clone(&is_closed);
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             Self::accept_loop(connection, inbound_tx, is_closed_clone, activity).await;
         });
 
         Ok(Self {
             inbound_rx,
             is_closed,
+            accept_task,
             protocol,
             padding_enabled,
         })
@@ -302,6 +308,7 @@ impl H2MuxServerSession {
     #[allow(dead_code)]
     pub fn close(&self) {
         self.is_closed.store(true, Ordering::Relaxed);
+        self.accept_task.abort();
     }
 
     /// Get the protocol being used
@@ -312,6 +319,13 @@ impl H2MuxServerSession {
     /// Check if padding is enabled
     pub fn padding_enabled(&self) -> bool {
         self.padding_enabled
+    }
+}
+
+impl Drop for H2MuxServerSession {
+    fn drop(&mut self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        self.accept_task.abort();
     }
 }
 
@@ -366,6 +380,41 @@ where
 /// The spawn-safe form of [`handle_h2mux_session`]. Protocol handlers capture the
 /// task-local connection before spawning the long-lived session and pass it here.
 pub async fn handle_h2mux_session_with_meter<S>(
+    stream: S,
+    initial_data: Option<Box<[u8]>>,
+    udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    meter: Option<Arc<ConnContext>>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let removal_meter = meter.clone();
+    let work = handle_h2mux_session_core(
+        stream,
+        initial_data,
+        udp_enabled,
+        proxy_selector,
+        resolver,
+        meter,
+    );
+
+    if let Some(meter) = removal_meter {
+        tokio::select! {
+            biased;
+            () = meter.cancelled() => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection removed",
+            )),
+            result = work => result,
+        }
+    } else {
+        work.await
+    }
+}
+
+async fn handle_h2mux_session_core<S>(
     stream: S,
     initial_data: Option<Box<[u8]>>,
     udp_enabled: bool,
@@ -643,15 +692,175 @@ async fn handle_h2mux_udp_packet_addr(
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
-    use super::{forward_client_early_data, sniff_h2mux_tcp};
+    use tokio::io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, duplex,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    use super::{forward_client_early_data, handle_h2mux_session_with_meter, sniff_h2mux_tcp};
+    use crate::address::{Address, NetLocation};
     use crate::client_proxy_selector::ClientProxySelector;
+    use crate::dynamic::ConnContext;
+    use crate::h2mux::{H2MuxClientSession, H2MuxOptions};
+    use crate::resolver::{NativeResolver, Resolver};
     use crate::routing::predicate::RouteProtocol;
+
+    struct DropNotifyStream {
+        inner: DuplexStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl DropNotifyStream {
+        fn new(inner: DuplexStream, dropped: Arc<AtomicBool>) -> Self {
+            Self { inner, dropped }
+        }
+    }
+
+    impl Drop for DropNotifyStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    impl AsyncRead for DropNotifyStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DropNotifyStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    fn routing_dependencies() -> (Arc<ClientProxySelector>, Arc<dyn Resolver>) {
+        (
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+        )
+    }
+
+    async fn wait_until_dropped(dropped: &AtomicBool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled H2 connection owner must be dropped");
+    }
 
     #[tokio::test]
     async fn test_server_session_creation() {
         // Verifies types compile correctly; full integration tests require a matching client
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_incomplete_h2mux_initialization() {
+        let (client, server) = duplex(4096);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = DropNotifyStream::new(server, Arc::clone(&dropped));
+        let parent = CancellationToken::new();
+        let meter = ConnContext::new_child(&parent);
+        let (selector, resolver) = routing_dependencies();
+
+        let task = tokio::spawn(handle_h2mux_session_with_meter(
+            stream,
+            None,
+            false,
+            selector,
+            resolver,
+            Some(meter),
+        ));
+        tokio::task::yield_now().await;
+        parent.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("hard stop must interrupt the mux header/H2 handshake")
+            .expect("server task must not panic")
+            .expect_err("cancelled initialization must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        wait_until_dropped(&dropped).await;
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_an_established_idle_h2mux_accept_loop() {
+        let (client_io, server_io) = duplex(64 * 1024);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = DropNotifyStream::new(server_io, Arc::clone(&dropped));
+        let parent = CancellationToken::new();
+        let meter = ConnContext::new_child(&parent);
+        let (selector, resolver) = routing_dependencies();
+
+        let server = tokio::spawn(handle_h2mux_session_with_meter(
+            stream,
+            None,
+            false,
+            selector,
+            resolver,
+            Some(meter),
+        ));
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(1),
+            H2MuxClientSession::new(client_io, &H2MuxOptions::default()),
+        )
+        .await
+        .expect("client H2 handshake must complete")
+        .expect("client H2 session must be valid");
+
+        // A completed logical request proves the server is past initialization and
+        // has returned to its physical session accept loop. With no routing rules,
+        // the request is rejected locally and leaves the outer session idle.
+        let destination = NetLocation::new(Address::from("idle.example").unwrap(), 443);
+        let mut logical = client.open_tcp(&destination).await.unwrap();
+        logical.write_all(b"probe").await.unwrap();
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(1), logical.read(&mut byte))
+            .await
+            .expect("blocked logical stream must receive a response")
+            .expect_err("empty selector rejects the logical destination");
+        drop(logical);
+
+        parent.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("hard stop must interrupt idle session.accept")
+            .expect("server task must not panic")
+            .expect_err("cancelled H2 session must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        wait_until_dropped(&dropped).await;
+        drop(client);
     }
 
     #[tokio::test]

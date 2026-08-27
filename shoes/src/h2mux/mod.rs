@@ -36,7 +36,9 @@ mod prepend_stream;
 
 // Re-exports for external use
 pub use h2mux_client_handler::H2MuxClientHandler;
-pub use h2mux_server_session::{handle_h2mux_session, handle_h2mux_session_with_meter};
+#[allow(unused_imports)]
+pub use h2mux_server_session::handle_h2mux_session;
+pub use h2mux_server_session::handle_h2mux_session_with_meter;
 
 // Reserved for future use (e.g., session pooling, direct stream access)
 #[allow(unused_imports)]

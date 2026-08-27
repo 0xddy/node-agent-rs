@@ -11,7 +11,8 @@ use crate::address::{Address, NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+use crate::dynamic::current_connection;
+use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
 use crate::resolver::Resolver;
 use crate::shadowsocks::{
     ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
@@ -192,14 +193,16 @@ impl TcpServerHandler for SnellServerHandler {
                 let udp_enabled = self.udp_enabled;
 
                 let initial_data = stream_reader.unparsed_data_owned();
+                let meter = current_connection();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_h2mux_session(
+                    if let Err(e) = handle_h2mux_session_with_meter(
                         server_stream,
                         initial_data,
                         udp_enabled,
                         proxy_selector,
                         resolver,
+                        meter,
                     )
                     .await
                     {

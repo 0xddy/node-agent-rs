@@ -196,14 +196,11 @@ impl FrameMetadata {
             return Ok(None);
         }
 
-        // Skip length field
-        buf.advance(2);
-
         if metadata_len < 4 {
             log::error!(
                 "[XUDP DECODE] Metadata too short: {} (buffer was {} bytes, first 8 bytes: {:?})",
                 metadata_len,
-                buf.len() + 2,
+                buf.len(),
                 &buf[..std::cmp::min(8, buf.len())]
             );
             return Err(std::io::Error::new(
@@ -212,43 +209,72 @@ impl FrameMetadata {
             ));
         }
 
-        // Track how many metadata bytes we consume
-        let metadata_start = buf.len();
-
-        let session_id = buf.get_u16();
-        let status = SessionStatus::try_from(buf.get_u8())?;
-        let option = FrameOption::from(buf.get_u8());
+        // Parse from an independent, exactly bounded metadata buffer. A malformed
+        // target must never consume the following DATA length/payload. Keep the
+        // caller's buffer untouched until the complete metadata parses.
+        let mut metadata = BytesMut::from(&buf[2..2 + metadata_len]);
+        let session_id = metadata.get_u16();
+        let status = SessionStatus::try_from(metadata.get_u8())?;
+        let option = FrameOption::from(metadata.get_u8());
 
         let mut network = None;
         let mut target = None;
 
         // Calculate remaining metadata bytes (after session_id, status, option = 4 bytes)
-        let remaining_metadata = metadata_len.saturating_sub(4);
+        let remaining_metadata = metadata.remaining();
 
         // Parse destination for New or Keep+UDP
         // Check remaining_metadata > 0 to know if there's address data
-        if remaining_metadata > 0
-            && (status == SessionStatus::New
-                || (status == SessionStatus::Keep && buf.remaining() > 0 && buf[0] == 0x02))
-        {
-            let net_byte = buf.get_u8();
+        let has_target = status == SessionStatus::New
+            || (status == SessionStatus::Keep
+                && remaining_metadata > 0
+                && metadata[0] == TargetNetwork::Udp as u8);
+        if has_target {
+            // network(1) + port(2) + address type(1) is the minimum target.
+            if remaining_metadata < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("XUDP {:?} metadata has a truncated target", status),
+                ));
+            }
+
+            let net_byte = metadata.get_u8();
             network = Some(TargetNetwork::try_from(net_byte)?);
 
-            let port = buf.get_u16();
-            let address = decode_address(buf)?;
+            if metadata.remaining() < 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "XUDP metadata has a truncated target port",
+                ));
+            }
+            let port = metadata.get_u16();
+            let address = decode_address(&mut metadata).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                } else {
+                    error
+                }
+            })?;
             target = Some(NetLocation::new(address, port));
+        } else if status == SessionStatus::New {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "XUDP New metadata is missing its target",
+            ));
         }
 
         // Consume any remaining metadata bytes we didn't parse
-        let consumed = metadata_start - buf.len();
-        let unconsumed = metadata_len.saturating_sub(consumed);
+        let unconsumed = metadata.remaining();
         if unconsumed > 0 {
             log::debug!(
                 "[XUDP DECODE] Skipping {} unconsumed metadata bytes (GlobalID or padding)",
                 unconsumed
             );
-            buf.advance(unconsumed);
+            metadata.advance(unconsumed);
         }
+
+        debug_assert!(metadata.is_empty());
+        buf.advance(2 + metadata_len);
 
         Ok(Some(FrameMetadata {
             session_id,

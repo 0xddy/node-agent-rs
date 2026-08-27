@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ConnectDecision;
@@ -18,8 +18,8 @@ use crate::config::{
 };
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::dynamic::{
-    ConnContext, HandlerSlot, ServerHandle, StaticUserRegistry, TrafficMeterStream, UserRegistry,
-    scope_connection_until_cancelled,
+    ConnContext, HandlerSlot, InboundReplayScope, ServerHandle, StaticUserRegistry,
+    TrafficMeterStream, UserRegistry, scope_connection_until_cancelled,
 };
 use crate::quic_stream::QuicStream;
 use crate::resolver::Resolver;
@@ -27,10 +27,14 @@ use crate::routing::{ServerStream, run_udp_routing};
 use crate::rustls_config_util::create_server_config;
 use crate::socket_util::new_socket2_udp_socket;
 use crate::tcp::handshake_gate::{
-    HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
+    DEFERRED_AUTHENTICATION_TIMEOUT, HandshakeGate, HandshakePermit, MAX_ACTIVE_FALLBACKS,
+    MAX_ACTIVE_FALLBACKS_PER_SOURCE, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
 };
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{
+    DeferredAuthenticationCompletion, DeferredAuthenticationOutcome, TcpServerHandler,
+    TcpServerSetupResult, UnauthenticatedFallbackCompletion,
+};
 use crate::tcp::tcp_server::{
     run_udp_copy, setup_client_tcp_stream_with_metadata, sniff_tcp_after_success_response,
 };
@@ -74,6 +78,31 @@ pub(crate) const QUIC_TRANSPORT_HANDSHAKE_TIMEOUT: Duration = Duration::from_sec
 const MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS: usize = 1024;
 const MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS_PER_SOURCE: usize = 64;
 
+/// Cancellation root for one physical QUIC connection.
+///
+/// The token inherits a hard inbound removal from `parent`. Its owned guard also
+/// cancels the token on every natural or error return from the connection task, so
+/// detached logical work cannot outlive the transport that created it.
+pub(crate) struct QuicConnectionLifecycle {
+    token: CancellationToken,
+    _cancel_on_drop: DropGuard,
+}
+
+impl QuicConnectionLifecycle {
+    pub(crate) fn new(parent: &CancellationToken) -> Self {
+        let token = parent.child_token();
+        let cancel_on_drop = token.clone().drop_guard();
+        Self {
+            token,
+            _cancel_on_drop: cancel_on_drop,
+        }
+    }
+
+    pub(crate) fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
 /// Error codes used only by the generic QUIC transport.
 ///
 /// Zero means success/application shutdown in a number of protocols. Refusing work
@@ -81,6 +110,7 @@ const MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS_PER_SOURCE: usize = 64;
 /// an error by the peer rather than looking like a clean end of stream.
 const QUIC_ERR_PRE_AUTH_TIMEOUT: u32 = 1;
 const QUIC_ERR_HANDSHAKE_LIMIT: u32 = 2;
+const QUIC_ERR_INBOUND_HARD_CLOSE: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IncomingAddressAction {
@@ -144,15 +174,21 @@ pub(crate) fn require_validated_quic_address(
 /// connections rather than deadlocking against its own connection permits.
 struct QuicHandshakeState {
     stream_gate: Arc<HandshakeGate>,
+    fallback_gate: Arc<HandshakeGate>,
     source: IpAddr,
     first_handshake_completed: AtomicBool,
     first_handshake_notify: Notify,
 }
 
 impl QuicHandshakeState {
-    fn new(stream_gate: Arc<HandshakeGate>, source: IpAddr) -> Arc<Self> {
+    fn new(
+        stream_gate: Arc<HandshakeGate>,
+        fallback_gate: Arc<HandshakeGate>,
+        source: IpAddr,
+    ) -> Arc<Self> {
         Arc::new(Self {
             stream_gate,
+            fallback_gate,
             source,
             first_handshake_completed: AtomicBool::new(false),
             first_handshake_notify: Notify::new(),
@@ -170,6 +206,10 @@ impl QuicHandshakeState {
 
     fn first_handshake_completed(&self) -> bool {
         self.first_handshake_completed.load(Ordering::Acquire)
+    }
+
+    fn enter_fallback(&self) -> Option<HandshakePermit> {
+        self.fallback_gate.enter(Some(self.source))
     }
 }
 
@@ -215,6 +255,22 @@ impl QuicStreamHandshakePermit {
     }
 }
 
+/// Prepare a complete endpoint batch before any accept task is spawned.
+///
+/// This is deliberately generic so the native QUIC protocols use the same
+/// all-or-nothing boundary. If `prepare` fails partway through, dropping the local
+/// vector closes every socket prepared earlier in the batch.
+pub(crate) fn prepare_endpoint_batch<T>(
+    count: usize,
+    mut prepare: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<Vec<T>> {
+    let mut endpoints = Vec::with_capacity(count);
+    for _ in 0..count {
+        endpoints.push(prepare()?);
+    }
+    Ok(endpoints)
+}
+
 async fn start_quic_server(
     bind_address: SocketAddr,
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
@@ -224,8 +280,8 @@ async fn start_quic_server(
     num_endpoints: usize,
     metered: bool,
     cancel: CancellationToken,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = vec![];
     // Connections and stream handshakes are different resources and need independent
     // shares. Sharing each gate across the endpoint fan-out prevents `num_endpoints`
     // from multiplying either ceiling.
@@ -234,7 +290,8 @@ async fn start_quic_server(
         MAX_ACTIVE_GENERIC_QUIC_CONNECTIONS_PER_SOURCE,
     );
     let stream_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
-    for _ in 0..num_endpoints {
+    let fallback_gate = HandshakeGate::new(MAX_ACTIVE_FALLBACKS, MAX_ACTIVE_FALLBACKS_PER_SOURCE);
+    let endpoints = prepare_endpoint_batch(num_endpoints, || {
         let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
         // A peer cannot create more simultaneous bidi streams on one connection than
         // one source is allowed to hold in the listener-wide stream-handshake gate.
@@ -252,24 +309,29 @@ async fn start_quic_server(
             None,
             Some(bind_address),
             num_endpoints > 1,
-        )
-        .unwrap();
+        )?;
 
-        let endpoint = quinn::Endpoint::new(
+        quinn::Endpoint::new(
             EndpointConfig::default(),
             Some(server_config),
             socket2_socket.into(),
             Arc::new(quinn::TokioRuntime),
-        )?;
+        )
+    })?;
 
+    let mut join_handles = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
         let handler_slot = handler_slot.clone();
         let connection_gate = connection_gate.clone();
         let stream_gate = stream_gate.clone();
+        let fallback_gate = fallback_gate.clone();
         let cancel = cancel.clone();
+        let connection_cancel = connection_cancel.clone();
         let join_handle = tokio::spawn(async move {
             loop {
                 let conn = tokio::select! {
                     biased;
+                    () = connection_cancel.cancelled() => break,
                     () = cancel.cancelled() => break,
                     incoming = endpoint.accept() => match incoming {
                         Some(conn) => conn,
@@ -289,21 +351,23 @@ async fn start_quic_server(
                     continue;
                 };
                 let pre_auth_deadline = Instant::now() + QUIC_PRE_AUTH_TIMEOUT;
-                let handshake_state = QuicHandshakeState::new(stream_gate.clone(), remote_ip);
-                // Read once per QUIC connection: every stream it goes on to open
-                // is served by the generation that was current when the connection
-                // was accepted -- the resolver included, so its rules and its DNS
-                // are always from the same reload.
-                let (server_handler, resolver) = handler_slot.load();
+                let handshake_state =
+                    QuicHandshakeState::new(stream_gate.clone(), fallback_gate.clone(), remote_ip);
+                // Generic QUIC authenticates and routes each bidirectional stream
+                // independently. Keep the slot on the transport so every newly
+                // accepted logical flow observes the current handler and its paired
+                // resolver, while an already-running stream retains its loaded Arc.
+                let handler_slot = handler_slot.clone();
+                let stream_connection_cancel = connection_cancel.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
-                        resolver,
-                        server_handler,
+                        handler_slot,
                         conn,
                         metered,
                         handshake_state,
                         connection_permit,
                         pre_auth_deadline,
+                        stream_connection_cancel,
                     )
                     .await
                     {
@@ -312,7 +376,11 @@ async fn start_quic_server(
                 });
             }
 
-            drain_endpoint(endpoint, bind_address).await;
+            if connection_cancel.is_cancelled() {
+                hard_close_endpoint(endpoint, bind_address).await;
+            } else {
+                drain_endpoint(endpoint, bind_address).await;
+            }
         });
 
         join_handles.push(join_handle);
@@ -342,31 +410,64 @@ pub(crate) async fn drain_endpoint(endpoint: quinn::Endpoint, bind_address: Sock
     }
 }
 
+/// Immediately close every connection on an endpoint, then wait only for quinn to
+/// finish processing that forced close and release the socket.
+///
+/// This is intentionally distinct from [`drain_endpoint`]: the close signal is sent
+/// before waiting, so a peer cannot extend a hard inbound removal by keeping a QUIC
+/// stream alive.
+pub(crate) async fn hard_close_endpoint(endpoint: quinn::Endpoint, bind_address: SocketAddr) {
+    let open_connections = endpoint.open_connections();
+    endpoint.close(QUIC_ERR_INBOUND_HARD_CLOSE.into(), b"inbound hard close");
+    if tokio::time::timeout(QUIC_DRAIN_TIMEOUT, endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        debug!(
+            "quic endpoint on {bind_address} still had work after hard-closing \
+             {open_connections} connection(s); dropping it"
+        );
+    }
+}
+
 async fn process_connection(
-    resolver: Arc<dyn Resolver>,
-    server_handler: Arc<dyn TcpServerHandler>,
+    handler_slot: Arc<HandlerSlot>,
     conn: quinn::Incoming,
     metered: bool,
     handshake_state: Arc<QuicHandshakeState>,
     connection_permit: HandshakePermit,
     pre_auth_deadline: Instant,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<()> {
     // Generic QUIC has no connection-level user identity: every stream performs an
     // independent configured-protocol handshake. Keep the separate active-transport
     // quota until the connection ends so one cheap successful stream cannot leave an
     // unlimited pool of empty, PING-kept-alive transports.
     let _connection_permit = connection_permit;
+    // Streams need a transport-local cancellation parent, not a clone of the
+    // inbound-wide token. It inherits hard removal, while this guard additionally
+    // cancels detached logical work when the physical QUIC connection ends normally.
+    let connection_lifecycle = QuicConnectionLifecycle::new(&connection_cancel);
     let transport_deadline = std::cmp::min(
         pre_auth_deadline,
         Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
     );
-    let connection = match timeout_at(transport_deadline, conn).await {
-        Ok(result) => result?,
-        Err(_elapsed) => {
+    let connection = tokio::select! {
+        biased;
+        () = connection_lifecycle.token().cancelled() => {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "generic QUIC transport handshake exceeded the pre-auth deadline",
+                std::io::ErrorKind::ConnectionAborted,
+                "generic QUIC inbound was hard-stopped during transport handshake",
             ));
+        }
+        result = timeout_at(transport_deadline, conn) => match result {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "generic QUIC transport handshake exceeded the pre-auth deadline",
+                ));
+            }
         }
     };
 
@@ -382,6 +483,14 @@ async fn process_connection(
         }
 
         let accepted = tokio::select! {
+            biased;
+            () = connection_lifecycle.token().cancelled() => {
+                connection.close(QUIC_ERR_INBOUND_HARD_CLOSE.into(), b"inbound hard close");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "generic QUIC inbound was hard-stopped",
+                ));
+            }
             completed = &mut pre_auth_completion, if pre_auth_pending => {
                 // A stream can complete without opening another stream to wake
                 // `accept_bi`; Notify releases the admission immediately rather
@@ -418,8 +527,11 @@ async fn process_connection(
             let _ = recv.stop(QUIC_ERR_HANDSHAKE_LIMIT.into());
             continue;
         };
-        let cloned_resolver = resolver.clone();
-        let cloned_handler = server_handler.clone();
+        // Load after accepting the stream and before spawning its task. The pair is
+        // one atomic slot generation, and the task-owned Arcs pin that generation
+        // for this flow even if a reload happens while its handshake is in flight.
+        let (cloned_handler, cloned_resolver) = handler_slot.load();
+        let stream_connection_cancel = connection_lifecycle.token().clone();
         tokio::spawn(async move {
             if let Err(e) = process_streams(
                 cloned_resolver,
@@ -427,6 +539,7 @@ async fn process_connection(
                 (send, recv),
                 metered,
                 handshake_permit,
+                stream_connection_cancel,
             )
             .await
             {
@@ -456,31 +569,37 @@ async fn process_streams(
     (send, recv): (quinn::SendStream, quinn::RecvStream),
     metered: bool,
     handshake_permit: QuicStreamHandshakePermit,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<()> {
     let quic_stream = QuicStream::from(send, recv);
 
-    if !metered {
-        return serve_stream(
-            resolver,
-            server_handler,
-            Box::new(quic_stream),
-            handshake_permit,
-        )
-        .await;
-    }
-
-    let conn = ConnContext::new();
-    let quic_stream = TrafficMeterStream::new(quic_stream, Arc::clone(&conn));
-    scope_connection_until_cancelled(
-        conn,
-        serve_stream(
-            resolver,
-            server_handler,
-            Box::new(quic_stream),
-            handshake_permit,
-        ),
-    )
+    scope_generic_quic_stream_until_cancelled(&connection_cancel, move |conn| async move {
+        let quic_stream: Box<dyn AsyncStream> = if metered {
+            Box::new(TrafficMeterStream::new(quic_stream, conn))
+        } else {
+            Box::new(quic_stream)
+        };
+        serve_stream(resolver, server_handler, quic_stream, handshake_permit).await
+    })
     .await
+}
+
+/// Run one independently authenticated generic-QUIC stream under its physical
+/// connection's lifecycle (which itself inherits the inbound hard-removal tree).
+/// A context exists even when byte accounting is disabled so a handler that
+/// detaches a fallback or mux session can carry the same cancellation token across
+/// its own `tokio::spawn` boundary.
+async fn scope_generic_quic_stream_until_cancelled<F, Fut>(
+    connection_cancel: &CancellationToken,
+    build: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(Arc<ConnContext>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let conn = ConnContext::new_child(connection_cancel);
+    let future = build(Arc::clone(&conn));
+    scope_connection_until_cancelled(conn, future).await
 }
 
 async fn serve_stream(
@@ -510,7 +629,7 @@ async fn serve_stream(
         }
     };
 
-    finish_stream_handshake(&setup_result, handshake_permit);
+    let admission = finish_stream_handshake(&setup_result, handshake_permit)?;
 
     match setup_result {
         TcpServerSetupResult::TcpForward {
@@ -646,27 +765,91 @@ async fn serve_stream(
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled
-        | TcpServerSetupResult::UnauthenticatedFallbackHandled => {
-            // Connection already handled by a spawned task (e.g., Reality fallback)
-            Ok(())
+        TcpServerSetupResult::AlreadyHandled => Ok(()),
+        TcpServerSetupResult::UnauthenticatedFallbackHandled(completion) => {
+            wait_for_quic_fallback(
+                completion,
+                match admission {
+                    StreamSetupAdmission::Fallback(permit) => permit,
+                    _ => unreachable!("fallback setup transfers to fallback admission"),
+                },
+            )
+            .await
+        }
+        TcpServerSetupResult::DeferredAuthenticationHandled(completion) => {
+            wait_for_quic_deferred_authentication(
+                completion,
+                match admission {
+                    StreamSetupAdmission::Deferred(permit) => permit,
+                    _ => unreachable!("deferred setup retains its stream admission"),
+                },
+            )
+            .await
         }
     }
+}
+
+enum StreamSetupAdmission {
+    Complete,
+    Fallback(HandshakePermit),
+    Deferred(QuicStreamHandshakePermit),
 }
 
 fn finish_stream_handshake(
     setup_result: &TcpServerSetupResult,
     handshake_permit: QuicStreamHandshakePermit,
-) {
-    if setup_result.completes_protocol_handshake() {
-        // This stream completed its configured protocol handshake. Release the
-        // stream permit and notify the connection admission waiter immediately.
-        handshake_permit.complete();
-    } else {
-        // A camouflage/fallback task owns the stream after failed or deferred proxy
-        // authentication. It no longer consumes a stream-handshake slot, but it
-        // must not authenticate the whole multiplexed QUIC connection.
-        drop(handshake_permit);
+) -> std::io::Result<StreamSetupAdmission> {
+    match setup_result {
+        TcpServerSetupResult::UnauthenticatedFallbackHandled(_) => {
+            // A fallback is still bounded, but it must not keep a scarce protocol
+            // handshake slot for its whole camouflage lifetime. Transfer to the
+            // independent fallback gate without marking this QUIC connection as
+            // authenticated.
+            let fallback = handshake_permit.state.enter_fallback().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "generic QUIC listener is at its unauthenticated fallback limit",
+                )
+            })?;
+            drop(handshake_permit);
+            Ok(StreamSetupAdmission::Fallback(fallback))
+        }
+        TcpServerSetupResult::DeferredAuthenticationHandled(_) => {
+            Ok(StreamSetupAdmission::Deferred(handshake_permit))
+        }
+        _ => {
+            // This stream completed its configured protocol handshake. Release the
+            // stream permit and notify the connection admission waiter immediately.
+            handshake_permit.complete();
+            Ok(StreamSetupAdmission::Complete)
+        }
+    }
+}
+
+async fn wait_for_quic_fallback(
+    completion: UnauthenticatedFallbackCompletion,
+    _permit: HandshakePermit,
+) -> std::io::Result<()> {
+    completion.wait().await
+}
+
+async fn wait_for_quic_deferred_authentication(
+    completion: DeferredAuthenticationCompletion,
+    permit: QuicStreamHandshakePermit,
+) -> std::io::Result<()> {
+    match timeout(DEFERRED_AUTHENTICATION_TIMEOUT, completion.wait()).await {
+        Ok(DeferredAuthenticationOutcome::Authenticated) => {
+            permit.complete();
+            Ok(())
+        }
+        Ok(DeferredAuthenticationOutcome::Completed(result)) => {
+            drop(permit);
+            result
+        }
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "deferred QUIC authentication exceeded its absolute deadline",
+        )),
     }
 }
 
@@ -674,6 +857,7 @@ pub async fn start_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
+    replay_scope: InboundReplayScope,
 ) -> std::io::Result<ServerHandle> {
     // One token for the whole inbound: every accept loop started below selects on
     // it, so the embedder stops all of them together.
@@ -682,9 +866,10 @@ pub async fn start_quic_servers(
     // Created here, before the config is taken apart, so it can record what the
     // endpoint below is about to bake in -- the certificate and the ALPN list, which
     // a reload cannot rebuild. `check_reload` compares against these.
-    let mut handle = ServerHandle::new(config.transport.clone(), cancel.clone());
+    let mut handle =
+        ServerHandle::new_with_replay_scope(config.transport.clone(), cancel.clone(), replay_scope);
     handle.record_listener_settings(&config);
-    let replay_state = handle.replay_state();
+    let replay_scope = handle.replay_scope();
 
     let ServerConfig {
         bind_location,
@@ -799,7 +984,7 @@ pub async fn start_quic_servers(
                     &started_protocol,
                     users.is_some(),
                 );
-                let hysteria2_handles = crate::hysteria2_server::start_hysteria2_server(
+                let hysteria2_handles = match crate::hysteria2_server::start_hysteria2_server(
                     bind_address,
                     quic_server_config.clone(),
                     hysteria2_users.clone(),
@@ -812,8 +997,19 @@ pub async fn start_quic_servers(
                     obfs.clone(),
                     masquerade.clone(),
                     cancel.clone(),
+                    handle.connection_token(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(handles) => handles,
+                    Err(error) => {
+                        // A prior bind address may already have spawned accept
+                        // loops. Revoke and join them before returning an error for
+                        // this later endpoint batch.
+                        handle.hard_shutdown(QUIC_DRAIN_TIMEOUT).await;
+                        return Err(error);
+                    }
+                };
                 for listener in hysteria2_handles {
                     handle.push_listener(listener);
                 }
@@ -842,7 +1038,7 @@ pub async fn start_quic_servers(
                     &started_protocol,
                     users.is_some(),
                 );
-                let tuic_handles = crate::tuic_server::start_tuic_server(
+                let tuic_handles = match crate::tuic_server::start_tuic_server(
                     bind_address,
                     quic_server_config.clone(),
                     tuic_users.clone(),
@@ -851,8 +1047,16 @@ pub async fn start_quic_servers(
                     num_endpoints,
                     zero_rtt_handshake,
                     cancel.clone(),
+                    handle.connection_token(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(handles) => handles,
+                    Err(error) => {
+                        handle.hard_shutdown(QUIC_DRAIN_TIMEOUT).await;
+                        return Err(error);
+                    }
+                };
                 for listener in tuic_handles {
                     handle.push_listener(listener);
                 }
@@ -869,19 +1073,27 @@ pub async fn start_quic_servers(
                         &resolver,
                         Some(bind_address.ip()),
                         users.as_ref(),
-                        &replay_state,
+                        &replay_scope,
                     )
                     .into()
                 });
-                let quic_handles = start_quic_server(
+                let quic_handles = match start_quic_server(
                     bind_address,
                     quic_server_config.clone(),
                     handler_slot,
                     num_endpoints,
                     metered,
                     cancel.clone(),
+                    handle.connection_token(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(handles) => handles,
+                    Err(error) => {
+                        handle.hard_shutdown(QUIC_DRAIN_TIMEOUT).await;
+                        return Err(error);
+                    }
+                };
 
                 for listener in quic_handles {
                     handle.push_listener(listener);
@@ -898,18 +1110,117 @@ pub async fn start_quic_servers(
 mod tests {
     use super::{
         IncomingAddressAction, QUIC_ERR_HANDSHAKE_LIMIT, QUIC_ERR_PRE_AUTH_TIMEOUT,
-        QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, QuicHandshakeState,
-        finish_stream_handshake, first_handshake_completed_before_deadline,
-        incoming_address_action,
+        QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, QuicConnectionLifecycle,
+        QuicHandshakeState, finish_stream_handshake, first_handshake_completed_before_deadline,
+        incoming_address_action, prepare_endpoint_batch, scope_generic_quic_stream_until_cancelled,
+        wait_for_quic_fallback,
     };
     use crate::tcp::handshake_gate::{HandshakeGate, MAX_PENDING_PER_SOURCE};
-    use crate::tcp::tcp_handler::TcpServerSetupResult;
+    use crate::tcp::tcp_handler::{TcpServerSetupResult, UnauthenticatedFallbackCompletion};
+    use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{Instant, advance};
+    use tokio_util::sync::CancellationToken;
 
     fn source(last: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))
+    }
+
+    fn handshake_state(stream_gate: Arc<HandshakeGate>, source: IpAddr) -> Arc<QuicHandshakeState> {
+        QuicHandshakeState::new(stream_gate, HandshakeGate::new(1, 1), source)
+    }
+
+    #[tokio::test]
+    async fn nonmetered_generic_quic_work_observes_the_hard_stop_tree() {
+        let hard_stop = CancellationToken::new();
+        let task_token = hard_stop.clone();
+        let (weak_tx, weak_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            scope_generic_quic_stream_until_cancelled(&task_token, |conn| {
+                let _ = weak_tx.send(Arc::downgrade(&conn));
+                async { std::future::pending::<std::io::Result<()>>().await }
+            })
+            .await
+        });
+
+        let weak = weak_rx.await.expect("logical stream context was created");
+        assert!(weak.upgrade().is_some());
+        hard_stop.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("hard stop must wake nonmetered logical work")
+            .expect("logical stream task must not panic")
+            .expect_err("hard-stopped logical work must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn natural_quic_exit_cancels_detached_logical_work_only_for_that_connection() {
+        let inbound = CancellationToken::new();
+        let connection = QuicConnectionLifecycle::new(&inbound);
+        let task_token = connection.token().clone();
+        let (weak_tx, weak_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            scope_generic_quic_stream_until_cancelled(&task_token, |conn| {
+                let _ = weak_tx.send(Arc::downgrade(&conn));
+                async { std::future::pending::<std::io::Result<()>>().await }
+            })
+            .await
+        });
+
+        let weak = weak_rx.await.expect("logical stream context was created");
+        assert!(weak.upgrade().is_some());
+        drop(connection);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("natural transport exit must wake detached logical work")
+            .expect("logical stream task must not panic")
+            .expect_err("connection-scoped logical work must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(weak.upgrade().is_none());
+        assert!(
+            !inbound.is_cancelled(),
+            "one transport ending must not cancel the whole inbound"
+        );
+    }
+
+    #[test]
+    fn failed_endpoint_batch_drops_every_prepared_endpoint() {
+        #[derive(Debug)]
+        struct DropSpy(Rc<Cell<usize>>);
+
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let attempts = Cell::new(0);
+        let drops = Rc::new(Cell::new(0));
+        let error = prepare_endpoint_batch(3, || {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 1 {
+                Err(std::io::Error::other("injected second-endpoint failure"))
+            } else {
+                Ok(DropSpy(Rc::clone(&drops)))
+            }
+        })
+        .expect_err("the injected second endpoint fails");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(attempts.get(), 2, "preparation stops at the first error");
+        assert_eq!(
+            drops.get(),
+            1,
+            "the first prepared endpoint is rolled back before Err escapes"
+        );
     }
 
     #[test]
@@ -942,7 +1253,7 @@ mod tests {
         let connection_permit = connection_gate
             .enter(Some(ip))
             .expect("admit the QUIC connection");
-        let state = QuicHandshakeState::new(stream_gate.clone(), ip);
+        let state = handshake_state(stream_gate.clone(), ip);
         let completion_state = state.clone();
         let completion = tokio::spawn(first_handshake_completed_before_deadline(
             completion_state,
@@ -975,7 +1286,7 @@ mod tests {
     fn a_failed_stream_releases_only_its_stream_permit() {
         let stream_gate = HandshakeGate::new(1, 1);
         let ip = source(1);
-        let state = QuicHandshakeState::new(stream_gate.clone(), ip);
+        let state = handshake_state(stream_gate.clone(), ip);
 
         let failed = state.enter_stream().expect("first stream");
         assert!(stream_gate.enter(Some(source(2))).is_none());
@@ -991,7 +1302,7 @@ mod tests {
     fn every_concurrent_stream_has_a_per_source_handshake_charge() {
         let stream_gate = HandshakeGate::new(8, 2);
         let ip = source(1);
-        let state = QuicHandshakeState::new(stream_gate.clone(), ip);
+        let state = handshake_state(stream_gate.clone(), ip);
 
         let first = state.enter_stream().expect("first stream");
         let second = state.enter_stream().expect("second stream");
@@ -1011,7 +1322,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn absolute_deadline_fires_without_a_successful_stream() {
-        let state = QuicHandshakeState::new(HandshakeGate::new(1, 1), source(1));
+        let state = handshake_state(HandshakeGate::new(1, 1), source(1));
         let deadline = Instant::now() + Duration::from_secs(60);
         let waiter = tokio::spawn(first_handshake_completed_before_deadline(state, deadline));
         tokio::task::yield_now().await;
@@ -1022,7 +1333,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_success_disarms_the_absolute_deadline() {
-        let state = QuicHandshakeState::new(HandshakeGate::new(1, 1), source(1));
+        let state = handshake_state(HandshakeGate::new(1, 1), source(1));
         let deadline = Instant::now() + Duration::from_secs(60);
         let waiter = tokio::spawn(first_handshake_completed_before_deadline(
             state.clone(),
@@ -1039,31 +1350,67 @@ mod tests {
         assert!(waiter.await.unwrap());
     }
 
-    #[test]
-    fn unauthenticated_fallback_does_not_complete_the_connection_handshake() {
+    #[tokio::test]
+    async fn unauthenticated_fallback_transfers_to_an_independent_admission() {
         let stream_gate = HandshakeGate::new(1, 1);
-        let state = QuicHandshakeState::new(stream_gate.clone(), source(1));
+        let fallback_gate = HandshakeGate::new(1, 1);
+        let state = QuicHandshakeState::new(stream_gate.clone(), fallback_gate.clone(), source(1));
         let permit = state.enter_stream().expect("fallback stream permit");
-
-        finish_stream_handshake(
-            &TcpServerSetupResult::UnauthenticatedFallbackHandled,
-            permit,
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let setup_result = TcpServerSetupResult::UnauthenticatedFallbackHandled(
+            UnauthenticatedFallbackCompletion::new(tokio::spawn(async move {
+                finish_rx.await.map_err(std::io::Error::other)?;
+                Ok(())
+            })),
         );
+
+        let retained_permit = match finish_stream_handshake(&setup_result, permit)
+            .expect("unauthenticated fallback must transfer admission")
+        {
+            super::StreamSetupAdmission::Fallback(permit) => permit,
+            _ => panic!("fallback setup returned the wrong admission kind"),
+        };
+        let TcpServerSetupResult::UnauthenticatedFallbackHandled(completion) = setup_result else {
+            unreachable!()
+        };
+        let waiter = tokio::spawn(wait_for_quic_fallback(completion, retained_permit));
+        tokio::task::yield_now().await;
 
         assert!(!state.first_handshake_completed());
         assert!(
             stream_gate.enter(Some(source(2))).is_some(),
-            "the handed-off stream no longer consumes a pending stream slot"
+            "fallback work must release the protocol-handshake slot"
+        );
+        assert!(
+            fallback_gate.enter(Some(source(2))).is_none(),
+            "the handed-off unauthenticated stream remains independently bounded"
+        );
+
+        finish_tx.send(()).expect("finish fallback");
+        waiter
+            .await
+            .expect("fallback waiter must not panic")
+            .expect("fallback completion must succeed");
+        assert!(
+            !state.first_handshake_completed(),
+            "fallback completion is not protocol authentication"
+        );
+        assert!(
+            fallback_gate.enter(Some(source(2))).is_some(),
+            "fallback completion must release its fallback slot"
         );
     }
 
     #[test]
     fn authenticated_background_handoff_completes_the_connection_handshake() {
         let stream_gate = HandshakeGate::new(1, 1);
-        let state = QuicHandshakeState::new(stream_gate.clone(), source(1));
+        let state = handshake_state(stream_gate.clone(), source(1));
         let permit = state.enter_stream().expect("authenticated stream permit");
 
-        finish_stream_handshake(&TcpServerSetupResult::AlreadyHandled, permit);
+        assert!(matches!(
+            finish_stream_handshake(&TcpServerSetupResult::AlreadyHandled, permit),
+            Ok(super::StreamSetupAdmission::Complete)
+        ));
 
         assert!(state.first_handshake_completed());
         assert!(stream_gate.enter(Some(source(2))).is_some());

@@ -57,7 +57,7 @@ futures = "*"
 h2 = "*"
 h3 = "*"
 h3-quinn = "*"
-hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs", "quic-aws-lc-rs"] }
+hickory-resolver = { version = "*", default-features = false, features = ["system-config", "tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs", "quic-aws-lc-rs"] }
 http = "*"
 http-body-util = "*"
 hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
@@ -81,6 +81,7 @@ rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "*"
+resolv-conf = "*"
 rust-argon2 = "*"
 rustc-hash = "*"
 rustls = "*"
@@ -88,6 +89,7 @@ rustls-platform-verifier = "*"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = "*"
 serde_yaml = "*"
+sha2.workspace = true
 shake = "*"
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32"] }
 socket2 = { version = "*", features = ["all"] }
@@ -119,6 +121,9 @@ tokio-rustls = "*"
 # jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
 [target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
 tikv-jemallocator = "*"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ipconfig = "*"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "*"

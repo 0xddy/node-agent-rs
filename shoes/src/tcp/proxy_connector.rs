@@ -41,11 +41,25 @@ pub trait ProxyConnector: Send + Sync + Debug {
     /// when this is the first ProxyConnector in the chain.
     fn proxy_location(&self) -> &NetLocation;
 
+    /// Optional exact DNS upstream used to resolve this proxy server before
+    /// the preceding hop connects to it. Hop 0 is resolved by its
+    /// [`SocketConnector`](super::socket_connector::SocketConnector); this
+    /// accessor preserves the same per-outbound resolver semantics for hop 1+.
+    fn dns_resolver(&self) -> Option<&str> {
+        None
+    }
+
     /// Check if this connector supports UDP-over-TCP tunneling.
     fn supports_udp_over_tcp(&self) -> bool;
 
     /// Check if this connector supports protocol-native UDP datagrams.
     fn supports_native_udp(&self) -> bool {
+        false
+    }
+
+    /// Whether this protocol's UDP wire format requires the final destination
+    /// to be projected to a literal IP before protocol setup.
+    fn requires_literal_udp_target(&self) -> bool {
         false
     }
 

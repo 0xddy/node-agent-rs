@@ -28,6 +28,20 @@ pub enum ClientChainSelectionConfig {
     RoundRobin,
     #[serde(rename = "urltest", alias = "url_test")]
     UrlTest {
+        /// Opaque runtime identity used by embedders to share one URLTest
+        /// selection/history/worker across every reference to the same logical
+        /// outbound. Plain shoes configurations omit it and retain the historical
+        /// per-rule behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shared_id: Option<String>,
+        /// Go RealTag identities used by the generation-global history store.
+        /// Embedders set one key per compiled chain; plain Shoes configs omit it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        history_keys: Vec<String>,
+        /// Original URLTest member tags deleted after a live dial failure.
+        /// Go probes by RealTag but invalidates by the member's own tag.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failure_history_keys: Vec<String>,
         #[serde(default)]
         url: String,
         /// Use the operating system's TLS trust policy for HTTPS probes.
@@ -1376,6 +1390,9 @@ client_chain_selection:
         assert_eq!(
             client_chain_selection,
             &ClientChainSelectionConfig::UrlTest {
+                shared_id: None,
+                history_keys: Vec::new(),
+                failure_history_keys: Vec::new(),
                 url: "https://www.gstatic.com/generate_204".to_string(),
                 use_native_roots: false,
                 reselect_on_connection_failure: false,

@@ -2,10 +2,202 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream, AsyncTargetedMessageStream};
 use crate::client_proxy_selector::ClientProxySelector;
+
+/// Completion of an unauthenticated camouflage/fallback connection that was
+/// handed to a background task.
+///
+/// Keeping this handle in [`TcpServerSetupResult`] lets the transport retain its
+/// pre-authentication admission permit until the handed-off connection actually
+/// ends. Tokio normally detaches a dropped [`JoinHandle`]; this wrapper instead
+/// aborts on drop so hard-cancelling the transport cannot leave fallback work
+/// running without its admission charge. Normal completion uses
+/// [`wait`](Self::wait).
+pub struct UnauthenticatedFallbackCompletion {
+    task: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+impl UnauthenticatedFallbackCompletion {
+    pub fn new(task: JoinHandle<std::io::Result<()>>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    /// Wait for the background fallback, converting task cancellation or panic to
+    /// an ordinary I/O error rather than propagating a Tokio join failure.
+    pub async fn wait(mut self) -> std::io::Result<()> {
+        // Poll through a mutable reference so `self` continues to own the handle
+        // while this future is pending. If the waiter is cancelled, `Drop` can
+        // still abort the fallback instead of accidentally detaching it.
+        let result = self
+            .task
+            .as_mut()
+            .expect("fallback completion can only be awaited once")
+            .await;
+        self.task.take();
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("unauthenticated fallback task was cancelled: {error}"),
+            )),
+            Err(error) => Err(std::io::Error::other(format!(
+                "unauthenticated fallback task failed: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for UnauthenticatedFallbackCompletion {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // A transport hard-cancel drops its setup future. Tokio normally
+            // detaches a dropped JoinHandle, which would let the unauthenticated
+            // fallback outlive both its gate permit and connection scope.
+            task.abort();
+        }
+    }
+}
+
+/// One deferred-authentication handoff's terminal state as observed by the
+/// accepting transport.
+pub enum DeferredAuthenticationOutcome {
+    /// The background protocol task authenticated a user and may now continue
+    /// independently under that user's connection accounting.
+    Authenticated,
+    /// The background task ended before any request authenticated.
+    Completed(std::io::Result<()>),
+}
+
+/// A cloneable edge-trigger for a protocol whose authentication happens after its
+/// physical connection has been handed to a background task.
+///
+/// NaiveProxy HTTP/2 is the motivating case: Hyper owns the connection before the
+/// first CONNECT request carries Basic credentials. A watch channel makes the edge
+/// race-free even when that first request authenticates before the transport starts
+/// waiting for it.
+#[derive(Clone)]
+pub struct DeferredAuthenticationSignal {
+    authenticated: watch::Sender<bool>,
+}
+
+impl DeferredAuthenticationSignal {
+    pub fn channel() -> (Self, watch::Receiver<bool>) {
+        let (authenticated, receiver) = watch::channel(false);
+        (Self { authenticated }, receiver)
+    }
+
+    pub fn complete(&self) {
+        self.authenticated.send_replace(true);
+    }
+}
+
+/// Completion of a background protocol task whose user authentication is deferred
+/// until after the handler has returned.
+///
+/// Until [`wait`](Self::wait) observes authentication, dropping this value aborts
+/// the task just like [`UnauthenticatedFallbackCompletion`]. Once authentication is
+/// observed the join handle is deliberately detached: the task is then owned by the
+/// connection cancellation tree and user accounting rather than the pre-auth gate.
+pub struct DeferredAuthenticationCompletion {
+    task: Option<JoinHandle<std::io::Result<()>>>,
+    authenticated: watch::Receiver<bool>,
+}
+
+impl DeferredAuthenticationCompletion {
+    pub fn new(
+        task: JoinHandle<std::io::Result<()>>,
+        authenticated: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            authenticated,
+        }
+    }
+
+    pub async fn wait(mut self) -> DeferredAuthenticationOutcome {
+        enum Wake {
+            Authenticated(Result<(), watch::error::RecvError>),
+            Task(Result<std::io::Result<()>, tokio::task::JoinError>),
+        }
+
+        if *self.authenticated.borrow() {
+            // Taking and dropping a JoinHandle detaches it. `self` no longer owns a
+            // handle for Drop to abort, which is intentional after authentication.
+            self.task.take();
+            return DeferredAuthenticationOutcome::Authenticated;
+        }
+
+        let wake = {
+            let task = self
+                .task
+                .as_mut()
+                .expect("deferred authentication completion can only be awaited once");
+            tokio::select! {
+                biased;
+                signal = self.authenticated.changed() => Wake::Authenticated(signal),
+                result = task => Wake::Task(result),
+            }
+        };
+
+        match wake {
+            Wake::Authenticated(Ok(())) if *self.authenticated.borrow() => {
+                self.task.take();
+                DeferredAuthenticationOutcome::Authenticated
+            }
+            Wake::Authenticated(_) => {
+                // Every sender disappeared without authenticating. The task owns
+                // those senders, so wait for its concrete result rather than turn a
+                // normal connection close into a synthetic channel error.
+                let result = self
+                    .task
+                    .as_mut()
+                    .expect("deferred task remains owned until it completes")
+                    .await;
+                self.task.take();
+                DeferredAuthenticationOutcome::Completed(map_background_result(
+                    result,
+                    "deferred authentication task",
+                ))
+            }
+            Wake::Task(result) => {
+                self.task.take();
+                DeferredAuthenticationOutcome::Completed(map_background_result(
+                    result,
+                    "deferred authentication task",
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for DeferredAuthenticationCompletion {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn map_background_result(
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+    task_name: &str,
+) -> std::io::Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!("{task_name} was cancelled: {error}"),
+        )),
+        Err(error) => Err(std::io::Error::other(format!(
+            "{task_name} failed: {error}"
+        ))),
+    }
+}
 
 pub enum TcpServerSetupResult {
     TcpForward {
@@ -48,19 +240,21 @@ pub enum TcpServerSetupResult {
     ///
     /// Transport callers must stop processing this stream, but must not count it as
     /// a successful proxy handshake for a multiplexed connection-wide auth gate.
-    UnauthenticatedFallbackHandled,
+    UnauthenticatedFallbackHandled(UnauthenticatedFallbackCompletion),
+    /// A background protocol connection is live, but authentication will happen on
+    /// its first logical request. The transport must keep the pre-auth permit until
+    /// that signal arrives, then detach the background task without aborting it.
+    DeferredAuthenticationHandled(DeferredAuthenticationCompletion),
 }
 
 impl TcpServerSetupResult {
     pub(crate) fn is_already_handled(&self) -> bool {
         matches!(
             self,
-            Self::AlreadyHandled | Self::UnauthenticatedFallbackHandled
+            Self::AlreadyHandled
+                | Self::UnauthenticatedFallbackHandled(_)
+                | Self::DeferredAuthenticationHandled(_)
         )
-    }
-
-    pub(crate) fn completes_protocol_handshake(&self) -> bool {
-        !matches!(self, Self::UnauthenticatedFallbackHandled)
     }
 
     pub fn set_need_initial_flush(&mut self, need_initial_flush: bool) {
@@ -84,7 +278,8 @@ impl TcpServerSetupResult {
                 *flush = need_initial_flush;
             }
             TcpServerSetupResult::AlreadyHandled
-            | TcpServerSetupResult::UnauthenticatedFallbackHandled => {}
+            | TcpServerSetupResult::UnauthenticatedFallbackHandled(_)
+            | TcpServerSetupResult::DeferredAuthenticationHandled(_) => {}
         }
     }
 }
@@ -179,5 +374,74 @@ pub trait TcpClientHandler: Send + Sync + Debug {
             std::io::ErrorKind::Unsupported,
             "native UDP not supported by this protocol",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DeferredAuthenticationCompletion, DeferredAuthenticationOutcome,
+        DeferredAuthenticationSignal, UnauthenticatedFallbackCompletion,
+    };
+
+    #[tokio::test]
+    async fn fallback_task_panic_becomes_an_io_error() {
+        let completion = UnauthenticatedFallbackCompletion::new(tokio::spawn(async move {
+            panic!("injected fallback panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+
+        let error = completion
+            .wait()
+            .await
+            .expect_err("join failure must not escape as a panic");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("fallback task failed"));
+    }
+
+    #[tokio::test]
+    async fn deferred_authentication_detaches_live_work_only_after_the_signal() {
+        let (signal, receiver) = DeferredAuthenticationSignal::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let completion = DeferredAuthenticationCompletion::new(
+            tokio::spawn(async move {
+                finish_rx.await.map_err(std::io::Error::other)?;
+                let _ = done_tx.send(());
+                Ok(())
+            }),
+            receiver,
+        );
+
+        signal.complete();
+        assert!(matches!(
+            completion.wait().await,
+            DeferredAuthenticationOutcome::Authenticated
+        ));
+
+        finish_tx
+            .send(())
+            .expect("the authenticated background task remains live");
+        tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .expect("the detached task must still run")
+            .expect("the detached task must report completion");
+    }
+
+    #[tokio::test]
+    async fn deferred_task_end_before_authentication_is_reported() {
+        let (_signal, receiver) = DeferredAuthenticationSignal::channel();
+        let completion = DeferredAuthenticationCompletion::new(
+            tokio::spawn(async { Err(std::io::Error::other("ended before auth")) }),
+            receiver,
+        );
+
+        match completion.wait().await {
+            DeferredAuthenticationOutcome::Completed(Err(error)) => {
+                assert!(error.to_string().contains("ended before auth"));
+            }
+            _ => panic!("task completion must not be mistaken for authentication"),
+        }
     }
 }

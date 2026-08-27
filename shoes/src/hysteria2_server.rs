@@ -1,29 +1,49 @@
 use lru::LruCache;
 use std::collections::hash_map::Entry;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use log::{debug, error, warn};
+use futures::future::poll_fn;
+use log::{debug, error};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncWriteExt, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-/// Maximum number of fragmented packets to track per session.
+/// Maximum number of fragmented packets to track per connection.
 /// Old entries are automatically evicted when this limit is reached.
 const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum number of authenticated TCP logical flows one physical Hysteria2
+/// connection may process concurrently.
+///
+/// Quinn enforces the same advertised stream ceiling, while the semaphore below
+/// remains the application-owned backstop and covers work after the peer has
+/// finished uploading its stream bytes but DNS, outbound setup, or copying is still
+/// alive.
+const MAX_ACTIVE_TCP_LOGICAL_FLOWS: usize = 256;
+
+/// Absolute time allowed to deliver one Hysteria2 TCP request header after its QUIC
+/// stream is accepted. Progress does not reset this deadline.
+const TCP_REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Application error code used to refuse a peer-opened TCP stream after the
+/// connection-local logical-flow budget is exhausted.
+const TCP_FLOW_LIMIT_ERROR_CODE: u32 = 0x01;
 
 /// Maximum number of concurrent UDP sessions one connection may hold open.
 ///
@@ -39,20 +59,65 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// while capping one connection at roughly 32 MiB and 512 descriptors.
 const MAX_UDP_SESSIONS: usize = 512;
 
+/// Bound packets queued behind one outbound association. The old direct socket
+/// path applied backpressure in `send_to`; a bounded channel preserves that
+/// property when a proxy transport owns the write side in another task.
+const UDP_SESSION_QUEUE_CAPACITY: usize = 64;
+
+/// Commands for one fixed target are serialized by that target's owner task.
+/// Keeping this much smaller than the association queue prevents one stalled
+/// destination from absorbing the whole connection byte budget.
+const UDP_TARGET_QUEUE_CAPACITY: usize = 8;
+
+/// Remote replies are best-effort UDP. A single-slot handoff keeps target tasks
+/// independent without multiplying 64 KiB response buffers by every target.
+const UDP_TARGET_RESPONSE_CAPACITY: usize = 1;
+
+/// Hysteria associations are full-cone: one id may legitimately talk to many
+/// destinations. Keep enough fixed-target transports for normal DNS/P2P traffic,
+/// while preventing one association from opening an unbounded proxy fan-out.
+const MAX_UDP_TARGETS_PER_SESSION: usize = 64;
+
+/// Bound fixed-target outbound transports across every association on one QUIC
+/// connection. The per-association ceiling alone still permits 32768 sockets.
+const MAX_UDP_TARGETS_PER_CONNECTION: usize = 1024;
+
+/// Upper bound for one reassembled UDP payload.
+const MAX_UDP_PACKET_SIZE: usize = u16::MAX as usize;
+
+/// One connection's incomplete UDP fragments are bounded independently of the
+/// number of client-chosen session ids.
+const MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION: usize = 8 * 1024 * 1024;
+
+/// Incomplete datagrams must not survive long enough to collide with a wrapped
+/// packet id from a later generation of the same association.
+const UDP_FRAGMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+const UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bytes waiting in, or currently being written by, all association workers on
+/// one authenticated connection.
+const MAX_UDP_QUEUED_BYTES_PER_CONNECTION: usize = 16 * 1024 * 1024;
+
 /// HTTP/3 error code for normal closure.
 /// Per official hysteria reference: https://github.com/apernet/hysteria/blob/master/core/server/server.go#L20
 const CLOSE_ERR_CODE_OK: u32 = 0x100; // HTTP3 ErrCodeNoError
 
 use crate::address::NetLocation;
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
-use crate::dynamic::{ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry};
+use crate::dynamic::{
+    ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry,
+    scope_connection_until_cancelled,
+};
 use crate::quic_server::{
-    QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, require_validated_quic_address,
+    QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, QuicConnectionLifecycle,
+    require_validated_quic_address,
 };
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, ResolverCache};
+use crate::resolver::Resolver;
 use crate::routing::protocol::sniff_tcp;
 use crate::stream_reader::StreamReader;
 use crate::tcp::handshake_gate::{
@@ -69,10 +134,31 @@ use crate::util::allocate_vec;
 /// unlike the TCP path there is no anonymous phase to hand over: one context is
 /// bound to its user immediately and then shared by every loop below.
 ///
-/// It travels as an explicit parameter rather than through
-/// [`scope_connection`](crate::dynamic::scope_connection), because each of those
-/// loops runs in a task of its own and a task local would not survive the spawn.
+/// It travels as an explicit parameter because each loop runs in a task of its own.
+/// Every logical TCP task installs it with
+/// [`scope_connection_until_cancelled`](crate::dynamic::scope_connection_until_cancelled),
+/// so hard inbound removal also interrupts DNS and outbound setup.
 type Meter = Option<Arc<ConnContext>>;
+
+fn try_admit_tcp_logical_flow(gate: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    gate.clone().try_acquire_owned().ok()
+}
+
+async fn read_tcp_request_header_before_deadline<T, F>(
+    deadline: Instant,
+    future: F,
+) -> std::io::Result<T>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    match timeout_at(deadline, future).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Hysteria2 TCP request header timed out",
+        )),
+    }
+}
 
 /// Decode the QUIC-varint address length at byte 8 of a Hysteria UDP datagram.
 ///
@@ -97,6 +183,41 @@ fn valid_udp_fragment(fragment_id: u8, fragment_count: u8) -> bool {
     fragment_count != 0 && fragment_id < fragment_count
 }
 
+fn checked_udp_packet_len(current: usize, fragment_len: usize) -> Option<usize> {
+    current
+        .checked_add(fragment_len)
+        .filter(|length| *length <= MAX_UDP_PACKET_SIZE)
+}
+
+fn try_reserve_payload_bytes(
+    budget: &Arc<Semaphore>,
+    payload_len: usize,
+) -> Option<OwnedSemaphorePermit> {
+    let permits = u32::try_from(payload_len.max(1)).ok()?;
+    budget.clone().try_acquire_many_owned(permits).ok()
+}
+
+fn checked_response_fragment_count(
+    payload_len: usize,
+    available_payload: usize,
+) -> std::io::Result<u8> {
+    let fragment_count = payload_len.div_ceil(available_payload);
+    u8::try_from(fragment_count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Hysteria2 UDP response needs {fragment_count} fragments, protocol limit is {}",
+                u8::MAX
+            ),
+        )
+    })
+}
+
+#[inline]
+fn udp_response_send_allowed(cancel_token: &CancellationToken) -> bool {
+    !cancel_token.is_cancelled()
+}
+
 #[derive(Clone)]
 struct Hysteria2ConnectionSettings {
     users: Arc<dyn UserRegistry>,
@@ -108,18 +229,32 @@ struct Hysteria2ConnectionSettings {
 }
 
 async fn process_connection(
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
+    selector: Arc<SelectorSlot>,
     conn: quinn::Incoming,
     settings: Hysteria2ConnectionSettings,
     handshake_permit: HandshakePermit,
     pre_auth_deadline: Instant,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<()> {
+    // Each physical transport has its own child below the inbound hard-stop token.
+    // The guard also cancels it when QUIC ends naturally, so logical TCP tasks that
+    // are between client I/O operations cannot outlive their transport.
+    let connection_lifecycle = QuicConnectionLifecycle::new(&connection_cancel);
+    // Metered peers bind this record after authentication; unmetered peers leave it
+    // anonymous, but still use it for hard-stop and natural-exit cancellation.
+    let lifecycle = ConnContext::new_child(connection_lifecycle.token());
     let transport_deadline = std::cmp::min(
         pre_auth_deadline,
         Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
     );
-    let connection = match timeout_at(transport_deadline, conn).await {
+    let transport_result = tokio::select! {
+        biased;
+        () = lifecycle.cancelled() => {
+            return Err(connection_lifecycle_cancelled_error());
+        }
+        result = timeout_at(transport_deadline, conn) => result,
+    };
+    let connection = match transport_result {
         Ok(result) => result?,
         Err(_elapsed) => {
             return Err(std::io::Error::new(
@@ -131,7 +266,7 @@ async fn process_connection(
 
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions) will terminate gracefully.
-    let cancel_token = CancellationToken::new();
+    let cancel_token = connection_lifecycle.token().child_token();
     // `process_connection` has several early returns and drives attacker-controlled
     // parsers. Keep cleanup exception-safe: unwinding or dropping this future must
     // cancel every child token even when control never reaches the normal epilogue.
@@ -149,37 +284,50 @@ async fn process_connection(
         pre_auth_deadline,
         Instant::now() + QUIC_TRANSPORT_HANDSHAKE_TIMEOUT,
     );
-    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> = match timeout_at(
-        h3_setup_deadline,
-        h3::server::Connection::new(h3_quinn_connection),
-    )
-    .await
-    {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(e)) => {
-            return Err(std::io::Error::other(format!(
-                "H3 connection setup failed: {e}"
-            )));
+    let h3_setup_result = tokio::select! {
+        biased;
+        () = lifecycle.cancelled() => {
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"connection cancelled");
+            return Err(connection_lifecycle_cancelled_error());
         }
-        Err(_elapsed) => {
-            connection.close(CLOSE_ERR_CODE_OK.into(), b"pre-auth timeout");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Hysteria2 H3 setup exceeded the pre-auth deadline",
-            ));
-        }
+        result = timeout_at(
+            h3_setup_deadline,
+            h3::server::Connection::new(h3_quinn_connection),
+        ) => result,
     };
+    let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
+        match h3_setup_result {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(e)) => {
+                return Err(std::io::Error::other(format!(
+                    "H3 connection setup failed: {e}"
+                )));
+            }
+            Err(_elapsed) => {
+                connection.close(CLOSE_ERR_CODE_OK.into(), b"pre-auth timeout");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Hysteria2 H3 setup exceeded the pre-auth deadline",
+                ));
+            }
+        };
 
     // Preserve the sing-box-compatible three-second application-authentication
     // window after H3 setup, but never let it outlive the 60-second absolute outer
     // deadline that began at gate admission.
     let auth_deadline = std::cmp::min(pre_auth_deadline, Instant::now() + AUTH_TIMEOUT);
-    let meter = match timeout_at(
-        auth_deadline,
-        auth_connection(&mut h3_conn, &connection, &settings),
-    )
-    .await
-    {
+    let auth_result = tokio::select! {
+        biased;
+        () = lifecycle.cancelled() => {
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"connection cancelled");
+            return Err(connection_lifecycle_cancelled_error());
+        }
+        result = timeout_at(
+            auth_deadline,
+            auth_connection(&mut h3_conn, &connection, &settings, &lifecycle),
+        ) => result,
+    };
+    let meter = match auth_result {
         Ok(Ok(user)) => user,
         Ok(Err(e)) => {
             connection.close(CLOSE_ERR_CODE_OK.into(), b"auth failed");
@@ -205,11 +353,8 @@ async fn process_connection(
     // framing and QPACK encoding quinn and h3 own between them. It is a few hundred
     // bytes once per connection, and the same argument already applies to the QUIC
     // handshake that carried it.
-    let removal_meter = meter.clone();
-
     let udp_connection = connection.clone();
-    let udp_client_proxy_selector = client_proxy_selector.clone();
-    let udp_resolver = resolver.clone();
+    let udp_selector = selector.clone();
     let udp_cancel_token = cancel_token.clone();
     let udp_meter = meter.clone();
 
@@ -219,14 +364,8 @@ async fn process_connection(
     // This reduces task count and avoids spawning separate tasks for the main loops.
     let udp_loop = async {
         if settings.udp_enabled {
-            run_udp_local_to_remote_loop(
-                udp_connection,
-                udp_client_proxy_selector,
-                udp_resolver,
-                udp_meter,
-                udp_cancel_token,
-            )
-            .await
+            run_udp_local_to_remote_loop(udp_connection, udp_selector, udp_meter, udp_cancel_token)
+                .await
         } else {
             Ok(())
         }
@@ -252,24 +391,14 @@ async fn process_connection(
     };
 
     let tcp_connection = connection.clone();
-    let tcp_loop = run_tcp_loop(tcp_connection, client_proxy_selector, resolver, meter);
-
-    let user_removed = async move {
-        match removal_meter {
-            Some(context) => context.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
+    let tcp_loop = run_tcp_loop(tcp_connection, selector, meter, Arc::clone(&lifecycle));
 
     let result = tokio::select! {
         biased;
-        () = user_removed => {
+        () = lifecycle.cancelled() => {
             cancel_token.cancel();
-            connection.close(CLOSE_ERR_CODE_OK.into(), b"user removed");
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "connection closed because its user was removed",
-            ))
+            connection.close(CLOSE_ERR_CODE_OK.into(), b"connection cancelled");
+            Err(connection_lifecycle_cancelled_error())
         }
         result = async { tokio::try_join!(udp_loop, uni_loop, tcp_loop) } => result,
     };
@@ -286,6 +415,13 @@ async fn process_connection(
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn connection_lifecycle_cancelled_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "connection closed because its user or inbound was removed",
+    )
 }
 
 /// Check that this really is a hysteria2 auth request, and hand back whose it is.
@@ -341,6 +477,7 @@ async fn auth_connection(
     h3_conn: &mut h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     connection: &quinn::Connection,
     settings: &Hysteria2ConnectionSettings,
+    lifecycle: &Arc<ConnContext>,
 ) -> std::io::Result<Meter> {
     loop {
         match h3_conn
@@ -358,14 +495,13 @@ async fn auth_connection(
                         // operation. Do it before sending success, so remove_user
                         // cannot return while this peer is being told it authenticated.
                         let meter = if settings.metered {
-                            let context = ConnContext::new();
-                            if !context.bind_authenticated(user) {
+                            if !lifecycle.bind_authenticated(user) {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::PermissionDenied,
                                     "user could not be admitted: removed, suspended, or at their connection limit",
                                 ));
                             }
-                            Some(context)
+                            Some(Arc::clone(lifecycle))
                         } else {
                             if !user.admit_unmetered() {
                                 return Err(std::io::Error::new(
@@ -454,15 +590,49 @@ async fn auth_connection(
 }
 
 struct UdpSession {
-    fragments: LruCache<u16, FragmentedPacket>,
-    send_socket: Arc<UdpSocket>,
-    // we cache the last location in case of mid-session address changes, and
-    // don't want to have to call ClientProxySelector::judge on every packet.
-    last_location: NetLocation,
-    last_socket_addr: SocketAddr,
-    override_remote_write_address: Option<SocketAddr>,
-    last_activity: std::time::Instant,
+    outbound_tx: mpsc::Sender<UdpForwardCommand>,
+    last_activity: Arc<Mutex<std::time::Instant>>,
     cancel_token: CancellationToken,
+}
+
+struct UdpForwardCommand {
+    remote_location: NetLocation,
+    payload: Bytes,
+    _payload_permit: OwnedSemaphorePermit,
+}
+
+struct UdpTargetWorker {
+    outbound_tx: mpsc::Sender<UdpForwardCommand>,
+    last_used: u64,
+    generation: u64,
+    cancel_token: CancellationToken,
+}
+
+enum UdpTargetPermit {
+    Ready(OwnedSemaphorePermit),
+    /// The association was full and its LRU worker has been cancelled. Waiting
+    /// in the replacement worker preserves the first packet without letting the
+    /// association router or healthy targets wait for permit handoff.
+    Awaiting(Arc<Semaphore>),
+}
+
+impl Drop for UdpTargetWorker {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+    }
+}
+
+enum UdpTargetEvent {
+    Message {
+        remote_location: NetLocation,
+        generation: u64,
+        payload: Bytes,
+    },
+    Closed {
+        remote_location: NetLocation,
+        generation: u64,
+        error: std::io::Error,
+    },
 }
 
 impl Drop for UdpSession {
@@ -470,11 +640,9 @@ impl Drop for UdpSession {
     ///
     /// A `CancellationToken` does not fire when its last handle is dropped -- only
     /// an explicit `cancel` or a `DropGuard` does that -- and the spawned loop holds
-    /// its own clone of this one along with the client socket and a 64 KiB receive
-    /// buffer. So every path that discards a session without going through the
-    /// reaper would otherwise strand that task, its fd and its buffer until the
-    /// whole QUIC connection ends: the send-failure `remove` below is one such path,
-    /// and it is the one an unreachable destination reaches on the first packet.
+    /// its own clone of this one along with every fixed-target stream and a 64 KiB
+    /// receive buffer. Every path that discards a session must therefore wake the
+    /// worker so its proxy transports are dropped promptly.
     ///
     /// Cancelling here rather than at each call site makes the release a property of
     /// the session's lifetime, so a future path that drops one is covered too. The
@@ -489,58 +657,258 @@ struct FragmentedPacket {
     fragment_received: u8,
     packet_len: usize,
     received: Vec<Option<Bytes>>,
-    remote_location: NetLocation,
+    remote_location: Option<NetLocation>,
+    last_update: std::time::Instant,
+}
+
+struct UdpFragmentCache {
+    entries: LruCache<(u32, u16), FragmentedPacket>,
+    total_bytes: usize,
+}
+
+impl UdpFragmentCache {
+    fn new() -> Self {
+        Self {
+            entries: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
+            total_bytes: 0,
+        }
+    }
+
+    fn remove(&mut self, key: &(u32, u16)) -> Option<FragmentedPacket> {
+        let packet = self.entries.pop(key)?;
+        self.total_bytes = self.total_bytes.saturating_sub(packet.packet_len);
+        Some(packet)
+    }
+
+    fn pop_lru(&mut self) -> Option<((u32, u16), FragmentedPacket)> {
+        let (key, packet) = self.entries.pop_lru()?;
+        self.total_bytes = self.total_bytes.saturating_sub(packet.packet_len);
+        Some((key, packet))
+    }
+
+    fn clear_session(&mut self, session_id: u32) {
+        let keys: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(key, _)| (key.0 == session_id).then_some(*key))
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    fn purge_expired(&mut self, now: std::time::Instant) {
+        let keys: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(key, packet)| {
+                now.checked_duration_since(packet.last_update)
+                    .is_some_and(|age| age >= UDP_FRAGMENT_TIMEOUT)
+                    .then_some(*key)
+            })
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    fn accept_fragment(
+        &mut self,
+        session_id: u32,
+        packet_id: u16,
+        fragment_id: u8,
+        fragment_count: u8,
+        remote_location: NetLocation,
+        payload: Bytes,
+    ) -> std::io::Result<Option<(Bytes, NetLocation)>> {
+        self.accept_fragment_at(
+            session_id,
+            packet_id,
+            fragment_id,
+            fragment_count,
+            remote_location,
+            payload,
+            std::time::Instant::now(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_fragment_at(
+        &mut self,
+        session_id: u32,
+        packet_id: u16,
+        fragment_id: u8,
+        fragment_count: u8,
+        remote_location: NetLocation,
+        payload: Bytes,
+        now: std::time::Instant,
+    ) -> std::io::Result<Option<(Bytes, NetLocation)>> {
+        if !valid_udp_fragment(fragment_id, fragment_count) {
+            return Err(std::io::Error::other(
+                "invalid Hysteria2 UDP fragment index",
+            ));
+        }
+        self.purge_expired(now);
+        let key = (session_id, packet_id);
+        if !self.entries.contains(&key) {
+            if self.entries.len() >= MAX_FRAGMENT_CACHE_SIZE {
+                self.pop_lru();
+            }
+            self.entries.put(
+                key,
+                FragmentedPacket {
+                    fragment_count,
+                    fragment_received: 0,
+                    packet_len: 0,
+                    received: vec![None; fragment_count as usize],
+                    // Only fragment zero is authoritative. Some clients repeat an
+                    // address on continuation fragments; it must not win merely by
+                    // arriving first.
+                    remote_location: (fragment_id == 0).then_some(remote_location.clone()),
+                    last_update: now,
+                },
+            );
+        }
+
+        let (cached_count, cached_len) = {
+            let packet = self
+                .entries
+                .get(&key)
+                .expect("fragment entry was just inserted or already present");
+            (packet.fragment_count, packet.packet_len)
+        };
+        if cached_count != fragment_count {
+            self.remove(&key);
+            return Err(std::io::Error::other(format!(
+                "Mismatched fragment count for session {session_id} packet {packet_id}"
+            )));
+        }
+        let duplicate = self
+            .entries
+            .get(&key)
+            .expect("fragment count match keeps the entry")
+            .received[fragment_id as usize]
+            .is_some();
+        if duplicate {
+            self.remove(&key);
+            return Err(std::io::Error::other(format!(
+                "Duplicate fragment for session {session_id} packet {packet_id}"
+            )));
+        }
+        let Some(packet_len) = checked_udp_packet_len(cached_len, payload.len()) else {
+            self.remove(&key);
+            return Err(std::io::Error::other(format!(
+                "Oversized fragmented UDP packet for session {session_id}"
+            )));
+        };
+
+        while self
+            .total_bytes
+            .checked_add(payload.len())
+            .is_none_or(|bytes| bytes > MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION)
+        {
+            let Some((evicted_key, _)) = self.pop_lru() else {
+                return Err(std::io::Error::other(
+                    "Hysteria2 fragment byte budget exhausted",
+                ));
+            };
+            if evicted_key == key {
+                return Err(std::io::Error::other(
+                    "Hysteria2 fragment byte budget exhausted",
+                ));
+            }
+        }
+
+        let complete = {
+            let packet = self
+                .entries
+                .get_mut(&key)
+                .expect("current fragment entry survives byte-budget eviction");
+            if fragment_id == 0 {
+                packet.remote_location = Some(remote_location);
+            }
+            packet.fragment_received += 1;
+            packet.packet_len = packet_len;
+            packet.received[fragment_id as usize] = Some(payload);
+            packet.last_update = now;
+            packet.fragment_received == packet.fragment_count
+        };
+        self.total_bytes += packet_len - cached_len;
+        if !complete {
+            return Ok(None);
+        }
+
+        let packet = self
+            .remove(&key)
+            .expect("complete fragment entry remains cached");
+        let remote_location = packet.remote_location.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "Missing fragment-zero destination for session {session_id} packet {packet_id}"
+            ))
+        })?;
+        let mut complete_payload = BytesMut::with_capacity(packet.packet_len);
+        for fragment in packet.received {
+            complete_payload.extend_from_slice(
+                fragment
+                    .as_ref()
+                    .expect("fragment count proves every slot is populated"),
+            );
+        }
+        Ok(Some((complete_payload.freeze(), remote_location)))
+    }
 }
 
 impl UdpSession {
-    // TODO: remove this function completely and inline?
+    fn touch(&self, now: std::time::Instant) {
+        if let Ok(mut last_activity) = self.last_activity.lock() {
+            *last_activity = now;
+        }
+    }
+
+    fn is_idle_at(&self, now: std::time::Instant, idle_timeout: Duration) -> bool {
+        self.last_activity
+            .lock()
+            .ok()
+            .and_then(|last_activity| now.checked_duration_since(*last_activity))
+            .is_some_and(|idle| idle > idle_timeout)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start(
         session_id: u32,
         connection: quinn::Connection,
-        client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
-        override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        client_proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+        target_permits: Arc<Semaphore>,
         meter: Meter,
         parent_cancel_token: &CancellationToken,
     ) -> Self {
-        // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
+        let (outbound_tx, outbound_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAPACITY);
+        let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
 
         let session = UdpSession {
-            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
-            send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
-            last_activity: std::time::Instant::now(),
+            outbound_tx,
+            last_activity: last_activity.clone(),
             cancel_token: session_cancel_token.clone(),
         };
 
-        let removal_meter = meter.clone();
         tokio::spawn(async move {
-            let work = run_udp_remote_to_local_loop(
+            let result = run_udp_session_worker(
                 session_id,
                 connection,
-                client_socket,
-                override_local_write_location,
+                outbound_rx,
+                client_proxy_selector,
+                resolver,
+                target_permits,
                 meter,
+                last_activity,
                 session_cancel_token,
-            );
-            let result = if let Some(context) = removal_meter {
-                tokio::select! {
-                    biased;
-                    () = context.cancelled() => Ok(()),
-                    result = work => result,
-                }
-            } else {
-                work.await
-            };
+            )
+            .await;
 
             if let Err(e) = result {
-                error!("UDP remote-to-local write loop ended with error: {e}");
+                error!("Hysteria2 UDP association {session_id} ended with error: {e}");
             }
         });
 
@@ -548,73 +916,441 @@ impl UdpSession {
     }
 }
 
-async fn run_udp_remote_to_local_loop(
+fn cleanup_udp_sessions(
+    sessions: &mut FxHashMap<u32, UdpSession>,
+    fragments: &mut UdpFragmentCache,
+    now: std::time::Instant,
+) {
+    sessions.retain(|session_id, session| {
+        if session.is_idle_at(now, UDP_SESSION_IDLE_TIMEOUT) {
+            session.cancel_token.cancel();
+            fragments.clear_session(*session_id);
+            debug!("Removing inactive UDP session {session_id}");
+            false
+        } else {
+            true
+        }
+    });
+    // Packet ids are only 16 bits. Expire incomplete packets even while their
+    // association remains active, so an old fragment cannot be combined with a
+    // later packet after the id wraps.
+    fragments.purge_expired(now);
+}
+
+async fn connect_udp_target(
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    remote_location: NetLocation,
+) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+    match client_proxy_selector
+        .judge_udp(remote_location.into(), resolver)
+        .await?
+    {
+        ConnectDecision::Allow {
+            chain_group,
+            remote_location,
+        } => {
+            chain_group
+                .connect_udp_bidirectional(resolver, remote_location)
+                .await
+        }
+        ConnectDecision::Block => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "UDP destination blocked by routing rules",
+        )),
+    }
+}
+
+fn evict_lru_udp_target_worker(targets: &mut FxHashMap<NetLocation, UdpTargetWorker>) {
+    let Some(remote_location) = targets
+        .iter()
+        .min_by_key(|(_, target)| target.last_used)
+        .map(|(remote_location, _)| remote_location.clone())
+    else {
+        return;
+    };
+    targets.remove(&remote_location);
+}
+
+fn try_reserve_udp_target_worker(
+    targets: &mut FxHashMap<NetLocation, UdpTargetWorker>,
+    target_permits: &Arc<Semaphore>,
+) -> Option<UdpTargetPermit> {
+    match target_permits.clone().try_acquire_owned() {
+        Ok(permit) => Some(UdpTargetPermit::Ready(permit)),
+        Err(_) if targets.len() >= MAX_UDP_TARGETS_PER_SESSION => {
+            evict_lru_udp_target_worker(targets);
+            Some(UdpTargetPermit::Awaiting(target_permits.clone()))
+        }
+        Err(_) => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_udp_target_worker(
+    remote_location: NetLocation,
+    initial_command: UdpForwardCommand,
+    generation: u64,
+    permit: UdpTargetPermit,
+    session_target_permits: Arc<Semaphore>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    response_tx: mpsc::Sender<UdpTargetEvent>,
+    parent_cancel_token: &CancellationToken,
+) -> UdpTargetWorker {
+    let cancel_token = parent_cancel_token.child_token();
+    let task_cancel_token = cancel_token.clone();
+    let (outbound_tx, outbound_rx) = mpsc::channel(UDP_TARGET_QUEUE_CAPACITY);
+    assert!(
+        outbound_tx.try_send(initial_command).is_ok(),
+        "a new target queue has room for its initial packet"
+    );
+    let task_location = remote_location.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_udp_target_worker(
+            task_location.clone(),
+            generation,
+            permit,
+            session_target_permits,
+            outbound_rx,
+            client_proxy_selector,
+            resolver,
+            response_tx.clone(),
+            task_cancel_token,
+        )
+        .await
+        {
+            let _ = response_tx.try_send(UdpTargetEvent::Closed {
+                remote_location: task_location,
+                generation,
+                error,
+            });
+        }
+    });
+    UdpTargetWorker {
+        outbound_tx,
+        last_used: generation,
+        generation,
+        cancel_token,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_target_worker(
+    remote_location: NetLocation,
+    generation: u64,
+    permit: UdpTargetPermit,
+    session_target_permits: Arc<Semaphore>,
+    outbound_rx: mpsc::Receiver<UdpForwardCommand>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    response_tx: mpsc::Sender<UdpTargetEvent>,
+    cancel_token: CancellationToken,
+) -> std::io::Result<()> {
+    let Some((_session_permit, permit)) =
+        acquire_udp_target_permits(permit, session_target_permits, &cancel_token).await?
+    else {
+        return Ok(());
+    };
+    let connect = connect_udp_target(&client_proxy_selector, &resolver, remote_location.clone());
+    let mut remote = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Ok(()),
+        result = connect => result?,
+    };
+    run_connected_udp_target_worker(
+        remote_location,
+        generation,
+        permit,
+        outbound_rx,
+        &mut remote,
+        response_tx,
+        cancel_token,
+    )
+    .await
+}
+
+async fn acquire_udp_target_permits(
+    permit: UdpTargetPermit,
+    session_target_permits: Arc<Semaphore>,
+    cancel_token: &CancellationToken,
+) -> std::io::Result<Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>> {
+    let session_permit = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Ok(None),
+        permit = session_target_permits.acquire_owned() => permit.map_err(|_| {
+            std::io::Error::other("Hysteria2 UDP association target budget closed")
+        })?,
+    };
+    let permit = match permit {
+        UdpTargetPermit::Ready(permit) => permit,
+        UdpTargetPermit::Awaiting(permits) => tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return Ok(None),
+            permit = permits.acquire_owned() => permit.map_err(|_| {
+                std::io::Error::other("Hysteria2 UDP target budget closed")
+            })?,
+        },
+    };
+    Ok(Some((session_permit, permit)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_connected_udp_target_worker(
+    remote_location: NetLocation,
+    generation: u64,
+    _permit: OwnedSemaphorePermit,
+    mut outbound_rx: mpsc::Receiver<UdpForwardCommand>,
+    remote: &mut Box<dyn AsyncMessageStream>,
+    response_tx: mpsc::Sender<UdpTargetEvent>,
+    cancel_token: CancellationToken,
+) -> std::io::Result<()> {
+    let mut read_storage = allocate_vec(MAX_UDP_PACKET_SIZE);
+    let mut prefer_read = false;
+
+    enum TargetAction {
+        Command(Option<UdpForwardCommand>),
+        Read(std::io::Result<usize>),
+    }
+
+    loop {
+        if cancel_token.is_cancelled() {
+            return Ok(());
+        }
+        // Explicitly alternate priority when both directions are ready. This keeps
+        // cancellation strict while preventing a continuously full write queue
+        // from starving remote replies on this target.
+        let action = {
+            let mut read_buf = ReadBuf::new(&mut read_storage);
+            if prefer_read {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => return Ok(()),
+                    result = poll_fn(|cx| Pin::new(&mut **remote).poll_read_message(cx, &mut read_buf)) => {
+                        TargetAction::Read(result.map(|()| read_buf.filled().len()))
+                    }
+                    command = outbound_rx.recv() => TargetAction::Command(command),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => return Ok(()),
+                    command = outbound_rx.recv() => TargetAction::Command(command),
+                    result = poll_fn(|cx| Pin::new(&mut **remote).poll_read_message(cx, &mut read_buf)) => {
+                        TargetAction::Read(result.map(|()| read_buf.filled().len()))
+                    }
+                }
+            }
+        };
+
+        match action {
+            TargetAction::Command(Some(command)) => {
+                prefer_read = true;
+                let write = async {
+                    poll_fn(|cx| Pin::new(&mut **remote).poll_write_message(cx, &command.payload))
+                        .await?;
+                    poll_fn(|cx| Pin::new(&mut **remote).poll_flush_message(cx)).await
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => return Ok(()),
+                    result = write => result?,
+                }
+                // `command`, including its byte-budget permit, is held through the
+                // successful write and flush and is released here.
+                drop(command);
+            }
+            TargetAction::Command(None) => return Ok(()),
+            TargetAction::Read(result) => {
+                prefer_read = false;
+                let payload_len = result?;
+                let event = UdpTargetEvent::Message {
+                    remote_location: remote_location.clone(),
+                    generation,
+                    payload: Bytes::copy_from_slice(&read_storage[..payload_len]),
+                };
+                if response_tx.try_send(event).is_err() {
+                    debug!("Dropping Hysteria2 UDP response for slow association");
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_udp_target_command(
+    targets: &mut FxHashMap<NetLocation, UdpTargetWorker>,
+    use_counter: &mut u64,
+    next_generation: &mut u64,
+    command: UdpForwardCommand,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    target_permits: &Arc<Semaphore>,
+    session_target_permits: &Arc<Semaphore>,
+    response_tx: &mpsc::Sender<UdpTargetEvent>,
+    cancel_token: &CancellationToken,
+) {
+    if cancel_token.is_cancelled() {
+        return;
+    }
+    let remote_location = command.remote_location.clone();
+    if let Some(target) = targets.get_mut(&remote_location) {
+        *use_counter = use_counter.wrapping_add(1);
+        target.last_used = *use_counter;
+        match target.outbound_tx.try_send(command) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("Dropping Hysteria2 UDP packet for saturated target {remote_location}");
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(command)) => {
+                targets.remove(&remote_location);
+                return dispatch_udp_target_command(
+                    targets,
+                    use_counter,
+                    next_generation,
+                    command,
+                    client_proxy_selector,
+                    resolver,
+                    target_permits,
+                    session_target_permits,
+                    response_tx,
+                    cancel_token,
+                );
+            }
+        }
+    }
+
+    let Some(permit) = try_reserve_udp_target_worker(targets, target_permits) else {
+        debug!(
+            "Dropping Hysteria2 UDP packet for {remote_location}: connection target limit reached"
+        );
+        return;
+    };
+    if targets.len() >= MAX_UDP_TARGETS_PER_SESSION {
+        evict_lru_udp_target_worker(targets);
+    }
+    *use_counter = use_counter.wrapping_add(1);
+    *next_generation = next_generation.wrapping_add(1);
+    let generation = *next_generation;
+    let mut target = spawn_udp_target_worker(
+        remote_location.clone(),
+        command,
+        generation,
+        permit,
+        session_target_permits.clone(),
+        client_proxy_selector.clone(),
+        resolver.clone(),
+        response_tx.clone(),
+        cancel_token,
+    );
+    target.last_used = *use_counter;
+    targets.insert(remote_location, target);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_session_worker(
     session_id: u32,
     connection: quinn::Connection,
-    socket: Arc<UdpSocket>,
-    override_local_write_address: Option<NetLocation>,
+    mut outbound_rx: mpsc::Receiver<UdpForwardCommand>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    target_permits: Arc<Semaphore>,
     meter: Meter,
+    last_activity: Arc<Mutex<std::time::Instant>>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let max_datagram_size = connection
         .max_datagram_size()
         .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
 
-    let original_address_bytes: Option<(Bytes, Bytes)> = match override_local_write_address {
-        Some(a) => {
-            let address_bytes: Bytes = a.to_string().into_bytes().into();
-            let address_len = address_bytes.len();
-            let address_len_bytes = encode_varint(address_len as u64)?;
-            Some((address_bytes, address_len_bytes.into()))
-        }
-        None => None,
-    };
-
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(65535);
-    let mut loop_count: u8 = 0;
+    let mut targets: FxHashMap<NetLocation, UdpTargetWorker> = FxHashMap::default();
+    let mut use_counter = 0u64;
+    let mut next_target_generation = 0u64;
+    let (response_tx, mut response_rx) = mpsc::channel(UDP_TARGET_RESPONSE_CAPACITY);
+    let session_target_permits = Arc::new(Semaphore::new(MAX_UDP_TARGETS_PER_SESSION));
 
     loop {
-        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf) {
-            Ok(res) => res,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        return Ok(());
-                    }
-                    result = socket.readable() => {
-                        result?;
-                        continue;
-                    }
-                }
+        if cancel_token.is_cancelled() {
+            return Ok(());
+        }
+        let event = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            command = outbound_rx.recv() => {
+                let Some(command) = command else {
+                    return Ok(());
+                };
+                dispatch_udp_target_command(
+                    &mut targets,
+                    &mut use_counter,
+                    &mut next_target_generation,
+                    command,
+                    &client_proxy_selector,
+                    &resolver,
+                    &target_permits,
+                    &session_target_permits,
+                    &response_tx,
+                    &cancel_token,
+                );
+                continue;
             }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to receive from UDP socket: {e}"
-                )));
-            }
+            event = response_rx.recv() => {
+                let Some(event) = event else {
+                    return Ok(());
+                };
+                event
+            },
         };
 
-        // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
-        // This prevents starvation during heavy UDP traffic.
-        loop_count = loop_count.wrapping_add(1);
-        if loop_count == 0 {
-            tokio::task::yield_now().await;
+        let (remote_location, payload) = match event {
+            UdpTargetEvent::Message {
+                remote_location,
+                generation,
+                payload,
+            } => {
+                let Some(target) = targets.get_mut(&remote_location) else {
+                    continue;
+                };
+                if target.generation != generation {
+                    continue;
+                }
+                use_counter = use_counter.wrapping_add(1);
+                target.last_used = use_counter;
+                if let Ok(mut activity) = last_activity.lock() {
+                    *activity = std::time::Instant::now();
+                }
+                (remote_location, payload)
+            }
+            UdpTargetEvent::Closed {
+                remote_location,
+                generation,
+                error,
+            } => {
+                error!("Hysteria2 UDP target {remote_location} ended: {error}");
+                if targets
+                    .get(&remote_location)
+                    .is_some_and(|target| target.generation == generation)
+                {
+                    targets.remove(&remote_location);
+                }
+                continue;
+            }
+        };
+        if cancel_token.is_cancelled() {
+            return Ok(());
         }
+        let payload_len = payload.len();
 
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
-        let (address_bytes, address_len_bytes) = match original_address_bytes {
-            Some((ref a, ref b)) => (a.clone(), b.clone()),
-            None => {
-                let address_bytes: Bytes = src_addr.to_string().into_bytes().into();
-                // no need to do a length check since this is a socket address and an IP.
-                let address_len = address_bytes.len();
-                let address_len_bytes = encode_varint(address_len as u64)?.into();
-                (address_bytes, address_len_bytes)
-            }
-        };
+        // A fixed-destination AsyncMessageStream does not expose the final source
+        // (for a proxy its transport peer is the proxy). Echo the address the HY2
+        // client associated with this stream, which is also what preserves a
+        // hostname or a routing rewrite on replies.
+        let address_bytes: Bytes = remote_location.to_string().into_bytes().into();
+        let address_len_bytes: Bytes = encode_varint(address_bytes.len() as u64)?.into();
 
         // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
         let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
@@ -640,17 +1376,20 @@ async fn run_udp_remote_to_local_loop(
             let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
             datagram.extend_from_slice(&session_id.to_be_bytes());
             datagram.extend_from_slice(&packet_id.to_be_bytes());
-            // fragment id = 0, fragment count = 0
+            // fragment id = 0, fragment count = 1
             datagram.extend_from_slice(&[0, 1]);
             datagram.extend_from_slice(&address_len_bytes);
             datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
+            datagram.extend_from_slice(&payload);
 
             // Counted after the send, and by datagram length rather than payload
             // length, so the session and address headers the client is charged for
             // receiving are the ones actually put on the wire.
             let datagram = datagram.freeze();
             let datagram_len = datagram.len();
+            if !udp_response_send_allowed(&cancel_token) {
+                return Ok(());
+            }
             connection
                 .send_datagram(datagram)
                 .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
@@ -659,7 +1398,7 @@ async fn run_udp_remote_to_local_loop(
             }
         } else {
             let available_payload = max_datagram_size - header_overhead;
-            let fragment_count = payload_len.div_ceil(available_payload) as u8;
+            let fragment_count = checked_response_fragment_count(payload_len, available_payload)?;
             for fragment_id in 0..fragment_count {
                 let start = (fragment_id as usize) * available_payload;
                 let end = std::cmp::min(start + available_payload, payload_len);
@@ -669,10 +1408,16 @@ async fn run_udp_remote_to_local_loop(
                 datagram.extend_from_slice(&[fragment_id, fragment_count]);
                 datagram.extend_from_slice(&address_len_bytes);
                 datagram.extend_from_slice(&address_bytes);
-                datagram.extend_from_slice(&buf[start..end]);
+                datagram.extend_from_slice(&payload[start..end]);
 
                 let datagram = datagram.freeze();
                 let datagram_len = datagram.len();
+                // Metering the previous fragment is asynchronous. Cancellation
+                // may arrive while it is awaited, so every fragment rechecks
+                // immediately before its own wire write.
+                if !udp_response_send_allowed(&cancel_token) {
+                    return Ok(());
+                }
                 connection.send_datagram(datagram).map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to send datagram fragment {fragment_id}: {e}"
@@ -688,39 +1433,38 @@ async fn run_udp_remote_to_local_loop(
 
 async fn run_udp_local_to_remote_loop(
     connection: quinn::Connection,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
+    selector: Arc<SelectorSlot>,
     meter: Meter,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut resolver_cache = ResolverCache::new(resolver.clone());
     let mut sessions: FxHashMap<u32, UdpSession> = FxHashMap::default();
-    let mut last_cleanup = std::time::Instant::now();
-
-    // Match reference implementation defaults for UDP session management
-    const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let target_permits = Arc::new(Semaphore::new(MAX_UDP_TARGETS_PER_CONNECTION));
+    let queued_payload_budget = Arc::new(Semaphore::new(MAX_UDP_QUEUED_BYTES_PER_CONNECTION));
+    let mut fragments = UdpFragmentCache::new();
+    let mut cleanup_interval = tokio::time::interval(UDP_SESSION_CLEANUP_INTERVAL);
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval` ticks immediately once. Consume that tick so the select below is
+    // driven by the first real cleanup deadline.
+    cleanup_interval.tick().await;
 
     loop {
-        let now = std::time::Instant::now();
-        if (now - last_cleanup) > CLEANUP_INTERVAL {
-            sessions.retain(|session_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
-                    // Cancel the session's background task before removing
-                    session.cancel_token.cancel();
-                    debug!("Removing inactive UDP session {session_id}");
-                    false
-                } else {
-                    true
-                }
-            });
-            last_cleanup = now;
-        }
-
-        let data = connection
-            .read_datagram()
-            .await
-            .map_err(|err| std::io::Error::other(format!("failed to read datagram: {err}")))?;
+        let data = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return Ok(()),
+            _ = cleanup_interval.tick() => {
+                cleanup_udp_sessions(
+                    &mut sessions,
+                    &mut fragments,
+                    std::time::Instant::now(),
+                );
+                continue;
+            }
+            result = connection.read_datagram() => {
+                result.map_err(|err| {
+                    std::io::Error::other(format!("failed to read datagram: {err}"))
+                })?
+            }
+        };
 
         // Counted before any of the validation below, because every one of those
         // `continue`s discards a datagram the client has already sent and this proxy
@@ -784,242 +1528,91 @@ async fn run_udp_local_to_remote_loop(
             }
         };
 
-        // Read before taking the entry, which borrows the map for the rest of the
-        // match. Nothing mutates in between, so this is the exact live count.
-        let session_count = sessions.len();
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.touch(std::time::Instant::now());
+        }
 
-        let mut session_entry = sessions.entry(session_id);
-        let session = match session_entry {
+        let (complete_payload, remote_location) = if fragment_count == 1 {
+            (payload_fragment, remote_location)
+        } else {
+            match fragments.accept_fragment(
+                session_id,
+                packet_id,
+                fragment_id,
+                fragment_count,
+                remote_location,
+                payload_fragment,
+            ) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => continue,
+                Err(error) => {
+                    debug!("Ignoring Hysteria2 UDP fragment: {error}");
+                    continue;
+                }
+            }
+        };
+
+        let Some(payload_permit) =
+            try_reserve_payload_bytes(&queued_payload_budget, complete_payload.len())
+        else {
+            debug!("Dropping Hysteria2 UDP packet: connection queue byte budget exhausted");
+            continue;
+        };
+        if cancel_token.is_cancelled() {
+            return Ok(());
+        }
+
+        let session_count = sessions.len();
+        let session = match sessions.entry(session_id) {
             Entry::Vacant(entry) => {
                 if session_count >= MAX_UDP_SESSIONS {
-                    // Refusing the packet rather than evicting somebody: an eviction
-                    // policy would let a client at the ceiling knock out its own
-                    // established flows by naming new ids, and would hand an attacker
-                    // a way to churn sockets indefinitely at a fixed occupancy.
                     debug!(
                         "Refusing new UDP session {session_id}: at the {MAX_UDP_SESSIONS} session limit"
                     );
                     continue;
                 }
-
-                let action = client_proxy_selector
-                    .judge_udp(remote_location.clone().into(), &resolver)
-                    .await;
-
-                let (_chain_group, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    }) => (chain_group, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        warn!("Blocked UDP forward to {remote_location}");
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("Failed to judge UDP forward to {remote_location}: {e}");
-                        continue;
-                    }
-                };
-
-                // the remote location specified at the beginning of a session is assumed
-                // to be the remote location for the entire session iif it does not match
-                // the resolved address, as per the official client - which is only if
-                // it's a hostname. in our case, we also have to handle when the remote
-                // location is replaced by a different location in the rules.
-                //
-                // it's possible that when we receive packets on the client socket,
-                // it could be the resolved hostname versus what was initially provided,
-                // and we need to write datagrams back to the user using their provided
-                // address so that they know where it's from.
-                //
-                // it would be much simpler to always replace, or never, but we stick to
-                // the official client behavior for now.
-                //
-                // ref: https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/udp.go#L137
-
-                let resolved_address = match resolver_cache
-                    .resolve_location(updated_location.location())
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to resolve initial remote location {remote_location}: {e}");
-                        continue;
-                    }
-                };
-
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        (None, None)
-                    };
-
-                // TODO: the configured client socket is for the current remote_location, but
-                // the remote_location could be changed later on with a different client_socket
-                // configuration.
-                //
-                // The family follows the first destination, as `SocketConnector` does
-                // for every other protocol (`tcp/socket_connector_impl.rs:328`). An
-                // AF_INET6 socket is not a dual-stack shortcut here: sending to a plain
-                // `SocketAddr::V4` from one is a WSAEFAULT/EINVAL, and reaching an IPv4
-                // peer through its `::ffff:` form would put a mapped address in the
-                // source field this loop writes back to the client.
-                let client_socket =
-                    crate::socket_util::new_udp_socket(resolved_address.is_ipv6(), None)?;
-
-                let session = UdpSession::start(
+                let (session_selector, session_resolver) = selector.load();
+                entry.insert(UdpSession::start(
                     session_id,
                     connection.clone(),
-                    Arc::new(client_socket),
-                    remote_location.clone(),
-                    resolved_address,
-                    override_local_write_location,
-                    override_remote_write_address,
+                    session_selector,
+                    session_resolver,
+                    target_permits.clone(),
                     meter.clone(),
                     &cancel_token,
-                );
-                entry.insert(session)
+                ))
             }
-            Entry::Occupied(ref mut entry) => entry.get_mut(),
+            Entry::Occupied(entry) => entry.into_mut(),
         };
+        session.touch(std::time::Instant::now());
 
-        // The client just sent something for this session, so it is not idle. Without
-        // this the field only ever held its creation time and the reaper below tore
-        // every session down 60 seconds in, however busy it was -- a plain bug, and
-        // the reason the idle limit did not bound the map either.
-        //
-        // Refreshed here, on arrival, rather than after a successful forward: a
-        // session receiving the fragments of one large packet is active even before
-        // any of them can be reassembled and sent, and being reaped mid-reassembly
-        // would discard the fragments already held.
-        session.last_activity = std::time::Instant::now();
-
-        let (complete_payload, remote_location) = if fragment_count == 1 {
-            (payload_fragment, remote_location)
-        } else {
-            let is_new = !session.fragments.contains(&packet_id);
-
-            if is_new {
-                session.fragments.put(
-                    packet_id,
-                    FragmentedPacket {
-                        fragment_count,
-                        fragment_received: 0,
-                        packet_len: 0,
-                        received: vec![None; fragment_count as usize],
-                        remote_location: remote_location.clone(),
-                    },
-                );
+        match session.outbound_tx.try_send(UdpForwardCommand {
+            remote_location,
+            payload: complete_payload,
+            _payload_permit: payload_permit,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("Dropping Hysteria2 UDP packet for saturated session {session_id}");
             }
-
-            let entry = match session.fragments.get_mut(&packet_id) {
-                Some(e) => e,
-                None => {
-                    // This shouldn't happen since we just inserted it
-                    error!("Fragment cache error for session {session_id}");
-                    continue;
-                }
-            };
-
-            if entry.fragment_count != fragment_count {
-                session.fragments.pop(&packet_id);
-                error!("Mismatched fragment count for session {session_id} packet {packet_id}");
-                continue;
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("Hysteria2 UDP association worker {session_id} has stopped");
+                sessions.remove(&session_id);
+                fragments.clear_session(session_id);
             }
-            if entry.received[fragment_id as usize].is_some() {
-                session.fragments.pop(&packet_id);
-                error!("Duplicate fragment for session {session_id} packet {packet_id}");
-                continue;
-            }
-            entry.fragment_received += 1;
-            entry.packet_len += payload_fragment.len();
-            entry.received[fragment_id as usize] = Some(payload_fragment);
-
-            if entry.fragment_received != entry.fragment_count {
-                continue;
-            }
-
-            // All fragments received - remove from cache and process
-            let FragmentedPacket {
-                remote_location: initial_location,
-                received,
-                packet_len,
-                ..
-            } = session.fragments.pop(&packet_id).unwrap();
-            let mut complete_payload = BytesMut::with_capacity(packet_len);
-            for frag in received.iter() {
-                complete_payload.extend_from_slice(frag.as_ref().unwrap());
-            }
-            (complete_payload.freeze(), initial_location)
-        };
-
-        let socket_addr = match session.override_remote_write_address {
-            Some(addr) => addr,
-            None => {
-                if remote_location == session.last_location {
-                    session.last_socket_addr
-                } else {
-                    warn!(
-                        "Location changed during ongoing UDP session: {}",
-                        remote_location.clone()
-                    );
-                    let action = client_proxy_selector
-                        .judge_udp(remote_location.clone().into(), &resolver)
-                        .await;
-                    let updated_location = match action {
-                        Ok(ConnectDecision::Allow {
-                            chain_group: _,
-                            remote_location,
-                        }) => remote_location,
-                        Ok(ConnectDecision::Block) => {
-                            warn!("Blocked UDP forward to {remote_location}");
-                            continue;
-                        }
-                        Err(e) => {
-                            error!("Failed to judge UDP forward to {remote_location}: {e}");
-                            continue;
-                        }
-                    };
-                    let updated_socket_addr = match resolver_cache
-                        .resolve_location(updated_location.location())
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                "Failed to resolve updated remote location {}: {e}",
-                                updated_location.location()
-                            );
-                            continue;
-                        }
-                    };
-                    session.last_location = updated_location.into_location();
-                    session.last_socket_addr = updated_socket_addr;
-                    updated_socket_addr
-                }
-            }
-        };
-
-        if let Err(e) = session
-            .send_socket
-            .send_to(&complete_payload, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {session_id}: {e}");
-            sessions.remove(&session_id);
         }
     }
 }
 
 async fn run_tcp_loop(
     connection: quinn::Connection,
-    client_proxy_selector: Arc<ClientProxySelector>,
-    resolver: Arc<dyn Resolver>,
+    selector: Arc<SelectorSlot>,
     meter: Meter,
+    lifecycle: Arc<ConnContext>,
 ) -> std::io::Result<()> {
+    let flow_gate = Arc::new(Semaphore::new(MAX_ACTIVE_TCP_LOGICAL_FLOWS));
     loop {
-        let (send_stream, recv_stream) = match connection.accept_bi().await {
+        let (mut send_stream, mut recv_stream) = match connection.accept_bi().await {
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 break;
@@ -1034,33 +1627,40 @@ async fn run_tcp_loop(
             }
         };
 
-        let client_proxy_selector = client_proxy_selector.clone();
-        let resolver = resolver.clone();
+        let Some(flow_permit) = try_admit_tcp_logical_flow(&flow_gate) else {
+            debug!(
+                "refusing Hysteria2 TCP stream: {MAX_ACTIVE_TCP_LOGICAL_FLOWS} logical flows are already active"
+            );
+            let _ = send_stream.reset(TCP_FLOW_LIMIT_ERROR_CODE.into());
+            let _ = recv_stream.stop(TCP_FLOW_LIMIT_ERROR_CODE.into());
+            continue;
+        };
+        let request_header_deadline = Instant::now() + TCP_REQUEST_HEADER_TIMEOUT;
+
+        // TCP requests are independent Hysteria2 logical flows. Load the current
+        // policy only after accepting the stream; the spawned task owns the Arcs
+        // and therefore remains pinned if another reload happens meanwhile.
+        let (client_proxy_selector, resolver) = selector.load();
         // Every stream on this connection shares the one context, so a user's
         // counters cover all of them at once and the live-connection count follows
         // the QUIC connection rather than the streams multiplexed over it.
         let meter = meter.clone();
-        let removal_meter = meter.clone();
+        let lifecycle = Arc::clone(&lifecycle);
         tokio::spawn(async move {
-            let work = process_tcp_stream(
-                client_proxy_selector,
-                resolver,
-                meter,
-                send_stream,
-                recv_stream,
-            );
-            let result = if let Some(meter) = removal_meter {
-                tokio::select! {
-                    biased;
-                    () = meter.cancelled() => Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionAborted,
-                        "user removed",
-                    )),
-                    result = work => result,
-                }
-            } else {
-                work.await
-            };
+            // Covers header parsing, DNS/outbound setup, and bidirectional copying.
+            let _flow_permit = flow_permit;
+            let result = scope_connection_until_cancelled(
+                lifecycle,
+                process_tcp_stream(
+                    client_proxy_selector,
+                    resolver,
+                    meter,
+                    send_stream,
+                    recv_stream,
+                    request_header_deadline,
+                ),
+            )
+            .await;
             if let Err(e) = result {
                 error!("Failed to process streams: {e}");
             }
@@ -1149,6 +1749,7 @@ async fn process_tcp_stream(
     meter: Meter,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
+    request_header_deadline: Instant,
 ) -> std::io::Result<()> {
     // Metered before the request header is read, rather than after, so the address,
     // the padding, and the status response this proxy writes back are all billed --
@@ -1160,7 +1761,12 @@ async fn process_tcp_stream(
         None => Box::new(QuicStream::from(send, recv)),
     };
 
-    let (remote_location, stream_reader) = match handle_tcp_header(&mut server_stream).await {
+    let header = read_tcp_request_header_before_deadline(
+        request_header_deadline,
+        handle_tcp_header(&mut server_stream),
+    )
+    .await;
+    let (remote_location, stream_reader) = match header {
         Ok(res) => res,
         Err(e) => {
             let _ = server_stream.shutdown().await;
@@ -1304,10 +1910,9 @@ pub async fn start_hysteria2_server(
     quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
     users: Arc<dyn UserRegistry>,
     metered: bool,
-    // Read once per accepted connection, so a rules reload reaches the next
-    // connection and never one already running. See `SelectorSlot`.
-    // The resolver travels inside the slot, alongside the rules it was built with,
-    // so this loop takes no copy of its own.
+    // Retained for the lifetime of accepted connections, which load it once for
+    // every new logical TCP flow or UDP session. Authentication and the fixed QUIC
+    // listener settings remain connection/listener scoped.
     selector: Arc<SelectorSlot>,
     num_endpoints: usize,
     udp_enabled: bool,
@@ -1317,106 +1922,106 @@ pub async fn start_hysteria2_server(
     obfs: Option<crate::hysteria2_obfs::Salamander>,
     masquerade: Arc<crate::hysteria2_masquerade::Hysteria2Masquerade>,
     shutdown: CancellationToken,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
-    let mut join_handles = vec![];
     // `num_endpoints` is an SO_REUSEPORT fan-out for one logical listener, not a
     // multiplier for its unauthenticated-connection budget.
     let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
-    for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
-        let obfs = obfs.clone();
-        let connection_settings = Hysteria2ConnectionSettings {
-            users: users.clone(),
-            metered,
-            udp_enabled,
-            up_mbps,
-            down_mbps,
-            masquerade: masquerade.clone(),
-        };
+    let endpoints = crate::quic_server::prepare_endpoint_batch(num_endpoints, || {
+        let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config.clone());
+
+        // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
+        Arc::get_mut(&mut server_config.transport)
+            .unwrap()
+            .max_concurrent_bidi_streams((MAX_ACTIVE_TCP_LOGICAL_FLOWS as u32).into())
+            // required for HTTP/3 QPACK updates
+            .max_concurrent_uni_streams(1024_u32.into())
+            .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
+            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .send_window(16 * 1024 * 1024)
+            .receive_window((20u32 * 1024 * 1024).into())
+            .stream_receive_window((8u32 * 1024 * 1024).into())
+            // MTU settings per official TUIC reference
+            .initial_mtu(1200)
+            .min_mtu(1200)
+            // Enable MTU discovery for larger packets on capable networks
+            .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+            // QUIC exists before the HTTP/3 auth request carrying
+            // Hysteria-CC-RX. This factory starts each connection on BBR and
+            // exposes a connection-local switch that auth flips to Brutal.
+            .congestion_controller_factory(Arc::new(crate::hysteria2::brutal::BrutalConfig))
+            // Enable GSO (Generic Segmentation Offload) for better throughput.
+            // Salamander gives every datagram its own salt, so a coalesced
+            // batch cannot be obfuscated as one buffer -- the offload has to
+            // go when obfuscation is on.
+            .enable_segmentation_offload(obfs.is_none())
+            // Lower initial RTT estimate for faster initial window growth
+            .initial_rtt(Duration::from_millis(100));
+
+        // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
+        // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
+        //
+        // SO_REUSEPORT only when there is a second endpoint to share the port with:
+        // platforms without it panic rather than fail.
+        let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
+            bind_address.is_ipv6(),
+            None,
+            Some(bind_address),
+            num_endpoints > 1,
+            Some(8_625_000),
+        )?;
+
+        // `wrap_udp_socket` lives on the Runtime trait.
+        use quinn::Runtime as _;
+        let runtime = Arc::new(quinn::TokioRuntime);
+        match obfs.clone() {
+            // Obfuscation is a transformation of the bytes leaving and
+            // entering the socket, so it wraps quinn's own socket rather
+            // than replacing it: everything platform-specific about the UDP
+            // path stays where quinn maintains it.
+            Some(salamander) => {
+                let inner = runtime.wrap_udp_socket(socket2_socket.into())?;
+                quinn::Endpoint::new_with_abstract_socket(
+                    quinn::EndpointConfig::default(),
+                    Some(server_config),
+                    Arc::new(crate::hysteria2_obfs::ObfuscatedUdpSocket::new(
+                        inner, salamander,
+                    )),
+                    runtime,
+                )
+            }
+            None => quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                socket2_socket.into(),
+                runtime,
+            ),
+        }
+    })?;
+
+    let connection_settings = Hysteria2ConnectionSettings {
+        users,
+        metered,
+        udp_enabled,
+        up_mbps,
+        down_mbps,
+        masquerade,
+    };
+    let mut join_handles = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
         // No resolver clone: the accept loop takes it from the selector slot, so the
         // rules and the DNS a connection routes by are always one generation.
         let selector = selector.clone();
         let handshake_gate = handshake_gate.clone();
         let shutdown = shutdown.clone();
+        let connection_cancel = connection_cancel.clone();
+        let connection_settings = connection_settings.clone();
 
         let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-
-            // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                // required for HTTP/3 QPACK updates
-                .max_concurrent_uni_streams(1024_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(10)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
-                // MTU settings per official TUIC reference
-                .initial_mtu(1200)
-                .min_mtu(1200)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // QUIC exists before the HTTP/3 auth request carrying
-                // Hysteria-CC-RX. This factory starts each connection on BBR and
-                // exposes a connection-local switch that auth flips to Brutal.
-                .congestion_controller_factory(Arc::new(crate::hysteria2::brutal::BrutalConfig))
-                // Enable GSO (Generic Segmentation Offload) for better throughput.
-                // Salamander gives every datagram its own salt, so a coalesced
-                // batch cannot be obfuscated as one buffer -- the offload has to
-                // go when obfuscation is on.
-                .enable_segmentation_offload(obfs.is_none())
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
-
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            //
-            // SO_REUSEPORT only when there is a second endpoint to share the port with:
-            // platforms without it panic rather than fail.
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                num_endpoints > 1,
-                Some(8_625_000),
-            )
-            .unwrap();
-
-            // `wrap_udp_socket` lives on the Runtime trait.
-            use quinn::Runtime as _;
-            let runtime = Arc::new(quinn::TokioRuntime);
-            let endpoint = match obfs {
-                // Obfuscation is a transformation of the bytes leaving and
-                // entering the socket, so it wraps quinn's own socket rather
-                // than replacing it: everything platform-specific about the UDP
-                // path stays where quinn maintains it.
-                Some(salamander) => {
-                    let inner = runtime
-                        .wrap_udp_socket(socket2_socket.into())
-                        .expect("wrap the hysteria2 udp socket");
-                    quinn::Endpoint::new_with_abstract_socket(
-                        quinn::EndpointConfig::default(),
-                        Some(server_config),
-                        Arc::new(crate::hysteria2_obfs::ObfuscatedUdpSocket::new(
-                            inner, salamander,
-                        )),
-                        runtime,
-                    )
-                }
-                None => quinn::Endpoint::new(
-                    quinn::EndpointConfig::default(),
-                    Some(server_config),
-                    socket2_socket.into(),
-                    runtime,
-                ),
-            }
-            .unwrap();
-
             loop {
                 let conn = tokio::select! {
                     biased;
+                    () = connection_cancel.cancelled() => break,
                     () = shutdown.cancelled() => break,
                     incoming = endpoint.accept() => match incoming {
                         Some(conn) => conn,
@@ -1435,21 +2040,17 @@ pub async fn start_hysteria2_server(
                     continue;
                 };
                 let pre_auth_deadline = Instant::now() + QUIC_PRE_AUTH_TIMEOUT;
-                // Loaded here rather than inside the spawned task: a connection
-                // must be pinned to the rules it was *accepted* under, not to
-                // whichever generation happened to be current when its task ran.
-                // The resolver travels with the rules, so a connection cannot be
-                // accepted under one generation and route by another's DNS.
-                let (cloned_selector, cloned_resolver) = selector.load();
+                let selector = selector.clone();
                 let connection_settings = connection_settings.clone();
+                let connection_cancel = connection_cancel.clone();
                 tokio::spawn(async move {
                     if let Err(e) = process_connection(
-                        cloned_selector,
-                        cloned_resolver,
+                        selector,
                         conn,
                         connection_settings,
                         handshake_permit,
                         pre_auth_deadline,
+                        connection_cancel,
                     )
                     .await
                     {
@@ -1458,9 +2059,13 @@ pub async fn start_hysteria2_server(
                 });
             }
 
-            // The connections are multiplexed over this endpoint's socket, so
-            // letting them finish and giving the port back are the same act.
-            crate::quic_server::drain_endpoint(endpoint, bind_address).await;
+            if connection_cancel.is_cancelled() {
+                crate::quic_server::hard_close_endpoint(endpoint, bind_address).await;
+            } else {
+                // The connections are multiplexed over this endpoint's socket, so
+                // letting them finish and giving the port back are the same act.
+                crate::quic_server::drain_endpoint(endpoint, bind_address).await;
+            }
         });
         join_handles.push(join_handle);
     }
@@ -1471,50 +2076,707 @@ pub async fn start_hysteria2_server(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_FRAGMENT_CACHE_SIZE, UdpSession, decode_udp_address_length, valid_udp_fragment,
+        MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE,
+        MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION, MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION,
+        TCP_REQUEST_HEADER_TIMEOUT, UdpForwardCommand, UdpFragmentCache, UdpSession,
+        UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
+        checked_response_fragment_count, checked_udp_packet_len, cleanup_udp_sessions,
+        connect_udp_target, decode_udp_address_length, dispatch_udp_target_command,
+        read_tcp_request_header_before_deadline, run_connected_udp_target_worker,
+        try_admit_tcp_logical_flow, try_reserve_payload_bytes, try_reserve_udp_target_worker,
+        udp_response_send_allowed, valid_udp_fragment,
     };
-    use crate::address::{Address, NetLocation};
-    use lru::LruCache;
+    use crate::address::{Address, NetLocation, NetLocationMask};
+    use crate::async_stream::{
+        AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
+        AsyncWriteMessage,
+    };
+    use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
+    use crate::option_util::NoneOrSome;
+    use crate::resolver::{NativeResolver, Resolver};
+    use crate::tcp::chain_builder::build_client_chain_group;
+    use bytes::Bytes;
+    use futures::future::poll_fn;
+    use rustc_hash::FxHashMap;
     use std::net::Ipv4Addr;
-    use std::num::NonZeroUsize;
-    use std::sync::Arc;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::ReadBuf;
+    use tokio::sync::Semaphore;
+    use tokio::time::{Instant, advance};
     use tokio_util::sync::CancellationToken;
 
-    /// Dropping a session must stop the task it started.
-    ///
-    /// The reaper cancels explicitly, but it is not the only way a session leaves
-    /// the map: a failed forward removes one too, and that is the path an
-    /// unreachable destination takes on its very first packet. Constructed by hand
-    /// rather than through `start`, because the point is the struct's own lifetime.
+    struct CountingWriteMessageStream(Arc<AtomicUsize>);
+
+    impl AsyncReadMessage for CountingWriteMessageStream {
+        fn poll_read_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWriteMessage for CountingWriteMessageStream {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<()>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for CountingWriteMessageStream {
+        fn poll_flush_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for CountingWriteMessageStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for CountingWriteMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for CountingWriteMessageStream {}
+
+    struct ReplyAndCountingWriteMessageStream {
+        reply: Option<Vec<u8>>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl AsyncReadMessage for ReplyAndCountingWriteMessageStream {
+        fn poll_read_message(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.reply.take() {
+                Some(reply) => {
+                    buf.put_slice(&reply);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl AsyncWriteMessage for ReplyAndCountingWriteMessageStream {
+        fn poll_write_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<()>> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncFlushMessage for ReplyAndCountingWriteMessageStream {
+        fn poll_flush_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncShutdownMessage for ReplyAndCountingWriteMessageStream {
+        fn poll_shutdown_message(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncPing for ReplyAndCountingWriteMessageStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+
+        fn poll_write_ping(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+
+    impl AsyncMessageStream for ReplyAndCountingWriteMessageStream {}
+
+    fn location(port: u16) -> NetLocation {
+        NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[tokio::test]
+    async fn pending_target_does_not_block_a_healthy_target_write_or_reply() {
+        let global_permits = Arc::new(Semaphore::new(2));
+        let session_permits = Arc::new(Semaphore::new(MAX_UDP_TARGETS_PER_SESSION));
+        let queue_budget = Arc::new(Semaphore::new(32));
+        let cancel = CancellationToken::new();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chain = build_client_chain_group(NoneOrSome::None, resolver.clone());
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::from("0.0.0.0/0").unwrap()],
+            ConnectAction::new_allow(None, chain),
+        )]));
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::channel(1);
+        let mut targets = FxHashMap::default();
+
+        let healthy = location(1001);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (healthy_tx, healthy_rx) = tokio::sync::mpsc::channel(8);
+        let healthy_cancel = cancel.child_token();
+        let mut healthy_remote: Box<dyn AsyncMessageStream> =
+            Box::new(ReplyAndCountingWriteMessageStream {
+                reply: Some(b"reply".to_vec()),
+                writes: writes.clone(),
+            });
+        let healthy_task_cancel = healthy_cancel.clone();
+        let healthy_response_tx = response_tx.clone();
+        let healthy_permit = global_permits.clone().try_acquire_owned().unwrap();
+        let healthy_location = healthy.clone();
+        tokio::spawn(async move {
+            run_connected_udp_target_worker(
+                healthy_location,
+                1,
+                healthy_permit,
+                healthy_rx,
+                &mut healthy_remote,
+                healthy_response_tx,
+                healthy_task_cancel,
+            )
+            .await
+            .unwrap();
+        });
+        targets.insert(
+            healthy.clone(),
+            UdpTargetWorker {
+                outbound_tx: healthy_tx,
+                last_used: 1,
+                generation: 1,
+                cancel_token: healthy_cancel,
+            },
+        );
+
+        // Holding this receiver without polling models a second target whose
+        // DNS/proxy connect is pending forever.
+        let pending_target = location(1002);
+        let (pending_tx, pending_rx) = tokio::sync::mpsc::channel(8);
+        let _pending_rx = pending_rx;
+        let _pending_permit = global_permits.clone().try_acquire_owned().unwrap();
+        targets.insert(
+            pending_target.clone(),
+            UdpTargetWorker {
+                outbound_tx: pending_tx,
+                last_used: 2,
+                generation: 2,
+                cancel_token: cancel.child_token(),
+            },
+        );
+
+        let mut use_counter = 2;
+        let mut next_generation = 2;
+        for (remote_location, payload) in [
+            (pending_target, Bytes::from_static(b"blocked")),
+            (healthy.clone(), Bytes::from_static(b"healthy")),
+        ] {
+            dispatch_udp_target_command(
+                &mut targets,
+                &mut use_counter,
+                &mut next_generation,
+                UdpForwardCommand {
+                    remote_location,
+                    payload: payload.clone(),
+                    _payload_permit: try_reserve_payload_bytes(&queue_budget, payload.len())
+                        .unwrap(),
+                },
+                &selector,
+                &resolver,
+                &global_permits,
+                &session_permits,
+                &response_tx,
+                &cancel,
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while writes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let UdpTargetEvent::Message {
+            remote_location,
+            payload,
+            ..
+        } = tokio::time::timeout(Duration::from_secs(1), response_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("healthy target unexpectedly closed");
+        };
+        assert_eq!(remote_location, healthy);
+        assert_eq!(payload, Bytes::from_static(b"reply"));
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn exhausted_global_budget_rotates_without_losing_the_first_packet() {
+        let permits = Arc::new(Semaphore::new(MAX_UDP_TARGETS_PER_SESSION));
+        let session_permits = Arc::new(Semaphore::new(MAX_UDP_TARGETS_PER_SESSION));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut targets = FxHashMap::default();
+        for port in 1..=MAX_UDP_TARGETS_PER_SESSION as u16 {
+            let global_permit = permits.clone().try_acquire_owned().unwrap();
+            let session_permit = session_permits.clone().try_acquire_owned().unwrap();
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let task_active = active.clone();
+            let task_max_active = max_active.clone();
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            task_max_active.fetch_max(current, Ordering::SeqCst);
+            tokio::spawn(async move {
+                task_cancel.cancelled().await;
+                task_active.fetch_sub(1, Ordering::SeqCst);
+                drop(session_permit);
+                drop(global_permit);
+            });
+            let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+            targets.insert(
+                location(port),
+                UdpTargetWorker {
+                    outbound_tx,
+                    last_used: port as u64,
+                    generation: port as u64,
+                    cancel_token: cancel,
+                },
+            );
+        }
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(session_permits.available_permits(), 0);
+        assert_eq!(active.load(Ordering::SeqCst), MAX_UDP_TARGETS_PER_SESSION);
+
+        let replacement = try_reserve_udp_target_worker(&mut targets, &permits)
+            .expect("a full association rotates its LRU target");
+        assert!(matches!(&replacement, UdpTargetPermit::Awaiting(_)));
+        assert_eq!(targets.len(), MAX_UDP_TARGETS_PER_SESSION - 1);
+
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = peer.local_addr().unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chain = build_client_chain_group(NoneOrSome::None, resolver.clone());
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::from("0.0.0.0/0").unwrap()],
+            ConnectAction::new_allow(None, chain),
+        )]));
+        let queue_budget = Arc::new(Semaphore::new(32));
+        let cancel = CancellationToken::new();
+        let remote_location =
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), destination.port());
+        let command = UdpForwardCommand {
+            remote_location: remote_location.clone(),
+            payload: Bytes::from_static(b"replacement"),
+            _payload_permit: try_reserve_payload_bytes(&queue_budget, 11).unwrap(),
+        };
+        let (session_permit, global_permit) = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_udp_target_permits(replacement, session_permits.clone(), &cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_active.fetch_max(current, Ordering::SeqCst);
+        let mut stream = connect_udp_target(&selector, &resolver, remote_location)
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, &command.payload))
+            .await
+            .unwrap();
+        poll_fn(|cx| Pin::new(&mut *stream).poll_flush_message(cx))
+            .await
+            .unwrap();
+        drop(command);
+
+        let mut received = [0u8; 32];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..len], b"replacement");
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(session_permits.available_permits(), 0);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            MAX_UDP_TARGETS_PER_SESSION
+        );
+        active.fetch_sub(1, Ordering::SeqCst);
+        drop(session_permit);
+        drop(global_permit);
+        cancel.cancel();
+        drop(targets);
+    }
+
+    #[test]
+    fn fragmented_payload_and_response_counts_are_bounded() {
+        assert_eq!(
+            checked_udp_packet_len(MAX_UDP_PACKET_SIZE - 1, 1),
+            Some(MAX_UDP_PACKET_SIZE)
+        );
+        assert_eq!(checked_udp_packet_len(MAX_UDP_PACKET_SIZE, 1), None);
+        assert_eq!(checked_response_fragment_count(2550, 10).unwrap(), 255);
+        assert!(checked_response_fragment_count(2560, 10).is_err());
+    }
+
+    #[test]
+    fn fragmented_response_stops_before_the_next_write_after_cancellation() {
+        let cancel = CancellationToken::new();
+        let mut writes = 0;
+        for fragment_id in 0..3 {
+            if !udp_response_send_allowed(&cancel) {
+                break;
+            }
+            writes += 1;
+            if fragment_id == 0 {
+                // Models cancellation while the first fragment's asynchronous
+                // metering operation is pending.
+                cancel.cancel();
+            }
+        }
+        assert_eq!(writes, 1, "no fragment after cancellation reaches the wire");
+    }
+
+    #[test]
+    fn connection_fragment_cache_bounds_512_sessions_and_total_bytes() {
+        let mut cache = UdpFragmentCache::new();
+        for session_id in 0..512 {
+            cache
+                .accept_fragment(
+                    session_id,
+                    1,
+                    0,
+                    2,
+                    location(53),
+                    Bytes::from(vec![0u8; 40_000]),
+                )
+                .unwrap();
+        }
+        assert!(cache.entries.len() <= MAX_FRAGMENT_CACHE_SIZE);
+        assert!(cache.total_bytes <= MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION);
+        assert!(cache.entries.len() < 512);
+    }
+
+    #[test]
+    fn fragment_zero_destination_wins_and_accounting_is_released() {
+        let mut cache = UdpFragmentCache::new();
+        let continuation_target = location(2000);
+        let first_target = location(1000);
+        assert!(
+            cache
+                .accept_fragment(7, 9, 1, 2, continuation_target, Bytes::from_static(b"tail"),)
+                .unwrap()
+                .is_none()
+        );
+        let (payload, target) = cache
+            .accept_fragment(
+                7,
+                9,
+                0,
+                2,
+                first_target.clone(),
+                Bytes::from_static(b"head"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(target, first_target);
+        assert_eq!(payload, Bytes::from_static(b"headtail"));
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn fragment_ttl_prevents_packet_id_wraparound_mixing_and_refreshes_on_progress() {
+        let started = std::time::Instant::now();
+        let mut cache = UdpFragmentCache::new();
+        cache
+            .accept_fragment_at(
+                7,
+                9,
+                0,
+                2,
+                location(1000),
+                Bytes::from_static(b"old-head"),
+                started,
+            )
+            .unwrap();
+
+        // The old fragment zero expires. A continuation with the wrapped packet
+        // id starts a fresh entry and must not complete with the old payload or
+        // destination.
+        assert!(
+            cache
+                .accept_fragment_at(
+                    7,
+                    9,
+                    1,
+                    2,
+                    location(2000),
+                    Bytes::from_static(b"new-tail"),
+                    started + super::UDP_FRAGMENT_TIMEOUT + Duration::from_millis(1),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let new_target = location(3000);
+        let (payload, target) = cache
+            .accept_fragment_at(
+                7,
+                9,
+                0,
+                2,
+                new_target.clone(),
+                Bytes::from_static(b"new-head"),
+                started + super::UDP_FRAGMENT_TIMEOUT + Duration::from_secs(1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(target, new_target);
+        assert_eq!(payload, Bytes::from_static(b"new-headnew-tail"));
+
+        // A continuation inside the age window still completes normally and its
+        // access refreshes the entry rather than expiring it early.
+        let mut live = UdpFragmentCache::new();
+        live.accept_fragment_at(
+            8,
+            10,
+            1,
+            3,
+            location(4000),
+            Bytes::from_static(b"b"),
+            started,
+        )
+        .unwrap();
+        live.accept_fragment_at(
+            8,
+            10,
+            2,
+            3,
+            location(4000),
+            Bytes::from_static(b"c"),
+            started + Duration::from_secs(9),
+        )
+        .unwrap();
+        let completed = live
+            .accept_fragment_at(
+                8,
+                10,
+                0,
+                3,
+                location(5000),
+                Bytes::from_static(b"a"),
+                started + Duration::from_secs(18),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.0, Bytes::from_static(b"abc"));
+        assert_eq!(completed.1, location(5000));
+    }
+
+    #[test]
+    fn fragment_error_and_session_cleanup_release_accounting() {
+        let mut cache = UdpFragmentCache::new();
+        cache
+            .accept_fragment(1, 1, 0, 2, location(53), Bytes::from_static(b"one"))
+            .unwrap();
+        assert!(
+            cache
+                .accept_fragment(1, 1, 0, 2, location(53), Bytes::from_static(b"duplicate"),)
+                .is_err()
+        );
+        assert_eq!(cache.total_bytes, 0);
+
+        for packet_id in [2, 3] {
+            cache
+                .accept_fragment(
+                    1,
+                    packet_id,
+                    0,
+                    2,
+                    location(53),
+                    Bytes::from_static(b"pending"),
+                )
+                .unwrap();
+        }
+        cache.clear_session(1);
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn queued_payload_budget_is_connection_wide_and_counts_zero_length() {
+        let budget = Arc::new(Semaphore::new(3));
+        let two = try_reserve_payload_bytes(&budget, 2).unwrap();
+        let zero = try_reserve_payload_bytes(&budget, 0).unwrap();
+        assert!(try_reserve_payload_bytes(&budget, 1).is_none());
+        drop(two);
+        assert!(try_reserve_payload_bytes(&budget, 2).is_some());
+        drop(zero);
+    }
+
+    #[tokio::test]
+    async fn cancelled_prefilled_command_never_writes() {
+        let queue_budget = Arc::new(Semaphore::new(16));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(UdpForwardCommand {
+            remote_location: location(53),
+            payload: Bytes::from_static(b"queued"),
+            _payload_permit: try_reserve_payload_bytes(&queue_budget, 6).unwrap(),
+        })
+        .unwrap();
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let target_budget = Arc::new(Semaphore::new(1));
+        let mut remote: Box<dyn AsyncMessageStream> =
+            Box::new(CountingWriteMessageStream(writes.clone()));
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        run_connected_udp_target_worker(
+            location(53),
+            1,
+            target_budget.try_acquire_owned().unwrap(),
+            rx,
+            &mut remote,
+            response_tx,
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+        assert_eq!(queue_budget.available_permits(), 16);
+    }
+
+    #[tokio::test]
+    async fn routed_udp_connect_uses_allow_rule_chain() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = peer.local_addr().unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chain = build_client_chain_group(NoneOrSome::None, resolver.clone());
+        let selector = Arc::new(ClientProxySelector::new(vec![ConnectRule::new(
+            vec![NetLocationMask::from("0.0.0.0/0").unwrap()],
+            ConnectAction::new_allow(None, chain),
+        )]));
+        let mut stream = connect_udp_target(
+            &selector,
+            &resolver,
+            NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), destination.port()),
+        )
+        .await
+        .unwrap();
+
+        poll_fn(|cx| Pin::new(&mut *stream).poll_write_message(cx, b"via-chain"))
+            .await
+            .unwrap();
+        let mut received = [0u8; 32];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..len], b"via-chain");
+    }
+
     #[tokio::test]
     async fn dropping_a_session_cancels_its_background_task() {
         let parent = CancellationToken::new();
         let token = parent.child_token();
-
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
         let session = UdpSession {
-            fragments: LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap()),
-            send_socket: Arc::new(
-                tokio::net::UdpSocket::bind("127.0.0.1:0")
-                    .await
-                    .expect("bind a loopback socket"),
-            ),
-            last_location: NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 1),
-            last_socket_addr: "127.0.0.1:1".parse().unwrap(),
-            override_remote_write_address: None,
-            last_activity: std::time::Instant::now(),
+            outbound_tx,
+            last_activity: Arc::new(Mutex::new(std::time::Instant::now())),
             cancel_token: token.clone(),
         };
 
-        assert!(!token.is_cancelled(), "a live session is not cancelled");
         drop(session);
-        assert!(
-            token.is_cancelled(),
-            "the spawned loop holds its own clone of this token and would otherwise              keep its socket and 64 KiB buffer alive until the connection ended"
+        assert!(token.is_cancelled());
+        assert!(!parent.is_cancelled());
+    }
+
+    #[test]
+    fn periodic_cleanup_runs_without_datagrams_and_downlink_touch_prevents_reaping() {
+        let started = std::time::Instant::now();
+        let token = CancellationToken::new();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let session = UdpSession {
+            outbound_tx,
+            last_activity: Arc::new(Mutex::new(started)),
+            cancel_token: token.clone(),
+        };
+        // The response path calls the same touch after a generation-valid remote read.
+        session.touch(started + Duration::from_secs(59));
+        let mut sessions = FxHashMap::default();
+        sessions.insert(7, session);
+        let mut fragments = UdpFragmentCache::new();
+
+        cleanup_udp_sessions(
+            &mut sessions,
+            &mut fragments,
+            started + Duration::from_secs(61),
         );
-        assert!(
-            !parent.is_cancelled(),
-            "one session ending must not take the whole connection with it"
+        assert!(sessions.contains_key(&7));
+        assert!(!token.is_cancelled());
+
+        cleanup_udp_sessions(
+            &mut sessions,
+            &mut fragments,
+            started + Duration::from_secs(120),
         );
+        assert!(!sessions.contains_key(&7));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn changed_fragment_count_is_rejected_before_indexing_and_releases_accounting() {
+        let mut cache = UdpFragmentCache::new();
+        cache
+            .accept_fragment(1, 7, 0, 2, location(53), Bytes::from_static(b"head"))
+            .unwrap();
+        let error = cache
+            .accept_fragment(1, 7, 254, 255, location(53), Bytes::from_static(b"tail"))
+            .expect_err("fragment count mismatch must be an ordinary packet error");
+        assert!(error.to_string().contains("Mismatched fragment count"));
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.entries.is_empty());
     }
 
     #[test]
@@ -1545,5 +2807,46 @@ mod tests {
         assert!(!valid_udp_fragment(2, 2));
         assert!(valid_udp_fragment(0, 1));
         assert!(valid_udp_fragment(1, 2));
+    }
+
+    #[test]
+    fn tcp_logical_flow_gate_rejects_257th_and_reopens_after_release() {
+        let gate = Arc::new(Semaphore::new(MAX_ACTIVE_TCP_LOGICAL_FLOWS));
+        let mut permits: Vec<_> = (0..MAX_ACTIVE_TCP_LOGICAL_FLOWS)
+            .map(|_| try_admit_tcp_logical_flow(&gate).expect("flow is within the limit"))
+            .collect();
+
+        assert!(try_admit_tcp_logical_flow(&gate).is_none());
+        drop(permits.pop());
+        assert!(try_admit_tcp_logical_flow(&gate).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_tcp_header_progress_does_not_extend_absolute_deadline() {
+        let deadline = Instant::now() + TCP_REQUEST_HEADER_TIMEOUT;
+        let task = tokio::spawn(async move {
+            read_tcp_request_header_before_deadline(deadline, async {
+                for _ in 0..100 {
+                    // Models a peer that supplies another header byte often enough
+                    // to defeat a per-read timeout but never completes the header.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        for _ in 0..14 {
+            advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished());
+        }
+        advance(Duration::from_secs(1)).await;
+        let error = task
+            .await
+            .expect("header task must not panic")
+            .expect_err("the absolute deadline must expire");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

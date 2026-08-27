@@ -584,6 +584,7 @@ fn expand_dns_specs(
             validate_direct_connector_positions(&chain.hops, expanded_chains.len())?;
             expanded_chains.push(chain);
         }
+        validate_urltest_history_keys(&client_chain_selection, expanded_chains.len())?;
 
         // Validate protocol compatibility with chains
         if !expanded_chains.is_empty() {
@@ -643,8 +644,20 @@ fn expand_dns_specs(
             }
         }
 
+        let client_subnet = spec
+            .client_subnet()
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("DNS upstream {url_str:?} has invalid {error}"),
+                )
+            })?;
+
         result.push(ExpandedDnsSpec {
             tag: spec.tag().map(String::from),
+            source_tag: spec.source_tag().map(String::from),
             url: url_str.to_string(),
             server_name: server_name_override.map(String::from),
             use_native_roots: spec.use_native_roots(),
@@ -652,6 +665,9 @@ fn expand_dns_specs(
             client_chain_selection,
             bootstrap_url: spec.bootstrap_url().map(String::from),
             ip_strategy: spec.ip_strategy(),
+            disable_cache: spec.disable_cache(),
+            rewrite_ttl: spec.rewrite_ttl(),
+            client_subnet,
             timeout_secs: spec.timeout_secs(),
             connect_timeout_secs: spec.connect_timeout_secs(),
             attempts: spec.attempts(),
@@ -711,6 +727,20 @@ fn expand_dns_policy(
             ));
         }
     }
+    for (index, spec) in specs.iter().enumerate() {
+        let Some(source_tag) = spec.source_tag.as_deref() else {
+            continue;
+        };
+        if source_tag.is_empty() || source_tag.trim() != source_tag || !tags.contains(source_tag) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "DNS group '{}' upstream {index} has invalid __acp_source_tag {source_tag:?}",
+                    group.dns_group
+                ),
+            ));
+        }
+    }
 
     let final_server = match group.final_server.as_deref() {
         Some(tag) if tag.is_empty() || tag.trim() != tag => {
@@ -746,8 +776,10 @@ fn expand_dns_policy(
         let rule_set = rule.rule_set.clone();
         let action = match rule.action {
             DnsPolicyActionConfig::Route => {
-                if !rule.rcode.is_empty()
+                if !rule.reject_flood_state_key.is_empty()
+                    || !rule.rcode.is_empty()
                     || !rule.method.is_empty()
+                    || rule.no_drop
                     || !rule.answer.is_empty()
                     || !rule.ns.is_empty()
                     || !rule.extra.is_empty()
@@ -755,7 +787,7 @@ fn expand_dns_policy(
                     return Err(invalid_dns_rule(
                         group,
                         index,
-                        "route action must not contain rcode, method, answer, ns, or extra",
+                        "route action must not contain __acp_reject_flood_key, rcode, method, no_drop, answer, ns, or extra",
                     ));
                 }
                 let tag = rule.server.as_deref().ok_or_else(|| {
@@ -794,14 +826,37 @@ fn expand_dns_policy(
                         ),
                     )
                 })?;
-                ExpandedDnsPolicyAction::Reject(method)
-            }
-            DnsPolicyActionConfig::Predefined => {
-                if rule.server.is_some() || !rule.method.is_empty() || rule.timeout_millis != 0 {
+                if method == DnsRejectMethod::Drop && rule.no_drop {
                     return Err(invalid_dns_rule(
                         group,
                         index,
-                        "predefined action must not contain server, method, or timeout_millis",
+                        "no_drop is not valid with reject method drop",
+                    ));
+                }
+                if !rule.reject_flood_state_key.is_empty() {
+                    validate_dns_reject_flood_state_key(&rule.reject_flood_state_key)
+                        .map_err(|error| invalid_dns_rule(group, index, error))?;
+                    if method != DnsRejectMethod::Default || rule.no_drop {
+                        return Err(invalid_dns_rule(
+                            group,
+                            index,
+                            "__acp_reject_flood_key is only valid for default reject without no_drop",
+                        ));
+                    }
+                }
+                ExpandedDnsPolicyAction::Reject(method)
+            }
+            DnsPolicyActionConfig::Predefined => {
+                if !rule.reject_flood_state_key.is_empty()
+                    || rule.server.is_some()
+                    || !rule.method.is_empty()
+                    || rule.no_drop
+                    || rule.timeout_millis != 0
+                {
+                    return Err(invalid_dns_rule(
+                        group,
+                        index,
+                        "predefined action must not contain __acp_reject_flood_key, server, method, no_drop, or timeout_millis",
                     ));
                 }
                 let rcode = DnsRcode::parse(&rule.rcode).ok_or_else(|| {
@@ -809,7 +864,7 @@ fn expand_dns_policy(
                         group,
                         index,
                         format!(
-                            "predefined rcode must be NOERROR, NXDOMAIN, REFUSED, or SERVFAIL, got {:?}",
+                            "predefined rcode must be an exact miekg/dns response-code name, got {:?}",
                             rule.rcode
                         ),
                     )
@@ -822,12 +877,15 @@ fn expand_dns_policy(
         };
 
         expanded_rules.push(ExpandedDnsPolicyRule {
+            reject_flood_state_key: (!rule.reject_flood_state_key.is_empty())
+                .then(|| rule.reject_flood_state_key.clone()),
             exact: rule.domain.clone(),
             suffix: rule.domain_suffix.clone(),
             keyword: rule.domain_keyword.clone(),
             regex: rule.domain_regex.clone(),
             rule_set,
             action,
+            no_drop: rule.no_drop,
             timeout_millis: rule.timeout_millis,
         });
     }
@@ -844,6 +902,7 @@ fn expand_dns_policy(
             keyword: rule.keyword.clone(),
             regex: rule.regex.clone(),
             rule_set: rule.rule_set.clone(),
+            no_drop: rule.no_drop,
             timeout: (rule.timeout_millis != 0)
                 .then(|| std::time::Duration::from_millis(rule.timeout_millis)),
             action: match &rule.action {
@@ -863,6 +922,21 @@ fn expand_dns_policy(
     })?;
 
     Ok((Some(final_server), expanded_rules))
+}
+
+fn validate_dns_reject_flood_state_key(value: &str) -> Result<(), &'static str> {
+    const PREFIX: &str = "__acp_dns_reject_v1_";
+    let Some(digest) = value.strip_prefix(PREFIX) else {
+        return Err("__acp_reject_flood_key has an invalid internal prefix");
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("__acp_reject_flood_key must contain exactly 64 lowercase hexadecimal digits");
+    }
+    Ok(())
 }
 
 fn invalid_dns_rule(
@@ -2131,6 +2205,7 @@ fn validate_rule_config(
             // Validate that direct connectors only appear at hop 0
             validate_direct_connector_positions(&chain.hops, chain_index)?;
         }
+        validate_urltest_history_keys(client_chain_selection, client_chains.len())?;
     }
 
     Ok(())
@@ -2140,8 +2215,9 @@ fn validate_client_chain_selection(
     selection: &crate::config::ClientChainSelectionConfig,
 ) -> std::io::Result<()> {
     let crate::config::ClientChainSelectionConfig::UrlTest {
-        url,
+        shared_id,
         interval_millis,
+        tolerance_millis,
         idle_timeout_millis,
         ..
     } = selection
@@ -2149,10 +2225,27 @@ fn validate_client_chain_selection(
         return Ok(());
     };
 
+    if let Some(shared_id) = shared_id
+        && (shared_id.is_empty()
+            || shared_id.len() > 128
+            || !shared_id.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest shared_id must be 1..=128 printable ASCII bytes",
+        ));
+    }
+
     if *interval_millis == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "client_chain_selection urltest interval_millis must be greater than zero",
+        ));
+    }
+    if *tolerance_millis > u16::MAX as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest tolerance_millis must fit uint16",
         ));
     }
     let idle_timeout_millis = if *idle_timeout_millis == 0 {
@@ -2167,28 +2260,56 @@ fn validate_client_chain_selection(
         ));
     }
 
-    let link = if url.is_empty() {
-        "https://www.gstatic.com/generate_204"
-    } else {
-        url.as_str()
+    Ok(())
+}
+
+fn validate_urltest_history_keys(
+    selection: &crate::config::ClientChainSelectionConfig,
+    chain_count: usize,
+) -> std::io::Result<()> {
+    let crate::config::ClientChainSelectionConfig::UrlTest {
+        shared_id,
+        history_keys,
+        failure_history_keys,
+        ..
+    } = selection
+    else {
+        return Ok(());
     };
-    let parsed = url::Url::parse(link).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid client_chain_selection urltest URL {link:?}: {error}"),
-        )
-    })?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
+    if history_keys.is_empty() {
+        if !failure_history_keys.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "client_chain_selection urltest failure_history_keys require history_keys",
+            ));
+        }
+        return Ok(());
+    }
+    if shared_id.is_none()
+        || history_keys.len() != chain_count
+        || history_keys.iter().any(String::is_empty)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "client_chain_selection urltest URL must be an absolute HTTP or HTTPS URL without user info",
+            "client_chain_selection urltest history_keys require shared_id and exactly one non-empty key per chain",
         ));
     }
-
+    let unique = history_keys.iter().collect::<HashSet<_>>();
+    if unique.len() != history_keys.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest history_keys must be unique",
+        ));
+    }
+    if !failure_history_keys.is_empty()
+        && (failure_history_keys.len() != chain_count
+            || failure_history_keys.iter().any(String::is_empty))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client_chain_selection urltest failure_history_keys require exactly one non-empty key per chain",
+        ));
+    }
     Ok(())
 }
 
@@ -2470,8 +2591,11 @@ mod tests {
     }
 
     #[test]
-    fn urltest_selection_validation_is_strict() {
+    fn urltest_selection_validates_runtime_controls_but_defers_url_syntax() {
         let valid = crate::config::ClientChainSelectionConfig::UrlTest {
+            shared_id: None,
+            history_keys: Vec::new(),
+            failure_history_keys: Vec::new(),
             url: "https://example.com/generate_204".to_string(),
             use_native_roots: false,
             reselect_on_connection_failure: false,
@@ -2482,6 +2606,9 @@ mod tests {
         validate_client_chain_selection(&valid).unwrap();
 
         let empty_url_uses_default = crate::config::ClientChainSelectionConfig::UrlTest {
+            shared_id: None,
+            history_keys: Vec::new(),
+            failure_history_keys: Vec::new(),
             url: String::new(),
             use_native_roots: false,
             reselect_on_connection_failure: false,
@@ -2491,7 +2618,23 @@ mod tests {
         };
         validate_client_chain_selection(&empty_url_uses_default).unwrap();
 
+        let basic_auth_url = crate::config::ClientChainSelectionConfig::UrlTest {
+            shared_id: None,
+            history_keys: Vec::new(),
+            failure_history_keys: Vec::new(),
+            url: "https://user:pass@example.com/".to_string(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 1,
+            tolerance_millis: 0,
+            idle_timeout_millis: crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
+        };
+        validate_client_chain_selection(&basic_auth_url).unwrap();
+
         let zero_interval = crate::config::ClientChainSelectionConfig::UrlTest {
+            shared_id: None,
+            history_keys: Vec::new(),
+            failure_history_keys: Vec::new(),
             url: "http://example.com/".to_string(),
             use_native_roots: false,
             reselect_on_connection_failure: false,
@@ -2507,6 +2650,9 @@ mod tests {
         );
 
         let interval_exceeds_idle = crate::config::ClientChainSelectionConfig::UrlTest {
+            shared_id: None,
+            history_keys: Vec::new(),
+            failure_history_keys: Vec::new(),
             url: "http://example.com/".to_string(),
             use_native_roots: false,
             reselect_on_connection_failure: false,
@@ -2521,20 +2667,20 @@ mod tests {
                 .contains("less than or equal")
         );
 
-        for invalid_url in [
-            "ftp://example.com/file",
-            "/relative-url",
-            "https://user:pass@example.com/",
-        ] {
-            let invalid = crate::config::ClientChainSelectionConfig::UrlTest {
-                url: invalid_url.to_string(),
+        for deferred_url in ["ftp://example.com/file", "/relative-url"] {
+            let deferred = crate::config::ClientChainSelectionConfig::UrlTest {
+                shared_id: None,
+                history_keys: Vec::new(),
+                failure_history_keys: Vec::new(),
+                url: deferred_url.to_string(),
                 use_native_roots: false,
                 reselect_on_connection_failure: false,
                 interval_millis: 1,
                 tolerance_millis: 0,
                 idle_timeout_millis: crate::config::DEFAULT_URLTEST_IDLE_TIMEOUT_MILLIS,
             };
-            assert!(validate_client_chain_selection(&invalid).is_err());
+            validate_client_chain_selection(&deferred)
+                .expect("Go accepts URL syntax at topology load and fails the async probe");
         }
     }
 
@@ -2577,6 +2723,7 @@ mod tests {
     fn expanded_tagged_system(tag: Option<&str>) -> ExpandedDnsSpec {
         ExpandedDnsSpec {
             tag: tag.map(String::from),
+            source_tag: None,
             url: "system".to_string(),
             server_name: None,
             use_native_roots: false,
@@ -2584,6 +2731,9 @@ mod tests {
             client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
             bootstrap_url: None,
             ip_strategy: IpStrategy::default(),
+            disable_cache: false,
+            rewrite_ttl: None,
+            client_subnet: None,
             timeout_secs: 5,
             connect_timeout_secs: 5,
             attempts: 1,
@@ -2592,6 +2742,7 @@ mod tests {
 
     fn dns_policy_rule(action: DnsPolicyActionConfig) -> DnsPolicyRuleConfig {
         DnsPolicyRuleConfig {
+            reject_flood_state_key: String::new(),
             domain: Vec::new(),
             domain_suffix: Vec::new(),
             domain_keyword: Vec::new(),
@@ -2601,6 +2752,7 @@ mod tests {
             server: None,
             rcode: String::new(),
             method: String::new(),
+            no_drop: false,
             answer: Vec::new(),
             ns: Vec::new(),
             extra: Vec::new(),
@@ -3352,7 +3504,8 @@ mod tests {
         route.server = Some("secondary".to_string());
         route.timeout_millis = 1_250;
         let predefined = dns_policy_rule(DnsPolicyActionConfig::Predefined);
-        let reject = dns_policy_rule(DnsPolicyActionConfig::Reject);
+        let mut reject = dns_policy_rule(DnsPolicyActionConfig::Reject);
+        reject.no_drop = true;
         let group = DnsConfigGroup {
             dns_group: "policy-dns".to_string(),
             dns_servers: NoneOrSome::Unspecified,
@@ -3379,6 +3532,7 @@ mod tests {
             &rules[2].action,
             ExpandedDnsPolicyAction::Reject(DnsRejectMethod::Default)
         ));
+        assert!(rules[2].no_drop);
 
         let mut unknown = group.clone();
         unknown.rules[0].server = Some("missing".to_string());
@@ -3407,6 +3561,53 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("timeout_millis")
+        );
+
+        let mut invalid_no_drop = group.clone();
+        invalid_no_drop.rules[2].method = "drop".to_string();
+        assert!(
+            expand_dns_policy(&invalid_no_drop, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("no_drop")
+        );
+
+        let mut misplaced_no_drop = group.clone();
+        misplaced_no_drop.rules[0].no_drop = true;
+        assert!(
+            expand_dns_policy(&misplaced_no_drop, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("no_drop")
+        );
+
+        let mut keyed_reject = group.clone();
+        keyed_reject.rules[2].no_drop = false;
+        keyed_reject.rules[2].reject_flood_state_key =
+            format!("__acp_dns_reject_v1_{}", "a".repeat(64));
+        let (_, keyed_rules) = expand_dns_policy(&keyed_reject, &specs).unwrap();
+        assert_eq!(
+            keyed_rules[2].reject_flood_state_key.as_deref(),
+            Some(keyed_reject.rules[2].reject_flood_state_key.as_str())
+        );
+
+        let mut invalid_key = keyed_reject.clone();
+        invalid_key.rules[2].reject_flood_state_key =
+            "__acp_dns_reject_v1_not-a-digest".to_string();
+        assert!(
+            expand_dns_policy(&invalid_key, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("64 lowercase hexadecimal")
+        );
+
+        let mut keyed_no_drop = keyed_reject;
+        keyed_no_drop.rules[2].no_drop = true;
+        assert!(
+            expand_dns_policy(&keyed_no_drop, &specs)
+                .unwrap_err()
+                .to_string()
+                .contains("only valid for default reject without no_drop")
         );
 
         let mut invalid_regex = group;
@@ -3492,6 +3693,7 @@ mod tests {
             rules: Vec::new(),
             dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                 tag: None,
+                source_tag: None,
                 client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                 url: "system".to_string(),
                 client_chain: NoneOrSome::One(ConfigSelection::Config(ClientChain::default())),
@@ -3499,6 +3701,9 @@ mod tests {
                 server_name: None,
                 use_native_roots: false,
                 ip_strategy: IpStrategy::default(),
+                disable_cache: false,
+                rewrite_ttl: None,
+                client_subnet: String::new(),
                 timeout_secs: 10,
                 connect_timeout_secs: 5,
                 attempts: 1,
@@ -3536,6 +3741,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "udp://8.8.8.8".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3545,6 +3751,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3577,6 +3786,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "udp://8.8.8.8".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3586,6 +3796,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3621,6 +3834,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "quic://94.140.14.14".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3630,6 +3844,9 @@ mod tests {
                     server_name: Some("dns.adguard-dns.com".to_string()),
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3660,6 +3877,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "quic://94.140.14.14".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3669,6 +3887,9 @@ mod tests {
                     server_name: Some("dns.adguard-dns.com".to_string()),
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3710,6 +3931,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "h3://1.1.1.1/dns-query".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3719,6 +3941,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3745,6 +3970,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "h3://1.1.1.1/dns-query".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3754,6 +3980,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3779,6 +4008,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "tcp://8.8.8.8".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3788,6 +4018,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3814,6 +4047,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "tls://1.1.1.1".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3823,6 +4057,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -3849,6 +4086,7 @@ mod tests {
                 rules: Vec::new(),
                 dns_servers: NoneOrSome::One(DnsServerSpec::WithOptions {
                     tag: None,
+                    source_tag: None,
                     client_chain_selection: crate::config::ClientChainSelectionConfig::RoundRobin,
                     url: "https://1.1.1.1/dns-query".to_string(),
                     client_chain: NoneOrSome::One(ConfigSelection::GroupName(
@@ -3858,6 +4096,9 @@ mod tests {
                     server_name: None,
                     use_native_roots: false,
                     ip_strategy: IpStrategy::default(),
+                    disable_cache: false,
+                    rewrite_ttl: None,
+                    client_subnet: String::new(),
                     timeout_secs: 10,
                     connect_timeout_secs: 5,
                     attempts: 1,
@@ -4010,6 +4251,7 @@ mod tests {
                     DnsServerSpec::Simple("base-dns".to_string()), // Composition reference
                     DnsServerSpec::WithOptions {
                         tag: None,
+                        source_tag: None,
                         client_chain_selection:
                             crate::config::ClientChainSelectionConfig::RoundRobin,
                         url: "tls://8.8.4.4".to_string(), // IP-based, no resolution needed
@@ -4018,6 +4260,9 @@ mod tests {
                         server_name: Some("dns.google".to_string()),      // SNI override
                         use_native_roots: false,
                         ip_strategy: IpStrategy::default(),
+                        disable_cache: false,
+                        rewrite_ttl: None,
+                        client_subnet: String::new(),
                         timeout_secs: 10,
                         connect_timeout_secs: 5,
                         attempts: 1,

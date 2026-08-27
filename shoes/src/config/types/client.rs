@@ -813,6 +813,31 @@ impl ClientProxyConfig {
             _ => false,
         }
     }
+
+    /// Whether the final UDP protocol can only encode a literal IP target.
+    ///
+    /// Most proxy protocols deliberately retain the original hostname and let
+    /// the upstream resolve it. VLESS packetaddr is the exception: its packet
+    /// address format has only IPv4 and IPv6 variants. H2MUX carries the final
+    /// target itself, so an inner packetaddr setting does not apply there.
+    pub fn requires_literal_udp_target(&self) -> bool {
+        match self {
+            ClientProxyConfig::Vless {
+                packet_encoding,
+                h2mux,
+                ..
+            } => {
+                h2mux.is_none() && matches!(packet_encoding, Some(VlessPacketEncoding::Packetaddr))
+            }
+            ClientProxyConfig::Reality { protocol, .. }
+            | ClientProxyConfig::ShadowTls { protocol, .. } => {
+                protocol.requires_literal_udp_target()
+            }
+            ClientProxyConfig::Tls(config) => config.protocol.requires_literal_udp_target(),
+            ClientProxyConfig::Websocket(config) => config.protocol.requires_literal_udp_target(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

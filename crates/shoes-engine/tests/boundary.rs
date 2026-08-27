@@ -8,7 +8,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
-use shoes_engine::InboundSpec;
+use shoes_engine::{EngineError, InboundSpec};
 
 const ALICE: &str = "11111111-1111-4111-8111-111111111111";
 const BOB: &str = "22222222-2222-4222-8222-222222222222";
@@ -388,14 +388,15 @@ async fn boundary_cases() {
             .await
             .is_ok(),
     );
-    // And the same path runs again on reload, which is where the rebuilt handler is
-    // handed its resolver.
+    // VLESS may create fresh logical flows after the TCP stream is accepted, so the
+    // engine tells its caller to hard-replace the listener rather than retain an old
+    // routing generation behind an in-place reload.
+    let reload = engine
+        .update_inbound(classic("dns", with_dns(dns_addr, "udp://127.0.0.1:5354")))
+        .await;
     checks.that(
-        "and the inbound reloads with a different one",
-        engine
-            .update_inbound(classic("dns", with_dns(dns_addr, "udp://127.0.0.1:5354")))
-            .await
-            .is_ok(),
+        "and changing its DNS requests a hard listener replacement",
+        matches!(reload, Err(EngineError::ReloadRequired(_))),
     );
     checks.that(
         "an inbound without a dns section is unaffected",

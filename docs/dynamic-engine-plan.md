@@ -1,7 +1,8 @@
 # Dynamic engine: remaining work
 
-The plan of record for `feature/dynamic-engine`. Written 2026-08-21, after the TUIC
-increment landed as `6f163d9`.
+The plan of record for direct development on `master`. Originally written 2026-08-21,
+after the TUIC increment landed as `6f163d9`; feature-branch development is no longer
+used for this project.
 
 The goal has not changed: turn `shoes` from a static config-file CLI into an
 API-driven dynamic engine by 微创手术 — minimally invasive edits, so upstream stays
@@ -22,29 +23,35 @@ mergeable. Protocols are converted one at a time to authenticate through
 | NaiveProxy | yes | yes | increment 3 |
 | Snell | n/a | n/a | out of scope: no multi-user identity mechanism exists |
 
-Rules hot-reload works for every inbound, including Hysteria2 and TUIC — see
-increment 1, which has landed.
+Rule updates work for every inbound, but only RCU-safe protocols hot-swap their
+handler/selector generation. Hysteria2 with UDP enabled, TUIC, and the other
+post-accept logical-flow protocols return `ReloadRequired`; node-agent applies those
+updates by hard-replacing the inbound — see increment 1, which has landed.
 
 All three have landed. What remains is listed under **Still open** at the foot of
 this document.
 
 ---
 
-## 1. Rules hot-reload for the QUIC-native inbounds — **landed**
+## 1. Rules generation handling for the QUIC-native inbounds — **landed**
 
-Built as designed below. `SelectorSlot` sits beside `HandlerSlot` in
-`shoes/src/dynamic/reload.rs`; the two QUIC-native arms of `start_quic_servers`
-record one per bind address and their accept loops `load()` once per accepted
-connection. The settings comparison went the way the decision section proposes,
+`SelectorSlot` sits beside `HandlerSlot` in `shoes/src/dynamic/reload.rs`; the two
+QUIC-native arms of `start_quic_servers` record one per bind address and load it at
+logical-flow boundaries. That RCU path is used only when the accepted transport
+cannot continue admitting independently routed work. Hysteria2 with UDP enabled and
+TUIC are classified as post-accept producers: `check_reload` returns
+`ReloadRequired`, and node-agent hard-replaces the inbound and closes its old endpoint
+before publishing the replacement. A long-lived UDP association therefore cannot
+keep opening destinations under retired rules.
+The settings comparison went the way the decision section proposes,
 with one refinement found on contact with the code: a dynamic inbound's config
 credential is a placeholder the engine regenerates on every `update_inbound`, so it
 carries no operator intent and is excluded from the comparison — `FixedProtocol`
 records whether a registry was injected so it knows to skip it. Without a registry
 the credential is real and is compared.
 
-Covered by four unit tests in `reload.rs` and
-`a_quic_native_inbound_swaps_its_rules_in_place` in
-`crates/shoes-engine/tests/reload.rs`.
+Covered by the post-accept classifier tests in `reload.rs`, the engine boundary test
+for `ReloadRequired`, and node-agent replacement/rollback lifecycle tests.
 
 <details>
 <summary>The original plan, kept as the design record</summary>
@@ -75,12 +82,11 @@ pub struct SelectorSlot {
 }
 ```
 
-The safety argument transfers unchanged, and it is worth restating because it is the
-whole reason this needs no draining: the accept loop calls `load()` **once per
-accepted QUIC connection** and hands that `Arc` to the connection's loops. The
-connection is therefore pinned to the generation it started on, and a `store` can only
-change what the *next* `load` returns. The old selector is freed when its last
-connection ends. That is the entire grace period.
+For an RCU-safe inbound, each new logical flow calls `load()` once and keeps that
+selector/resolver pair for its lifetime; a `store` changes only subsequently created
+flows. For a post-accept producer there is deliberately no in-place `store`: hard
+replacement ends the old connection tree, so its association-scoped selector cannot
+be reused for destinations created after the configuration change.
 
 `ClientProxySelector` is already `Sized`, unlike `dyn TcpServerHandler`, so no
 `HandlerCell`-style indirection is needed.
@@ -94,7 +100,8 @@ connection ends. That is the entire grace period.
   `push_selector(&mut self, selector) -> Arc<SelectorSlot>` for the start functions.
 - `generation()` takes the max across both slot kinds.
 - `check_reload`: the "nothing to swap" refusal becomes `slots.is_empty() &&
-  selectors.is_empty()`.
+  selectors.is_empty()`, and protocols capable of post-accept logical work return
+  `ReloadRequired` even when only rules changed.
 - `reload()`: after building the shared `Arc<ClientProxySelector>` it already builds,
   store it into every selector slot as well as rebuilding the handlers. Keep the
   existing all-or-nothing shape — everything fallible before the first `store`.
@@ -112,31 +119,33 @@ connection ends. That is the entire grace period.
 
 ### The decision this forces
 
-For these two protocols a reload can swap **rules only**. `udp_enabled`,
-`zero_rtt_handshake`, the credential and the QUIC certificates all live in the accept
-loop or the endpoint, not behind anything swappable. (Certificates are already fixed
-for every QUIC inbound — `reload`'s own docs say so.)
+For TCP-only Hysteria2, a reload can swap rules for subsequently accepted TCP streams.
+Hysteria2 UDP and TUIC instead require listener replacement. `udp_enabled`,
+`zero_rtt_handshake`, the credential and the QUIC certificates also live in the accept
+loop or endpoint and therefore require replacement.
 
-Silently ignoring a changed `udp_enabled` would be fail-open, and the failure would be
-invisible until someone noticed UDP still working. So: have `ServerHandle` remember
-the `ServerProxyConfig` these arms started with, compare it on reload, and reject a
-config that changes anything but the rules — with a message naming the field that
-cannot change in place. That matches how `check_bind_location` already refuses a
-changed listen set.
+Silently ignoring a changed fixed setting, or letting an old full-cone association
+create new target workers through a retired selector, would be fail-open. `ServerHandle`
+therefore records both fixed settings and whether the protocol can create post-accept
+logical work. The former names the field requiring replacement; the latter rejects
+even a rules-only in-place update so node-agent performs the hard cutover.
 
 ### Tests
 
 Extend `crates/shoes-engine/tests/reload.rs`, which already owns this property for
 TCP. Using `redirect_to(dest)` rules and two named sinks:
 
-- a connection opened after the swap reaches sink B;
-- a connection established before the swap still reaches sink A, and completes;
+- an RCU-safe flow opened after the swap reaches sink B while an older flow completes
+  against sink A;
+- a post-accept protocol returns `ReloadRequired`, after which node-agent hard-closes
+  the old connection tree before starting the replacement;
 - users, credentials and counters survive the swap untouched;
-- a config that changes `udp_enabled` is refused, and the inbound keeps serving.
+- a config that changes `udp_enabled` is classified for replacement rather than
+  reported as an applied hot reload.
 
 `a_handle_without_slots_refuses_to_reload` (`reload.rs:575`) stays valid — a handle
 with neither kind of slot still refuses — and gains a sibling for the selectors-only
-case that reloads successfully.
+case that reloads successfully only for an RCU-safe protocol.
 
 **Risk: moderate.** This touches the reload core every other inbound depends on. The
 mitigation is that `SelectorSlot` is additive: nothing existing changes shape.
@@ -336,6 +345,27 @@ refuse everyone, not panic.
 part, and it is the part a passing TCP-only suite would not catch.
 
 </details>
+
+---
+
+## 4. Node-agent full Box lifecycle — **landed**
+
+The embedding API keeps RCU updates and graceful `remove_inbound`, while node-agent
+listener removal/replacement uses `remove_inbound_hard`. Forced reload now stops the
+complete old listener/connection set before starting any candidate inbound; rollback
+hard-removes candidates before restoring the complete prior topology. TCP pre-auth,
+authenticated, classic, dynamic and metered fallback flows share an inbound connection
+cancellation tree; generic QUIC, Hysteria2 and TUIC hard-close their endpoints.
+
+VMess/SS replay state is owned by the logical inbound rather than a handler. Replacement,
+rollback and recovery require an opaque lease bound to tag, Engine identity and monotonic
+lineage epoch. A normal fresh add advances the epoch only after listener health succeeds,
+so failed adds do not invalidate rollback state and stale/cross-Engine leases cannot
+overwrite a newer replay namespace.
+
+All address and endpoint fan-out is prepared before spawning accept tasks. Any candidate
+that fails or is cancelled before publication is hard-abandoned, closing its brief
+connection window as well as releasing its sockets.
 
 ---
 

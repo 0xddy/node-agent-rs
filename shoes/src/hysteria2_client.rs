@@ -273,14 +273,26 @@ impl Hysteria2ConnectionManager {
             ));
         }
 
-        connect_resolved_addresses_with_handshake_timeout(addresses, |address| {
-            self.connect_address(address)
-        })
+        // TLS identity/configuration belongs to the Hysteria2 client, not to
+        // one resolved address attempt. Build it once so a static TLS error is
+        // never misclassified as a reason to advance through DNS candidates.
+        let (client_config, server_name) = self.create_client_config(addresses[0])?;
+
+        connect_resolved_udp_endpoint(
+            addresses,
+            |address| self.prepare_udp_endpoint(address),
+            |address, endpoint| {
+                self.connect_prepared_endpoint(address, (endpoint, client_config, server_name))
+            },
+        )
         .await
     }
 
-    async fn connect_address(&self, address: SocketAddr) -> io::Result<AuthenticatedConnection> {
-        let (endpoint, client_config, server_name) = self.create_endpoint(address)?;
+    async fn connect_prepared_endpoint(
+        &self,
+        address: SocketAddr,
+        (endpoint, client_config, server_name): (quinn::Endpoint, quinn::ClientConfig, String),
+    ) -> io::Result<AuthenticatedConnection> {
         let connecting = endpoint
             .connect_with(client_config, address, &server_name)
             .map_err(|error| {
@@ -304,10 +316,10 @@ impl Hysteria2ConnectionManager {
         .await
     }
 
-    fn create_endpoint(
+    fn create_client_config(
         &self,
         target: SocketAddr,
-    ) -> io::Result<(quinn::Endpoint, quinn::ClientConfig, String)> {
+    ) -> io::Result<(quinn::ClientConfig, String)> {
         let mut alpn_protocols = self.options.tls.alpn_protocols.clone().into_vec();
         if alpn_protocols.is_empty() {
             alpn_protocols.push("h3".to_string());
@@ -368,8 +380,16 @@ impl Hysteria2ConnectionManager {
             .initial_rtt(Duration::from_millis(100));
         client_config.transport_config(Arc::new(transport));
 
+        Ok((client_config, sni_hostname))
+    }
+
+    async fn prepare_udp_endpoint(&self, target: SocketAddr) -> io::Result<quinn::Endpoint> {
+        // sing-quic calls ResolveDialer.DialContext("udp"), whose DialSerial
+        // returns the connected UDP socket itself. Keep that exact socket for
+        // Quinn so its selected source route, peer filtering, and asynchronous
+        // ICMP errors are not lost between candidate selection and handshake.
         let socket =
-            new_outbound_udp_socket(target.is_ipv6(), &self.options.socket_options)?.into_std()?;
+            new_connected_hysteria_udp_socket(target, &self.options.socket_options).await?;
         let runtime = Arc::new(quinn::TokioRuntime);
         use quinn::Runtime as _;
         let endpoint = match self.options.salamander_password.as_deref() {
@@ -385,40 +405,62 @@ impl Hysteria2ConnectionManager {
             None => quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?,
         };
 
-        Ok((endpoint, client_config, sni_hostname))
+        Ok(endpoint)
     }
 }
 
-/// Try the resolved endpoints under one shared handshake budget.  Failed
-/// addresses retain the ordinary last-error behavior as long as the total
-/// budget has not expired.
-async fn connect_resolved_addresses_with_handshake_timeout<T, F, Fut>(
-    addresses: Vec<SocketAddr>,
-    mut connect: F,
-) -> io::Result<T>
-where
-    F: FnMut(SocketAddr) -> Fut,
-    Fut: Future<Output = io::Result<T>>,
-{
-    run_with_handshake_timeout(async move {
-        let mut last_error = None;
-        for address in addresses {
-            match connect(address).await {
-                Ok(connection) => return Ok(connection),
-                Err(error) => {
-                    log::debug!("Hysteria2 connect to {address} failed: {error}");
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| io::Error::other("no Hysteria2 address succeeded")))
-    })
-    .await
+async fn new_connected_hysteria_udp_socket(
+    target: SocketAddr,
+    socket_options: &OutboundSocketOptions,
+) -> io::Result<std::net::UdpSocket> {
+    let socket = new_outbound_udp_socket(target.is_ipv6(), socket_options)?;
+    socket.connect(target).await?;
+    let socket = socket.into_std()?;
+    debug_assert_eq!(socket.peer_addr().ok(), Some(target));
+    Ok(socket)
 }
 
-/// Apply the one deadline used by sing-quic's Hysteria2 client.  Every resolved
-/// address, its QUIC/TLS handshake and the HTTP/3 authentication exchange
-/// consume the same budget; no phase or address gets a fresh 15 seconds.
+/// Match sing-box's `ResolveDialer.DialContext("udp")` / `DialSerial`: only
+/// connected UDP route/socket preparation failures advance to the next DNS
+/// address. Once one endpoint exists, QUIC/TLS and HTTP/3 authentication run
+/// once; their failure must not be misclassified as an address-family setup
+/// failure.
+async fn connect_resolved_udp_endpoint<T, U, P, PrepareFuture, C, ConnectFuture>(
+    addresses: Vec<SocketAddr>,
+    mut prepare: P,
+    connect: C,
+) -> io::Result<U>
+where
+    P: FnMut(SocketAddr) -> PrepareFuture,
+    PrepareFuture: Future<Output = io::Result<T>>,
+    C: FnOnce(SocketAddr, T) -> ConnectFuture,
+    ConnectFuture: Future<Output = io::Result<U>>,
+{
+    let mut last_error = None;
+    let mut selected = None;
+    for address in addresses {
+        match prepare(address).await {
+            Ok(endpoint) => {
+                selected = Some((address, endpoint));
+                break;
+            }
+            Err(error) => {
+                log::debug!(
+                    "Hysteria2 UDP endpoint setup for {address} failed: {error}; trying next"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    let (address, endpoint) = selected.ok_or_else(|| {
+        last_error.unwrap_or_else(|| io::Error::other("no Hysteria2 UDP endpoint succeeded"))
+    })?;
+    run_with_handshake_timeout(connect(address, endpoint)).await
+}
+
+/// Apply the one deadline used by sing-quic's Hysteria2 client. The selected
+/// endpoint's QUIC/TLS handshake and HTTP/3 authentication exchange consume the
+/// same budget; no phase gets a fresh 15 seconds.
 async fn run_with_handshake_timeout<T>(
     handshake: impl Future<Output = io::Result<T>>,
 ) -> io::Result<T> {
@@ -1461,54 +1503,136 @@ mod tests {
         assert_eq!(started.elapsed(), HANDSHAKE_TIMEOUT);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn resolved_addresses_share_one_fifteen_second_handshake_budget() {
-        let addresses = vec![
-            "127.0.0.1:1".parse().unwrap(),
-            "127.0.0.1:2".parse().unwrap(),
-        ];
-        let attempts = Arc::new(AtomicU32::new(0));
+    #[tokio::test]
+    async fn resolved_addresses_retry_udp_endpoint_creation_before_handshake() {
+        let first = "127.0.0.1:1".parse().unwrap();
+        let second = "127.0.0.1:2".parse().unwrap();
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_attempts = Arc::clone(&attempts);
-        let started = tokio::time::Instant::now();
+        let handshakes = Arc::new(AtomicU32::new(0));
+        let observed_handshakes = Arc::clone(&handshakes);
 
-        let error = connect_resolved_addresses_with_handshake_timeout(addresses, move |address| {
-            let attempts = Arc::clone(&observed_attempts);
-            async move {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Err::<(), _>(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("test failure for {address}"),
-                ))
-            }
-        })
+        let selected = connect_resolved_udp_endpoint(
+            vec![first, second],
+            move |address| {
+                observed_attempts.lock().unwrap().push(address);
+                async move {
+                    if address == first {
+                        Err(io::Error::new(
+                            io::ErrorKind::AddrNotAvailable,
+                            "mock IPv6/source bind failure",
+                        ))
+                    } else {
+                        Ok(address)
+                    }
+                }
+            },
+            move |address, endpoint| async move {
+                observed_handshakes.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(address, endpoint);
+                Ok(address)
+            },
+        )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(started.elapsed(), HANDSHAKE_TIMEOUT);
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(selected, second);
+        assert_eq!(&*attempts.lock().unwrap(), &[first, second]);
+        assert_eq!(handshakes.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
-    async fn resolved_addresses_still_return_the_last_error_before_timeout() {
-        let addresses = vec![
-            "127.0.0.1:1".parse().unwrap(),
-            "127.0.0.1:2".parse().unwrap(),
-        ];
+    async fn quic_or_auth_failure_does_not_retry_the_next_server_address() {
+        let first = "127.0.0.1:1".parse().unwrap();
+        let second = "127.0.0.1:2".parse().unwrap();
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_attempts = Arc::clone(&attempts);
 
-        let error =
-            connect_resolved_addresses_with_handshake_timeout(addresses, |address| async move {
+        let error = connect_resolved_udp_endpoint(
+            vec![first, second],
+            move |address| {
+                observed_attempts.lock().unwrap().push(address);
+                async move { Ok(address) }
+            },
+            |_address, _endpoint| async {
                 Err::<(), _>(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("test failure for {address}"),
+                    io::ErrorKind::PermissionDenied,
+                    "mock Hysteria2 authentication failure",
                 ))
-            })
-            .await
-            .unwrap_err();
+            },
+        )
+        .await
+        .unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
-        assert!(error.to_string().contains("127.0.0.1:2"));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(&*attempts.lock().unwrap(), &[first]);
+    }
+
+    #[tokio::test]
+    async fn hysteria_endpoint_socket_remains_connected_and_filters_other_peers() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = peer.local_addr().unwrap();
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket =
+            new_connected_hysteria_udp_socket(peer_address, &OutboundSocketOptions::default())
+                .await
+                .unwrap();
+
+        assert_eq!(socket.peer_addr().unwrap(), peer_address);
+        let client_address = socket.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
+        stranger.send_to(b"stranger", client_address).await.unwrap();
+        peer.send_to(b"peer", client_address).await.unwrap();
+
+        let mut buffer = [0_u8; 32];
+        let length = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buffer))
+            .await
+            .expect("the connected peer's datagram should be delivered")
+            .unwrap();
+        assert_eq!(&buffer[..length], b"peer");
+    }
+
+    #[tokio::test]
+    async fn quinn_runtime_transmits_on_the_connected_hysteria_socket() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = peer.local_addr().unwrap();
+        let socket =
+            new_connected_hysteria_udp_socket(peer_address, &OutboundSocketOptions::default())
+                .await
+                .unwrap();
+        let client_address = socket.local_addr().unwrap();
+        assert_eq!(socket.peer_addr().unwrap(), peer_address);
+
+        use quinn::Runtime as _;
+        let socket = quinn::TokioRuntime.wrap_udp_socket(socket).unwrap();
+        let transmit = quinn::udp::Transmit {
+            destination: peer_address,
+            ecn: None,
+            contents: b"quinn-connected",
+            segment_size: None,
+            src_ip: None,
+        };
+        loop {
+            match socket.try_send(&transmit) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut poller = socket.clone().create_io_poller();
+                    poll_fn(|context| poller.as_mut().poll_writable(context))
+                        .await
+                        .unwrap();
+                }
+                Err(error) => panic!("Quinn rejected a connected UDP socket: {error}"),
+            }
+        }
+
+        let mut buffer = [0_u8; 32];
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut buffer))
+                .await
+                .expect("Quinn must send through the connected socket")
+                .unwrap();
+        assert_eq!(source, client_address);
+        assert_eq!(&buffer[..length], b"quinn-connected");
     }
 
     #[test]
@@ -1555,6 +1679,7 @@ mod tests {
             Some(Salamander::new("test-obfs")),
             Arc::new(Hysteria2Masquerade::new(None).unwrap()),
             shutdown.clone(),
+            CancellationToken::new(),
         )
         .await
         .expect("start Hysteria2 test server");

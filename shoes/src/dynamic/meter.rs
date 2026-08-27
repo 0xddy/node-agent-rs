@@ -36,8 +36,9 @@
 //! between, including the ones that have nothing to do with users. The task local
 //! costs one thread-local read per connection, once, and leaves those signatures
 //! untouched. VLESS, VMess, Trojan, Shadowsocks 2022 and AnyTLS all work this way:
-//! each authenticates inline on the task that accepted the connection, and only
-//! spawns afterwards, by which point the meter holds its own `Arc<ConnContext>`.
+//! each authenticates inline on the task that accepted the connection. A handler
+//! that then detaches the physical connection uses
+//! [`spawn_connection_until_cancelled`] to capture the same context first.
 //!
 //! **Shape B -- explicit parameter.** Task locals do not cross [`tokio::spawn`], so
 //! Shape A works only where authentication is inline. Three protocols authenticate
@@ -116,13 +117,25 @@ impl std::fmt::Debug for ConnContext {
 
 impl ConnContext {
     pub fn new() -> Arc<Self> {
+        Self::with_cancellation(CancellationToken::new())
+    }
+
+    /// Create a connection context under an inbound's hard-removal tree.
+    ///
+    /// Cancelling this child for user revocation does not affect sibling
+    /// connections, while cancelling `parent` terminates every child connection.
+    pub(crate) fn new_child(parent: &CancellationToken) -> Arc<Self> {
+        Self::with_cancellation(parent.child_token())
+    }
+
+    fn with_cancellation(cancellation: CancellationToken) -> Arc<Self> {
         Arc::new(Self {
             pending_tx: AtomicU64::new(0),
             pending_rx: AtomicU64::new(0),
             binding: Mutex::new(()),
             user: OnceLock::new(),
             registration: OnceLock::new(),
-            cancellation: CancellationToken::new(),
+            cancellation,
         })
     }
 
@@ -383,6 +396,32 @@ pub fn bind_connection_user(user: &Arc<UserContext>) -> bool {
 /// context across a [`tokio::spawn`] boundary itself.
 pub fn current_connection() -> Option<Arc<ConnContext>> {
     METERED_CONNECTION.try_with(Arc::clone).ok()
+}
+
+/// Spawn a future that takes ownership of the connection currently being handled.
+///
+/// Tokio task locals do not cross a [`tokio::spawn`] boundary. Protocol handlers
+/// that return `AlreadyHandled`, an unauthenticated fallback hand-off, or deferred
+/// authentication therefore must capture the context before they return to the
+/// outer connection scope. This helper performs that capture synchronously, keeps
+/// the same `ConnContext` alive in the child task, and interrupts work that is not
+/// polling a metered stream when the inbound's hard-removal tree is cancelled.
+///
+/// Outside an accepted connection (for example, a standalone handler test), the
+/// future is spawned unchanged.
+pub fn spawn_connection_until_cancelled<F>(
+    future: F,
+) -> tokio::task::JoinHandle<std::io::Result<()>>
+where
+    F: Future<Output = std::io::Result<()>> + Send + 'static,
+{
+    let conn = current_connection();
+    tokio::spawn(async move {
+        match conn {
+            Some(conn) => scope_connection_until_cancelled(conn, future).await,
+            None => future.await,
+        }
+    })
 }
 
 /// A stream that counts every byte that actually crosses it.
@@ -854,6 +893,44 @@ mod tests {
         assert_eq!(&**conn.user().unwrap().id(), "alice");
         assert_eq!(user.conns(), 1);
         assert_eq!(user.total_conns(), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::async_yields_async)]
+    async fn detached_unmetered_work_keeps_its_context_and_observes_hard_stop() {
+        let parent = CancellationToken::new();
+        let conn = ConnContext::new_child(&parent);
+        let weak = Arc::downgrade(&conn);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        // The outer future must deliberately yield the detached JoinHandle: awaiting
+        // it inside the task-local scope would wait forever and defeat this test.
+        let task = scope_connection(Arc::clone(&conn), async move {
+            spawn_connection_until_cancelled(async move {
+                let _ = started_tx.send(());
+                std::future::pending::<std::io::Result<()>>().await
+            })
+        })
+        .await;
+        drop(conn);
+
+        started_rx.await.expect("detached work started");
+        assert!(
+            weak.upgrade().is_some(),
+            "the detached task must retain the otherwise-unmetered context"
+        );
+
+        parent.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("hard stop must wake detached work")
+            .expect("detached task must not panic")
+            .expect_err("hard stop must cancel detached work");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(
+            weak.upgrade().is_none(),
+            "the task must release its connection context after cancellation"
+        );
     }
 
     #[tokio::test]

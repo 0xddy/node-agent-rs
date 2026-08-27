@@ -499,6 +499,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xudp_new_frame_preserves_hostname_with_resolved_candidate() {
+        let (client, mut server) = duplex(4096);
+        let hostname = "dns.example";
+        let target = ResolvedLocation::with_resolved(
+            NetLocation::new(Address::Hostname(hostname.to_owned()), 53),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 53)),
+        );
+        let mut stream = setup_vless_udp_stream(
+            Box::new(TestStream(client)),
+            &[0x12; 16],
+            target,
+            Some(VlessPacketEncoding::Xudp),
+        )
+        .await
+        .unwrap();
+
+        write_message(&mut stream, b"dns").await;
+
+        let metadata_len = 9 + hostname.len();
+        let mut frame = vec![0, metadata_len as u8, 0, 0, 1, 1, 2, 0, 53, 2];
+        frame.push(hostname.len() as u8);
+        frame.extend_from_slice(hostname.as_bytes());
+        frame.extend_from_slice(&[0, 3, b'd', b'n', b's']);
+        let mut expected = vec![0];
+        expected.extend_from_slice(&[0x12; 16]);
+        expected.extend_from_slice(&[0, COMMAND_MUX]);
+        expected.extend_from_slice(&frame);
+
+        let mut actual = vec![0; expected.len()];
+        server.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
     async fn packetaddr_wire_uses_magic_request_and_v2fly_ip_frame() {
         let (client, mut server) = duplex(4096);
         let mut stream = setup_vless_udp_stream(

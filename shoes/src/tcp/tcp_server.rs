@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 // NOTE(shoes-engine): only `run_unix_server` names this type, and that is
 // unix-only, so an unconditional import is unused everywhere else.
 #[cfg(target_family = "unix")]
@@ -13,7 +13,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use super::handshake_gate::{
-    HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
+    DEFERRED_AUTHENTICATION_TIMEOUT, HandshakeGate, HandshakePermit, MAX_ACTIVE_FALLBACKS,
+    MAX_ACTIVE_FALLBACKS_PER_SOURCE, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
 };
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector_with_sniff_policy;
 use super::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
@@ -26,8 +27,8 @@ use crate::config::{BindLocation, Config, ConfigSelection, ServerConfig, TcpConf
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
 use crate::dynamic::{
-    ConnContext, HandlerSlot, ServerHandle, TrafficMeterStream, UserRegistry,
-    scope_connection_until_cancelled,
+    ConnContext, HandlerSlot, InboundReplayScope, InboundReplayState, ServerHandle,
+    TrafficMeterStream, UserRegistry, scope_connection_until_cancelled,
 };
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
@@ -36,23 +37,28 @@ use crate::routing::protocol::{
 };
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
-use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{
+    DeferredAuthenticationCompletion, DeferredAuthenticationOutcome, TcpClientSetupResult,
+    TcpServerHandler, TcpServerSetupResult, UnauthenticatedFallbackCompletion,
+};
 #[cfg(unix)]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
 
 async fn run_tcp_server(
+    listener: tokio::net::TcpListener,
     bind_address: SocketAddr,
     tcp_config: TcpConfig,
     handler_slot: Arc<HandlerSlot>,
     metered: bool,
     cancel: CancellationToken,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<()> {
     let TcpConfig { no_delay } = tcp_config;
 
-    let listener = new_tcp_listener(bind_address, 4096, None)?;
     // One budget per listener, so a flood against this bind cannot starve another.
     let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
+    let fallback_gate = HandshakeGate::new(MAX_ACTIVE_FALLBACKS, MAX_ACTIVE_FALLBACKS_PER_SOURCE);
 
     loop {
         // Returning here drops the listener, which is what frees the port. The
@@ -103,10 +109,22 @@ async fn run_tcp_server(
         // resolver comes out of the slot rather than from this loop's own capture,
         // because a reload can hand the rebuilt handler a different one.
         let (cloned_handler, cloned_resolver) = handler_slot.load();
+        let connection_cancel = connection_cancel.clone();
+        let fallback_gate = fallback_gate.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_metered_stream(stream, metered, cloned_handler, cloned_resolver, permit)
-                    .await
+            if let Err(e) = process_metered_stream(
+                stream,
+                metered,
+                cloned_handler,
+                cloned_resolver,
+                AcceptedConnectionAdmission {
+                    handshake: permit,
+                    fallback_gate,
+                    source: Some(addr.ip()),
+                    connection_cancel,
+                },
+            )
+            .await
             {
                 error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
@@ -116,12 +134,29 @@ async fn run_tcp_server(
     }
 }
 
+/// Bind a complete TCP listen set before any accept task is spawned.
+///
+/// `Vec`'s ordinary drop is the rollback: if a later bind fails, every listener
+/// prepared earlier in the batch is closed before the error reaches the caller.
+fn prepare_tcp_listeners(
+    bind_addresses: Vec<SocketAddr>,
+) -> std::io::Result<Vec<(SocketAddr, tokio::net::TcpListener)>> {
+    bind_addresses
+        .into_iter()
+        .map(|address| {
+            let listener = new_tcp_listener(address, 4096, None)?;
+            Ok((address, listener))
+        })
+        .collect()
+}
+
 #[cfg(target_family = "unix")]
 async fn run_unix_server(
     path_buf: PathBuf,
     handler_slot: Arc<HandlerSlot>,
     metered: bool,
     cancel: CancellationToken,
+    connection_cancel: CancellationToken,
 ) -> std::io::Result<()> {
     if tokio::fs::symlink_metadata(&path_buf).await.is_ok() {
         println!(
@@ -135,6 +170,7 @@ async fn run_unix_server(
     // See `run_tcp_server`. A unix peer has no address to hold a share of, so only
     // the total applies here.
     let handshake_gate = HandshakeGate::new(MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE);
+    let fallback_gate = HandshakeGate::new(MAX_ACTIVE_FALLBACKS, MAX_ACTIVE_FALLBACKS_PER_SOURCE);
 
     loop {
         // See `run_tcp_server`.
@@ -161,10 +197,22 @@ async fn run_unix_server(
 
         // See `run_tcp_server`.
         let (cloned_handler, cloned_resolver) = handler_slot.load();
+        let connection_cancel = connection_cancel.clone();
+        let fallback_gate = fallback_gate.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                process_metered_stream(stream, metered, cloned_handler, cloned_resolver, permit)
-                    .await
+            if let Err(e) = process_metered_stream(
+                stream,
+                metered,
+                cloned_handler,
+                cloned_resolver,
+                AcceptedConnectionAdmission {
+                    handshake: permit,
+                    fallback_gate,
+                    source: None,
+                    connection_cancel,
+                },
+            )
+            .await
             {
                 error!("{addr:?} finished with error: {e:?}");
             } else {
@@ -172,6 +220,13 @@ async fn run_unix_server(
             }
         });
     }
+}
+
+struct AcceptedConnectionAdmission {
+    handshake: HandshakePermit,
+    fallback_gate: Arc<HandshakeGate>,
+    source: Option<IpAddr>,
+    connection_cancel: CancellationToken,
 }
 
 /// Handle one accepted connection, counting its traffic if the inbound is metered.
@@ -186,22 +241,50 @@ async fn process_metered_stream<AS>(
     metered: bool,
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
-    permit: HandshakePermit,
+    admission: AcceptedConnectionAdmission,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
 {
-    if !metered {
-        return process_stream(stream, server_handler, resolver, permit).await;
+    let AcceptedConnectionAdmission {
+        handshake,
+        fallback_gate,
+        source,
+        connection_cancel,
+    } = admission;
+    // This child remains live across ordinary listener removal, but a hard inbound
+    // removal reaches it before or after authentication. It also covers classic
+    // non-metered inbounds: a handler that detaches ownership captures this task-
+    // local context through `spawn_connection_until_cancelled` before returning.
+    let conn = ConnContext::new_child(&connection_cancel);
+    if metered {
+        let stream = TrafficMeterStream::new(stream, Arc::clone(&conn));
+        scope_connection_until_cancelled(
+            conn,
+            process_stream(
+                stream,
+                server_handler,
+                resolver,
+                handshake,
+                fallback_gate,
+                source,
+            ),
+        )
+        .await
+    } else {
+        scope_connection_until_cancelled(
+            conn,
+            process_stream(
+                stream,
+                server_handler,
+                resolver,
+                handshake,
+                fallback_gate,
+                source,
+            ),
+        )
+        .await
     }
-
-    let conn = ConnContext::new();
-    let stream = TrafficMeterStream::new(stream, Arc::clone(&conn));
-    scope_connection_until_cancelled(
-        conn,
-        process_stream(stream, server_handler, resolver, permit),
-    )
-    .await
 }
 
 async fn setup_server_stream<AS>(
@@ -226,6 +309,8 @@ pub async fn process_stream<AS>(
     server_handler: Arc<dyn TcpServerHandler>,
     resolver: Arc<dyn Resolver>,
     permit: HandshakePermit,
+    fallback_gate: Arc<HandshakeGate>,
+    source: Option<IpAddr>,
 ) -> std::io::Result<()>
 where
     AS: AsyncStream + 'static,
@@ -251,13 +336,36 @@ where
         }
     };
 
-    // The handshake is over, so the budget it was charged against is no longer the
-    // right one to hold: everything past this point is either an authenticated
-    // connection, bounded by its own user's ceiling, or a protocol that does not
-    // authenticate at all. Holding on would turn a bound on handshakes into a bound
-    // on connections, which is exactly the shape this gate exists to avoid. The
-    // early returns above release it too, by dropping it on the way out.
-    drop(permit);
+    // Authenticated and authentication-free protocols no longer belong in the
+    // pending-handshake budget once setup succeeds. An unauthenticated camouflage
+    // fallback is different: setup only detached the same untrusted connection, so
+    // retain its charge until that background connection ends. The early error
+    // returns above release the charge on their way out.
+    let mut handshake_permit = Some(permit);
+    let fallback_permit = if matches!(
+        setup_result,
+        TcpServerSetupResult::UnauthenticatedFallbackHandled(_)
+    ) {
+        // A completed protocol parser must not let a camouflage connection retain
+        // the scarce handshake budget. Transfer it to an independent, still-bounded
+        // fallback gate; refusing the transfer drops the completion and aborts its
+        // background task.
+        drop(handshake_permit.take());
+        Some(fallback_gate.enter(source).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "listener is at its unauthenticated fallback limit",
+            )
+        })?)
+    } else if matches!(
+        setup_result,
+        TcpServerSetupResult::DeferredAuthenticationHandled(_)
+    ) {
+        None
+    } else {
+        drop(handshake_permit.take());
+        None
+    };
 
     match setup_result {
         TcpServerSetupResult::TcpForward {
@@ -396,12 +504,45 @@ where
             )
             .await
         }
-        TcpServerSetupResult::AlreadyHandled
-        | TcpServerSetupResult::UnauthenticatedFallbackHandled => {
-            // Connection is being handled by a spawned task (e.g., Reality fallback).
-            // Nothing more to do here.
-            Ok(())
+        TcpServerSetupResult::AlreadyHandled => Ok(()),
+        TcpServerSetupResult::UnauthenticatedFallbackHandled(completion) => {
+            wait_for_tcp_fallback(
+                completion,
+                fallback_permit.expect("fallback setup transfers to fallback admission"),
+            )
+            .await
         }
+        TcpServerSetupResult::DeferredAuthenticationHandled(completion) => {
+            wait_for_tcp_deferred_authentication(
+                completion,
+                handshake_permit.expect("deferred authentication retains its handshake permit"),
+            )
+            .await
+        }
+    }
+}
+
+async fn wait_for_tcp_fallback(
+    completion: UnauthenticatedFallbackCompletion,
+    _permit: HandshakePermit,
+) -> std::io::Result<()> {
+    // Reality/VLESS/AnyTLS/ShadowTLS camouflage is a real proxied connection and
+    // may legitimately be long-lived. Its independent fallback gate bounds
+    // concurrency; normal EOF or hard inbound cancellation bounds its lifetime.
+    completion.wait().await
+}
+
+async fn wait_for_tcp_deferred_authentication(
+    completion: DeferredAuthenticationCompletion,
+    _permit: HandshakePermit,
+) -> std::io::Result<()> {
+    match timeout(DEFERRED_AUTHENTICATION_TIMEOUT, completion.wait()).await {
+        Ok(DeferredAuthenticationOutcome::Authenticated) => Ok(()),
+        Ok(DeferredAuthenticationOutcome::Completed(result)) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "deferred TCP authentication exceeded its absolute deadline",
+        )),
     }
 }
 
@@ -564,10 +705,52 @@ pub async fn start_servers_with_users(
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
 ) -> std::io::Result<ServerHandle> {
+    start_servers_with_users_and_replay_state(
+        config,
+        resolver,
+        users,
+        InboundReplayState::default(),
+    )
+    .await
+}
+
+/// Start one inbound while retaining an embedder-owned replay namespace.
+///
+/// A control plane uses this only when it intentionally rebuilds the listener for
+/// the same logical inbound. The new listener then still rejects VMess auth ids and
+/// Shadowsocks salts already seen by the retired listener.
+pub async fn start_servers_with_users_and_replay_state(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
+    replay_state: InboundReplayState,
+) -> std::io::Result<ServerHandle> {
+    start_servers_with_users_and_replay_scope(
+        config,
+        resolver,
+        users,
+        InboundReplayScope::new(replay_state),
+    )
+    .await
+}
+
+/// Start one expanded listener group under an embedder-owned live replay scope.
+/// Cloning the scope across all groups lets the engine observe old handlers that
+/// outlive their registered inbound slot without retaining dead tags itself.
+pub async fn start_servers_with_users_and_replay_scope(
+    config: Config,
+    resolver: Arc<dyn Resolver>,
+    users: Option<Arc<dyn UserRegistry>>,
+    replay_scope: InboundReplayScope,
+) -> std::io::Result<ServerHandle> {
     match config {
         #[cfg(unix)]
         Config::TunServer(tun_config) => {
-            let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+            let mut handle = ServerHandle::new_with_replay_scope(
+                Transport::Tcp,
+                CancellationToken::new(),
+                replay_scope,
+            );
             handle.push_listener(start_tun_server(tun_config, resolver).await?);
             Ok(handle)
         }
@@ -577,7 +760,7 @@ pub async fn start_servers_with_users(
             "TUN server is not supported on this platform",
         )),
         Config::Server(server_config) => {
-            start_tcp_or_quic_servers(server_config, resolver, users).await
+            start_tcp_or_quic_servers(server_config, resolver, users, replay_scope).await
         }
         _ => unreachable!("create_server_configs only returns Server and TunServer"),
     }
@@ -587,10 +770,13 @@ async fn start_tcp_or_quic_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
+    replay_scope: InboundReplayScope,
 ) -> std::io::Result<ServerHandle> {
     let handle = match config.transport {
-        Transport::Tcp => start_tcp_servers(config.clone(), resolver, users).await?,
-        Transport::Quic => start_quic_servers(config.clone(), resolver, users).await?,
+        Transport::Tcp => start_tcp_servers(config.clone(), resolver, users, replay_scope).await?,
+        Transport::Quic => {
+            start_quic_servers(config.clone(), resolver, users, replay_scope).await?
+        }
         Transport::Udp => todo!(),
     };
 
@@ -608,13 +794,15 @@ async fn start_tcp_servers(
     config: ServerConfig,
     resolver: Arc<dyn Resolver>,
     users: Option<Arc<dyn UserRegistry>>,
+    replay_scope: InboundReplayScope,
 ) -> std::io::Result<ServerHandle> {
     // Recorded before the config is taken apart. These are the settings the accept
     // loop is about to bake in, and `check_reload` compares against them so that a
     // later update changing one is refused rather than silently ignored.
-    let mut handle = ServerHandle::new(Transport::Tcp, CancellationToken::new());
+    let mut handle =
+        ServerHandle::new_with_replay_scope(Transport::Tcp, CancellationToken::new(), replay_scope);
     handle.record_listener_settings(&config);
-    let replay_state = handle.replay_state();
+    let replay_scope = handle.replay_scope();
 
     let ServerConfig {
         bind_location,
@@ -644,37 +832,61 @@ async fn start_tcp_servers(
         sniff,
     ));
 
-    match bind_location {
+    // Resolve the complete address list and bind every socket before spawning the
+    // first accept loop. Otherwise a failure resolving or binding a later address
+    // would return `Err` after the earlier listener task had already escaped with
+    // no `ServerHandle` left for the caller to stop.
+    let prepared_tcp_listeners = match &bind_location {
         BindLocation::Address(addresses) => {
-            for address in addresses.into_vec() {
-                for socket_addr in address.to_socket_addrs()? {
-                    // Shares protocol state across ports without reusing an
-                    // interface-specific UDP bind IP.
-                    let handler_slot = handle.slot_for_ip(socket_addr.ip(), &resolver, || {
-                        create_tcp_server_handler_with_replay_state(
-                            protocol.clone(),
-                            &client_proxy_selector,
-                            &resolver,
-                            Some(socket_addr.ip()),
-                            users.as_ref(),
-                            &replay_state,
-                        )
-                        .into()
-                    });
-                    debug!("TCP handler for {}: {handler_slot:?}", socket_addr.ip());
+            let mut bind_addresses = Vec::new();
+            for address in addresses.clone().into_vec() {
+                bind_addresses.extend(address.to_socket_addrs()?);
+            }
+            Some(prepare_tcp_listeners(bind_addresses)?)
+        }
+        BindLocation::Path(_) => None,
+    };
 
-                    let tcp_config = tcp_config.clone();
-                    let cancel = handle.cancel_token();
-                    let listener = tokio::spawn(async move {
-                        // No resolver here: the loop takes it from the slot, with the
-                        // handler, so both come from one generation.
-                        run_tcp_server(socket_addr, tcp_config, handler_slot, metered, cancel)
-                            .await
-                            .unwrap();
-                    });
-                    handle.push_listener(listener);
-                    handle.push_address(socket_addr);
-                }
+    match bind_location {
+        BindLocation::Address(_) => {
+            for (socket_addr, tcp_listener) in
+                prepared_tcp_listeners.expect("address listeners were prepared above")
+            {
+                // Shares protocol state across ports without reusing an
+                // interface-specific UDP bind IP.
+                let handler_slot = handle.slot_for_ip(socket_addr.ip(), &resolver, || {
+                    create_tcp_server_handler_with_replay_state(
+                        protocol.clone(),
+                        &client_proxy_selector,
+                        &resolver,
+                        Some(socket_addr.ip()),
+                        users.as_ref(),
+                        &replay_scope,
+                    )
+                    .into()
+                });
+                debug!("TCP handler for {}: {handler_slot:?}", socket_addr.ip());
+
+                let tcp_config = tcp_config.clone();
+                let cancel = handle.cancel_token();
+                let connection_cancel = handle.connection_token();
+                let listener = tokio::spawn(async move {
+                    // No resolver here: the loop takes it from the slot, with the
+                    // handler, so both come from one generation.
+                    run_tcp_server(
+                        tcp_listener,
+                        socket_addr,
+                        tcp_config,
+                        handler_slot,
+                        metered,
+                        cancel,
+                        connection_cancel,
+                    )
+                    .await
+                    .unwrap();
+                });
+                handle.push_listener(listener);
+                handle.push_address(socket_addr);
             }
         }
         BindLocation::Path(_path_buf) => {
@@ -687,15 +899,16 @@ async fn start_tcp_servers(
                         &resolver,
                         None,
                         users.as_ref(),
-                        &replay_state,
+                        &replay_scope,
                     )
                     .into(),
                     &resolver,
                 );
                 debug!("TCP handler: {handler_slot:?}");
                 let cancel = handle.cancel_token();
+                let connection_cancel = handle.connection_token();
                 let listener = tokio::spawn(async move {
-                    run_unix_server(_path_buf, handler_slot, metered, cancel)
+                    run_unix_server(_path_buf, handler_slot, metered, cancel, connection_cancel)
                         .await
                         .unwrap();
                 });
@@ -720,9 +933,142 @@ mod tests {
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-    use super::sniff_tcp_after_success_response;
+    use super::{prepare_tcp_listeners, sniff_tcp_after_success_response, wait_for_tcp_fallback};
     use crate::async_stream::{AsyncPing, AsyncStream};
     use crate::routing::predicate::RouteProtocol;
+    use crate::tcp::handshake_gate::HandshakeGate;
+    use crate::tcp::tcp_handler::UnauthenticatedFallbackCompletion;
+
+    #[tokio::test]
+    async fn unauthenticated_tcp_fallback_holds_its_independent_admission_until_completion() {
+        let gate = HandshakeGate::new(1, 1);
+        let permit = gate.enter(None).expect("admit fallback handshake");
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let completion = UnauthenticatedFallbackCompletion::new(tokio::spawn(async move {
+            finish_rx.await.map_err(std::io::Error::other)?;
+            Ok(())
+        }));
+        let waiter = tokio::spawn(wait_for_tcp_fallback(completion, permit));
+        tokio::task::yield_now().await;
+
+        assert!(
+            gate.enter(None).is_none(),
+            "a detached unauthenticated connection must retain its fallback admission"
+        );
+
+        finish_tx.send(()).expect("finish fallback");
+        waiter
+            .await
+            .expect("fallback waiter must not panic")
+            .expect("fallback completion must succeed");
+        assert!(
+            gate.enter(None).is_some(),
+            "completion must release the independent fallback admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_tcp_fallback_wait_releases_admission() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
+        let gate = HandshakeGate::new(1, 1);
+        let permit = gate.enter(None).expect("admit fallback handshake");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let completion = UnauthenticatedFallbackCompletion::new(tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        }));
+        let waiter = tokio::spawn(wait_for_tcp_fallback(completion, permit));
+        started_rx.await.expect("fallback task started");
+
+        assert!(
+            gate.enter(None).is_none(),
+            "the live fallback must retain its admission before cancellation"
+        );
+
+        waiter.abort();
+        waiter
+            .await
+            .expect_err("hard cancellation aborts the waiter");
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("hard cancellation must abort fallback work")
+            .expect("fallback drop signal must be delivered");
+        assert!(
+            gate.enter(None).is_some(),
+            "hard cancellation must release the fallback admission"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_lived_tcp_fallback_is_not_cut_off_by_the_authentication_deadline() {
+        let gate = HandshakeGate::new(1, 1);
+        let permit = gate.enter(None).expect("admit fallback");
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let completion = UnauthenticatedFallbackCompletion::new(tokio::spawn(async move {
+            finish_rx.await.map_err(std::io::Error::other)?;
+            Ok(())
+        }));
+        let waiter = tokio::spawn(wait_for_tcp_fallback(completion, permit));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(super::DEFERRED_AUTHENTICATION_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a camouflage connection must not inherit the deferred-auth deadline"
+        );
+        assert!(
+            gate.enter(None).is_none(),
+            "live fallback retains its quota"
+        );
+
+        finish_tx.send(()).expect("finish fallback");
+        waiter
+            .await
+            .expect("fallback waiter must not panic")
+            .expect("fallback completion must succeed");
+        assert!(
+            gate.enter(None).is_some(),
+            "completion returns fallback capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_tcp_listen_batch_releases_earlier_sockets() {
+        let first_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = first_reservation.local_addr().unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_address = occupied.local_addr().unwrap();
+        assert_ne!(first, occupied_address);
+        drop(first_reservation);
+
+        let error = prepare_tcp_listeners(vec![first, occupied_address])
+            .expect_err("the second address is already occupied");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+            ),
+            "the occupied address must reject the second bind: {error}"
+        );
+
+        // The first bind succeeded before the second failed. Returning `Err` must
+        // have dropped that prepared listener rather than leaking its port.
+        std::net::TcpListener::bind(first)
+            .expect("the earlier listener in the failed batch must be closed");
+    }
 
     struct TestDuplexStream(tokio::io::DuplexStream);
 

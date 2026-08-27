@@ -27,6 +27,8 @@ use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 #[derive(Debug)]
 pub struct ProxyConnectorImpl {
     location: NetLocation,
+    dns_resolver: Option<String>,
+    requires_literal_udp_target: bool,
     client_handler: Box<dyn TcpClientHandler>,
 }
 
@@ -41,8 +43,11 @@ impl ProxyConnectorImpl {
 
         let default_sni_hostname = config.address.address().hostname().map(ToString::to_string);
 
+        let requires_literal_udp_target = config.protocol.requires_literal_udp_target();
         Some(Self {
             location: config.address,
+            dns_resolver: config.dns_resolver,
+            requires_literal_udp_target,
             client_handler: create_tcp_client_handler(
                 config.protocol,
                 default_sni_hostname,
@@ -56,6 +61,8 @@ impl ProxyConnectorImpl {
     pub fn new(location: NetLocation, handler: Box<dyn TcpClientHandler>) -> Self {
         Self {
             location,
+            dns_resolver: None,
+            requires_literal_udp_target: false,
             client_handler: handler,
         }
     }
@@ -67,12 +74,20 @@ impl ProxyConnector for ProxyConnectorImpl {
         &self.location
     }
 
+    fn dns_resolver(&self) -> Option<&str> {
+        self.dns_resolver.as_deref()
+    }
+
     fn supports_udp_over_tcp(&self) -> bool {
         self.client_handler.supports_udp_over_tcp()
     }
 
     fn supports_native_udp(&self) -> bool {
         self.client_handler.supports_native_udp()
+    }
+
+    fn requires_literal_udp_target(&self) -> bool {
+        self.requires_literal_udp_target
     }
 
     fn needs_handshake_for_write(&self) -> bool {

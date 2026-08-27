@@ -25,8 +25,8 @@ use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
 use crate::tcp::chain_builder::build_client_proxy_chain;
-use crate::tcp::inbound_replay::InboundReplayState;
-use crate::tcp::tcp_handler::TcpServerHandler;
+use crate::tcp::inbound_replay::InboundReplayScope;
+use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
 use crate::tls_server_handler::NaiveConfig;
 use crate::tls_server_handler::{
     InnerProtocol, TlsServerHandler, TlsServerTarget, VisionVlessConfig,
@@ -170,14 +170,44 @@ pub fn create_tcp_server_handler(
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
 ) -> Box<dyn TcpServerHandler> {
+    let replay_scope = InboundReplayScope::new(Default::default());
     create_tcp_server_handler_with_replay_state(
         server_proxy_config,
         client_proxy_selector,
         resolver,
         bind_ip,
         users,
-        &InboundReplayState::default(),
+        &replay_scope,
     )
+}
+
+/// Keeps the complete replay namespace alive for as long as an accepted handler
+/// can still perform a VMess/Shadowsocks authentication.
+///
+/// The protocol-specific handlers retain their individual filter Arcs. This outer
+/// owner is additionally required so the engine's weak live-generation registry can
+/// recover the whole namespace when the same tag is gracefully rebuilt.
+struct ReplayScopedTcpServerHandler {
+    inner: Box<dyn TcpServerHandler>,
+    _replay_scope: InboundReplayScope,
+}
+
+impl std::fmt::Debug for ReplayScopedTcpServerHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReplayScopedTcpServerHandler")
+            .field(&self.inner)
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl TcpServerHandler for ReplayScopedTcpServerHandler {
+    async fn setup_server_stream(
+        &self,
+        server_stream: Box<dyn crate::async_stream::AsyncStream>,
+    ) -> std::io::Result<TcpServerSetupResult> {
+        self.inner.setup_server_stream(server_stream).await
+    }
 }
 
 /// Build one handler generation while retaining the replay namespace of its
@@ -189,9 +219,9 @@ pub(crate) fn create_tcp_server_handler_with_replay_state(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
-    replay_state: &InboundReplayState,
+    replay_state: &InboundReplayScope,
 ) -> Box<dyn TcpServerHandler> {
-    match server_proxy_config {
+    let handler: Box<dyn TcpServerHandler> = match server_proxy_config {
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
             create_auth_credentials(username, password),
             client_proxy_selector.clone(),
@@ -459,7 +489,11 @@ pub(crate) fn create_tcp_server_handler_with_replay_state(
         unknown_config => {
             panic!("Unsupported TCP proxy config: {unknown_config:?}")
         }
-    }
+    };
+    Box::new(ReplayScopedTcpServerHandler {
+        inner: handler,
+        _replay_scope: replay_state.clone(),
+    })
 }
 
 fn create_override_selector(
@@ -480,7 +514,7 @@ fn create_tls_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
-    replay_state: &InboundReplayState,
+    replay_state: &InboundReplayScope,
 ) -> TlsServerTarget {
     let TlsServerConfig {
         cert,
@@ -594,7 +628,7 @@ fn create_shadow_tls_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
-    replay_state: &InboundReplayState,
+    replay_state: &InboundReplayScope,
 ) -> TlsServerTarget {
     let ShadowTlsServerConfig {
         password,
@@ -665,7 +699,7 @@ fn create_reality_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
-    replay_state: &InboundReplayState,
+    replay_state: &InboundReplayScope,
 ) -> TlsServerTarget {
     let RealityServerConfig {
         private_key,
@@ -792,7 +826,7 @@ fn create_websocket_server_target(
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
     users: Option<&Arc<dyn UserRegistry>>,
-    replay_state: &InboundReplayState,
+    replay_state: &InboundReplayScope,
 ) -> WebsocketServerTarget {
     let WebsocketServerConfig {
         matching_path,
@@ -842,6 +876,7 @@ fn create_websocket_server_target(
 mod tests {
     use super::*;
     use crate::config::server::{AnyTlsUserConfig, NaiveUserConfig};
+    use crate::dynamic::HandlerSlot;
     use crate::dynamic::credential::{naive_basic_credential, password_sha256};
     use crate::resolver::NativeResolver;
 
@@ -854,6 +889,42 @@ mod tests {
             let child = create_override_selector(vec![RuleConfig::default()], &parent, &resolver);
             assert_eq!(child.sniff_policy(), policy);
         }
+    }
+
+    #[test]
+    fn accepted_handler_owns_the_live_replay_scope_after_listener_drop() {
+        let state = crate::dynamic::InboundReplayState::default();
+        let scope = InboundReplayScope::new(state);
+        let weak = scope.downgrade();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
+        let handler: Arc<dyn TcpServerHandler> = create_tcp_server_handler_with_replay_state(
+            ServerProxyConfig::Http {
+                username: None,
+                password: None,
+            },
+            &selector,
+            &resolver,
+            None,
+            None,
+            &scope,
+        )
+        .into();
+        let slot = HandlerSlot::new(handler, Arc::clone(&resolver));
+        let (accepted_handler, accepted_resolver) = slot.load();
+
+        drop(scope);
+        drop(slot);
+        assert!(
+            weak.upgrade().is_some(),
+            "an accepted handler must keep the namespace discoverable after its slot drops"
+        );
+        drop(accepted_handler);
+        drop(accepted_resolver);
+        assert!(
+            weak.upgrade().is_none(),
+            "the weak registry owner must become reclaimable after the last handler exits"
+        );
     }
 
     /// NOTE(shoes-engine): a user's id reaches logs and reports -- the AnyTLS handler

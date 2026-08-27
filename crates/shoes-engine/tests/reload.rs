@@ -18,15 +18,12 @@ mod common;
 
 use std::time::Duration;
 
-use common::tuic as tu;
 use common::*;
 use serde_json::json;
-use shoes_engine::InboundSpec;
+use shoes_engine::{EngineError, InboundSpec};
 use tokio::io::AsyncWriteExt;
 
 const ALICE: &str = "11111111-1111-4111-8111-111111111111";
-const BOB: &str = "22222222-2222-4222-8222-222222222222";
-const ALICE_PASSWORD: &str = "alice-password";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn config_swaps_are_forward_looking() {
@@ -86,8 +83,26 @@ async fn config_swaps_are_forward_looking() {
             "vless",
             vless_inbound_with_rules(vless, true, allow_all()),
         ))
-        .await
-        .expect("reloading with an equivalent config should be accepted");
+        .await;
+    if let Err(EngineError::ReloadRequired(message)) = reloaded {
+        checks.that(
+            "a logical-flow protocol requests physical listener replacement",
+            message.contains("logical flows"),
+        );
+        let after = quiet(&engine, "vless", "alice").await;
+        checks.eq(
+            "refusing the in-place reload preserves user counters",
+            (after.tx, after.rx, after.total_conns),
+            (before.tx, before.rx, before.total_conns),
+        );
+        checks.that(
+            "the original generation remains usable",
+            reach(leg, sink_a.address).await.is_ok(),
+        );
+        checks.finish();
+        return;
+    }
+    let reloaded = reloaded.expect("an unexpected reload error should fail the test");
     checks.detail(
         "the revision advanced",
         reloaded.revision > first.revision,
@@ -349,162 +364,92 @@ async fn config_swaps_are_forward_looking() {
     checks.finish();
 }
 
-/// The same property, on an inbound that has no handler to swap.
-///
-/// Hysteria2 and TUIC authenticate inside their own QUIC accept loops, so they never
-/// build a `TcpServerHandler` and the `HandlerSlot` the test above exercises does not
-/// exist for them. Until `SelectorSlot`, `update_inbound` refused them outright and
-/// the only way to change their rules was to remove and re-add the inbound -- which
-/// drops every established connection, i.e. exactly the thing this suite exists to
-/// prevent.
-///
-/// What a rule slot reaches is *only* the rules, so section 4 is as important as the
-/// swap itself: a setting the accept loop read once, before it started, has to be
-/// refused rather than silently ignored.
+/// QUIC-native selectors are not all safe to swap just because the physical
+/// listener remains unchanged. A TUIC connection can open new TCP and UDP logical
+/// flows for its whole lifetime, so swapping only the selector would let a retired
+/// connection continue admitting work under the old rules. The embedding runtime
+/// handles this explicit signal by hard-replacing the inbound.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_quic_native_inbound_swaps_its_rules_in_place() {
-    let mut checks = Checks::new("rcu reload on a quic-native inbound");
-
+async fn tuic_rules_only_update_requires_replacement() {
     let engine = engine().await;
-    let sink_a = Sink::start("A").await;
-    let sink_b = Sink::start("B").await;
-    // Never listened on. Every rule below overrides the destination, so a connection
-    // that reached anything at all proves which generation it was routed by.
-    let nowhere = free_addr();
-
-    let tuic = free_addr();
+    let address = free_addr();
     engine
         .add_inbound(dynamic(
             "tuic",
-            tuic_inbound_with_rules(tuic, redirect_to(sink_a.address)),
+            tuic_inbound_with_rules(address, allow_all()),
         ))
         .await
-        .expect("a tuic inbound with rules should start");
-    engine
-        .add_user("tuic", tuic_user("alice", ALICE, ALICE_PASSWORD))
-        .expect("alice should be accepted");
+        .expect("the TUIC inbound should start");
 
-    let first = info(&engine, "tuic");
-
-    // -- 1. the inbound routes by its starting rules --------------------------
-    checks.section("1. the starting generation");
-    checks.eq(
-        "alice reaches A, though she asked for nowhere",
-        tu::reach(tuic, ALICE, ALICE_PASSWORD, nowhere).await.ok(),
-        Some("A".to_string()),
-    );
-    checks.eq("no swap has happened yet", first.revision, 0);
-
-    // -- 2. hold a connection open across the swap ----------------------------
-    checks.section("2. swap the rules under a live connection");
-    let held_client = tu::TuicClient::connect(tuic, ALICE, ALICE_PASSWORD)
-        .await
-        .expect("alice should authenticate");
-    let mut held = held_client
-        .open_tcp(nowhere)
-        .await
-        .expect("alice should open a proxied stream");
-    held.write_all(b"wh").await.expect("send half a request");
-    // Let the first half reach sink A, so the connection is established end to end
-    // rather than merely accepted at the QUIC layer.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let before = quiet(&engine, "tuic", "alice").await;
-    let redirected = engine
+    let result = engine
         .update_inbound(classic(
             "tuic",
-            tuic_inbound_with_rules(tuic, redirect_to(sink_b.address)),
+            tuic_inbound_with_rules(address, redirect_to(free_addr())),
         ))
-        .await
-        .expect("a rules-only swap should be accepted on a quic-native inbound");
-
-    // -- 3. the decisive pair -------------------------------------------------
-    checks.section("3. new rules for new connections only");
-    checks.eq(
-        "a new connection is redirected to B",
-        tu::reach(tuic, ALICE, ALICE_PASSWORD, nowhere).await.ok(),
-        Some("B".to_string()),
-    );
-
-    held.write_all(b"o\n")
-        .await
-        .expect("finish the held request");
-    checks.eq(
-        "the connection held across the swap still answers A",
-        held.read_line().await.ok(),
-        Some("A".to_string()),
-    );
-    drop(held);
-    drop(held_client);
-
-    checks.detail(
-        "the revision advanced",
-        redirected.revision > first.revision,
-        format!("{} -> {}", first.revision, redirected.revision),
-    );
-    checks.eq(
-        "the listener count is unchanged -- nothing rebound",
-        redirected.listeners,
-        first.listeners,
-    );
-    checks.eq(
-        "and the bind set is unchanged",
-        redirected.bind.clone(),
-        first.bind.clone(),
-    );
-
-    // -- 4. what a rule slot cannot reach -------------------------------------
-    //
-    // `zero_rtt_handshake` is read once, before the accept loop starts. Accepting it
-    // here would report success for a setting that never took effect.
-    checks.section("4. settings the accept loop baked in are refused");
-    let mut with_zero_rtt = tuic_inbound_with_rules(tuic, redirect_to(sink_b.address));
-    with_zero_rtt["protocol"]["zero_rtt_handshake"] = json!(true);
-    checks.refused(
-        "changing zero_rtt_handshake in place is refused",
-        engine.update_inbound(classic("tuic", with_zero_rtt)).await,
-        "zero_rtt_handshake",
-    );
-    checks.eq(
-        "the inbound kept serving the rules it had",
-        tu::reach(tuic, ALICE, ALICE_PASSWORD, nowhere).await.ok(),
-        Some("B".to_string()),
-    );
-    checks.eq(
-        "and stayed on the revision it had",
-        info(&engine, "tuic").revision,
-        redirected.revision,
-    );
-
-    // -- 5. users and counters came through -----------------------------------
-    checks.section("5. the registry survived the swap");
-    let after = quiet(&engine, "tuic", "alice").await;
-    checks.detail(
-        "alice's counters carried across the swap",
-        after.tx >= before.tx && after.rx >= before.rx,
-        format!(
-            "tx {} -> {}, rx {} -> {}",
-            before.tx, after.tx, before.rx, after.rx
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(EngineError::ReloadRequired(message))
+                if message.contains("logical flows") && message.contains("replace the inbound")
         ),
+        "a TUIC rules update must request hard replacement, got {result:?}"
     );
-    checks.eq(
-        "and she is still the only user",
-        engine.list_users("tuic").map(|u| u.len()).unwrap_or(0),
-        1,
-    );
-    checks.that(
-        "a user added after the swap authenticates too",
-        engine
-            .add_user("tuic", tuic_user("bob", BOB, "bob-password"))
-            .is_ok(),
-    );
-    checks.eq(
-        "bob reaches B like everyone else",
-        tu::reach(tuic, BOB, "bob-password", nowhere).await.ok(),
-        Some("B".to_string()),
-    );
+    assert_eq!(info(&engine, "tuic").revision, 0);
+}
 
-    checks.finish();
+/// Hysteria2 gains the same long-lived logical-flow lifetime when UDP is enabled:
+/// one authenticated QUIC association may create destinations after a rules swap.
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_enabled_hysteria2_rules_update_requires_replacement() {
+    let engine = engine().await;
+    let address = free_addr();
+    let mut initial = hysteria2_inbound(address, true);
+    initial["rules"] = allow_all();
+    engine
+        .add_inbound(dynamic("hysteria2", initial))
+        .await
+        .expect("the Hysteria2 inbound should start");
+
+    let mut updated = hysteria2_inbound(address, true);
+    updated["rules"] = redirect_to(free_addr());
+    let result = engine.update_inbound(classic("hysteria2", updated)).await;
+    assert!(
+        matches!(
+            &result,
+            Err(EngineError::ReloadRequired(message))
+                if message.contains("logical flows") && message.contains("replace the inbound")
+        ),
+        "a UDP-enabled Hysteria2 rules update must request hard replacement, got {result:?}"
+    );
+    assert_eq!(info(&engine, "hysteria2").revision, 0);
+}
+
+/// With UDP disabled, each Hysteria2 TCP request is pinned to the selector loaded
+/// for that request. There is no long-lived UDP association that can create later
+/// destinations, so a rules-only RCU update remains safe.
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_only_hysteria2_rules_update_remains_rcu_safe() {
+    let engine = engine().await;
+    let address = free_addr();
+    let mut initial = hysteria2_inbound(address, false);
+    initial["rules"] = allow_all();
+    engine
+        .add_inbound(dynamic("hysteria2", initial))
+        .await
+        .expect("the Hysteria2 inbound should start");
+    let before = info(&engine, "hysteria2");
+
+    let mut updated = hysteria2_inbound(address, false);
+    updated["rules"] = redirect_to(free_addr());
+    let after = engine
+        .update_inbound(classic("hysteria2", updated))
+        .await
+        .expect("TCP-only Hysteria2 should accept a rules-only RCU update");
+
+    assert!(after.revision > before.revision);
+    assert_eq!(after.listeners, before.listeners);
+    assert_eq!(after.bind, before.bind);
 }
 
 /// A reload rebuilds handlers. Everything below a handler therefore cannot change,
@@ -525,13 +470,13 @@ async fn listener_settings_are_refused_rather_than_ignored() {
     let with_no_delay = |value: bool| {
         json!({
             "address": tcp.to_string(),
-            "protocol": {"type": "vless"},
+            "protocol": {"type": "socks", "udp_enabled": false},
             "tcp_settings": {"no_delay": value},
             "rules": allow_all(),
         })
     };
     engine
-        .add_inbound(dynamic("tcp", with_no_delay(true)))
+        .add_inbound(classic("tcp", with_no_delay(true)))
         .await
         .expect("the inbound should start");
 
@@ -558,7 +503,7 @@ async fn listener_settings_are_refused_rather_than_ignored() {
                 "tcp",
                 json!({
                     "address": tcp.to_string(),
-                    "protocol": {"type": "vless"},
+                    "protocol": {"type": "socks", "udp_enabled": false},
                     "rules": allow_all(),
                 }),
             ))
@@ -567,14 +512,17 @@ async fn listener_settings_are_refused_rather_than_ignored() {
     );
 
     // -- 2. quic: the endpoint owns the certificate, not the handler ------------
+    // TCP-only Hysteria2 is intentionally used here so the fixed-listener field
+    // comparison is reached; its UDP-enabled form requires hard replacement even
+    // for a rules-only update and is covered above.
     checks.section("2. quic_settings");
     let quic = free_addr();
     engine
-        .add_inbound(dynamic("quic", hysteria2_inbound(quic, true)))
+        .add_inbound(dynamic("quic", hysteria2_inbound(quic, false)))
         .await
         .expect("the quic inbound should start");
 
-    let mut different_alpn = hysteria2_inbound(quic, true);
+    let mut different_alpn = hysteria2_inbound(quic, false);
     different_alpn["quic_settings"]["alpn_protocols"] = json!(["h3", "something-else"]);
     checks.refused(
         "changing the alpn list is refused",
@@ -582,7 +530,7 @@ async fn listener_settings_are_refused_rather_than_ignored() {
         "quic_settings.alpn_protocols",
     );
 
-    let mut different_cert = hysteria2_inbound(quic, true);
+    let mut different_cert = hysteria2_inbound(quic, false);
     different_cert["quic_settings"]["cert"] = json!(format!("{}\n", test_cert()));
     checks.refused(
         "and so is rotating the certificate, which is the one that matters",
@@ -593,7 +541,7 @@ async fn listener_settings_are_refused_rather_than_ignored() {
     checks.that(
         "the unchanged config still reloads, so rules remain swappable",
         engine
-            .update_inbound(classic("quic", hysteria2_inbound(quic, true)))
+            .update_inbound(classic("quic", hysteria2_inbound(quic, false)))
             .await
             .is_ok(),
     );

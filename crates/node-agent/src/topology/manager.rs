@@ -711,7 +711,11 @@ async fn runtime_transaction_failure_parts(
     let should_restore_runtime = previous_config.is_some()
         && match mode {
             RuntimeFailureMode::OrdinaryApply => true,
-            RuntimeFailureMode::ForcedReload => !runtime_running,
+            // `running` is only a liveness hint: a failed per-inbound rollback can
+            // leave one listener alive while the topology is incoherent. Only the
+            // explicit transaction classifications prove that the published Box
+            // survived intact or was completely restored.
+            RuntimeFailureMode::ForcedReload => !(runtime_rolled_back || runtime_unchanged),
         };
     let mut restored_runtime = false;
     let mut running = runtime_running;
@@ -722,7 +726,10 @@ async fn runtime_transaction_failure_parts(
                 running = true;
             }
             Err(error) => {
-                running = error.running();
+                // A failed restore does not establish that the previous topology
+                // is serving coherently, even if a fragment of the candidate still
+                // owns a listener.
+                running = false;
                 rollback_errors.push(format!("restore previous shoes configuration: {error}"));
             }
         }
@@ -2034,6 +2041,20 @@ mod transaction_tests {
         assert_eq!(rolled_back.outcome, ReloadOutcome::FailedRolledBack);
         assert_eq!(rolled_back.stage, ReloadStage::Rollback);
         assert_eq!(runtime.reload_calls(), 1);
+
+        let (partial_candidate, runtime, _) = reload_with(
+            RuntimeError::external("replacement left a partial topology", false, false, true),
+            None,
+        )
+        .await;
+        assert_eq!(partial_candidate.outcome, ReloadOutcome::FailedRolledBack);
+        assert_eq!(partial_candidate.stage, ReloadStage::Rollback);
+        assert_eq!(runtime.reload_calls(), 1);
+        assert_eq!(
+            runtime.apply_calls(),
+            2,
+            "a live fragment is not proof that the previous topology was restored"
+        );
 
         let (stopped, runtime, _) = reload_with(
             RuntimeError::external("replacement stopped", false, false, false),

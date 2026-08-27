@@ -169,16 +169,16 @@ impl serde::ser::Serialize for NetLocation {
     }
 }
 
-/// A network location with optional pre-resolved socket address.
+/// A network location with optional pre-resolved socket addresses.
 ///
-/// When `resolved_addr` is `Some`, consumers should use it directly
-/// instead of performing DNS resolution. This avoids duplicate DNS
-/// lookups when the same hostname is resolved multiple times in the
-/// connection pipeline (rule matching, socket connection, protocol setup).
+/// The full, ordered result is retained so a socket connector can retry every
+/// candidate after routing inspected the first address. Consumers that need a
+/// single address (for example protocol metadata) can keep using
+/// [`Self::resolved_addr`].
 #[derive(Debug, Clone)]
 pub struct ResolvedLocation {
     location: NetLocation,
-    resolved_addr: Option<SocketAddr>,
+    resolved_addrs: Vec<SocketAddr>,
 }
 
 impl ResolvedLocation {
@@ -186,7 +186,7 @@ impl ResolvedLocation {
     pub fn new(location: NetLocation) -> Self {
         Self {
             location,
-            resolved_addr: None,
+            resolved_addrs: Vec::new(),
         }
     }
 
@@ -194,7 +194,7 @@ impl ResolvedLocation {
     pub fn with_resolved(location: NetLocation, addr: SocketAddr) -> Self {
         Self {
             location,
-            resolved_addr: Some(addr),
+            resolved_addrs: vec![addr],
         }
     }
 
@@ -210,7 +210,12 @@ impl ResolvedLocation {
 
     /// Get the pre-resolved address, if available.
     pub fn resolved_addr(&self) -> Option<SocketAddr> {
-        self.resolved_addr
+        self.resolved_addrs.first().copied()
+    }
+
+    /// Get every pre-resolved address in resolver preference order.
+    pub fn resolved_addrs(&self) -> Option<&[SocketAddr]> {
+        (!self.resolved_addrs.is_empty()).then_some(self.resolved_addrs.as_slice())
     }
 
     /// Get the port.
@@ -227,13 +232,19 @@ impl ResolvedLocation {
     /// Set the resolved address directly.
     /// Used by the resolver when performing lazy resolution.
     pub fn set_resolved(&mut self, addr: SocketAddr) {
-        self.resolved_addr = Some(addr);
+        self.resolved_addrs.clear();
+        self.resolved_addrs.push(addr);
+    }
+
+    /// Retain the complete ordered result of a lazy DNS resolution.
+    pub fn set_resolved_addrs(&mut self, addrs: Vec<SocketAddr>) {
+        self.resolved_addrs = addrs;
     }
 }
 
 impl std::fmt::Display for ResolvedLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.resolved_addr {
+        match self.resolved_addr() {
             Some(addr) => write!(f, "{} (resolved: {})", self.location, addr),
             None => write!(f, "{}", self.location),
         }

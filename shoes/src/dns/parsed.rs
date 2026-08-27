@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::client_proxy_chain::ClientChainGroup;
+use crate::dns::{DnsClientSubnet, DnsQueryCache};
 use crate::resolver::Resolver;
 
 /// IP lookup strategy for DNS resolution.
@@ -52,6 +53,14 @@ pub struct ParsedDnsServerEntry {
     pub bootstrap_resolver: Arc<dyn Resolver>,
     /// IP lookup strategy (IPv4/IPv6 selection).
     pub ip_strategy: IpStrategy,
+    /// Private query profile controls projected from an ACP DNS rule.
+    pub disable_cache: bool,
+    pub rewrite_ttl: Option<u32>,
+    pub client_subnet: Option<DnsClientSubnet>,
+    /// Shared Go-compatible DNS-client cache and the original transport tag
+    /// used only for miss single-flight identity.
+    pub shared_cache: Option<Arc<DnsQueryCache>>,
+    pub transport_tag: Arc<str>,
     /// Whether encrypted DNS transports use the operating-system trust policy.
     pub use_native_roots: bool,
     /// Timeout for DNS resolution in seconds. 0 means no timeout.
@@ -77,6 +86,11 @@ impl ParsedDnsServerEntry {
             client_chain: chain,
             bootstrap_resolver: bootstrap,
             ip_strategy,
+            disable_cache: false,
+            rewrite_ttl: None,
+            client_subnet: None,
+            shared_cache: None,
+            transport_tag: Arc::from(""),
             use_native_roots: false,
             timeout_secs,
             connect_timeout_secs,
@@ -86,6 +100,28 @@ impl ParsedDnsServerEntry {
 
     pub fn with_native_roots(mut self, use_native_roots: bool) -> Self {
         self.use_native_roots = use_native_roots && self.server.uses_tls();
+        self
+    }
+
+    pub fn with_query_profile(
+        mut self,
+        disable_cache: bool,
+        rewrite_ttl: Option<u32>,
+        client_subnet: Option<DnsClientSubnet>,
+    ) -> Self {
+        self.disable_cache = disable_cache;
+        self.rewrite_ttl = rewrite_ttl;
+        self.client_subnet = client_subnet;
+        self
+    }
+
+    pub fn with_shared_cache(
+        mut self,
+        shared_cache: Arc<DnsQueryCache>,
+        transport_tag: impl Into<Arc<str>>,
+    ) -> Self {
+        self.shared_cache = Some(shared_cache);
+        self.transport_tag = transport_tag.into();
         self
     }
 }

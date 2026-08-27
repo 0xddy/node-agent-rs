@@ -191,11 +191,11 @@ async fn a_reload_cannot_swap_the_protocol_out_from_under_the_users() {
         "authenticates with",
     );
 
-    // -- 3. the swap that is genuinely fine ------------------------------------
+    // -- 3. the swap that requires a physical-stream boundary ------------------
     //
-    // VMess reads the same 16-byte uuid VLESS does, so alice's credential still
-    // means alice. Allowing it is the point of stating the rule as "the credential
-    // shape may not change" rather than "the protocol may not change".
+    // VMess reads the same 16-byte uuid VLESS does, but both protocols may create
+    // fresh logical flows after accepting a physical stream. Keeping that stream
+    // alive across an in-place swap would let the retired generation admit work.
     checks.section("3. a protocol with the same credential shape");
     let updated = engine
         .update_inbound(InboundSpec {
@@ -204,11 +204,10 @@ async fn a_reload_cannot_swap_the_protocol_out_from_under_the_users() {
             users: None,
         })
         .await;
-    checks.that("vless -> vmess is allowed", updated.is_ok());
-    checks.eq(
-        "and the report follows the swap rather than naming what it used to be",
-        updated.map(|i| i.protocol).unwrap_or_default(),
-        "Vmess".to_string(),
+    checks.refused(
+        "vless -> vmess requests a hard listener replacement",
+        updated,
+        "logical flows",
     );
     checks.eq(
         "the users survive it",
@@ -216,11 +215,10 @@ async fn a_reload_cannot_swap_the_protocol_out_from_under_the_users() {
         1,
     );
 
-    // Alice's uuid still authenticates, now over VMess -- the same record, so her
-    // counters carried across too.
-    let leg = start_leg(&engine, "leg", vmess_chain(addr, ALICE, "any")).await;
+    // Refusing the in-place update leaves the original VLESS generation intact.
+    let leg = start_leg(&engine, "leg", vless_chain(addr, ALICE)).await;
     checks.eq(
-        "and alice reaches the sink under the new protocol",
+        "and alice still reaches the sink through the original generation",
         reach(leg, sink.address).await.ok(),
         Some("sink".to_string()),
     );
@@ -240,7 +238,10 @@ async fn a_classic_inbound_still_reports_what_it_became() {
     engine
         .add_inbound(classic(
             "c",
-            json!({"address": addr.to_string(), "protocol": {"type": "socks"}}),
+            json!({
+                "address": addr.to_string(),
+                "protocol": {"type": "socks", "udp_enabled": false}
+            }),
         ))
         .await
         .expect("a classic socks inbound should start");

@@ -306,14 +306,26 @@ async fn handle_udp_packets(
 
 /// Start TUN server based on the provided configuration.
 pub async fn start_tun_server(
-    config: TunConfig,
-    _resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+    mut config: TunConfig,
+    resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    // Build the selector before spawning: Tokio task-local embedder state is not
+    // inherited by child tasks, and logical URLTest outbounds must join the same
+    // generation-scoped registry as ordinary listeners and DNS detours.
+    let client_proxy_selector = take_client_proxy_selector(&mut config, resolver.clone());
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
-        if let Err(e) = run_tun_from_config(config, shutdown_rx, true).await {
+        if let Err(e) = run_tun_from_config_with_selector(
+            config,
+            client_proxy_selector,
+            resolver,
+            shutdown_rx,
+            true,
+        )
+        .await
+        {
             warn!("TUN server error: {}", e);
         }
     });
@@ -323,7 +335,36 @@ pub async fn start_tun_server(
 
 /// Run TUN server from config with external shutdown control.
 pub async fn run_tun_from_config(
+    mut config: TunConfig,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    close_fd_on_drop: bool,
+) -> std::io::Result<()> {
+    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+    let client_proxy_selector = take_client_proxy_selector(&mut config, resolver.clone());
+    run_tun_from_config_with_selector(
+        config,
+        client_proxy_selector,
+        resolver,
+        shutdown_rx,
+        close_fd_on_drop,
+    )
+    .await
+}
+
+fn take_client_proxy_selector(
+    config: &mut TunConfig,
+    resolver: Arc<dyn Resolver>,
+) -> Arc<ClientProxySelector> {
+    let rules = std::mem::take(&mut config.rules)
+        .map(ConfigSelection::unwrap_config)
+        .into_vec();
+    Arc::new(create_tcp_client_proxy_selector(rules, resolver))
+}
+
+async fn run_tun_from_config_with_selector(
     config: TunConfig,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
 ) -> std::io::Result<()> {
@@ -356,10 +397,6 @@ pub async fn run_tun_from_config(
         tun_server_config = tun_server_config.destination(dest);
     }
 
-    let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
-    let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
-
     run_tun_server(
         tun_server_config,
         client_proxy_selector,
@@ -367,4 +404,51 @@ pub async fn run_tun_from_config(
         shutdown_rx,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_proxy_chain::{ClientChainGroupRegistry, with_client_chain_group_registry};
+
+    #[tokio::test]
+    async fn tun_selector_joins_the_embedder_urltest_registry_before_spawn() {
+        let mut config: TunConfig = serde_yaml::from_str("{}").unwrap();
+        let mut rule = crate::config::RuleConfig::default();
+        let crate::config::RuleActionConfig::Allow {
+            client_chain_selection,
+            ..
+        } = &mut rule.action
+        else {
+            unreachable!("the default rule allows direct traffic")
+        };
+        *client_chain_selection = crate::config::ClientChainSelectionConfig::UrlTest {
+            shared_id: Some("node-agent-urltest-v1:tun-shared".to_string()),
+            history_keys: Vec::new(),
+            failure_history_keys: Vec::new(),
+            url: "http://127.0.0.1:9/generate_204".to_string(),
+            use_native_roots: false,
+            reselect_on_connection_failure: false,
+            interval_millis: 60_000,
+            tolerance_millis: 0,
+            idle_timeout_millis: 1_800_000,
+        };
+        config.rules = crate::option_util::NoneOrSome::One(ConfigSelection::Config(rule));
+        let registry = ClientChainGroupRegistry::default();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        registry
+            .bind_probe_resolver([4; 32], resolver.clone())
+            .unwrap();
+
+        let selector = with_client_chain_group_registry(registry.clone(), async {
+            take_client_proxy_selector(&mut config, resolver)
+        })
+        .await;
+
+        assert_eq!(registry.active_group_count(), 1);
+        assert!(config.rules.is_empty());
+        registry.start_pending();
+        drop(selector);
+        assert_eq!(registry.active_group_count(), 1);
+    }
 }

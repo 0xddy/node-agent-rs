@@ -14,7 +14,13 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
-use crate::address::{NetLocation, ResolvedLocation};
+// Resolver is a public embedding API, so its public input types must be
+// reachable by crates such as shoes-engine as well.
+use crate::address::ResolvedLocation;
+// `Address` is part of the embedding API used by shoes-engine; the standalone
+// binary's duplicate module graph does not reference it directly.
+#[allow(unused_imports)]
+pub use crate::address::{Address, NetLocation};
 
 type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 
@@ -30,6 +36,19 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
+
+    /// Maximum lifetime for an address result cached outside this resolver.
+    /// `None` disables outer result caching. Implementations with
+    /// location-dependent policy override [`Self::result_cache_ttl_for`].
+    fn result_cache_ttl(&self) -> Option<Duration> {
+        Some(Duration::from_secs(
+            ResolverCache::DEFAULT_RESULT_TIMEOUT_SECS,
+        ))
+    }
+
+    fn result_cache_ttl_for(&self, _location: &NetLocation) -> Option<Duration> {
+        self.result_cache_ttl()
+    }
 
     /// Resolve through one explicitly named upstream exposed by a composite
     /// resolver. Ordinary resolvers deliberately reject a non-empty tag rather
@@ -112,6 +131,18 @@ impl Resolver for LateBoundResolver {
             Ok(target) => target.resolve_location_via(upstream_tag, location),
             Err(error) => Box::pin(async move { Err(error) }),
         }
+    }
+
+    fn result_cache_ttl(&self) -> Option<Duration> {
+        self.target()
+            .ok()
+            .and_then(|target| target.result_cache_ttl())
+    }
+
+    fn result_cache_ttl_for(&self, location: &NetLocation) -> Option<Duration> {
+        self.target()
+            .ok()
+            .and_then(|target| target.result_cache_ttl_for(location))
     }
 }
 
@@ -199,6 +230,14 @@ impl<T: Resolver> Resolver for TimeoutResolver<T> {
                 })?
         })
     }
+
+    fn result_cache_ttl(&self) -> Option<Duration> {
+        self.inner.result_cache_ttl()
+    }
+
+    fn result_cache_ttl_for(&self, location: &NetLocation) -> Option<Duration> {
+        self.inner.result_cache_ttl_for(location)
+    }
 }
 
 type ResolverFactoryFuture =
@@ -206,11 +245,35 @@ type ResolverFactoryFuture =
 
 pub type ResolverFactory = Arc<dyn Fn() -> ResolverFactoryFuture + Send + Sync>;
 
+/// Socket/connectivity failures which can become healthy after rebuilding a
+/// connection pool or trying another transport. DNS semantic errors and data
+/// validation failures are intentionally excluded.
+pub(crate) fn is_connection_error_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
 /// Policy controlling when a RefreshingResolver rebuilds its inner resolver.
 #[derive(Debug, Clone, Copy)]
 pub struct RefreshPolicy {
     /// Rebuild the inner resolver if it has been idle longer than this.
     pub max_idle: Duration,
+    /// Rebuild the inner resolver once it reaches this age, even while queries
+    /// keep it continuously active. `None` preserves the historical idle-only
+    /// refresh behaviour.
+    pub max_age: Option<Duration>,
     /// After a refreshable error, rebuild and retry the lookup once.
     pub retry_once_after_refresh: bool,
 }
@@ -225,10 +288,13 @@ pub struct RefreshingResolver {
     refresh_state: Arc<Mutex<RefreshState>>,
     policy: RefreshPolicy,
     description: String,
+    result_cache_ttl: Option<Duration>,
 }
 
 struct RefreshState {
     last_activity_at: Option<Instant>,
+    last_refresh_attempt_at: Instant,
+    last_error_refresh_attempt_at: Option<Instant>,
     generation: u64,
 }
 
@@ -237,6 +303,7 @@ impl Debug for RefreshingResolver {
         f.debug_struct("RefreshingResolver")
             .field("description", &self.description)
             .field("max_idle", &self.policy.max_idle)
+            .field("max_age", &self.policy.max_age)
             .finish()
     }
 }
@@ -248,29 +315,49 @@ impl RefreshingResolver {
         description: String,
     ) -> std::io::Result<Self> {
         let inner = factory().await?;
+        let result_cache_ttl = inner.result_cache_ttl();
         Ok(Self {
             factory,
             inner: Arc::new(RwLock::new(inner)),
             refresh_lock: Arc::new(AsyncMutex::new(())),
             refresh_state: Arc::new(Mutex::new(RefreshState {
                 last_activity_at: None,
+                last_refresh_attempt_at: Instant::now(),
+                last_error_refresh_attempt_at: None,
                 generation: 0,
             })),
             policy,
             description,
+            result_cache_ttl,
         })
     }
 
     fn should_refresh_for_error(err: &std::io::Error) -> bool {
-        matches!(
-            err.kind(),
-            std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::NotConnected
-        )
+        is_connection_error_kind(err.kind())
+    }
+
+    fn scheduled_refresh_reason(
+        state: &RefreshState,
+        policy: RefreshPolicy,
+    ) -> Option<&'static str> {
+        if policy
+            .max_age
+            .is_some_and(|max_age| state.last_refresh_attempt_at.elapsed() >= max_age)
+        {
+            return Some("maximum age");
+        }
+        if matches!(state.last_activity_at, Some(last) if last.elapsed() > policy.max_idle) {
+            return Some("idle timeout");
+        }
+        None
+    }
+
+    fn error_refresh_is_rate_limited(state: &RefreshState, policy: RefreshPolicy) -> bool {
+        policy.max_age.is_some_and(|minimum_interval| {
+            state
+                .last_error_refresh_attempt_at
+                .is_some_and(|last_attempt| last_attempt.elapsed() < minimum_interval)
+        })
     }
 }
 
@@ -289,27 +376,59 @@ impl Resolver for RefreshingResolver {
         let description = self.description.clone();
 
         Box::pin(async move {
-            // Refreshes if idle too long using double-checked locking.
-            if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
-            {
+            // Refreshes after an idle period or a configured maximum instance
+            // age. The latter keeps system DNS configuration current even under
+            // continuous traffic. Double-checked locking coalesces concurrent
+            // refresh attempts.
+            let refresh_reason = {
+                let state = refresh_state.lock();
+                RefreshingResolver::scheduled_refresh_reason(&state, policy)
+            };
+            if refresh_reason.is_some() {
                 let _guard = refresh_lock.lock().await;
-                if matches!(refresh_state.lock().last_activity_at, Some(last) if last.elapsed() > policy.max_idle)
-                {
-                    log::info!(
-                        "RefreshingResolver ({}): rebuilding after idle timeout ({:?})",
-                        description,
-                        policy.max_idle
-                    );
+                let refresh_reason = {
+                    let state = refresh_state.lock();
+                    RefreshingResolver::scheduled_refresh_reason(&state, policy)
+                };
+                if let Some(refresh_reason) = refresh_reason {
                     match factory().await {
                         Ok(fresh) => {
-                            *inner.write().await = fresh;
+                            let unchanged = {
+                                let current = inner.read().await;
+                                Arc::ptr_eq(&current, &fresh)
+                            };
+                            if !unchanged {
+                                *inner.write().await = fresh;
+                                log::info!(
+                                    "RefreshingResolver ({}): rebuilt after {}",
+                                    description,
+                                    refresh_reason
+                                );
+                            } else {
+                                log::debug!(
+                                    "RefreshingResolver ({}): {} check found no resolver change",
+                                    description,
+                                    refresh_reason
+                                );
+                            }
                             let mut state = refresh_state.lock();
-                            state.last_activity_at = Some(Instant::now());
+                            let now = Instant::now();
+                            state.last_activity_at = Some(now);
+                            state.last_refresh_attempt_at = now;
+                            state.last_error_refresh_attempt_at = Some(now);
                             state.generation = state.generation.wrapping_add(1);
                         }
                         Err(e) => {
+                            // Rate-limit repeated scheduled rebuild failures to
+                            // the configured idle/age interval instead of trying
+                            // to re-read system state on every lookup.
+                            let now = Instant::now();
+                            let mut state = refresh_state.lock();
+                            state.last_activity_at = Some(now);
+                            state.last_refresh_attempt_at = now;
+                            state.last_error_refresh_attempt_at = Some(now);
                             log::warn!(
-                                "RefreshingResolver ({}): idle refresh failed: {}",
+                                "RefreshingResolver ({}): scheduled refresh failed: {}",
                                 description,
                                 e
                             );
@@ -336,17 +455,40 @@ impl Resolver for RefreshingResolver {
                         refresh_state.lock().last_activity_at = Some(Instant::now());
                         return Ok(addrs);
                     }
-                    log::info!(
-                        "RefreshingResolver ({}): refresh-on-error ({}) for {}",
-                        description,
-                        err.kind(),
-                        location
-                    );
+                    let error_refresh_is_rate_limited = {
+                        let state = refresh_state.lock();
+                        RefreshingResolver::error_refresh_is_rate_limited(&state, policy)
+                    };
+                    if error_refresh_is_rate_limited {
+                        return Err(err);
+                    }
                     match factory().await {
                         Ok(fresh) => {
-                            *inner.write().await = fresh.clone();
+                            let unchanged = {
+                                let current = inner.read().await;
+                                Arc::ptr_eq(&current, &fresh)
+                            };
+                            if !unchanged {
+                                *inner.write().await = fresh.clone();
+                                log::info!(
+                                    "RefreshingResolver ({}): rebuilt on {} error for {}",
+                                    description,
+                                    err.kind(),
+                                    location
+                                );
+                            } else {
+                                log::debug!(
+                                    "RefreshingResolver ({}): {} error check for {} found no resolver change",
+                                    description,
+                                    err.kind(),
+                                    location
+                                );
+                            }
                             {
                                 let mut state = refresh_state.lock();
+                                let now = Instant::now();
+                                state.last_refresh_attempt_at = now;
+                                state.last_error_refresh_attempt_at = Some(now);
                                 state.generation = state.generation.wrapping_add(1);
                             }
                             let addrs = fresh.resolve_location(&location).await?;
@@ -354,6 +496,10 @@ impl Resolver for RefreshingResolver {
                             Ok(addrs)
                         }
                         Err(factory_err) => {
+                            let now = Instant::now();
+                            let mut state = refresh_state.lock();
+                            state.last_refresh_attempt_at = now;
+                            state.last_error_refresh_attempt_at = Some(now);
                             log::warn!(
                                 "RefreshingResolver ({}): error-refresh factory failed: {}",
                                 description,
@@ -366,6 +512,10 @@ impl Resolver for RefreshingResolver {
                 Err(err) => Err(err),
             }
         })
+    }
+
+    fn result_cache_ttl(&self) -> Option<Duration> {
+        self.result_cache_ttl
     }
 }
 
@@ -442,9 +592,9 @@ pub async fn resolve_addresses_via(
     Ok(addrs)
 }
 
-/// Resolve a ResolvedLocation lazily. If already resolved, returns the cached
-/// address. Otherwise resolves, caches the result in the location, and returns it.
-/// This is the key function for the lazy resolution pattern.
+/// Resolve a ResolvedLocation lazily. If already resolved, returns the first
+/// cached address. Otherwise resolves and retains the complete ordered result
+/// so a later socket connector can retry every candidate.
 pub async fn resolve_location(
     location: &mut ResolvedLocation,
     resolver: &Arc<dyn Resolver>,
@@ -462,13 +612,13 @@ pub async fn resolve_location_via(
         return Ok(addr);
     }
     let addrs = resolve_addresses_via(resolver, upstream_tag, location.location()).await?;
-    let addr = addrs.into_iter().next().ok_or_else(|| {
+    let addr = addrs.first().copied().ok_or_else(|| {
         std::io::Error::other(format!(
             "could not resolve location: {}",
             location.location()
         ))
     })?;
-    location.set_resolved(addr);
+    location.set_resolved_addrs(addrs);
     Ok(addr)
 }
 
@@ -568,7 +718,7 @@ impl Resolver for CachingNativeResolver {
 pub struct ResolverCache {
     resolver: Arc<dyn Resolver>,
     /// Completed resolution results with timestamps
-    cache: LruCache<NetLocation, (Instant, SocketAddr)>,
+    cache: LruCache<NetLocation, (Instant, Vec<SocketAddr>)>,
     /// The latest poll-based lookup. A changed target cancels the abandoned lookup.
     pending: Option<(NetLocation, ResolveFuture)>,
     result_timeout_secs: u64,
@@ -590,20 +740,43 @@ impl ResolverCache {
         }
     }
 
+    fn result_cache_ttl(&self, target: &NetLocation) -> Option<Duration> {
+        self.resolver
+            .result_cache_ttl_for(target)
+            .map(|ttl| ttl.min(Duration::from_secs(self.result_timeout_secs)))
+    }
+
     /// Async resolve method for convenience.
     pub async fn resolve_location(&mut self, target: &NetLocation) -> std::io::Result<SocketAddr> {
+        self.resolve_addresses(target)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::other(format!("DNS lookup returned no addresses for {target}"))
+            })
+    }
+
+    /// Resolve and retain every address in resolver preference order.
+    pub async fn resolve_addresses(
+        &mut self,
+        target: &NetLocation,
+    ) -> std::io::Result<Vec<SocketAddr>> {
         self.pending = None;
 
         // Fast path: IP address
         if let Some(socket_addr) = target.to_socket_addr_nonblocking() {
-            return Ok(socket_addr);
+            return Ok(vec![socket_addr]);
         }
 
+        let result_cache_ttl = self.result_cache_ttl(target);
         // Check cache
-        if let Some((ts, addr)) = self.cache.get(target) {
-            if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
-                return Ok(*addr);
+        if let (Some(ttl), Some((ts, addrs))) = (result_cache_ttl, self.cache.get(target)) {
+            if !ttl.is_zero() && Instant::now().duration_since(*ts) <= ttl {
+                return Ok(addrs.clone());
             }
+            self.cache.pop(target);
+        } else if result_cache_ttl.is_none() {
             self.cache.pop(target);
         }
 
@@ -614,9 +787,11 @@ impl ResolverCache {
                 "DNS lookup returned no addresses for {target}"
             )));
         }
-        let addr = addrs[0];
-        self.cache.put(target.clone(), (Instant::now(), addr));
-        Ok(addr)
+        if result_cache_ttl.is_some_and(|ttl| !ttl.is_zero()) {
+            self.cache
+                .put(target.clone(), (Instant::now(), addrs.clone()));
+        }
+        Ok(addrs)
     }
 
     /// Poll-based resolve for use in Future/Stream poll methods.
@@ -625,6 +800,21 @@ impl ResolverCache {
         cx: &mut Context<'_>,
         target: &NetLocation,
     ) -> Poll<std::io::Result<SocketAddr>> {
+        match self.poll_resolve_addresses(cx, target) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(addrs)) => Poll::Ready(addrs.into_iter().next().ok_or_else(|| {
+                std::io::Error::other(format!("DNS lookup returned no addresses for {target}"))
+            })),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        }
+    }
+
+    /// Poll-based resolution that preserves every address in resolver order.
+    pub fn poll_resolve_addresses(
+        &mut self,
+        cx: &mut Context<'_>,
+        target: &NetLocation,
+    ) -> Poll<std::io::Result<Vec<SocketAddr>>> {
         if self
             .pending
             .as_ref()
@@ -635,14 +825,17 @@ impl ResolverCache {
 
         // Fast path: IP address
         if let Some(socket_addr) = target.to_socket_addr_nonblocking() {
-            return Poll::Ready(Ok(socket_addr));
+            return Poll::Ready(Ok(vec![socket_addr]));
         }
 
+        let result_cache_ttl = self.result_cache_ttl(target);
         // Check completed cache
-        if let Some((ts, addr)) = self.cache.get(target) {
-            if Instant::now().duration_since(*ts) <= Duration::from_secs(self.result_timeout_secs) {
-                return Poll::Ready(Ok(*addr));
+        if let (Some(ttl), Some((ts, addrs))) = (result_cache_ttl, self.cache.get(target)) {
+            if !ttl.is_zero() && Instant::now().duration_since(*ts) <= ttl {
+                return Poll::Ready(Ok(addrs.clone()));
             }
+            self.cache.pop(target);
+        } else if result_cache_ttl.is_none() {
             self.cache.pop(target);
         }
 
@@ -660,9 +853,11 @@ impl ResolverCache {
                         "DNS lookup returned no addresses for {target}"
                     ))));
                 }
-                let addr = addrs[0];
-                self.cache.put(target.clone(), (Instant::now(), addr));
-                Poll::Ready(Ok(addr))
+                if result_cache_ttl.is_some_and(|ttl| !ttl.is_zero()) {
+                    self.cache
+                        .put(target.clone(), (Instant::now(), addrs.clone()));
+                }
+                Poll::Ready(Ok(addrs))
             }
             Poll::Ready(Err(e)) => {
                 self.pending = None;
@@ -685,6 +880,7 @@ mod tests {
         addrs: Vec<SocketAddr>,
         call_count: AtomicUsize,
         error_kind: Option<std::io::ErrorKind>,
+        result_cache_ttl: Option<Duration>,
     }
 
     impl MockResolver {
@@ -693,6 +889,7 @@ mod tests {
                 addrs,
                 call_count: AtomicUsize::new(0),
                 error_kind: None,
+                result_cache_ttl: Some(Duration::from_secs(60 * 60)),
             }
         }
 
@@ -701,6 +898,16 @@ mod tests {
                 addrs: vec![],
                 call_count: AtomicUsize::new(0),
                 error_kind: Some(kind),
+                result_cache_ttl: Some(Duration::from_secs(60 * 60)),
+            }
+        }
+
+        fn with_cache_ttl(addrs: Vec<SocketAddr>, result_cache_ttl: Option<Duration>) -> Self {
+            Self {
+                addrs,
+                call_count: AtomicUsize::new(0),
+                error_kind: None,
+                result_cache_ttl,
             }
         }
 
@@ -721,6 +928,10 @@ mod tests {
                     Ok(addrs)
                 }
             })
+        }
+
+        fn result_cache_ttl(&self) -> Option<Duration> {
+            self.result_cache_ttl
         }
     }
 
@@ -808,6 +1019,21 @@ mod tests {
         NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
     }
 
+    #[test]
+    fn connectivity_classifier_covers_immediate_route_and_bind_failures() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(is_connection_error_kind(kind), "missing {kind:?}");
+        }
+        assert!(!is_connection_error_kind(std::io::ErrorKind::NotFound));
+        assert!(!is_connection_error_kind(std::io::ErrorKind::InvalidData));
+    }
+
     #[tokio::test]
     async fn late_bound_resolver_delegates_without_retaining_target() {
         let handle = LateBoundResolver::new();
@@ -866,6 +1092,30 @@ mod tests {
 
         assert_eq!(cache.cache.len(), RESOLVER_CACHE_CAPACITY);
         assert!(cache.cache.peek(&unique_location(0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolver_cache_honors_bypass_zero_and_positive_ttl_hints() {
+        for ttl in [None, Some(Duration::ZERO)] {
+            let concrete = Arc::new(MockResolver::with_cache_ttl(test_addrs(), ttl));
+            let resolver: Arc<dyn Resolver> = concrete.clone();
+            let mut cache = ResolverCache::new(resolver);
+            cache.resolve_location(&test_location()).await.unwrap();
+            cache.resolve_location(&test_location()).await.unwrap();
+            assert_eq!(concrete.count(), 2, "TTL {ttl:?} must bypass outer cache");
+            assert!(cache.cache.is_empty());
+        }
+
+        let concrete = Arc::new(MockResolver::with_cache_ttl(
+            test_addrs(),
+            Some(Duration::from_secs(30)),
+        ));
+        let resolver: Arc<dyn Resolver> = concrete.clone();
+        let mut cache = ResolverCache::new(resolver);
+        cache.resolve_location(&test_location()).await.unwrap();
+        cache.resolve_location(&test_location()).await.unwrap();
+        assert_eq!(concrete.count(), 1);
+        assert_eq!(cache.cache.len(), 1);
     }
 
     #[test]
@@ -929,6 +1179,7 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
+            max_age: None,
             retry_once_after_refresh: true,
         };
 
@@ -960,6 +1211,7 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_secs(60),
+            max_age: None,
             retry_once_after_refresh: true,
         };
 
@@ -971,6 +1223,49 @@ mod tests {
         assert!(result.is_err());
         // Factory called only once (initial build, no refresh for non-refreshable errors)
         assert_eq!(call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshing_resolver_rate_limits_system_style_error_refreshes() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let factory_count = call_count.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            factory_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(
+                    Arc::new(MockResolver::with_error(std::io::ErrorKind::TimedOut))
+                        as Arc<dyn Resolver>,
+                )
+            })
+        });
+        let interval = Duration::from_millis(20);
+        let resolver = RefreshingResolver::new(
+            factory,
+            RefreshPolicy {
+                max_idle: Duration::from_secs(60),
+                max_age: Some(interval),
+                retry_once_after_refresh: true,
+            },
+            "system-style-test".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(resolver.resolve_location(&test_location()).await.is_err());
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+
+        // A hot failing upstream must not run its refresh factory again on
+        // every query during the platform configuration cooldown.
+        assert!(resolver.resolve_location(&test_location()).await.is_err());
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+
+        tokio::time::sleep(interval + Duration::from_millis(10)).await;
+        assert!(resolver.resolve_location(&test_location()).await.is_err());
+        assert_eq!(
+            call_count.load(Ordering::Relaxed),
+            3,
+            "the scheduled age check must also suppress a duplicate error refresh"
+        );
     }
 
     #[tokio::test]
@@ -990,6 +1285,7 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_millis(50),
+            max_age: None,
             retry_once_after_refresh: true,
         };
 
@@ -1013,6 +1309,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refreshing_resolver_max_age_refreshes_while_active() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let addrs = test_addrs();
+
+        let call_count_clone = call_count.clone();
+        let addrs_clone = addrs.clone();
+        let factory: ResolverFactory = Arc::new(move || {
+            call_count_clone.fetch_add(1, Ordering::Relaxed);
+            let addrs = addrs_clone.clone();
+            Box::pin(
+                async move { Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>) },
+            )
+        });
+
+        let policy = RefreshPolicy {
+            max_idle: Duration::from_secs(60),
+            max_age: Some(Duration::from_millis(20)),
+            retry_once_after_refresh: true,
+        };
+        let resolver = RefreshingResolver::new(factory, policy, "max-age-test".to_string())
+            .await
+            .unwrap();
+
+        // Activity well inside max_idle must not suppress the independent
+        // maximum-age rebuild.
+        assert_eq!(
+            resolver.resolve_location(&test_location()).await.unwrap(),
+            addrs
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            resolver.resolve_location(&test_location()).await.unwrap(),
+            addrs
+        );
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn test_refreshing_resolver_coalesces_concurrent_idle_refresh() {
         let call_count = Arc::new(AtomicUsize::new(0));
         let addrs = test_addrs();
@@ -1030,6 +1364,7 @@ mod tests {
 
         let policy = RefreshPolicy {
             max_idle: Duration::from_millis(20),
+            max_age: None,
             retry_once_after_refresh: true,
         };
 

@@ -669,16 +669,29 @@ async fn match_rule(
         if let Some(predicate) = &rule.predicate {
             // Preserve the selector's existing hostname-resolution policy. If enabled,
             // resolve only when an IP-dependent OR branch is still undecidable.
-            let mut predicate_ip = location.resolved_addr().map(|address| address.ip());
-            if predicate.needs_resolved_ip(location.location(), predicate_ip, context)
+            let mut predicate_ips: Vec<IpAddr> = location
+                .resolved_addrs()
+                .map(|addresses| {
+                    addresses
+                        .iter()
+                        .map(|address| address.ip())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if predicate.needs_resolved_ips(location.location(), &predicate_ips, context)
                 && matches!(location.location().address(), Address::Hostname(_))
                 && resolve_rule_hostnames
             {
                 let socket_addr = resolve_location(location, resolver).await?;
                 resolved_ip = Some(ip_to_u128(socket_addr.ip()));
-                predicate_ip = Some(socket_addr.ip());
+                predicate_ips = location
+                    .resolved_addrs()
+                    .expect("successful resolution retains at least one address")
+                    .iter()
+                    .map(|address| address.ip())
+                    .collect::<Vec<_>>();
             }
-            if !predicate.matches(location.location(), predicate_ip, context) {
+            if !predicate.matches_resolved_ips(location.location(), &predicate_ips, context) {
                 continue;
             }
         }
@@ -2561,6 +2574,74 @@ mod tests {
                 .await
                 .unwrap(),
             ConnectDecision::Block
+        ));
+    }
+
+    #[tokio::test]
+    async fn ip_predicate_matches_later_candidate_and_preserves_order_for_dialing() {
+        let routed = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_cidr: vec!["192.0.2.0/24".into()],
+                ..Default::default()
+            },
+            ConnectAction::new_allow(None, mock_chain_group()),
+        )
+        .unwrap();
+        let selector = ClientProxySelector::new(vec![routed]);
+        let expected = vec![
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        ];
+        let resolver: Arc<dyn Resolver> =
+            Arc::new(MockResolver::new().with_mapping("multi.example", 443, expected.clone()));
+        let destination = NetLocation::new(Address::Hostname("multi.example".into()), 443);
+
+        let ConnectDecision::Allow {
+            remote_location, ..
+        } = selector
+            .judge_tcp(destination.into(), &resolver)
+            .await
+            .unwrap()
+        else {
+            panic!("a matching later DNS candidate should select the route");
+        };
+
+        let actual = remote_location
+            .resolved_addrs()
+            .expect("IP routing must retain the complete DNS answer")
+            .iter()
+            .map(|address| address.ip())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn ip_version_does_not_resolve_or_match_a_hostname() {
+        let ipv6_block = ConnectRule::try_with_match_config(
+            vec![NetLocationMask::ANY],
+            RouteMatchConfig {
+                ip_version: vec![6],
+                ..Default::default()
+            },
+            ConnectAction::new_block(),
+        )
+        .unwrap();
+        let selector =
+            ClientProxySelector::new(vec![ipv6_block, allow_rule(vec!["0.0.0.0/0"], "default")]);
+
+        // The empty resolver makes an accidental lookup observable as an
+        // error. sing-box's route IPVersionItem only inspects a literal
+        // destination (DNS query-family metadata is a separate DNS-router path).
+        assert!(matches!(
+            selector
+                .judge_tcp(
+                    NetLocation::new(Address::Hostname("dual-stack.example".into()), 443).into(),
+                    &mock_resolver(),
+                )
+                .await
+                .unwrap(),
+            ConnectDecision::Allow { .. }
         ));
     }
 

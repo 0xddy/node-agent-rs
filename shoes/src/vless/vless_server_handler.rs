@@ -9,11 +9,15 @@ use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::crypto::CryptoTlsStream;
-use crate::dynamic::{UserRegistry, bind_connection_user, current_connection};
+use crate::dynamic::{
+    UserRegistry, bind_connection_user, current_connection, spawn_connection_until_cancelled,
+};
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session_with_meter};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_handler::{TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{
+    TcpServerHandler, TcpServerSetupResult, UnauthenticatedFallbackCompletion,
+};
 use crate::util::write_all;
 use crate::xudp::XudpMessageStream;
 
@@ -101,7 +105,7 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
     // Spawn the long-running bidirectional copy as a background task.
     // This allows the setup to complete within the timeout while the actual
     // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    let completion = spawn_connection_until_cancelled(async move {
         let mut client_stream = client_stream;
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut client_stream,
@@ -119,9 +123,12 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
         } else {
             debug!("VLESS FALLBACK: Connection completed");
         }
+        Ok(())
     });
 
-    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
+    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled(
+        UnauthenticatedFallbackCompletion::new(completion),
+    ))
 }
 
 #[async_trait]
@@ -285,7 +292,8 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 // MUX/XUDP: Destination comes in XUDP frames, not VLESS header
                 let unparsed_data = stream_reader.unparsed_data();
                 write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
-                let mut xudp_stream = XudpMessageStream::new(server_stream);
+                let mut xudp_stream =
+                    XudpMessageStream::new_with_resolver(server_stream, self.resolver.clone());
                 if !unparsed_data.is_empty() {
                     xudp_stream.feed_initial_read_data(unparsed_data)?;
                 }
@@ -453,7 +461,8 @@ where
                     VisionStream::new_server(io, session, user_uuid, unparsed_data)?;
 
                 // Wrap VISION stream in XUDP stream
-                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream));
+                let xudp_stream =
+                    XudpMessageStream::new_with_resolver(Box::new(vision_stream), resolver.clone());
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
@@ -469,7 +478,8 @@ where
                 write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
 
                 // Wrap TLS stream in XUDP stream
-                let mut xudp_stream = XudpMessageStream::new(Box::new(tls_stream));
+                let mut xudp_stream =
+                    XudpMessageStream::new_with_resolver(Box::new(tls_stream), resolver.clone());
 
                 // Feed any unparsed data to XUDP stream
                 if !unparsed_data.is_empty() {

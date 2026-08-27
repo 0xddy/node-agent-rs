@@ -6,8 +6,8 @@
 //! and forgets it on every reload. This scope is instead owned by `ServerHandle` and
 //! cloned into every handler generation belonging to that handle.
 
-use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -32,9 +32,38 @@ pub(crate) type ShadowsocksSaltFilter = Arc<Mutex<dyn SaltChecker>>;
 /// instances, while all bind addresses and reload generations of one inbound clone
 /// these same two handles.
 #[derive(Clone, Default)]
-pub(crate) struct InboundReplayState {
+pub struct InboundReplayState {
     inner: Arc<InboundReplayStateInner>,
 }
+
+/// Strong live-generation owner for a replay namespace.
+///
+/// Rollback leases intentionally retain only [`InboundReplayState`]. Handlers and
+/// listener handles retain this separate scope, allowing the engine to distinguish
+/// "an old connection can still authenticate" from "only a rollback lease remains".
+#[derive(Clone)]
+pub struct InboundReplayScope {
+    inner: Arc<InboundReplayScopeInner>,
+}
+
+struct InboundReplayScopeInner {
+    state: InboundReplayState,
+    lineage: Arc<()>,
+}
+
+/// Non-owning registry reference to the live handlers of one replay namespace.
+#[derive(Clone)]
+pub struct InboundReplayScopeWeak {
+    inner: Weak<InboundReplayScopeInner>,
+}
+
+impl PartialEq for InboundReplayState {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for InboundReplayState {}
 
 #[derive(Default)]
 struct InboundReplayStateInner {
@@ -57,6 +86,50 @@ impl InboundReplayState {
                 .shadowsocks_salts
                 .get_or_init(new_shadowsocks_salt_filter),
         )
+    }
+}
+
+impl InboundReplayScope {
+    pub fn new(state: InboundReplayState) -> Self {
+        Self::with_lineage(state, Arc::new(()))
+    }
+
+    #[doc(hidden)]
+    pub fn with_lineage(state: InboundReplayState, lineage: Arc<()>) -> Self {
+        Self {
+            inner: Arc::new(InboundReplayScopeInner { state, lineage }),
+        }
+    }
+
+    pub fn state(&self) -> InboundReplayState {
+        self.inner.state.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn lineage(&self) -> Arc<()> {
+        Arc::clone(&self.inner.lineage)
+    }
+
+    pub fn downgrade(&self) -> InboundReplayScopeWeak {
+        InboundReplayScopeWeak {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub(crate) fn vmess_auth_ids(&self) -> VmessAuthIdFilter {
+        self.inner.state.vmess_auth_ids()
+    }
+
+    pub(crate) fn shadowsocks_salts(&self) -> ShadowsocksSaltFilter {
+        self.inner.state.shadowsocks_salts()
+    }
+}
+
+impl InboundReplayScopeWeak {
+    pub fn upgrade(&self) -> Option<InboundReplayScope> {
+        self.inner
+            .upgrade()
+            .map(|inner| InboundReplayScope { inner })
     }
 }
 

@@ -16,10 +16,13 @@ use crate::address::NetLocation;
 use crate::async_stream::AsyncStream;
 use crate::buf_reader::BufReader;
 use crate::client_proxy_chain::ClientProxyChain;
+use crate::dynamic::spawn_connection_until_cancelled;
 use crate::resolver::Resolver;
 use crate::rustls_connection_util::feed_rustls_server_connection;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
+use crate::tcp::tcp_handler::{
+    TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult, UnauthenticatedFallbackCompletion,
+};
 use crate::util::{allocate_vec, write_all};
 
 // context wrapper because it's not Debug
@@ -227,7 +230,7 @@ async fn shadowtls_fallback_to_handshake_server(
     // Spawn the long-running bidirectional copy as a background task.
     // This allows the setup to complete within the timeout while the actual
     // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    let completion = spawn_connection_until_cancelled(async move {
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut *client_stream,
             &mut *handshake_stream,
@@ -244,9 +247,12 @@ async fn shadowtls_fallback_to_handshake_server(
         } else {
             log::debug!("SHADOWTLS FALLBACK: Connection completed");
         }
+        Ok(())
     });
 
-    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled)
+    Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled(
+        UnauthenticatedFallbackCompletion::new(completion),
+    ))
 }
 
 #[inline]

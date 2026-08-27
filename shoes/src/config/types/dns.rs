@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::types::rules::{ClientChain, ClientChainSelectionConfig};
 use crate::config::types::selection::ConfigSelection;
-use crate::dns::{DnsPredefinedResponse, DnsRejectMethod, IpStrategy};
+use crate::dns::{DnsClientSubnet, DnsPredefinedResponse, DnsRejectMethod, IpStrategy};
 use crate::option_util::NoneOrSome;
 use crate::routing::predicate::RouteRuleSetConfig;
 
@@ -39,6 +39,15 @@ pub enum DnsServerSpec {
         /// Stable name used by DNS policy `final` and `route` actions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tag: Option<String>,
+        /// Original DNS transport tag retained by compiler-generated query
+        /// profiles. The shared answer cache is question-only, while Go's
+        /// single-flight lock is scoped to this source transport.
+        #[serde(
+            default,
+            rename = "__acp_source_tag",
+            skip_serializing_if = "Option::is_none"
+        )]
+        source_tag: Option<String>,
         url: String,
         #[serde(default)]
         client_chain: NoneOrSome<ConfigSelection<ClientChain>>,
@@ -59,7 +68,18 @@ pub enum DnsServerSpec {
         /// IP lookup strategy for DNS resolution. Defaults to ipv4_then_ipv6.
         #[serde(default)]
         ip_strategy: IpStrategy,
+        /// Disable the Hickory response cache for this private upstream profile.
+        #[serde(default, skip_serializing_if = "is_false")]
+        disable_cache: bool,
+        /// Force positive and negative response cache lifetime to this TTL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewrite_ttl: Option<u32>,
+        /// EDNS Client Subnet attached to every query through this profile.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        client_subnet: String,
         /// Timeout for DNS resolution in seconds. Defaults to 5. Set to 0 to disable.
+        /// Advanced `system` profiles retain the platform resolver timeout instead,
+        /// because this field cannot distinguish an omitted value from the serde default.
         #[serde(default = "default_timeout_secs")]
         timeout_secs: u32,
         /// Timeout for establishing connections to DNS upstreams in seconds.
@@ -69,7 +89,8 @@ pub enum DnsServerSpec {
         /// this connect timeout.
         #[serde(default = "default_connect_timeout_secs")]
         connect_timeout_secs: u32,
-        /// Number of retry attempts for failed queries. Defaults to 1.
+        /// Number of retry attempts for failed queries. Defaults to 1. Advanced
+        /// `system` profiles retain the platform resolver attempt count.
         #[serde(default = "default_attempts")]
         attempts: usize,
     },
@@ -172,6 +193,42 @@ impl DnsServerSpec {
         }
     }
 
+    /// Get the compiler-retained original transport tag for a private query
+    /// profile. Ordinary upstreams use their own policy tag instead.
+    pub fn source_tag(&self) -> Option<&str> {
+        if let Self::WithOptions { source_tag, .. } = self {
+            source_tag.as_deref()
+        } else {
+            None
+        }
+    }
+
+    pub fn disable_cache(&self) -> bool {
+        if let Self::WithOptions { disable_cache, .. } = self {
+            *disable_cache
+        } else {
+            false
+        }
+    }
+
+    pub fn rewrite_ttl(&self) -> Option<u32> {
+        if let Self::WithOptions { rewrite_ttl, .. } = self {
+            *rewrite_ttl
+        } else {
+            None
+        }
+    }
+
+    pub fn client_subnet(&self) -> Option<&str> {
+        if let Self::WithOptions { client_subnet, .. } = self
+            && !client_subnet.is_empty()
+        {
+            Some(client_subnet)
+        } else {
+            None
+        }
+    }
+
     /// Get the timeout in seconds (defaults to 5 for Simple variant).
     /// Returns 0 if timeout is disabled.
     pub fn timeout_secs(&self) -> u32 {
@@ -225,6 +282,15 @@ pub enum DnsPolicyActionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsPolicyRuleConfig {
+    /// Internal ACP compiler identity for sharing the rolling default-reject
+    /// flood window across per-inbound projections. Hand-written Shoes configs
+    /// should omit this field.
+    #[serde(
+        default,
+        rename = "__acp_reject_flood_key",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub reject_flood_state_key: String,
     /// Exact hostname matches. `exact` is accepted as a concise alias.
     #[serde(default, alias = "exact", skip_serializing_if = "Vec::is_empty")]
     pub domain: Vec<String>,
@@ -246,6 +312,10 @@ pub struct DnsPolicyRuleConfig {
     /// Reject method (`default` or `drop`) for `reject`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub method: String,
+    /// Keep the default reject method from degrading to drop after sing-box's
+    /// rolling flood threshold is exceeded.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_drop: bool,
     /// Answer-section resource records for `predefined`, as RR text or base64
     /// standalone wire RRs. Bare IPs remain accepted for local compatibility.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -316,6 +386,7 @@ impl DnsConfig {
 #[derive(Debug, Clone)]
 pub struct ExpandedDnsSpec {
     pub tag: Option<String>,
+    pub source_tag: Option<String>,
     pub url: String,
     pub server_name: Option<String>,
     pub use_native_roots: bool,
@@ -325,6 +396,9 @@ pub struct ExpandedDnsSpec {
     /// Bootstrap resolver URL or group name. Groups are resolved at runtime.
     pub bootstrap_url: Option<String>,
     pub ip_strategy: IpStrategy,
+    pub disable_cache: bool,
+    pub rewrite_ttl: Option<u32>,
+    pub client_subnet: Option<DnsClientSubnet>,
     /// Timeout for DNS resolution in seconds. 0 means no timeout.
     pub timeout_secs: u32,
     /// Timeout for establishing connections to DNS upstreams in seconds.
@@ -348,12 +422,14 @@ pub enum ExpandedDnsPolicyAction {
 /// DNS policy rule after action references and predefined answers are validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedDnsPolicyRule {
+    pub reject_flood_state_key: Option<String>,
     pub exact: Vec<String>,
     pub suffix: Vec<String>,
     pub keyword: Vec<String>,
     pub regex: Vec<String>,
     pub rule_set: Vec<RouteRuleSetConfig>,
     pub action: ExpandedDnsPolicyAction,
+    pub no_drop: bool,
     /// Zero means no rule-level timeout wrapper.
     pub timeout_millis: u64,
 }
@@ -573,6 +649,7 @@ servers: my-dns-group
         // WithOptions is never a group ref
         let spec = DnsServerSpec::WithOptions {
             tag: None,
+            source_tag: None,
             client_chain_selection: ClientChainSelectionConfig::RoundRobin,
             url: "tls://dns.google".to_string(),
             client_chain: NoneOrSome::None,
@@ -580,6 +657,9 @@ servers: my-dns-group
             server_name: None,
             use_native_roots: false,
             ip_strategy: IpStrategy::default(),
+            disable_cache: false,
+            rewrite_ttl: None,
+            client_subnet: String::new(),
             timeout_secs: default_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
             attempts: default_attempts(),
@@ -659,6 +739,9 @@ timeout_secs: 3
 connect_timeout_secs: 1
 attempts: 1
 ip_strategy: ipv4_only
+disable_cache: true
+rewrite_ttl: 0
+client_subnet: 192.0.2.7/24
 "#;
         let spec: DnsServerSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.timeout_secs(), 3);
@@ -666,6 +749,9 @@ ip_strategy: ipv4_only
         assert_eq!(spec.attempts(), 1);
         assert_eq!(spec.ip_strategy(), IpStrategy::Ipv4Only);
         assert_eq!(spec.server_name(), Some("cloudflare-dns.com"));
+        assert!(spec.disable_cache());
+        assert_eq!(spec.rewrite_ttl(), Some(0));
+        assert_eq!(spec.client_subnet(), Some("192.0.2.7/24"));
     }
 
     #[test]
@@ -691,6 +777,9 @@ rules:
     answer: []
     ns: ['example. 60 IN NS ns.example.']
     extra: ['ns.example. 60 IN A 192.0.2.53']
+  - domain_suffix: [blocked.example]
+    action: reject
+    no_drop: true
 "#;
         let config: DnsConfig = serde_yaml::from_str(yaml).unwrap();
         let servers = config.servers.into_vec();
@@ -709,6 +798,7 @@ rules:
         assert!(config.rules[1].answer.is_empty());
         assert_eq!(config.rules[1].ns.len(), 1);
         assert_eq!(config.rules[1].extra.len(), 1);
+        assert!(config.rules[2].no_drop);
     }
 
     #[test]
