@@ -18,6 +18,11 @@ use crate::topology::manager::{
 
 pub const MAX_QUEUED_CONTROL_COMMANDS: usize = 256;
 pub const MAX_QUEUED_USER_REFRESH_COMMANDS: usize = 256;
+/// Bounds ACKs waiting between command execution and tonic's already-bounded
+/// outgoing stream. This is intentionally smaller than the command queues:
+/// when the panel stops reading, execution should backpressure rather than
+/// retain an unbounded number of cloned command identifiers and messages.
+pub const MAX_QUEUED_CONTROL_ACKS: usize = 64;
 const MAX_USER_REFRESH_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,7 +509,7 @@ impl std::error::Error for WorkerClosed {}
 pub struct ControlCommandWorker {
     regular: mpsc::Sender<ControlCommand>,
     refresh: mpsc::Sender<ControlCommand>,
-    acknowledgements: mpsc::UnboundedSender<ControlAck>,
+    acknowledgements: mpsc::Sender<ControlAck>,
     lifecycle: Arc<WorkerLifecycle>,
 }
 
@@ -522,7 +527,7 @@ struct WorkerSpawnOptions {
 struct LaneContext {
     executor: Arc<dyn CommandExecutor>,
     acknowledgements: Arc<AckStore>,
-    output: mpsc::UnboundedSender<ControlAck>,
+    output: mpsc::Sender<ControlAck>,
     cancellation: CancellationToken,
 }
 
@@ -536,7 +541,7 @@ impl ControlCommandWorker {
     pub fn spawn(
         executor: Arc<dyn CommandExecutor>,
         acknowledgements: Arc<AckStore>,
-    ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+    ) -> (Self, mpsc::Receiver<ControlAck>) {
         Self::spawn_configured(
             executor,
             acknowledgements,
@@ -552,7 +557,7 @@ impl ControlCommandWorker {
         executor: Arc<dyn CommandExecutor>,
         acknowledgements: Arc<AckStore>,
         cancellation: CancellationToken,
-    ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+    ) -> (Self, mpsc::Receiver<ControlAck>) {
         Self::spawn_configured(
             executor,
             acknowledgements,
@@ -569,7 +574,7 @@ impl ControlCommandWorker {
         acknowledgements: Arc<AckStore>,
         regular_capacity: usize,
         refresh_capacity: usize,
-    ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+    ) -> (Self, mpsc::Receiver<ControlAck>) {
         Self::spawn_configured(
             executor,
             acknowledgements,
@@ -587,7 +592,7 @@ impl ControlCommandWorker {
         regular_capacity: usize,
         refresh_capacity: usize,
         parent_cancellation: CancellationToken,
-    ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+    ) -> (Self, mpsc::Receiver<ControlAck>) {
         Self::spawn_configured(
             executor,
             acknowledgements,
@@ -603,7 +608,7 @@ impl ControlCommandWorker {
         executor: Arc<dyn CommandExecutor>,
         acknowledgements: Arc<AckStore>,
         options: WorkerSpawnOptions,
-    ) -> (Self, mpsc::UnboundedReceiver<ControlAck>) {
+    ) -> (Self, mpsc::Receiver<ControlAck>) {
         let WorkerSpawnOptions {
             regular_capacity,
             refresh_capacity,
@@ -617,7 +622,7 @@ impl ControlCommandWorker {
         });
         let (regular_tx, regular_rx) = mpsc::channel(regular_capacity);
         let (refresh_tx, refresh_rx) = mpsc::channel(refresh_capacity);
-        let (ack_tx, ack_rx) = mpsc::unbounded_channel();
+        let (ack_tx, ack_rx) = mpsc::channel(MAX_QUEUED_CONTROL_ACKS);
         let lane = LaneContext {
             executor,
             acknowledgements,
@@ -646,46 +651,54 @@ impl ControlCommandWorker {
             return Err(WorkerClosed);
         }
         if uses_refresh_lane(command.r#type) {
-            self.acknowledgements
-                .send(proto_ack(
-                    &command,
-                    AckStatus::Accepted,
-                    "accepted for execution",
-                ))
-                .map_err(|_| WorkerClosed)?;
+            self.send_ack(proto_ack(
+                &command,
+                AckStatus::Accepted,
+                "accepted for execution",
+            ))
+            .await?;
             match self.refresh.try_send(command) {
                 Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(command)) => self
-                    .acknowledgements
-                    .send(proto_ack(
+                Err(mpsc::error::TrySendError::Full(command)) => {
+                    self.send_ack(proto_ack(
                         &command,
                         AckStatus::Failed,
                         "user refresh queue is full",
                     ))
-                    .map_err(|_| WorkerClosed),
-                Err(mpsc::error::TrySendError::Closed(command)) => self
-                    .acknowledgements
-                    .send(proto_ack(
+                    .await
+                }
+                Err(mpsc::error::TrySendError::Closed(command)) => {
+                    self.send_ack(proto_ack(
                         &command,
                         AckStatus::Failed,
                         "control command worker is closed",
                     ))
-                    .map_err(|_| WorkerClosed),
+                    .await
+                }
             }
         } else {
             // Reserve backlog space before accepting. When all 256 slots are
             // occupied this await stops the upstream receive loop, allowing
             // HTTP/2 flow control to push back on the panel exactly as in Go.
             let permit = self.regular.reserve().await.map_err(|_| WorkerClosed)?;
-            self.acknowledgements
-                .send(proto_ack(
-                    &command,
-                    AckStatus::Accepted,
-                    "accepted for execution",
-                ))
-                .map_err(|_| WorkerClosed)?;
+            self.send_ack(proto_ack(
+                &command,
+                AckStatus::Accepted,
+                "accepted for execution",
+            ))
+            .await?;
             permit.send(command);
             Ok(())
+        }
+    }
+
+    async fn send_ack(&self, acknowledgement: ControlAck) -> Result<(), WorkerClosed> {
+        tokio::select! {
+            biased;
+            () = self.lifecycle.cancellation.cancelled() => Err(WorkerClosed),
+            result = self.acknowledgements.send(acknowledgement) => {
+                result.map_err(|_| WorkerClosed)
+            }
         }
     }
 
@@ -718,7 +731,16 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
             if !generic.idempotency_key.is_empty()
                 && let Ok(Some(replay)) = acknowledgements.replay(&generic)
             {
-                let _ = output.send(proto_ack(&command, replay.status, replay.message));
+                if send_lane_ack(
+                    &output,
+                    &cancellation,
+                    proto_ack(&command, replay.status, replay.message),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
                 continue;
             }
 
@@ -777,9 +799,30 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
                         ..Ack::default()
                     })
             };
-            let _ = output.send(proto_ack(&command, terminal.status, terminal.message));
+            if send_lane_ack(
+                &output,
+                &cancellation,
+                proto_ack(&command, terminal.status, terminal.message),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
         }
     });
+}
+
+async fn send_lane_ack(
+    output: &mpsc::Sender<ControlAck>,
+    cancellation: &CancellationToken,
+    acknowledgement: ControlAck,
+) -> Result<(), WorkerClosed> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(WorkerClosed),
+        result = output.send(acknowledgement) => result.map_err(|_| WorkerClosed),
+    }
 }
 
 fn command_from_proto(command: &ControlCommand) -> Command {

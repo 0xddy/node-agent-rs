@@ -26,6 +26,7 @@ async-trait.workspace = true
 chrono.workspace = true
 if-addrs.workspace = true
 log.workspace = true
+mimalloc.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

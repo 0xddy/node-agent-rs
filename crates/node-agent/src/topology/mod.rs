@@ -9,6 +9,8 @@ pub mod manager;
 mod proto;
 pub mod provider;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use proto::{
@@ -24,11 +26,11 @@ pub const DEFAULT_DIRECT_OUTBOUND: &str = "direct";
 
 /// A JSON value whose original bytes are retained across protobuf conversion.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RawJson(Vec<u8>);
+pub struct RawJson(Arc<[u8]>);
 
 impl RawJson {
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
+        Self(Arc::from(bytes.into()))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -50,7 +52,9 @@ impl RawJson {
 
 impl From<serde_json::Value> for RawJson {
     fn from(value: serde_json::Value) -> Self {
-        Self(serde_json::to_vec(&value).expect("serializing a JSON value cannot fail"))
+        Self(Arc::from(
+            serde_json::to_vec(&value).expect("serializing a JSON value cannot fail"),
+        ))
     }
 }
 
@@ -72,6 +76,7 @@ impl<'de> Deserialize<'de> for RawJson {
     {
         let value = serde_json::Value::deserialize(deserializer)?;
         serde_json::to_vec(&value)
+            .map(Arc::from)
             .map(Self)
             .map_err(serde::de::Error::custom)
     }
@@ -573,4 +578,16 @@ fn is_zero_u32(value: &u32) -> bool {
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn cloning_raw_json_shares_its_payload() {
+        let original = RawJson::new(vec![b'x'; 128 * 1024]);
+        let cloned = original.clone();
+        assert!(Arc::ptr_eq(&original.0, &cloned.0));
+    }
 }

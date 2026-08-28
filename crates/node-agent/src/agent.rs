@@ -433,7 +433,7 @@ async fn run_control_stream(
     cancel: CancellationToken,
     mut control: OpenedControlStream,
     worker: ControlCommandWorker,
-    mut acknowledgements: mpsc::UnboundedReceiver<ControlAck>,
+    mut acknowledgements: mpsc::Receiver<ControlAck>,
 ) -> Result<(), SessionError> {
     loop {
         tokio::select! {

@@ -1,7 +1,14 @@
 use std::process::ExitCode;
 
+use mimalloc::MiMalloc;
 use node_agent::agent::Agent;
 use node_agent::{cli, config, logging, shutdown};
+
+// The agent is a long-running, allocation-heavy network process. mimalloc's
+// per-thread free lists and eager page reclamation reduce allocator contention
+// and fragmentation without affecting crates that embed `shoes` as a library.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const USAGE: &str = "usage: node-agent <config.toml> | node-agent version [--json]";
 

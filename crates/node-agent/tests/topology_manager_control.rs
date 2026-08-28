@@ -10,8 +10,8 @@ use acp_proto::{
 };
 use async_trait::async_trait;
 use node_agent::control::{
-    AckStatus, AckStore, CommandExecutor, ControlCommandWorker, FetchError, TerminalResult,
-    TopologyCommandExecutor, TopologyFetcher,
+    AckStatus, AckStore, CommandExecutor, ControlCommandWorker, FetchError,
+    MAX_QUEUED_CONTROL_ACKS, TerminalResult, TopologyCommandExecutor, TopologyFetcher,
 };
 use node_agent::policy::PolicyState;
 use node_agent::topology::manager::{
@@ -1244,7 +1244,7 @@ impl CommandExecutor for CancelExecutor {
     }
 }
 
-async fn ack(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ControlAck>) -> ControlAck {
+async fn ack(receiver: &mut tokio::sync::mpsc::Receiver<ControlAck>) -> ControlAck {
     tokio::time::timeout(Duration::from_secs(1), receiver.recv())
         .await
         .expect("timed out waiting for ACK")
@@ -1392,6 +1392,58 @@ impl CommandExecutor for GateExecutor {
         }
         TerminalResult::applied("applied")
     }
+}
+
+#[tokio::test]
+async fn acknowledgement_queue_backpressures_at_its_memory_bound() {
+    let executor = Arc::new(GateExecutor::new(false));
+    let (worker, mut acks) = ControlCommandWorker::spawn_with_capacity(
+        executor.clone(),
+        Arc::new(AckStore::new()),
+        MAX_QUEUED_CONTROL_ACKS + 1,
+        1,
+    );
+    let started = executor.started.notified();
+    worker
+        .submit(queued_command(
+            "bounded-0",
+            ControlCommandType::UserMutation,
+        ))
+        .await
+        .unwrap();
+    started.await;
+    for index in 1..MAX_QUEUED_CONTROL_ACKS {
+        worker
+            .submit(queued_command(
+                &format!("bounded-{index}"),
+                ControlCommandType::UserMutation,
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(acks.len(), MAX_QUEUED_CONTROL_ACKS);
+
+    let clone = worker.clone();
+    let mut blocked = tokio::spawn(async move {
+        clone
+            .submit(queued_command(
+                "bounded-overflow",
+                ControlCommandType::UserMutation,
+            ))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut blocked)
+            .await
+            .is_err(),
+        "ACK production must wait instead of growing past its bound"
+    );
+
+    assert_eq!(ack(&mut acks).await.command_id, "bounded-0");
+    blocked.await.unwrap().unwrap();
+    assert_eq!(acks.len(), MAX_QUEUED_CONTROL_ACKS);
+    drop(worker);
+    executor.permits.add_permits(1);
 }
 
 #[tokio::test]

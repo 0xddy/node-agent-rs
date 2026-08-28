@@ -34,6 +34,7 @@ dashmap = "*"
 hmac = "*"
 if-addrs = "*"
 log = { version = "*", features = ["std"] }
+mimalloc = "*"
 prost = "*"
 rand = "*"
 rcgen = "*"

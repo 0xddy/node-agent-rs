@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RULE_SET_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
 static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static RULE_SET_STATE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
@@ -47,7 +48,7 @@ pub enum RuleSetSource {
     /// snapshots these bytes exactly like local/remote resources so route and
     /// DNS consumers share the same parser and match semantics.
     Inline {
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
     },
 }
 
@@ -231,7 +232,9 @@ pub fn plan_inline_resource(tag: &str, bytes: Vec<u8>) -> Result<RuleSetResource
         tag: tag.to_owned(),
         format: "source".to_owned(),
         path,
-        source: RuleSetSource::Inline { bytes },
+        source: RuleSetSource::Inline {
+            bytes: Arc::from(bytes),
+        },
         update_interval: DEFAULT_UPDATE_INTERVAL,
     })
 }
@@ -382,16 +385,29 @@ impl RuleSetLoader {
         &self,
         resources: &[RuleSetResource],
     ) -> Result<PreparedRuleSets, RuleSetError> {
-        let mut prepared = Vec::with_capacity(resources.len());
+        let mut prepared = PreparedRuleSetBuilder::default();
         for resource in resources {
-            let (bytes, publish) = match &resource.source {
-                RuleSetSource::Local => (read_resource(resource).await?, false),
-                RuleSetSource::Remote { url } => self.prepare_remote(resource, url).await?,
-                RuleSetSource::Inline { bytes } => (bytes.clone(), false),
-            };
-            prepared.push((resource, bytes, publish));
+            match &resource.source {
+                RuleSetSource::Local => {
+                    let bytes = read_resource(resource).await?;
+                    prepared
+                        .push(&self.snapshot_root, resource, &bytes, false)
+                        .await?;
+                }
+                RuleSetSource::Remote { url } => {
+                    let (bytes, publish) = self.prepare_remote(resource, url).await?;
+                    prepared
+                        .push(&self.snapshot_root, resource, &bytes, publish)
+                        .await?;
+                }
+                RuleSetSource::Inline { bytes } => {
+                    prepared
+                        .push(&self.snapshot_root, resource, bytes, false)
+                        .await?;
+                }
+            }
         }
-        snapshot_and_fingerprint(&self.snapshot_root, prepared).await
+        Ok(prepared.finish())
     }
 
     async fn prepare_remote(
@@ -456,32 +472,43 @@ fn fixed_state_root() -> Result<PathBuf, RuleSetError> {
     Ok(RULE_SET_STATE_ROOT.get_or_init(|| resolved).clone())
 }
 
-async fn snapshot_and_fingerprint(
-    snapshot_root: &Path,
-    resources: Vec<(&RuleSetResource, Vec<u8>, bool)>,
-) -> Result<PreparedRuleSets, RuleSetError> {
-    let mut digest = Sha256::new();
-    let mut path_replacements = BTreeMap::new();
-    let mut pending_publications = Vec::new();
-    for (resource, bytes, publish) in resources {
-        validate_envelope(&resource.format, &bytes).map_err(|error| {
-            RuleSetError::new(format!("route rule-set {}: {error}", resource.tag))
-        })?;
-        validate_for_runtime(&resource.format, &bytes).map_err(|error| {
-            RuleSetError::new(format!("route rule-set {}: {error}", resource.tag))
-        })?;
-        digest.update((resource.tag.len() as u64).to_be_bytes());
-        digest.update(resource.tag.as_bytes());
-        digest.update((resource.format.len() as u64).to_be_bytes());
-        digest.update(resource.format.as_bytes());
-        digest.update((bytes.len() as u64).to_be_bytes());
-        digest.update(&bytes);
+#[derive(Default)]
+struct PreparedRuleSetBuilder {
+    digest: Sha256,
+    path_replacements: BTreeMap<String, String>,
+    pending_publications: Vec<PendingPublication>,
+}
 
-        let snapshot = snapshot_path(snapshot_root, resource, &bytes);
-        publish_snapshot(&snapshot, &bytes, &resource.tag).await?;
+impl PreparedRuleSetBuilder {
+    async fn push(
+        &mut self,
+        snapshot_root: &Path,
+        resource: &RuleSetResource,
+        bytes: &[u8],
+        publish: bool,
+    ) -> Result<(), RuleSetError> {
+        validate_envelope(&resource.format, bytes).map_err(|error| {
+            RuleSetError::new(format!("route rule-set {}: {error}", resource.tag))
+        })?;
+        validate_for_runtime(&resource.format, bytes).map_err(|error| {
+            RuleSetError::new(format!("route rule-set {}: {error}", resource.tag))
+        })?;
+        self.digest
+            .update((resource.tag.len() as u64).to_be_bytes());
+        self.digest.update(resource.tag.as_bytes());
+        self.digest
+            .update((resource.format.len() as u64).to_be_bytes());
+        self.digest.update(resource.format.as_bytes());
+        self.digest.update((bytes.len() as u64).to_be_bytes());
+        self.digest.update(bytes);
+
+        let snapshot = snapshot_path(snapshot_root, resource, bytes);
+        publish_snapshot(&snapshot, bytes, &resource.tag).await?;
         let source = resource.path.to_string_lossy().into_owned();
         let target = snapshot.to_string_lossy().into_owned();
-        if let Some(previous) = path_replacements.insert(source.clone(), target.clone())
+        if let Some(previous) = self
+            .path_replacements
+            .insert(source.clone(), target.clone())
             && previous != target
         {
             return Err(RuleSetError::new(format!(
@@ -489,18 +516,22 @@ async fn snapshot_and_fingerprint(
             )));
         }
         if publish {
-            pending_publications.push(PendingPublication {
+            self.pending_publications.push(PendingPublication {
                 tag: resource.tag.clone(),
                 snapshot,
                 target: resource.path.clone(),
             });
         }
+        Ok(())
     }
-    Ok(PreparedRuleSets {
-        digest: digest.finalize().into(),
-        path_replacements,
-        pending_publications,
-    })
+
+    fn finish(self) -> PreparedRuleSets {
+        PreparedRuleSets {
+            digest: self.digest.finalize().into(),
+            path_replacements: self.path_replacements,
+            pending_publications: self.pending_publications,
+        }
+    }
 }
 
 fn snapshot_path(root: &Path, resource: &RuleSetResource, bytes: &[u8]) -> PathBuf {
@@ -554,17 +585,33 @@ async fn publish_snapshot(target: &Path, bytes: &[u8], tag: &str) -> Result<(), 
 }
 
 async fn verify_snapshot(target: &Path, expected: &[u8], tag: &str) -> Result<(), RuleSetError> {
-    let actual = tokio::fs::read(target).await.map_err(|error| {
+    let mut actual = tokio::fs::File::open(target).await.map_err(|error| {
         RuleSetError::new(format!("read route rule-set {tag} snapshot: {error}"))
     })?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(RuleSetError::new(format!(
-            "route rule-set {tag} snapshot digest collision at {}",
-            target.display()
-        )))
+    let mut buffer = vec![0u8; SNAPSHOT_VERIFY_BUFFER_BYTES];
+    let mut offset = 0usize;
+    loop {
+        let read = actual.read(&mut buffer).await.map_err(|error| {
+            RuleSetError::new(format!("read route rule-set {tag} snapshot: {error}"))
+        })?;
+        if read == 0 {
+            if offset == expected.len() {
+                return Ok(());
+            }
+            break;
+        }
+        let Some(expected_chunk) = expected.get(offset..offset.saturating_add(read)) else {
+            break;
+        };
+        if buffer[..read] != *expected_chunk {
+            break;
+        }
+        offset += read;
     }
+    Err(RuleSetError::new(format!(
+        "route rule-set {tag} snapshot digest collision at {}",
+        target.display()
+    )))
 }
 
 fn rewrite_rule_set_paths(value: &mut serde_json::Value, replacements: &BTreeMap<String, String>) {
@@ -841,6 +888,19 @@ mod tests {
     }
 
     #[test]
+    fn cloning_inline_resource_shares_the_large_payload() {
+        let resource = plan_inline_resource("inline", br#"{"version":4,"rules":[]}"#.to_vec())
+            .expect("valid inline rule set");
+        let cloned = resource.clone();
+        let (RuleSetSource::Inline { bytes: original }, RuleSetSource::Inline { bytes: copy }) =
+            (&resource.source, &cloned.source)
+        else {
+            panic!("inline planner must retain inline bytes");
+        };
+        assert!(Arc::ptr_eq(original, copy));
+    }
+
+    #[test]
     fn rewrite_only_changes_rule_set_reference_paths() {
         let prepared = PreparedRuleSets {
             digest: [1; 32],
@@ -886,6 +946,30 @@ mod tests {
             br#"{"version":4,"rules":[]}"#
         );
         assert!(tokio::fs::metadata(&backup).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn existing_snapshot_is_verified_without_a_second_full_size_buffer() {
+        let temporary = tempfile::tempdir().expect("create snapshot directory");
+        let target = temporary.path().join("rules.json");
+        let expected = vec![b'x'; SNAPSHOT_VERIFY_BUFFER_BYTES * 2 + 17];
+        tokio::fs::write(&target, &expected)
+            .await
+            .expect("write matching snapshot");
+        verify_snapshot(&target, &expected, "matching")
+            .await
+            .expect("matching snapshot");
+
+        tokio::fs::write(&target, &expected[..expected.len() - 1])
+            .await
+            .expect("write truncated snapshot");
+        assert!(
+            verify_snapshot(&target, &expected, "truncated")
+                .await
+                .expect_err("truncated snapshot must fail")
+                .to_string()
+                .contains("digest collision")
+        );
     }
 
     #[tokio::test]
