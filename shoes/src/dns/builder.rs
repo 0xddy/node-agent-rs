@@ -802,6 +802,18 @@ fn server_to_ns_config(
 /// When all entries are hickory-backed with compatible settings, pools them
 /// into a single hickory resolver instead of using CompositeResolver.
 pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc<dyn Resolver>> {
+    build_resolver_with_system_configuration(
+        entries,
+        crate::dns::system_config::read_system_configuration_snapshot,
+    )
+}
+
+fn build_resolver_with_system_configuration(
+    entries: Vec<ParsedDnsServerEntry>,
+    load_system_configuration: impl Fn() -> std::io::Result<
+        crate::dns::system_config::SystemConfigurationSnapshot,
+    >,
+) -> std::io::Result<Arc<dyn Resolver>> {
     if entries.is_empty() {
         return Err(std::io::Error::other("no DNS servers configured"));
     }
@@ -843,7 +855,7 @@ pub fn build_resolver(entries: Vec<ParsedDnsServerEntry>) -> std::io::Result<Arc
             ParsedDnsServer::System
                 if crate::dns::system_config::wire_system_resolver_supported() =>
             {
-                let snapshot = crate::dns::system_config::read_system_configuration_snapshot()?;
+                let snapshot = load_system_configuration()?;
                 crate::dns::system_resolver::build_system_resolver(
                     snapshot.configuration,
                     snapshot.options,
@@ -1449,6 +1461,30 @@ mod tests {
         }
     }
 
+    fn build_resolver_with_test_system_configuration(
+        entries: Vec<ParsedDnsServerEntry>,
+    ) -> std::io::Result<Arc<dyn Resolver>> {
+        build_resolver_with_system_configuration(entries, || {
+            Ok(test_system_snapshot("test-system"))
+        })
+    }
+
+    fn use_test_system_configuration(
+        plan: &mut HickoryResolverPlan,
+        fingerprint: impl Into<String>,
+    ) {
+        let fingerprint = fingerprint.into();
+        let loader: SystemConfigurationLoader =
+            Arc::new(move || Ok(test_system_snapshot(fingerprint.clone())));
+        let state = plan
+            .system_state
+            .as_mut()
+            .expect("wire-aware system plan must have refresh state");
+        Arc::get_mut(state)
+            .expect("newly built test plan must own its refresh state")
+            .loader = loader;
+    }
+
     fn test_systemd_snapshot(
         fingerprint: impl Into<String>,
         dns_over_tls: crate::dns::system_config::ResolvedDnsOverTlsMode,
@@ -1520,7 +1556,7 @@ mod tests {
             Some(60),
             Some("192.0.2.7/24".parse().unwrap()),
         );
-        let resolver = build_resolver(vec![entry]).unwrap();
+        let resolver = build_resolver_with_test_system_configuration(vec![entry]).unwrap();
         let debug = format!("{resolver:?}");
         assert!(debug.contains("OrderedSystemResolver"), "{debug}");
         assert_eq!(resolver.result_cache_ttl(), None);
@@ -1543,8 +1579,9 @@ mod tests {
         let (_, advanced_plan) = build_entry_and_plan(&advanced, &registry, None)
             .await
             .unwrap();
-        let advanced_plan = advanced_plan.expect("advanced system profile must be rebuildable");
+        let mut advanced_plan = advanced_plan.expect("advanced system profile must be rebuildable");
         assert!(advanced_plan.is_system_profile());
+        use_test_system_configuration(&mut advanced_plan, "supported-system-profile");
 
         let first = advanced_plan.build().await.unwrap();
         let unchanged = advanced_plan.build().await.unwrap();
@@ -1553,13 +1590,10 @@ mod tests {
             "unchanged system configuration must preserve the Hickory cache"
         );
 
-        let resolver = build_resolver_from_specs(
-            std::slice::from_ref(&advanced),
-            &registry,
-            "advanced-system-test",
-        )
-        .await
-        .unwrap();
+        let refresh_plans = [ResolverRefreshPlan::Hickory(Box::new(advanced_plan))];
+        let resolver = build_system_aware_refresh_group(&refresh_plans)
+            .await
+            .unwrap();
         let debug = format!("{resolver:?}");
         assert!(debug.contains("RefreshingResolver"), "{debug}");
         assert!(debug.contains("max_age: Some(5s)"), "{debug}");
@@ -1964,12 +1998,12 @@ mod tests {
 
     #[tokio::test]
     async fn registry_returns_policy_resolver_for_server_group() {
-        let mut upstream = make_spec("system");
-        upstream.tag = Some("system-final".to_string());
+        let mut upstream = make_spec("udp://192.0.2.53");
+        upstream.tag = Some("policy-final".to_string());
         let group = ExpandedDnsGroup {
             name: "policy-dns".to_string(),
             specs: vec![upstream],
-            final_server: Some("system-final".to_string()),
+            final_server: Some("policy-final".to_string()),
             rules: vec![
                 ExpandedDnsPolicyRule {
                     reject_flood_state_key: None,
@@ -2263,7 +2297,7 @@ mod tests {
             ),
         ];
 
-        let resolver = build_resolver(entries).unwrap();
+        let resolver = build_resolver_with_test_system_configuration(entries).unwrap();
         let debug = format!("{:?}", resolver);
         assert!(
             !debug.contains("pool["),
