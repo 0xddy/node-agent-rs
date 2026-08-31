@@ -1,18 +1,18 @@
-# shoes-r
+# node-agent-rust
 
 English | [中文](README.zh-CN.md)
 
 Upstream [`shoes`](https://github.com/cfal/shoes) reads a YAML file, starts every
 listener, and blocks forever: users and rules are fixed for the life of the process.
-`shoes-r` keeps that behaviour and adds two things on top, without forking:
+`node-agent-rust` keeps that behaviour and adds two things on top:
 
 - **`shoes-engine`** — an `Engine` driven programmatically. Comes up with no inbounds and
   no users, populated over whatever API the embedder already speaks.
 - **`node-agent`** — the shipped daemon: a drop-in replacement for the Go ACP node agent,
   running shoes where the Go agent embedded sing-box.
 
-`shoes/` is imported verbatim by `git subtree` and never restructured, so upstream merges
-stay mechanical.
+`shoes/` remains subtree-derived from upstream. Integration changes stay focused so
+upstream merges remain reviewable.
 
 ## Engine
 

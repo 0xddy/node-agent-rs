@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    # Upstream shoes, imported verbatim via `git subtree` (prefix: shoes/).
-    # Never restructure this directory -- it must stay mergeable with upstream.
+    # Shoes core, maintained as subtree-derived code (prefix: shoes/).
+    # Keep integration changes focused so upstream merges stay reviewable.
     "shoes",
     # Our additions live outside it.
     "crates/shoes-api",

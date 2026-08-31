@@ -1,16 +1,16 @@
-# shoes-r
+# node-agent-rust
 
 [English](README.md) | 中文
 
 上游 [`shoes`](https://github.com/cfal/shoes) 读一个 YAML 文件，启动全部监听器，然后一直阻塞：
-用户和规则在进程生命周期内固定不变。`shoes-r` 保留这一行为，并在其上增加两样东西，不 fork 上游：
+用户和规则在进程生命周期内固定不变。`node-agent-rust` 保留这一行为，并在其上增加两样东西：
 
 - **`shoes-engine`** —— 可编程驱动的 `Engine`。启动时可以没有任何入站、没有任何用户，之后由
   嵌入方用它自己的 API 填充。
 - **`node-agent`** —— 对外发布的守护进程：Go ACP node agent 的原地替代，数据面用 shoes 取代
   它内嵌的 sing-box。
 
-`shoes/` 由 `git subtree` 原样导入，绝不重构，上游合并因此始终是机械操作。
+`shoes/` 仍基于 `git subtree` 与上游同步；集成改动保持集中，以便持续合并上游更新。
 
 ## Engine
 

@@ -1,6 +1,6 @@
 # Dynamic engine: architecture
 
-How `shoes-r` turns upstream [`shoes`](https://github.com/cfal/shoes) — a config-file
+How `node-agent-rust` turns upstream [`shoes`](https://github.com/cfal/shoes) — a config-file
 CLI — into an engine an API can drive, without making `shoes/` unmergeable.
 
 This is the design record: the boundaries, the invariants, and why each decision went
@@ -22,9 +22,9 @@ We need three things it does not do:
 3. **swap rules and protocol settings** on a running listener without disturbing
    established connections.
 
-And one thing that must not change: `shoes/` is imported verbatim by `git subtree` and
-has to keep absorbing upstream releases. Every line added there is a line a future
-merge has to survive.
+And one thing that must not change: `shoes/` remains subtree-derived and has to keep
+absorbing upstream releases. Every local line there is a line a future merge has to
+survive.
 
 So the governing rule is a seam, not a feature list:
 

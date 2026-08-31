@@ -9,7 +9,7 @@
 切换时可以继续使用原 TOML 文件和原启动参数形态：
 
 ```powershell
-G:\Development\Project\shoes-r\target\release\node-agent.exe C:\path\to\node-agent.toml
+.\target\release\node-agent.exe C:\path\to\node-agent.toml
 ```
 
 唯一的 CLI 例外是 Go 的 `node-agent dev` 本地开发辅助子命令：Rust 版本目前不实现它。该子命令直接加载 sing-box JSON，不参与生产 ACP 会话，也不影响现有生产 TOML 的无缝切换。
@@ -180,8 +180,10 @@ cargo build --release --locked -p node-agent --bin node-agent
 并使用当前 release 产物跑 Go 原仓库的真实 ACP 兼容门禁：
 
 ```powershell
-Set-Location 'G:\Development\Project\国际机场\node-agent\test'
-$env:ACP_RUST_NODE_AGENT_BIN='G:\Development\Project\shoes-r\target\release\node-agent.exe'
+$goPanelTestDir = 'C:\path\to\go-node-agent\test'
+$rustRepo = 'C:\path\to\node-agent-rust'
+Set-Location -LiteralPath $goPanelTestDir
+$env:ACP_RUST_NODE_AGENT_BIN = Join-Path $rustRepo 'target\release\node-agent.exe'
 go test ./cmd/acp-test-panel -run '^TestRustNodeAgentCompatibility$' -count=1 -v
 ```
 
