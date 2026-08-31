@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use http::Response;
-use log::{debug, info};
+use log::{debug, warn};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -425,13 +425,13 @@ async fn handle_h2mux_session_core<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    info!("H2MUX: Starting server session");
+    debug!("H2MUX: Starting server session");
 
     // Wrap with PrependStream if there's initial data from protocol parsing
     let stream = PrependStream::new(stream, initial_data);
     let mut session = H2MuxServerSession::new(stream).await?;
 
-    info!(
+    debug!(
         "H2MUX: Session established (protocol={:?}, padding={})",
         session.protocol(),
         session.padding_enabled()
@@ -482,7 +482,7 @@ async fn handle_h2mux_stream(
     let packet_addr = request.packet_addr;
     let destination = request.destination;
 
-    info!(
+    debug!(
         "H2MUX stream: {} -> {} (udp={}, packet_addr={})",
         if is_udp { "UDP" } else { "TCP" },
         destination,
@@ -527,21 +527,25 @@ async fn handle_h2mux_tcp(
     // and HTTP Host rules cannot be bypassed merely by enabling multiplexing.
     let (sniffed, replay) = sniff_h2mux_tcp(&mut stream, &proxy_selector).await?;
     let action = match sniffed {
-        Some(metadata) => {
-            proxy_selector
-                .judge_sniffed_tcp(
-                    destination.clone().into(),
-                    &resolver,
-                    metadata.protocol,
-                    metadata.domain,
-                )
-                .await?
-        }
-        None => {
-            proxy_selector
-                .judge_tcp(destination.clone().into(), &resolver)
-                .await?
-        }
+        Some(metadata) => proxy_selector
+            .judge_sniffed_tcp(
+                destination.clone().into(),
+                &resolver,
+                metadata.protocol,
+                metadata.domain,
+            )
+            .await
+            .map_err(|error| {
+                warn!("H2MUX TCP route selection for {destination} failed: {error}");
+                error
+            })?,
+        None => proxy_selector
+            .judge_tcp(destination.clone().into(), &resolver)
+            .await
+            .map_err(|error| {
+                warn!("H2MUX TCP route selection for {destination} failed: {error}");
+                error
+            })?,
     };
 
     match action {
@@ -554,7 +558,13 @@ async fn handle_h2mux_tcp(
             let TcpClientSetupResult {
                 mut client_stream,
                 early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
+            } = chain_group
+                .connect_tcp(remote_location.clone(), &resolver)
+                .await
+                .map_err(|error| {
+                    warn!("H2MUX outbound TCP connect to {remote_location} failed: {error}");
+                    error
+                })?;
 
             // A chained HTTP CONNECT/SOCKS handshake may read target bytes in the
             // same packet as its success response. Deliver those bytes before the
@@ -635,8 +645,12 @@ async fn handle_h2mux_udp(
     debug!("H2MUX UDP fixed: {}", destination);
 
     let action = proxy_selector
-        .judge_udp(destination.into(), &resolver)
-        .await?;
+        .judge_udp(destination.clone().into(), &resolver)
+        .await
+        .map_err(|error| {
+            warn!("H2MUX UDP route selection for {destination} failed: {error}");
+            error
+        })?;
 
     match action {
         ConnectDecision::Allow {
@@ -645,8 +659,12 @@ async fn handle_h2mux_udp(
         } => {
             // Connect to destination
             let client_stream = chain_group
-                .connect_udp_bidirectional(&resolver, remote_location)
-                .await?;
+                .connect_udp_bidirectional(&resolver, remote_location.clone())
+                .await
+                .map_err(|error| {
+                    warn!("H2MUX outbound UDP connect to {remote_location} failed: {error}");
+                    error
+                })?;
 
             // Wrap in VlessMessageStream for length-prefixed packets
             let server_stream = VlessMessageStream::new(Box::new(stream));

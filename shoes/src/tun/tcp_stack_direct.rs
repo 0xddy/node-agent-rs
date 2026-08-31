@@ -493,7 +493,7 @@ fn run_direct_stack_thread(
                                         continue;
                                     }
 
-                                    info!("New TCP SYN: {} -> {}", src_addr, dst_addr);
+                                    debug!("New TCP SYN: {} -> {}", src_addr, dst_addr);
 
                                     if let Some((new_conn, control)) = create_tcp_connection(
                                         src_addr,

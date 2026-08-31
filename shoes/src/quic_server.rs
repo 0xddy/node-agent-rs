@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use log::{debug, error};
+use log::{debug, warn};
 use quinn::EndpointConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
@@ -36,8 +36,8 @@ use crate::tcp::tcp_handler::{
     TcpServerSetupResult, UnauthenticatedFallbackCompletion,
 };
 use crate::tcp::tcp_server::{
-    ResolvedBind, run_udp_copy, setup_client_tcp_stream_with_metadata,
-    sniff_tcp_after_success_response,
+    ResolvedBind, apply_client_early_data, client_stream_setup_error, client_stream_setup_timeout,
+    prepare_client_tcp_stream_with_metadata, run_udp_copy, sniff_tcp_after_success_response,
 };
 use crate::tcp::tcp_server_handler_factory::create_tcp_server_handler_with_replay_state;
 
@@ -372,7 +372,7 @@ async fn start_quic_server(
                     )
                     .await
                     {
-                        error!("Connection ended with error: {e}");
+                        debug!("QUIC connection from {remote_ip} ended: {e}");
                     }
                 });
             }
@@ -544,7 +544,7 @@ async fn process_connection(
             )
             .await
             {
-                error!("Failed to process streams: {e}");
+                debug!("QUIC stream ended: {e}");
             }
         });
     }
@@ -651,8 +651,7 @@ async fn serve_stream(
             .await?;
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_tcp_stream_with_metadata(
-                    &mut server_stream,
+                prepare_client_tcp_stream_with_metadata(
                     proxy_selector,
                     resolver,
                     remote_location.clone(),
@@ -660,7 +659,7 @@ async fn serve_stream(
                 ),
             );
 
-            let mut client_stream = match setup_client_stream_future.await {
+            let client_setup = match setup_client_stream_future.await {
                 Ok(Ok(Some(s))) => s,
                 Ok(Ok(None)) => {
                     // Must have been blocked.
@@ -669,19 +668,15 @@ async fn serve_stream(
                 }
                 Ok(Err(e)) => {
                     let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
+                    return Err(client_stream_setup_error(&remote_location, e));
                 }
                 Err(elapsed) => {
                     let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
+                    return Err(client_stream_setup_timeout(&remote_location, elapsed));
                 }
             };
+            let mut client_stream =
+                apply_client_early_data(&mut server_stream, client_setup).await?;
 
             if let Some(data) = connection_success_response {
                 server_stream.write_all(&data).await?;
@@ -715,17 +710,30 @@ async fn serve_stream(
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
-            let action = proxy_selector
+            let requested_location = remote_location.clone();
+            let action = match proxy_selector
                 .judge_udp(remote_location.into(), &resolver)
-                .await?;
+                .await
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    warn!("UDP routing for {requested_location} failed: {error}");
+                    return Err(error);
+                }
+            };
             match action {
                 ConnectDecision::Allow {
                     chain_group,
                     remote_location,
                 } => {
+                    let outbound_location = remote_location.clone();
                     let client_stream = chain_group
                         .connect_udp_bidirectional(&resolver, remote_location)
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            warn!("UDP outbound setup to {outbound_location} failed: {error}");
+                            error
+                        })?;
 
                     run_udp_copy(
                         server_stream,

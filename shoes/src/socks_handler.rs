@@ -400,7 +400,7 @@ async fn handle_udp_associate(
     let udp_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
 
     let bound_addr = udp_socket.local_addr()?;
-    log::info!("SOCKS5 UDP ASSOCIATE: bound UDP relay at {}", bound_addr);
+    log::debug!("SOCKS5 UDP ASSOCIATE: bound UDP relay at {}", bound_addr);
 
     let response = build_udp_associate_response(bound_addr);
     write_all(&mut server_stream, &response).await?;

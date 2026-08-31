@@ -1697,8 +1697,10 @@ mod tests {
         let udp_echo_address = udp_echo.local_addr().unwrap();
         let udp_echo_task = tokio::spawn(async move {
             let mut data = [0_u8; 4096];
-            let (length, peer) = udp_echo.recv_from(&mut data).await.unwrap();
-            udp_echo.send_to(&data[..length], peer).await.unwrap();
+            for _ in 0..2 {
+                let (length, peer) = udp_echo.recv_from(&mut data).await.unwrap();
+                udp_echo.send_to(&data[..length], peer).await.unwrap();
+            }
         });
 
         // The accept task owns the actual bind.  One yield is sufficient in the
@@ -1777,6 +1779,22 @@ mod tests {
             )
             .await
             .expect("open Hysteria2 UDP request");
+
+        let fragmented_payload = vec![0x5a; 2048];
+        poll_fn(|cx| Pin::new(&mut *proxied_udp).poll_write_message(cx, &fragmented_payload))
+            .await
+            .unwrap();
+        let mut fragmented_reply = [0_u8; 4096];
+        let mut fragmented_reply = ReadBuf::new(&mut fragmented_reply);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            poll_fn(|cx| Pin::new(&mut *proxied_udp).poll_read_message(cx, &mut fragmented_reply)),
+        )
+        .await
+        .expect("fragmented UDP echo timeout")
+        .unwrap();
+        assert_eq!(fragmented_reply.filled(), fragmented_payload);
+
         poll_fn(|cx| Pin::new(&mut *proxied_udp).poll_write_message(cx, b"udp-round-trip"))
             .await
             .unwrap();

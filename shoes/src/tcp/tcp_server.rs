@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, error};
+use log::{debug, error, warn};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -126,7 +126,7 @@ async fn run_tcp_server(
             )
             .await
             {
-                error!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
+                debug!("{}:{} finished with error: {:?}", addr.ip(), addr.port(), e);
             } else {
                 debug!("{}:{} finished successfully", addr.ip(), addr.port());
             }
@@ -214,7 +214,7 @@ async fn run_unix_server(
             )
             .await
             {
-                error!("{addr:?} finished with error: {e:?}");
+                debug!("{addr:?} finished with error: {e:?}");
             } else {
                 debug!("{addr:?} finished successfully");
             }
@@ -386,8 +386,7 @@ where
             .await?;
             let setup_client_stream_future = timeout(
                 Duration::from_secs(60),
-                setup_client_tcp_stream_with_metadata(
-                    &mut server_stream,
+                prepare_client_tcp_stream_with_metadata(
                     proxy_selector,
                     resolver,
                     remote_location.clone(),
@@ -395,7 +394,7 @@ where
                 ),
             );
 
-            let mut client_stream = match setup_client_stream_future.await {
+            let client_setup = match setup_client_stream_future.await {
                 Ok(Ok(Some(s))) => s,
                 Ok(Ok(None)) => {
                     // Must have been blocked.
@@ -404,19 +403,15 @@ where
                 }
                 Ok(Err(e)) => {
                     let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to setup client stream to {remote_location}: {e}"),
-                    ));
+                    return Err(client_stream_setup_error(&remote_location, e));
                 }
                 Err(elapsed) => {
                     let _ = server_stream.shutdown().await;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("client setup to {remote_location} timed out: {elapsed}"),
-                    ));
+                    return Err(client_stream_setup_timeout(&remote_location, elapsed));
                 }
             };
+            let mut client_stream =
+                apply_client_early_data(&mut server_stream, client_setup).await?;
 
             if let Some(data) = connection_success_response {
                 write_all(&mut server_stream, &data).await?;
@@ -450,17 +445,30 @@ where
             need_initial_flush: server_need_initial_flush,
             proxy_selector,
         } => {
-            let action = proxy_selector
+            let requested_location = remote_location.clone();
+            let action = match proxy_selector
                 .judge_udp(remote_location.into(), &resolver)
-                .await?;
+                .await
+            {
+                Ok(action) => action,
+                Err(error) => {
+                    warn!("UDP routing for {requested_location} failed: {error}");
+                    return Err(error);
+                }
+            };
             match action {
                 ConnectDecision::Allow {
                     chain_group,
                     remote_location,
                 } => {
+                    let outbound_location = remote_location.clone();
                     let client_stream = chain_group
                         .connect_udp_bidirectional(&resolver, remote_location)
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            warn!("UDP outbound setup to {outbound_location} failed: {error}");
+                            error
+                        })?;
 
                     run_udp_copy(
                         server_stream,
@@ -589,24 +597,58 @@ pub async fn setup_client_tcp_stream(
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
 ) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    setup_client_tcp_stream_with_metadata(
-        server_stream,
+    let Some(setup) = prepare_client_tcp_stream_with_metadata(
         client_proxy_selector,
         resolver,
         remote_location,
         None,
     )
-    .await
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    apply_client_early_data(server_stream, setup)
+        .await
+        .map(Some)
 }
 
-pub(crate) async fn setup_client_tcp_stream_with_metadata(
-    server_stream: &mut Box<dyn AsyncStream>,
+/// Preserve the original kind while adding the destination to the error returned
+/// to the debug-only connection boundary. The actual routing or dial failure is
+/// logged at its source below, before peer-side writes can become involved.
+pub(crate) fn client_stream_setup_error(
+    remote_location: &NetLocation,
+    error: std::io::Error,
+) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("failed to setup client stream to {remote_location}: {error}"),
+    )
+}
+
+pub(crate) fn client_stream_setup_timeout(
+    remote_location: &NetLocation,
+    elapsed: tokio::time::error::Elapsed,
+) -> std::io::Error {
+    warn!("TCP outbound setup to {remote_location} timed out: {elapsed}");
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("client setup to {remote_location} timed out: {elapsed}"),
+    )
+}
+
+/// Resolve policy and establish the outbound side only. Keeping peer-side early
+/// data delivery out of this future lets callers put a precise timeout around DNS,
+/// routing and dialing without misreporting a stalled inbound write as an outbound
+/// setup timeout.
+pub(crate) async fn prepare_client_tcp_stream_with_metadata(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     remote_location: NetLocation,
     metadata: Option<SniffedTcpMetadata>,
-) -> std::io::Result<Option<Box<dyn AsyncStream>>> {
-    let action = match metadata {
+) -> std::io::Result<Option<TcpClientSetupResult>> {
+    let requested_location = remote_location.clone();
+    let action_result = match metadata {
         Some(metadata) => {
             client_proxy_selector
                 .judge_sniffed_tcp(
@@ -615,12 +657,20 @@ pub(crate) async fn setup_client_tcp_stream_with_metadata(
                     metadata.protocol,
                     metadata.domain,
                 )
-                .await?
+                .await
         }
         None => {
             client_proxy_selector
                 .judge_tcp(remote_location.into(), &resolver)
-                .await?
+                .await
+        }
+    };
+
+    let action = match action_result {
+        Ok(action) => action,
+        Err(error) => {
+            warn!("TCP outbound routing for {requested_location} failed: {error}");
+            return Err(error);
         }
     };
 
@@ -629,20 +679,45 @@ pub(crate) async fn setup_client_tcp_stream_with_metadata(
             chain_group,
             remote_location,
         } => {
-            let TcpClientSetupResult {
-                client_stream,
-                early_data,
-            } = chain_group.connect_tcp(remote_location, &resolver).await?;
-
-            if let Some(data) = early_data {
-                server_stream.write_all(&data).await?;
-                server_stream.flush().await?;
-            }
-
-            Ok(Some(client_stream))
+            let outbound_location = remote_location.clone();
+            let setup = chain_group
+                .connect_tcp(remote_location, &resolver)
+                .await
+                .map_err(|error| {
+                    warn!("TCP outbound setup to {outbound_location} failed: {error}");
+                    error
+                })?;
+            Ok(Some(setup))
         }
         ConnectDecision::Block => Ok(None),
     }
+}
+
+pub(crate) async fn apply_client_early_data(
+    server_stream: &mut Box<dyn AsyncStream>,
+    setup: TcpClientSetupResult,
+) -> std::io::Result<Box<dyn AsyncStream>> {
+    let TcpClientSetupResult {
+        client_stream,
+        early_data,
+    } = setup;
+    if let Some(data) = early_data {
+        // This is a write back to the inbound peer, not part of outbound setup.
+        // Keep its resource bound separate so a stalled peer is not reported as
+        // a routing or dial failure at production log levels.
+        timeout(Duration::from_secs(60), async {
+            server_stream.write_all(&data).await?;
+            server_stream.flush().await
+        })
+        .await
+        .map_err(|elapsed| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("writing proxy early data to inbound peer timed out: {elapsed}"),
+            )
+        })??;
+    }
+    Ok(client_stream)
 }
 
 /// Unified function to run the appropriate UDP copy based on the setup result.

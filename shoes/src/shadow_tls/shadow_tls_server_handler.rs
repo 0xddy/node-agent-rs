@@ -205,6 +205,7 @@ async fn shadowtls_fallback_to_handshake_server(
         .connect_tcp(location.clone().into(), resolver)
         .await
         .map_err(|e| {
+            log::warn!("SHADOWTLS FALLBACK: Failed to connect to handshake server {location}: {e}");
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("SHADOWTLS FALLBACK: Failed to connect to handshake server: {e}"),
@@ -222,8 +223,20 @@ async fn shadowtls_fallback_to_handshake_server(
         client_hello_bytes.len()
     );
 
-    write_all(&mut handshake_stream, client_hello_bytes).await?;
-    handshake_stream.flush().await?;
+    write_all(&mut handshake_stream, client_hello_bytes)
+        .await
+        .map_err(|error| {
+            log::warn!(
+                "SHADOWTLS FALLBACK: Failed to send ClientHello to handshake server {location}: {error}"
+            );
+            error
+        })?;
+    handshake_stream.flush().await.map_err(|error| {
+        log::warn!(
+            "SHADOWTLS FALLBACK: Failed to flush ClientHello to handshake server {location}: {error}"
+        );
+        error
+    })?;
 
     log::debug!("SHADOWTLS FALLBACK: ClientHello forwarded, spawning bidirectional copy");
 
@@ -271,7 +284,7 @@ pub async fn setup_shadowtls_server_stream(
                 ref client_chain,
             } = target.handshake
             {
-                log::warn!(
+                log::debug!(
                     "ShadowTLS authentication failed, falling back to handshake server: {} - reason: {}",
                     location,
                     e
@@ -696,6 +709,8 @@ async fn setup_remote_handshake(
 ) -> std::io::Result<ShadowTlsStream> {
     use crate::tcp::tcp_handler::TcpClientSetupResult;
 
+    let remote_location = remote_addr.clone();
+
     // The TLS handshake server is called client_stream (we are a client to it).
     let TcpClientSetupResult {
         mut client_stream,
@@ -704,6 +719,9 @@ async fn setup_remote_handshake(
         .connect_tcp(remote_addr.into(), resolver)
         .await
         .map_err(|e| {
+            log::warn!(
+                "ShadowTLS failed to connect to remote handshake server {remote_location}: {e}"
+            );
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("failed to connect to remote handshake server: {e}"),
@@ -713,12 +731,18 @@ async fn setup_remote_handshake(
     write_all(&mut client_stream, &client_hello_frame)
         .await
         .map_err(|e| {
+            log::warn!(
+                "ShadowTLS failed to send ClientHello to remote handshake server {remote_location}: {e}"
+            );
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 format!("failed to send ClientHello to remote server: {e}"),
             )
         })?;
     client_stream.flush().await.map_err(|e| {
+        log::warn!(
+            "ShadowTLS failed to flush ClientHello to remote handshake server {remote_location}: {e}"
+        );
         std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             format!("failed to flush ClientHello to remote server: {e}"),
@@ -730,6 +754,9 @@ async fn setup_remote_handshake(
         .read_slice(&mut client_stream, TLS_HEADER_LEN)
         .await
         .map_err(|e| {
+            log::warn!(
+                "ShadowTLS failed to read ServerHello header from remote handshake server {remote_location}: {e}"
+            );
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 format!("failed to read ServerHello header from remote server: {e}"),
@@ -746,6 +773,9 @@ async fn setup_remote_handshake(
         .read_slice(&mut client_stream, server_payload_size as usize)
         .await
         .map_err(|e| {
+            log::warn!(
+                "ShadowTLS failed to read ServerHello payload from remote handshake server {remote_location} (size: {server_payload_size}): {e}"
+            );
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 format!(
@@ -757,6 +787,9 @@ async fn setup_remote_handshake(
 
     let ParsedServerHello { server_random, .. } = parse_validated_server_hello(&server_hello_frame)
         .map_err(|e| {
+            log::warn!(
+                "ShadowTLS failed to parse ServerHello from remote handshake server {remote_location}: {e}"
+            );
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("failed to parse ServerHello from remote server: {e}"),

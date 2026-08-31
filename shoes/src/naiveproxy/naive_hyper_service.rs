@@ -396,7 +396,7 @@ async fn naive_service(
     let destination = match parse_connect_destination(&req) {
         Some(dest) => dest,
         None => {
-            log::warn!("NaiveProxy: invalid CONNECT destination");
+            log::debug!("NaiveProxy: rejecting invalid CONNECT destination");
             return Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(empty_body())

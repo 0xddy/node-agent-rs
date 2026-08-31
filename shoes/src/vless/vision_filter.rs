@@ -129,7 +129,7 @@ impl VisionFilter {
                         // Check if cipher is supported for XTLS
                         // Following Xray-core: all TLS 1.3 ciphers EXCEPT 0x1305 support XTLS
                         if parsed.cipher_suite == TLS13_CIPHER_AES_128_CCM_8_SHA256 {
-                            log::warn!(
+                            log::debug!(
                                 "VISION: TLS 1.3 detected but cipher 0x{:04x} (TLS_AES_128_CCM_8_SHA256) not supported for XTLS",
                                 parsed.cipher_suite
                             );

@@ -2137,7 +2137,7 @@ fn compile_inbound(
                 node.node_id, node.provider_id, node.provider_config_version
             )))
         }
-        VLESS_REALITY_VISION_ID => compile_vless(node, warnings),
+        VLESS_REALITY_VISION_ID => compile_vless(node),
         HYSTERIA2_SALAMANDER_ID => compile_hysteria2(node, warnings),
         _ => Err(CompileError::new(format!(
             "node {} has unsupported provider {:?}",
@@ -2170,10 +2170,7 @@ fn active_users(users: &[UserCredential]) -> impl Iterator<Item = &UserCredentia
     users.iter().filter(|user| user.status != "disabled")
 }
 
-fn compile_vless(
-    node: &NodeInstance,
-    warnings: &mut BTreeSet<String>,
-) -> Result<CompiledInbound, CompileError> {
+fn compile_vless(node: &NodeInstance) -> Result<CompiledInbound, CompileError> {
     let cfg: VlessRealityVisionConfig = node.provider_config.parse().map_err(|error| {
         CompileError::new(format!(
             "node {} decode vless provider config: {error}",
@@ -2217,12 +2214,6 @@ fn compile_vless(
             "node {} enables tcp_fast_open, which is not configurable on a shoes inbound",
             node.node_id
         )));
-    }
-    if !cfg.outbounds.is_empty() {
-        warnings.insert(format!(
-            "node {} provider-local outbounds are not consumed by either provider adapter",
-            node.node_id
-        ));
     }
     let dest = socket_address(
         &cfg.tls.reality.handshake.server,
@@ -2343,13 +2334,6 @@ fn compile_hysteria2(
             node.node_id, cfg.port_hopping
         ));
     }
-    if !cfg.outbounds.is_empty() {
-        warnings.insert(format!(
-            "node {} provider-local outbounds are not consumed by either provider adapter",
-            node.node_id
-        ));
-    }
-
     let mut protocol = Map::from_iter([
         ("type".to_string(), json!("hysteria2")),
         ("udp_enabled".to_string(), json!(true)),

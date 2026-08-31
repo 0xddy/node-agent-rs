@@ -76,6 +76,7 @@ pub async fn setup_reality_server_stream(
         .connect_tcp(target.dest.clone().into(), resolver)
         .await
         .map_err(|e| {
+            log::warn!("REALITY: Failed to connect to dest {}: {}", target.dest, e);
             std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("REALITY: Failed to connect to dest {}: {}", target.dest, e),
@@ -93,11 +94,27 @@ pub async fn setup_reality_server_stream(
         client_hello_frame.len()
     );
 
-    write_all(&mut dest_stream, client_hello_frame).await?;
-    dest_stream.flush().await?;
+    write_all(&mut dest_stream, client_hello_frame)
+        .await
+        .map_err(|error| {
+            log::warn!(
+                "REALITY: Failed to send ClientHello to dest {}: {}",
+                target.dest,
+                error
+            );
+            error
+        })?;
+    dest_stream.flush().await.map_err(|error| {
+        log::warn!(
+            "REALITY: Failed to flush ClientHello to dest {}: {}",
+            target.dest,
+            error
+        );
+        error
+    })?;
 
     if !parsed_client_hello.supports_tls13 {
-        log::warn!("REALITY: Client does not support TLS 1.3, falling back to dest");
+        log::debug!("REALITY: Client does not support TLS 1.3, falling back to dest");
         let completion = start_forward_to_dest(server_stream, dest_stream, vec![], Bytes::new());
         return Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled(
             completion,
@@ -125,10 +142,15 @@ pub async fn setup_reality_server_stream(
     let mut dest_records: Vec<Bytes> = Vec::new();
     let mut buf = allocate_vec(8192).into_boxed_slice();
     let mut dest_handshake_success = false;
+    let mut dest_record_parse_error = None;
 
     loop {
         let new_records = match timeout_at(deadline, dest_stream.read(&mut buf)).await {
             Ok(Ok(0)) => {
+                log::warn!(
+                    "REALITY: Dest {} closed during the TLS handshake",
+                    target.dest
+                );
                 return Err(std::io::Error::other(
                     "REALITY: Dest connection closed during TLS handshake",
                 ));
@@ -138,12 +160,17 @@ pub async fn setup_reality_server_stream(
                 match deframer.next_records() {
                     Ok(records) => records,
                     Err(e) => {
-                        log::error!("REALITY: Error parsing dest records: {}", e);
+                        dest_record_parse_error = Some(e.to_string());
                         break;
                     }
                 }
             }
             Ok(Err(e)) => {
+                log::warn!(
+                    "REALITY: Failed to read TLS handshake from dest {}: {}",
+                    target.dest,
+                    e
+                );
                 return Err(std::io::Error::other(format!(
                     "REALITY: Error reading from dest: {}",
                     e
@@ -160,7 +187,7 @@ pub async fn setup_reality_server_stream(
             match parse_server_hello(&new_records[0]) {
                 Ok(parsed) => {
                     if !parsed.is_tls13 {
-                        log::error!(
+                        log::warn!(
                             "REALITY: Dest {} is TLS 1.2, falling back to transparent forward",
                             target.dest
                         );
@@ -177,7 +204,7 @@ pub async fn setup_reality_server_stream(
                     log::debug!("REALITY: Dest confirmed TLS 1.3");
                 }
                 Err(e) => {
-                    log::error!("REALITY: Failed to parse dest ServerHello: {}", e);
+                    log::warn!("REALITY: Failed to parse dest ServerHello: {}", e);
                     let completion = start_forward_to_dest(
                         server_stream,
                         dest_stream,
@@ -222,10 +249,18 @@ pub async fn setup_reality_server_stream(
     let remaining_data = deframer.into_remaining_data();
 
     if !dest_handshake_success {
-        log::warn!(
-            "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
-            dest_records.len()
-        );
+        if let Some(error) = dest_record_parse_error {
+            log::warn!(
+                "REALITY: Failed to parse TLS records from dest {}: {}; falling back to transparent forward",
+                target.dest,
+                error
+            );
+        } else {
+            log::warn!(
+                "REALITY: Dest handshake failed (got {} records), falling back to transparent forward",
+                dest_records.len()
+            );
+        }
         let completion =
             start_forward_to_dest(server_stream, dest_stream, dest_records, remaining_data);
         return Ok(TcpServerSetupResult::UnauthenticatedFallbackHandled(
@@ -239,11 +274,17 @@ pub async fn setup_reality_server_stream(
         remaining_data.len()
     );
 
-    // Branch based on auth result. We don't short circuit on permission denied before the
-    // read loop above so that the timing is always the same.
+    // Branch based on auth result. Permission failures and malformed authentication
+    // material are both peer-controlled probe outcomes, so forward them to the
+    // configured destination without raising a production error.
     match auth_result {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            log::warn!(
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            log::debug!(
                 "REALITY: Auth failed ({}), forwarding to dest transparently",
                 e
             );

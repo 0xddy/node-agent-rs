@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::future::poll_fn;
-use log::{debug, error};
+use log::{debug, warn};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngExt};
 use rustc_hash::FxHashMap;
@@ -123,7 +123,10 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::handshake_gate::{
     HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
 };
-use crate::tcp::tcp_server::setup_client_tcp_stream_with_metadata;
+use crate::tcp::tcp_server::{
+    apply_client_early_data, client_stream_setup_error, client_stream_setup_timeout,
+    prepare_client_tcp_stream_with_metadata,
+};
 use crate::util::allocate_vec;
 
 /// The accounting record for one authenticated QUIC connection, or `None` when the
@@ -216,6 +219,103 @@ fn checked_response_fragment_count(
 #[inline]
 fn udp_response_send_allowed(cancel_token: &CancellationToken) -> bool {
     !cancel_token.is_cancelled()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpResponseSendOutcome {
+    Sent,
+    Cancelled,
+    DroppedTooLarge {
+        planned_max_datagram_size: usize,
+        current_max_datagram_size: Option<usize>,
+        attempted_datagram_len: usize,
+        fragment_id: u8,
+        fragment_count: u8,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_udp_response_with<M, S>(
+    session_id: u32,
+    meter: &Meter,
+    packet_id: u16,
+    source: &NetLocation,
+    payload: &[u8],
+    cancel_token: &CancellationToken,
+    mut max_datagram_size: M,
+    mut send_datagram: S,
+) -> std::io::Result<UdpResponseSendOutcome>
+where
+    M: FnMut() -> Option<usize>,
+    S: FnMut(Bytes) -> Result<(), quinn::SendDatagramError>,
+{
+    // Quinn's application datagram limit can change with the path MTU. Take one
+    // fresh snapshot for this logical packet so every fragment uses the same
+    // boundaries and fragment count.
+    let planned_max_datagram_size = max_datagram_size()
+        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
+    let payload_len = payload.len();
+    let address_bytes: Bytes = source.to_string().into_bytes().into();
+    let address_len_bytes: Bytes = encode_varint(address_bytes.len() as u64)?.into();
+
+    // session id (4) + packet id (2) + fragment id (1) + fragment count (1)
+    // + address length varint + address bytes
+    let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
+    if planned_max_datagram_size <= header_overhead {
+        return Err(std::io::Error::other(format!(
+            "the requested destination needs {header_overhead} header bytes, which does not \
+             fit a {planned_max_datagram_size} byte datagram"
+        )));
+    }
+
+    let available_payload = planned_max_datagram_size - header_overhead;
+    let fragment_count = if payload_len <= available_payload {
+        1
+    } else {
+        checked_response_fragment_count(payload_len, available_payload)?
+    };
+
+    for fragment_id in 0..fragment_count {
+        let start = (fragment_id as usize) * available_payload;
+        let end = std::cmp::min(start + available_payload, payload_len);
+        let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
+        datagram.extend_from_slice(&session_id.to_be_bytes());
+        datagram.extend_from_slice(&packet_id.to_be_bytes());
+        datagram.extend_from_slice(&[fragment_id, fragment_count]);
+        datagram.extend_from_slice(&address_len_bytes);
+        datagram.extend_from_slice(&address_bytes);
+        datagram.extend_from_slice(&payload[start..end]);
+
+        if !udp_response_send_allowed(cancel_token) {
+            return Ok(UdpResponseSendOutcome::Cancelled);
+        }
+        let datagram = datagram.freeze();
+        let datagram_len = datagram.len();
+        match send_datagram(datagram) {
+            Ok(()) => {}
+            // A path-MTU change between the snapshot above and this write is a
+            // loss of this UDP packet, not a failure of the association.
+            Err(quinn::SendDatagramError::TooLarge) => {
+                return Ok(UdpResponseSendOutcome::DroppedTooLarge {
+                    planned_max_datagram_size,
+                    current_max_datagram_size: max_datagram_size(),
+                    attempted_datagram_len: datagram_len,
+                    fragment_id,
+                    fragment_count,
+                });
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "Failed to send datagram fragment {fragment_id}: {error}"
+                )));
+            }
+        }
+        if let Some(meter) = meter {
+            meter.count_datagram_tx(datagram_len).await;
+        }
+    }
+
+    Ok(UdpResponseSendOutcome::Sent)
 }
 
 #[derive(Clone)]
@@ -334,7 +434,6 @@ async fn process_connection(
             return Err(e);
         }
         Err(_elapsed) => {
-            error!("Authentication timeout");
             connection.close(CLOSE_ERR_CODE_OK.into(), b"auth timeout");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -406,8 +505,7 @@ async fn process_connection(
     cancel_token.cancel();
 
     // Per sing-box reference (service.go:277-293), close connection on error
-    if let Err(ref e) = result {
-        error!("Connection failed: {e}");
+    if result.is_err() {
         connection.close(CLOSE_ERR_CODE_OK.into(), b"");
     }
 
@@ -889,6 +987,7 @@ impl UdpSession {
             cancel_token: session_cancel_token.clone(),
         };
 
+        let remote_ip = connection.remote_address().ip();
         tokio::spawn(async move {
             let result = run_udp_session_worker(
                 session_id,
@@ -904,7 +1003,7 @@ impl UdpSession {
             .await;
 
             if let Err(e) = result {
-                error!("Hysteria2 UDP association {session_id} ended with error: {e}");
+                debug!("Hysteria2 UDP association {session_id} from {remote_ip} ended: {e}");
             }
         });
 
@@ -938,17 +1037,31 @@ async fn connect_udp_target(
     resolver: &Arc<dyn Resolver>,
     remote_location: NetLocation,
 ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-    match client_proxy_selector
+    let requested_location = remote_location.clone();
+    let decision = match client_proxy_selector
         .judge_udp(remote_location.into(), resolver)
-        .await?
+        .await
     {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!("Hysteria2 UDP routing for {requested_location} failed: {error}");
+            return Err(error);
+        }
+    };
+
+    match decision {
         ConnectDecision::Allow {
             chain_group,
             remote_location,
         } => {
+            let outbound_location = remote_location.clone();
             chain_group
                 .connect_udp_bidirectional(resolver, remote_location)
                 .await
+                .map_err(|error| {
+                    warn!("Hysteria2 UDP outbound setup to {outbound_location} failed: {error}");
+                    error
+                })
         }
         ConnectDecision::Block => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1256,10 +1369,6 @@ async fn run_udp_session_worker(
     last_activity: Arc<Mutex<std::time::Instant>>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    let max_datagram_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| std::io::Error::other("datagram not supported by remote endpoint"))?;
-
     let mut next_packet_id: u16 = 0;
     let mut targets: FxHashMap<NetLocation, UdpTargetWorker> = FxHashMap::default();
     let mut use_counter = 0u64;
@@ -1323,7 +1432,10 @@ async fn run_udp_session_worker(
                 generation,
                 error,
             } => {
-                error!("Hysteria2 UDP target {remote_location} ended: {error}");
+                debug!(
+                    "Hysteria2 UDP target {remote_location} for association {session_id} from {} ended: {error}",
+                    connection.remote_address().ip()
+                );
                 if targets
                     .get(&remote_location)
                     .is_some_and(|target| target.generation == generation)
@@ -1336,8 +1448,6 @@ async fn run_udp_session_worker(
         if cancel_token.is_cancelled() {
             return Ok(());
         }
-        let payload_len = payload.len();
-
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.wrapping_add(1);
 
@@ -1345,83 +1455,37 @@ async fn run_udp_session_worker(
         // (for a proxy its transport peer is the proxy). Echo the address the HY2
         // client associated with this stream, which is also what preserves a
         // hostname or a routing rewrite on replies.
-        let address_bytes: Bytes = remote_location.to_string().into_bytes().into();
-        let address_len_bytes: Bytes = encode_varint(address_bytes.len() as u64)?.into();
-
-        // session_id(4) + packet_id(2) + fragment id(1) + fragment count(1) + address length varint + address bytes
-        let header_overhead = 4 + 2 + 1 + 1 + address_len_bytes.len() + address_bytes.len();
-
-        // Not an assertion, because `header_overhead` is not a fact about this
-        // program: the address in it is the location the *client* asked for, echoed
-        // back so it recognises the reply, and this inbound accepts one of up to 2048
-        // bytes while a QUIC datagram holds barely more than an MTU. A client that
-        // names a destination longer than the datagram it must be announced in makes
-        // this arithmetic underflow one line below, and a panic there would be a
-        // remote client deciding when a task on this server dies.
-        //
-        // The address is fixed for the session's lifetime, so this cannot come right
-        // on a later packet: end the loop and let the reaper collect the session.
-        if max_datagram_size <= header_overhead {
-            return Err(std::io::Error::other(format!(
-                "the requested destination needs {header_overhead} header bytes, which does not \
-                 fit a {max_datagram_size} byte datagram"
-            )));
-        }
-
-        if header_overhead + payload_len <= max_datagram_size {
-            let mut datagram = BytesMut::with_capacity(header_overhead + payload_len);
-            datagram.extend_from_slice(&session_id.to_be_bytes());
-            datagram.extend_from_slice(&packet_id.to_be_bytes());
-            // fragment id = 0, fragment count = 1
-            datagram.extend_from_slice(&[0, 1]);
-            datagram.extend_from_slice(&address_len_bytes);
-            datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&payload);
-
-            // Counted after the send, and by datagram length rather than payload
-            // length, so the session and address headers the client is charged for
-            // receiving are the ones actually put on the wire.
-            let datagram = datagram.freeze();
-            let datagram_len = datagram.len();
-            if !udp_response_send_allowed(&cancel_token) {
-                return Ok(());
-            }
-            connection
-                .send_datagram(datagram)
-                .map_err(|e| std::io::Error::other(format!("Failed to send datagram: {e}")))?;
-            if let Some(meter) = &meter {
-                meter.count_datagram_tx(datagram_len).await;
-            }
-        } else {
-            let available_payload = max_datagram_size - header_overhead;
-            let fragment_count = checked_response_fragment_count(payload_len, available_payload)?;
-            for fragment_id in 0..fragment_count {
-                let start = (fragment_id as usize) * available_payload;
-                let end = std::cmp::min(start + available_payload, payload_len);
-                let mut datagram = BytesMut::with_capacity(header_overhead + (end - start));
-                datagram.extend_from_slice(&session_id.to_be_bytes());
-                datagram.extend_from_slice(&packet_id.to_be_bytes());
-                datagram.extend_from_slice(&[fragment_id, fragment_count]);
-                datagram.extend_from_slice(&address_len_bytes);
-                datagram.extend_from_slice(&address_bytes);
-                datagram.extend_from_slice(&payload[start..end]);
-
-                let datagram = datagram.freeze();
-                let datagram_len = datagram.len();
-                // Metering the previous fragment is asynchronous. Cancellation
-                // may arrive while it is awaited, so every fragment rechecks
-                // immediately before its own wire write.
-                if !udp_response_send_allowed(&cancel_token) {
-                    return Ok(());
-                }
-                connection.send_datagram(datagram).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Failed to send datagram fragment {fragment_id}: {e}"
-                    ))
-                })?;
-                if let Some(meter) = &meter {
-                    meter.count_datagram_tx(datagram_len).await;
-                }
+        match send_udp_response_with(
+            session_id,
+            &meter,
+            packet_id,
+            &remote_location,
+            &payload,
+            &cancel_token,
+            || connection.max_datagram_size(),
+            |datagram| connection.send_datagram(datagram),
+        )
+        .await?
+        {
+            UdpResponseSendOutcome::Sent => {}
+            UdpResponseSendOutcome::Cancelled => return Ok(()),
+            UdpResponseSendOutcome::DroppedTooLarge {
+                planned_max_datagram_size,
+                current_max_datagram_size,
+                attempted_datagram_len,
+                fragment_id,
+                fragment_count,
+            } => {
+                debug!(
+                    "Hysteria2 UDP response dropped after the QUIC datagram size changed: \
+                     peer={}, association={session_id}, target={remote_location}, \
+                     payload_len={}, planned_max_datagram_size={planned_max_datagram_size}, \
+                     current_max_datagram_size={current_max_datagram_size:?}, \
+                     attempted_datagram_len={attempted_datagram_len}, \
+                     fragment_id={fragment_id}, fragment_count={fragment_count}",
+                    connection.remote_address().ip(),
+                    payload.len()
+                );
             }
         }
     }
@@ -1592,7 +1656,7 @@ async fn run_udp_local_to_remote_loop(
                 debug!("Dropping Hysteria2 UDP packet for saturated session {session_id}");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                error!("Hysteria2 UDP association worker {session_id} has stopped");
+                debug!("Hysteria2 UDP association worker {session_id} has stopped");
                 sessions.remove(&session_id);
                 fragments.clear_session(session_id);
             }
@@ -1658,7 +1722,7 @@ async fn run_tcp_loop(
             )
             .await;
             if let Err(e) = result {
-                error!("Failed to process streams: {e}");
+                debug!("Hysteria2 TCP stream ended: {e}");
             }
         });
     }
@@ -1783,8 +1847,7 @@ async fn process_tcp_stream(
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream_with_metadata(
-            &mut server_stream,
+        prepare_client_tcp_stream_with_metadata(
             client_proxy_selector,
             resolver,
             remote_location.clone(),
@@ -1792,7 +1855,7 @@ async fn process_tcp_stream(
         ),
     );
 
-    let mut client_stream = match setup_client_stream_future.await {
+    let client_setup = match setup_client_stream_future.await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
             // Must have been blocked.
@@ -1801,19 +1864,14 @@ async fn process_tcp_stream(
         }
         Ok(Err(e)) => {
             let _ = server_stream.shutdown().await;
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup client stream to {remote_location}: {e}"),
-            ));
+            return Err(client_stream_setup_error(&remote_location, e));
         }
         Err(elapsed) => {
             let _ = server_stream.shutdown().await;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("client setup to {remote_location} timed out: {elapsed}"),
-            ));
+            return Err(client_stream_setup_timeout(&remote_location, elapsed));
         }
     };
+    let mut client_stream = apply_client_early_data(&mut server_stream, client_setup).await?;
 
     let client_requires_flush = if replay.is_empty() {
         false
@@ -2050,7 +2108,7 @@ pub async fn start_hysteria2_server(
                     )
                     .await
                     {
-                        error!("Connection ended with error: {e}");
+                        debug!("Hysteria2 connection from {remote_ip} ended: {e}");
                     }
                 });
             }
@@ -2074,13 +2132,13 @@ mod tests {
     use super::{
         MAX_ACTIVE_TCP_LOGICAL_FLOWS, MAX_FRAGMENT_CACHE_SIZE,
         MAX_UDP_FRAGMENT_BYTES_PER_CONNECTION, MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION,
-        TCP_REQUEST_HEADER_TIMEOUT, UdpForwardCommand, UdpFragmentCache, UdpSession,
-        UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
+        TCP_REQUEST_HEADER_TIMEOUT, UdpForwardCommand, UdpFragmentCache, UdpResponseSendOutcome,
+        UdpSession, UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
         checked_response_fragment_count, checked_udp_packet_len, cleanup_udp_sessions,
         connect_udp_target, decode_udp_address_length, dispatch_udp_target_command,
         read_tcp_request_header_before_deadline, run_connected_udp_target_worker,
-        try_admit_tcp_logical_flow, try_reserve_payload_bytes, try_reserve_udp_target_worker,
-        udp_response_send_allowed, valid_udp_fragment,
+        send_udp_response_with, try_admit_tcp_logical_flow, try_reserve_payload_bytes,
+        try_reserve_udp_target_worker, udp_response_send_allowed, valid_udp_fragment,
     };
     use crate::address::{Address, NetLocation, NetLocationMask};
     use crate::async_stream::{
@@ -2453,6 +2511,107 @@ mod tests {
         assert_eq!(checked_udp_packet_len(MAX_UDP_PACKET_SIZE, 1), None);
         assert_eq!(checked_response_fragment_count(2550, 10).unwrap(), 255);
         assert!(checked_response_fragment_count(2560, 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn datagram_too_large_drops_only_current_response_and_next_uses_new_limit() {
+        let meter = None;
+        let cancel = CancellationToken::new();
+        let source = location(53);
+        let payload = vec![0x5a; 1300];
+
+        let mut first_limit_queries = 0;
+        let first = send_udp_response_with(
+            7,
+            &meter,
+            11,
+            &source,
+            &payload,
+            &cancel,
+            || {
+                first_limit_queries += 1;
+                if first_limit_queries == 1 {
+                    Some(1400)
+                } else {
+                    Some(1200)
+                }
+            },
+            |datagram| {
+                assert!(datagram.len() > 1200);
+                Err(quinn::SendDatagramError::TooLarge)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first,
+            UdpResponseSendOutcome::DroppedTooLarge {
+                planned_max_datagram_size: 1400,
+                current_max_datagram_size: Some(1200),
+                attempted_datagram_len: 1321,
+                fragment_id: 0,
+                fragment_count: 1,
+            }
+        );
+        assert_eq!(first_limit_queries, 2);
+
+        let mut second_limit_queries = 0;
+        let mut sent = Vec::new();
+        let second = send_udp_response_with(
+            7,
+            &meter,
+            12,
+            &source,
+            &payload,
+            &cancel,
+            || {
+                second_limit_queries += 1;
+                Some(1200)
+            },
+            |datagram| {
+                assert!(datagram.len() <= 1200);
+                sent.push(datagram);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, UdpResponseSendOutcome::Sent);
+        assert_eq!(second_limit_queries, 1);
+        assert_eq!(sent.len(), 2);
+
+        let mut reassembled = Vec::new();
+        for (fragment_id, datagram) in sent.iter().enumerate() {
+            assert_eq!(&datagram[..4], &7u32.to_be_bytes());
+            assert_eq!(&datagram[4..6], &12u16.to_be_bytes());
+            assert_eq!(datagram[6], fragment_id as u8);
+            assert_eq!(datagram[7], 2);
+            let (address_len, address_start) = decode_udp_address_length(datagram).unwrap();
+            let payload_start = address_start + address_len;
+            reassembled.extend_from_slice(&datagram[payload_start..]);
+        }
+        assert_eq!(reassembled, payload);
+    }
+
+    #[tokio::test]
+    async fn non_size_datagram_send_errors_remain_fatal() {
+        let error = send_udp_response_with(
+            7,
+            &None,
+            13,
+            &location(53),
+            b"payload",
+            &CancellationToken::new(),
+            || Some(1200),
+            |_datagram| Err(quinn::SendDatagramError::UnsupportedByPeer),
+        )
+        .await
+        .expect_err("unsupported datagrams are a connection-level failure");
+        assert!(
+            error
+                .to_string()
+                .contains("datagrams not supported by peer")
+        );
     }
 
     #[test]

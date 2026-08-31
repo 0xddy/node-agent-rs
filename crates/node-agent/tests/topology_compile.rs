@@ -9,8 +9,8 @@ use node_agent::compile::{
 use node_agent::outbound_adapter::MAX_OUTBOUND_REFERENCE_DEPTH;
 use node_agent::topology::provider::{
     CURRENT_CONFIG_VERSION, HYSTERIA2_SALAMANDER_ID, Hysteria2MasqueradeConfig,
-    Hysteria2ObfsConfig, Hysteria2SalamanderConfig, Hysteria2TlsConfig, RealityHandshake,
-    VLESS_REALITY_VISION_ID, VlessRealityConfig, VlessRealityVisionConfig,
+    Hysteria2ObfsConfig, Hysteria2SalamanderConfig, Hysteria2TlsConfig, OutboundConfig,
+    RealityHandshake, VLESS_REALITY_VISION_ID, VlessRealityConfig, VlessRealityVisionConfig,
     VlessRealityVisionTlsConfig,
 };
 use node_agent::topology::*;
@@ -1032,6 +1032,26 @@ fn provider_registry_rejects_go_validation_failures() {
         let error = compile_with_warnings(&topology(vec![node])).unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
     }
+}
+
+#[test]
+fn provider_local_outbound_metadata_is_ignored_like_go() {
+    let metadata = vec![OutboundConfig {
+        kind: "direct".into(),
+        tag: "direct".into(),
+    }];
+    let mut vless = vless_config("vless", 1443);
+    vless.outbounds.clone_from(&metadata);
+    let mut hysteria2 = hysteria_config("hy2", 1444);
+    hysteria2.outbounds = metadata;
+
+    let output = compile_with_warnings(&topology(vec![
+        node("vless", VLESS_REALITY_VISION_ID, vless, vec![]),
+        node("hy2", HYSTERIA2_SALAMANDER_ID, hysteria2, vec![]),
+    ]))
+    .expect("provider-local outbound metadata is accepted");
+
+    assert!(output.warnings.is_empty(), "{:?}", output.warnings);
 }
 
 #[test]

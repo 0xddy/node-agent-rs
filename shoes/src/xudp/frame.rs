@@ -197,8 +197,8 @@ impl FrameMetadata {
         }
 
         if metadata_len < 4 {
-            log::error!(
-                "[XUDP DECODE] Metadata too short: {} (buffer was {} bytes, first 8 bytes: {:?})",
+            log::debug!(
+                "[XUDP DECODE] Rejecting short peer metadata: {} (buffer was {} bytes, first 8 bytes: {:?})",
                 metadata_len,
                 buf.len(),
                 &buf[..std::cmp::min(8, buf.len())]

@@ -685,7 +685,7 @@ impl<'a> UdpRouter<'a> {
                         message
                     }
                     Poll::Ready(Err(error)) => {
-                        warn!("server read error: {error}");
+                        debug!("UDP inbound peer read ended: {error}");
                         self.set_server_read_eof();
                         return (made_progress, false);
                     }
@@ -741,7 +741,7 @@ impl<'a> UdpRouter<'a> {
                     message
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server read error: {}", e);
+                    debug!("UDP inbound peer read ended: {e}");
                     self.set_server_read_eof();
                     break;
                 }
@@ -955,7 +955,10 @@ impl<'a> UdpRouter<'a> {
                 Poll::Pending => {
                     self.remote_flush_queue.push_back(id);
                 }
-                Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(error)) => {
+                    if !session.remote_write_eof {
+                        warn!("remote flush error: {error}");
+                    }
                     session.in_remote_flush_queue = false;
                     session.remote_write_eof = true;
                     if session.should_remove() {
@@ -1058,7 +1061,7 @@ impl<'a> UdpRouter<'a> {
                                 }
                             }
                             Poll::Ready(Err(e)) => {
-                                warn!("server write error: {}", e);
+                                debug!("UDP inbound peer write ended: {e}");
                                 self.server_write_pool.release(buf); // release in-hand buffer
                                 self.set_server_write_eof();
                                 return (remote_read_progress, server_write_progress);
@@ -1129,7 +1132,7 @@ impl<'a> UdpRouter<'a> {
                     break;
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server write error: {}", e);
+                    debug!("UDP inbound peer write ended: {e}");
                     session.in_server_write_queue -= 1; // last use of session borrow
                     self.server_write_pool.release(buf); // release current buffer
                     self.set_server_write_eof(); // clears remaining queue
@@ -1159,7 +1162,7 @@ impl<'a> UdpRouter<'a> {
                 }
                 Poll::Pending => break,
                 Poll::Ready(Err(error)) => {
-                    warn!("server session End write error: {error}");
+                    debug!("UDP inbound peer session End write ended: {error}");
                     self.set_server_write_eof();
                     break;
                 }
@@ -1279,14 +1282,16 @@ impl<'a> UdpRouter<'a> {
                 true
             }
             Err(e) => {
-                warn!("Failed to create session for {}: {}", destination, e);
                 let rejected_protocol_session = match &lookup_key {
                     LookupKey::ProtocolSession(key) => Some(key.session_id),
                     LookupKey::Destination(_) => None,
                 };
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    debug!("UDP routing blocked session for {destination}: {e}");
                     // Mark as blocked
                     self.blocked.put(destination.clone(), ());
+                } else {
+                    warn!("Failed to create UDP session for {destination}: {e}");
                 }
                 // Remove from pending in lookup
                 match (&mut self.session_lookup, &lookup_key) {
@@ -1682,7 +1687,7 @@ impl UdpRouter<'_> {
                         server_write_progress = true;
                     }
                     Poll::Ready(Err(e)) => {
-                        warn!("server flush error: {}", e);
+                        debug!("UDP inbound peer flush ended: {e}");
                         self.set_server_write_eof();
                     }
                     Poll::Pending => {}

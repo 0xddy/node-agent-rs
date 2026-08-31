@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::future::poll_fn;
-use log::{debug, error};
+use log::{debug, warn};
 use lru::LruCache;
 use rustc_hash::FxHashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -37,7 +37,10 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::handshake_gate::{
     HandshakeGate, HandshakePermit, MAX_PENDING_HANDSHAKES, MAX_PENDING_PER_SOURCE,
 };
-use crate::tcp::tcp_server::setup_client_tcp_stream_with_metadata;
+use crate::tcp::tcp_server::{
+    apply_client_early_data, client_stream_setup_error, client_stream_setup_timeout,
+    prepare_client_tcp_stream_with_metadata,
+};
 use crate::util::{allocate_vec, write_all};
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
@@ -291,7 +294,6 @@ async fn process_connection(
             return Err(e);
         }
         Err(_elapsed) => {
-            error!("Authentication timeout");
             connection.close(0u32.into(), b"auth timeout");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -390,8 +392,7 @@ async fn process_connection(
     cancel_token.cancel();
 
     // Per sing-box reference (service.go:382-398), close connection on error
-    if let Err(ref e) = result {
-        error!("Connection failed: {e}");
+    if result.is_err() {
         connection.close(0u32.into(), b"");
     }
 
@@ -614,12 +615,12 @@ async fn run_bidirectional_loop(
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     // Per official TUIC reference (handle_stream.rs:127-135),
                     // header parsing errors close the connection
-                    error!("Error parsing TCP stream header, closing connection: {e}");
+                    debug!("TUIC TCP stream header was rejected: {e}");
                     conn.close(0u32.into(), b"");
                 }
                 Err(e) => {
                     // TCP proxying errors are just logged (handle_task.rs:238-246)
-                    error!("Error processing TCP stream: {e}");
+                    debug!("TUIC TCP stream ended: {e}");
                 }
             }
         });
@@ -783,8 +784,7 @@ async fn process_tcp_stream(
 
     let setup_client_stream_future = timeout(
         Duration::from_secs(60),
-        setup_client_tcp_stream_with_metadata(
-            &mut server_stream,
+        prepare_client_tcp_stream_with_metadata(
             client_proxy_selector,
             resolver,
             remote_location.clone(),
@@ -792,7 +792,7 @@ async fn process_tcp_stream(
         ),
     );
 
-    let mut client_stream = match setup_client_stream_future.await {
+    let client_setup = match setup_client_stream_future.await {
         Ok(Ok(Some(s))) => s,
         Ok(Ok(None)) => {
             // Must have been blocked.
@@ -801,19 +801,14 @@ async fn process_tcp_stream(
         }
         Ok(Err(e)) => {
             let _ = server_stream.shutdown().await;
-            return Err(std::io::Error::new(
-                e.kind(),
-                format!("failed to setup client stream to {remote_location}: {e}"),
-            ));
+            return Err(client_stream_setup_error(&remote_location, e));
         }
         Err(elapsed) => {
             let _ = server_stream.shutdown().await;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("client setup to {remote_location} timed out: {elapsed}"),
-            ));
+            return Err(client_stream_setup_timeout(&remote_location, elapsed));
         }
     };
+    let mut client_stream = apply_client_early_data(&mut server_stream, client_setup).await?;
 
     let client_requires_flush = if replay.is_empty() {
         false
@@ -1394,17 +1389,31 @@ async fn connect_udp_target(
     resolver: &Arc<dyn Resolver>,
     remote_location: NetLocation,
 ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
-    match client_proxy_selector
+    let requested_location = remote_location.clone();
+    let decision = match client_proxy_selector
         .judge_udp(remote_location.into(), resolver)
-        .await?
+        .await
     {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!("TUIC UDP routing for {requested_location} failed: {error}");
+            return Err(error);
+        }
+    };
+
+    match decision {
         ConnectDecision::Allow {
             chain_group,
             remote_location,
         } => {
+            let outbound_location = remote_location.clone();
             chain_group
                 .connect_udp_bidirectional(resolver, remote_location)
                 .await
+                .map_err(|error| {
+                    warn!("TUIC UDP outbound setup to {outbound_location} failed: {error}");
+                    error
+                })
         }
         ConnectDecision::Block => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -2089,7 +2098,7 @@ async fn run_udp_session_worker(
                 if !is_current {
                     continue;
                 }
-                error!("TUIC UDP target {remote_location} stopped: {error}");
+                debug!("TUIC UDP target {remote_location} stopped: {error}");
                 targets.remove(&remote_location);
             }
             UdpSessionWork::Target(Some(UdpTargetEvent::Message {
@@ -2217,7 +2226,7 @@ async fn run_unidirectional_loop(
                 Err(e) => {
                     // Per official TUIC reference (handle_stream.rs:70-78),
                     // uni stream errors close the connection
-                    error!("Error processing uni stream, closing connection: {e}");
+                    debug!("TUIC unidirectional stream ended: {e}");
                     connection.close(0u32.into(), b"");
                 }
             }
@@ -2397,7 +2406,7 @@ fn activate_udp_session(
         .await;
         remove_udp_generation(&cleanup_map, &cleanup_fragments, assoc_id, generation);
         if let Err(error) = result {
-            error!("TUIC UDP association {assoc_id} ended with error: {error}");
+            debug!("TUIC UDP association {assoc_id} ended: {error}");
         }
     });
     Ok(true)
@@ -3058,7 +3067,7 @@ async fn run_datagram_loop(
         )
         .await
         {
-            error!("Failed to process datagram UDP packet: {e}");
+            debug!("TUIC UDP datagram was rejected: {e}");
         }
     }
 }
@@ -3175,7 +3184,7 @@ pub async fn start_tuic_server(
                     )
                     .await
                     {
-                        error!("Connection ended with error: {e}");
+                        debug!("TUIC connection from {remote_ip} ended: {e}");
                     }
                 });
             }

@@ -325,8 +325,8 @@ impl XudpMessageStream {
 
         // Check for ERROR option bit - remote side is signaling an error
         if metadata.option.has_error() {
-            log::error!(
-                "[XUDP READ] Received frame with ERROR option set for session {}",
+            log::debug!(
+                "[XUDP READ] Peer closed session {} with the ERROR option",
                 metadata.session_id
             );
             return Err(std::io::Error::new(
@@ -559,7 +559,7 @@ impl AsyncReadSessionMessage for XudpMessageStream {
                     continue;
                 }
                 Err(e) => {
-                    log::error!("[XUDP SESSION READ] Error reading from inner stream: {}", e);
+                    log::debug!("[XUDP SESSION READ] Inner stream ended: {}", e);
                     return Poll::Ready(Err(e));
                 }
             }

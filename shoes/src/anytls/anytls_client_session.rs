@@ -494,7 +494,7 @@ impl AnyTlsClientSession {
                         frame.data.len()
                     );
                     if let Err(e) = session.handle_frame(frame).await {
-                        log::warn!("AnyTLS client error handling frame: {}", e);
+                        log::debug!("AnyTLS client frame handling ended the reader: {}", e);
                         return Err(e);
                     }
                 }
@@ -616,11 +616,11 @@ impl AnyTlsClientSession {
             Command::Alert => {
                 // Server alert - fatal
                 let msg = String::from_utf8_lossy(&frame.data);
-                log::warn!("AnyTLS server alert: {}", msg);
+                log::warn!("AnyTLS upstream alert: {:?}", msg);
                 self.is_closed.store(true, Ordering::Relaxed);
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    format!("Server alert: {}", msg),
+                    format!("upstream alert: {msg:?}"),
                 ));
             }
 

@@ -380,10 +380,6 @@ impl RealityServerConnection {
         });
 
         if !short_id_ok {
-            log::warn!(
-                "REALITY: Client short_id {:02x?} not in configured list",
-                client_short_id
-            );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("Invalid short_id: {:02x?}", client_short_id),
@@ -401,13 +397,6 @@ impl RealityServerConnection {
             let max_diff_secs = max_diff_ms / 1000;
 
             if time_diff_secs > max_diff_secs {
-                log::warn!(
-                    "REALITY: Client timestamp {} differs from server {} by {} seconds (max: {} seconds)",
-                    client_timestamp,
-                    now,
-                    time_diff_secs,
-                    max_diff_secs
-                );
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -422,11 +411,6 @@ impl RealityServerConnection {
         if let Some(min_ver) = &self.config.min_client_version
             && client_version < &min_ver[..]
         {
-            log::warn!(
-                "REALITY: Client version {:?} is below minimum {:?}",
-                client_version,
-                min_ver
-            );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -440,11 +424,6 @@ impl RealityServerConnection {
         if let Some(max_ver) = &self.config.max_client_version
             && client_version > &max_ver[..]
         {
-            log::warn!(
-                "REALITY: Client version {:?} is above maximum {:?}",
-                client_version,
-                max_ver
-            );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -937,7 +916,7 @@ impl RealityServerConnection {
                             return Ok(());
                         } else if alert_level != ALERT_LEVEL_WARNING {
                             // Fatal alert - connection must be terminated
-                            log::warn!(
+                            log::debug!(
                                 "REALITY: Received fatal alert: level={}, desc={}",
                                 alert_level,
                                 alert_desc

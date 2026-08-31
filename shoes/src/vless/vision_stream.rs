@@ -859,8 +859,8 @@ where
                             return Err(io::Error::other("FuzzyTlsDeframer returned empty prefix"));
                         }
                         if prefix.len() > 512 {
-                            log::warn!(
-                                "VISION READ: Unusually large prefix discarded: {} bytes",
+                            log::debug!(
+                                "VISION READ: Discarding unusually large peer prefix: {} bytes",
                                 prefix.len()
                             );
                         }
@@ -876,8 +876,8 @@ where
                         // Invalid TLS packet - stop filtering
                         // This only occurs if we've already seen valid TLS records, and
                         // then encountered invalid ones.
-                        log::error!(
-                            "VISION READ: Read invalid TLS data after valid records - stopping filtering: {}",
+                        log::debug!(
+                            "VISION READ: Peer sent invalid TLS data after valid records; stopping filtering: {}",
                             e
                         );
                         self.filter
@@ -1353,8 +1353,8 @@ where
                     // TODO: check lengths and see if we need to split into multiple packets, see
                     // https://github.com/XTLS/Xray-core/blob/9f5dcb15910aadc7ef450514747576827a389853/proxy/proxy.go#L390
                     //
-                    log::error!(
-                        "VISION WRITE: Deframing failed, invalid data after valid records - stopping filtering: {}",
+                    log::debug!(
+                        "VISION WRITE: Filter input became invalid after valid records; stopping filtering: {}",
                         e
                     );
 

@@ -313,7 +313,7 @@ impl AnyTlsSession {
             // Decode and process any frames already in buffer (from initial data)
             while let Some(frame) = FrameCodec::decode(&mut buffer)? {
                 if let Err(e) = self.handle_frame(frame).await {
-                    log::warn!("Error handling frame: {}", e);
+                    log::debug!("AnyTLS frame handling ended the session: {}", e);
                     return Err(e);
                 }
             }
@@ -362,7 +362,7 @@ impl AnyTlsSession {
             Command::Syn => {
                 // Stream open request (server side)
                 if self.is_client {
-                    log::warn!("Received SYN on client side");
+                    log::debug!("AnyTLS peer sent SYN to a client-side session");
                     return Ok(());
                 }
 
@@ -402,7 +402,9 @@ impl AnyTlsSession {
                     } else {
                         match streams.entry(stream_id) {
                             Entry::Occupied(_) => {
-                                log::warn!("Duplicate SYN for stream {}", stream_id);
+                                log::debug!(
+                                    "AnyTLS peer sent duplicate SYN for stream {stream_id}"
+                                );
                                 None
                             }
                             Entry::Vacant(entry) => {
@@ -470,7 +472,7 @@ impl AnyTlsSession {
                                     );
                                 }
                                 Err(_) => {
-                                    log::warn!(
+                                    log::debug!(
                                         "AnyTLS stream {} timed out after {:?}",
                                         stream_id_for_cleanup,
                                         STREAM_HANDLER_TIMEOUT
@@ -490,14 +492,14 @@ impl AnyTlsSession {
             Command::SynAck => {
                 // Server acknowledges stream (client side)
                 if !self.is_client {
-                    log::warn!("Received SYNACK on server side");
+                    log::debug!("AnyTLS peer sent SYNACK to a server-side session");
                     return Ok(());
                 }
 
                 // Handle SYNACK - for now just log
                 if !frame.data.is_empty() {
                     let error_msg = String::from_utf8_lossy(&frame.data);
-                    log::warn!(
+                    log::debug!(
                         "Stream {} error from server: {}",
                         frame.stream_id,
                         error_msg
@@ -589,14 +591,14 @@ impl AnyTlsSession {
                 if !self.is_client {
                     return Ok(());
                 }
-                log::info!("Received padding scheme update from server");
+                log::debug!("Received padding scheme update from server");
                 // Note: In a full implementation, we'd update the padding factory here
             }
 
             Command::Alert => {
                 // Alert - fatal error
                 let msg = String::from_utf8_lossy(&frame.data);
-                log::error!("Received alert: {}", msg);
+                log::debug!("AnyTLS peer sent alert: {:?}", msg);
                 return Err(io::Error::other(msg.to_string()));
             }
 
@@ -762,7 +764,7 @@ impl AnyTlsSession {
         match tokio::time::timeout(CONTROL_FRAME_TIMEOUT, self.write_frame(frame)).await {
             Ok(result) => result,
             Err(_) => {
-                log::warn!(
+                log::debug!(
                     "Control frame write timed out after {:?}, closing session",
                     CONTROL_FRAME_TIMEOUT
                 );
@@ -813,7 +815,14 @@ impl AnyTlsSession {
         let action = self
             .proxy_provider
             .judge_tcp(destination.clone().into(), &self.resolver)
-            .await?;
+            .await
+            .map_err(|error| {
+                log::warn!(
+                    "AnyTLS stream {stream_id} TCP route selection for {destination} failed: \
+                     {error}"
+                );
+                error
+            })?;
 
         match action {
             ConnectDecision::Allow {
@@ -828,11 +837,15 @@ impl AnyTlsSession {
 
                 // Connect through the proxy chain
                 let client_result = match chain_group
-                    .connect_tcp(remote_location, &self.resolver)
+                    .connect_tcp(remote_location.clone(), &self.resolver)
                     .await
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        log::warn!(
+                            "AnyTLS stream {stream_id} outbound TCP connect to {remote_location} \
+                             failed: {e}"
+                        );
                         // Send SYNACK with error message (protocol v2)
                         let error_msg = format!("connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
@@ -951,7 +964,14 @@ impl AnyTlsSession {
         let action = self
             .proxy_provider
             .judge_udp(destination.clone().into(), &self.resolver)
-            .await?;
+            .await
+            .map_err(|error| {
+                log::warn!(
+                    "AnyTLS stream {stream_id} UDP route selection for {destination} failed: \
+                     {error}"
+                );
+                error
+            })?;
 
         match action {
             ConnectDecision::Allow {
@@ -970,11 +990,15 @@ impl AnyTlsSession {
 
                 // Connect through the proxy chain
                 let client_stream = match chain_group
-                    .connect_udp_bidirectional(&self.resolver, remote_location)
+                    .connect_udp_bidirectional(&self.resolver, remote_location.clone())
                     .await
                 {
                     Ok(result) => result,
                     Err(e) => {
+                        log::warn!(
+                            "AnyTLS stream {stream_id} outbound UDP connect to {remote_location} \
+                             failed: {e}"
+                        );
                         // Send SYNACK with error (protocol v2)
                         let error_msg = format!("UDP connect failed: {}", e);
                         let _ = self.send_synack(stream_id, Some(&error_msg)).await;
@@ -1004,7 +1028,7 @@ impl AnyTlsSession {
                     .send_synack(stream_id, Some("UDP blocked by rules"))
                     .await;
 
-                log::warn!(
+                log::debug!(
                     "AnyTLS stream {} UoT V2 connect blocked by rules: {}",
                     stream_id,
                     destination

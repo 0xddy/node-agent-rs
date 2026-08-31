@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures::ready;
-use log::warn;
+use log::debug;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -304,7 +304,10 @@ impl WebsocketStream {
             }
             // TODO: handle close frames
             _ => {
-                warn!("Ignoring unknown frame type: {:?}", self.read_frame_opcode);
+                debug!(
+                    "Ignoring unknown WebSocket frame type from peer: {:?}",
+                    self.read_frame_opcode
+                );
                 if self.read_frame_length == 0 {
                     self.read_state = ReadState::Init;
                     self.step_init(cx, buf)
