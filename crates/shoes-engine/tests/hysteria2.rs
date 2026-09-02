@@ -343,6 +343,50 @@ async fn one_connection_carries_many_streams_for_one_user() {
     checks.finish();
 }
 
+/// A failed outbound setup is a logical-stream failure, not a successful Hysteria2
+/// handshake followed by EOF and not a reason to retire the shared QUIC connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_tcp_stream_is_reported_and_the_quic_connection_stays_usable() {
+    let mut checks = Checks::new("hysteria2 tcp setup failure isolation");
+
+    let engine = engine().await;
+    let sink = Sink::start("sink").await;
+    let hy = free_addr();
+    engine
+        .add_inbound(dynamic("hy2", hysteria2_inbound(hy, false)))
+        .await
+        .expect("the inbound should start");
+    engine
+        .add_user("hy2", password_user("alice", ALICE))
+        .expect("alice should be accepted");
+
+    let client = hy2::Hysteria2Client::connect(hy, ALICE)
+        .await
+        .expect("alice should authenticate");
+
+    // Nothing is listening on this freshly released address. The old server replied
+    // status=0 before attempting the dial, so this call incorrectly returned Ok and
+    // the client only discovered the failure when it tried to use the stream.
+    let refused = free_addr();
+    checks.that(
+        "a refused outbound is returned in the TCP response as status=1",
+        client.open_tcp(refused).await.is_err(),
+    );
+
+    let mut stream = client
+        .open_tcp(sink.address)
+        .await
+        .expect("a second stream on the same QUIC connection should still open");
+    stream.write_all(b"who\n").await.expect("send a request");
+    checks.eq(
+        "the next stream on the same connection still reaches its destination",
+        stream.read_line().await.ok(),
+        Some("sink".to_string()),
+    );
+
+    checks.finish();
+}
+
 /// Rotating a password: the old one has to stop working the moment the new one starts,
 /// and the user's counters have to survive.
 ///

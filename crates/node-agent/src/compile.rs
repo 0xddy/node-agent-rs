@@ -2339,6 +2339,10 @@ fn compile_hysteria2(
         ("udp_enabled".to_string(), json!(true)),
         ("up_mbps".to_string(), json!(cfg.up_mbps as u64)),
         ("down_mbps".to_string(), json!(cfg.down_mbps as u64)),
+        (
+            "ignore_client_bandwidth".to_string(),
+            json!(cfg.ignore_client_bandwidth),
+        ),
     ]);
     if cfg.obfs.kind == "salamander" {
         protocol.insert(

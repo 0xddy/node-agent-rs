@@ -32,20 +32,33 @@ async fn upload_and_download_bandwidths_negotiate_independently() {
     let sink = Sink::start("brutal-sink").await;
 
     let cases = [
-        // (tag, up Mbps, down Mbps, client RX B/s, advertised B/s, auto)
-        ("both", 100, 200, 20_000_000, 25_000_000, false),
-        ("download-only", 0, 37, 4_000_000, 4_625_000, false),
-        ("upload-only", 80, 0, 20_000_000, 0, false),
-        ("bbr", 100, 200, 0, 0, true),
+        // (tag, up Mbps, down Mbps, client RX B/s, ignore, advertised B/s, auto)
+        ("both", 100, 200, 20_000_000, false, 25_000_000, false),
+        ("download-only", 0, 37, 4_000_000, false, 4_625_000, false),
+        ("upload-only", 80, 0, 20_000_000, false, 0, false),
+        // Numeric zero is uncapped. It deliberately does not force the client's
+        // upload half onto BBR the way the literal `auto` value would.
+        ("uncapped", 100, 0, 0, false, 0, false),
+        ("ignored", 0, 0, 20_000_000, true, 0, true),
     ];
 
-    for (tag, up_mbps, down_mbps, client_receive_bps, expected_advertised, expected_auto) in cases {
+    for (
+        tag,
+        up_mbps,
+        down_mbps,
+        client_receive_bps,
+        ignore_client_bandwidth,
+        expected_advertised,
+        expected_auto,
+    ) in cases
+    {
         let address = free_addr();
+        let mut config = hysteria2_inbound_with_bandwidth(address, up_mbps, down_mbps, false);
+        if ignore_client_bandwidth {
+            config["protocol"]["ignore_client_bandwidth"] = serde_json::json!(true);
+        }
         engine
-            .add_inbound(dynamic(
-                tag,
-                hysteria2_inbound_with_bandwidth(address, up_mbps, down_mbps, false),
-            ))
+            .add_inbound(dynamic(tag, config))
             .await
             .unwrap_or_else(|e| panic!("{tag} inbound should start: {e}"));
         engine
@@ -113,6 +126,13 @@ async fn changing_either_bandwidth_rebuilds_the_quic_listener() {
             ))
             .await,
         "down_mbps",
+    );
+    let mut ignored = hysteria2_inbound_with_bandwidth(address, 100, 200, false);
+    ignored["protocol"]["ignore_client_bandwidth"] = serde_json::json!(true);
+    checks.refused(
+        "changing client-bandwidth policy is refused by name",
+        engine.update_inbound(classic("hy2", ignored)).await,
+        "ignore_client_bandwidth",
     );
     checks.that(
         "an unchanged bandwidth configuration remains reloadable",

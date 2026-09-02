@@ -71,6 +71,8 @@ pub struct Hysteria2SalamanderConfig {
     pub up_mbps: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub down_mbps: i64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignore_client_bandwidth: bool,
     pub obfs: Hysteria2ObfsConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub masquerade: Option<Hysteria2MasqueradeConfig>,
