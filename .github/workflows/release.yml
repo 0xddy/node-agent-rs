@@ -116,7 +116,7 @@ jobs:
         with:
           repository: 0xddy/shoes-plus
           # Keep release artifacts reproducible across shoes-plus main updates.
-          ref: c7d4e2b4c454b5eb3881eecfb56ab5bc0f3becfb
+          ref: 2330b9bd1b41cb229dc893fbf529a711518b045d
           path: shoes-plus
 
       - name: Install Rust
