@@ -4,6 +4,9 @@ The plan of record for direct development on `master`. Originally written 2026-0
 after the TUIC increment landed as `6f163d9`; feature-branch development is no longer
 used for this project.
 
+Repository layout since 2026-08-31: shoes source paths below point into the sibling
+`../shoes-plus/` repository, the sole copy of the proxy core.
+
 The goal has not changed: turn `shoes` from a static config-file CLI into an
 API-driven dynamic engine by 微创手术 — minimally invasive edits, so upstream stays
 mergeable. Protocols are converted one at a time to authenticate through
@@ -35,7 +38,7 @@ this document.
 
 ## 1. Rules generation handling for the QUIC-native inbounds — **landed**
 
-`SelectorSlot` sits beside `HandlerSlot` in `shoes/src/dynamic/reload.rs`; the two
+`SelectorSlot` sits beside `HandlerSlot` in `../shoes-plus/src/dynamic/reload.rs`; the two
 QUIC-native arms of `start_quic_servers` record one per bind address and load it at
 logical-flow boundaries. That RCU path is used only when the accepted transport
 cannot continue admitting independently routed work. Hysteria2 with UDP enabled and
@@ -93,7 +96,7 @@ be reused for destinations created after the configuration change.
 
 ### Changes
 
-**`shoes/src/dynamic/reload.rs`**
+**`../shoes-plus/src/dynamic/reload.rs`**
 - Add `SelectorSlot` beside `HandlerSlot`, with the same `load` / `store` /
   `generation` surface.
 - `ServerHandle.selectors: Vec<Arc<SelectorSlot>>`, plus a
@@ -106,12 +109,12 @@ be reused for destinations created after the configuration change.
   store it into every selector slot as well as rebuilding the handlers. Keep the
   existing all-or-nothing shape — everything fallible before the first `store`.
 
-**`shoes/src/quic_server.rs`**
+**`../shoes-plus/src/quic_server.rs`**
 - The Hysteria2 arm (the comment at `:474`) and the TuicV5 arm (`:508`) register a
   selector slot instead of explaining why they cannot.
 - Both pass `Arc<SelectorSlot>` where they now pass `Arc<ClientProxySelector>`.
 
-**`shoes/src/hysteria2_server.rs`, `shoes/src/tuic_server.rs`**
+**`../shoes-plus/src/hysteria2_server.rs`, `../shoes-plus/src/tuic_server.rs`**
 - `start_*_server` and `process_connection` take `Arc<SelectorSlot>`.
 - `process_connection` calls `load()` once, right after authentication, and everything
   below it keeps taking `Arc<ClientProxySelector>` exactly as today. The four TUIC
@@ -222,15 +225,15 @@ and on rotation, is the smallest thing that is correct.
 
 ### Files
 
-- `shoes/src/dynamic/registry.rs`, `static_registry.rs` — the two methods, plus
+- `../shoes-plus/src/dynamic/registry.rs`, `static_registry.rs` — the two methods, plus
   `add_anytls_password` / `single_anytls_password`.
 - `crates/shoes-engine/src/users.rs` — `by_anytls_hash: DashMap<[u8; 32], Arc<Entry>>`
   and the prefix refcount; maintain both in `upsert` and `remove`.
 - `crates/shoes-engine/src/protocol.rs` — `ServerProxyConfig::Anytls` moves out of the
   not-wired-up arm; the list-shaped placeholder rule.
-- `shoes/src/anytls/anytls_server_handler.rs` — take `Arc<dyn UserRegistry>`, replace
+- `../shoes-plus/src/anytls/anytls_server_handler.rs` — take `Arc<dyn UserRegistry>`, replace
   both lookups.
-- `shoes/src/tcp/tcp_server_handler_factory.rs:314` — **the Anytls arm destructures a
+- `../shoes-plus/src/tcp/tcp_server_handler_factory.rs:314` — **the Anytls arm destructures a
   config field named `users`, shadowing the `users: Option<&Arc<dyn UserRegistry>>`
   parameter.** Rename before touching anything else in that arm.
 
@@ -321,16 +324,16 @@ already does and should keep doing.
 
 ### Files
 
-- `shoes/src/dynamic/registry.rs`, `static_registry.rs` — the method and its builders.
+- `../shoes-plus/src/dynamic/registry.rs`, `static_registry.rs` — the method and its builders.
 - `crates/shoes-engine/src/users.rs` — a `by_naive_encoded` index;
   `CredentialKinds::naive_basic`.
 - `crates/shoes-engine/src/protocol.rs` — `Naiveproxy` out of the not-wired-up arm;
   reuses AnyTLS's list-shaped placeholder rule.
-- `shoes/src/naiveproxy/user_lookup.rs` — drop the assert; likely delete the type
+- `../shoes-plus/src/naiveproxy/user_lookup.rs` — drop the assert; likely delete the type
   entirely once the registry answers for it.
-- `shoes/src/naiveproxy/naive_hyper_service.rs` — the context across the spawn, the
+- `../shoes-plus/src/naiveproxy/naive_hyper_service.rs` — the context across the spawn, the
   lookup at `:257`.
-- `shoes/src/tcp/tcp_server_handler_factory.rs` — `create_tls_server_target` (`:360`)
+- `../shoes-plus/src/tcp/tcp_server_handler_factory.rs` — `create_tls_server_target` (`:360`)
   destructures `users` at `:422` **and** `:580`, shadowing the registry parameter in
   both. Same hazard as AnyTLS, twice.
 
@@ -386,10 +389,11 @@ The convention the last four commits established:
    process, covering: attribution across users, an unregistered credential, a miss
    billed to nobody, disabled users, rotation, removal actively closing an established
    connection, and both classic and dynamic mode.
-6. All three gates clean: `cargo fmt --all --check`,
-   `cargo clippy --workspace --all-targets`, `cargo test --workspace`. The
+6. All three node-agent workspace gates clean: `cargo fmt --all --check`,
+   `cargo clippy --workspace --all-targets`, `cargo test --workspace`, plus the
+   sibling `shoes-plus` manifest gates. The
    `--all-targets` matters — without it the acceptance suites themselves are never
-   linted. See the [README](../README.md#building-and-checking).
+   linted. See the [README](../README.md#gates).
 7. A commit message that explains the design decision and **names any pre-existing bug
    the new suite flushed out** — three of the four so far found at least one.
 
@@ -400,5 +404,5 @@ The convention the last four commits established:
   engine should keep refusing it a `users` list.
 - **Nothing else.** The "Invasiveness" table in `crates/shoes-engine/src/lib.rs` was
   the last known-stale item and was corrected in `e12de88`, which also fixed a claim
-  that was wrong rather than merely old: `shoes/src/dynamic/` was said to pull in no
+  that was wrong rather than merely old: `../shoes-plus/src/dynamic/` was said to pull in no
   new dependency, and it pulls in `arc-swap` for the reload slots.

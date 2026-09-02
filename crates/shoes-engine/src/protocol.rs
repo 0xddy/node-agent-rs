@@ -264,11 +264,11 @@ fn unauthenticated_target(
 ///
 /// This exists only to guarantee the label is non-empty. Upstream's `Display` builds a
 /// `Tls` label from its populated target maps and never consults `default_tls_target`
-/// (`shoes/src/config/types/server.rs:794`), so a TLS inbound configured with only a
+/// (`../shoes-plus/src/config/types/server.rs:794`), so a TLS inbound configured with only a
 /// default target renders as the empty string -- which then surfaced as an empty
 /// `InboundInfo::protocol`. Substituting a label here keeps the fix on the
 /// engine's side of the boundary; patching upstream's `Display` would mean carrying a
-/// cosmetic diff through every merge of `shoes/`.
+/// cosmetic diff through every merge of `../shoes-plus/`.
 pub(crate) fn display_name(protocol: &ServerProxyConfig) -> String {
     let label = protocol.to_string();
     if !label.is_empty() {

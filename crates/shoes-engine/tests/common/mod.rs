@@ -61,7 +61,7 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Self-signed leaf for `CN=e2e.test`, used by the TLS legs.
 ///
 /// Inlined rather than referenced by path: `shoes::config::pem` passes any value
-/// starting with `-----BEGIN` straight through (`shoes/src/config/pem.rs:418`), so
+/// starting with `-----BEGIN` straight through (`../shoes-plus/src/config/pem.rs:418`), so
 /// this keeps the tests independent of the directory they were launched from. The
 /// newline normalisation is for `core.autocrlf` checkouts.
 const TEST_CRT: &str = include_str!("../fixtures/test.crt");

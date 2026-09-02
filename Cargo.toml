@@ -1,10 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    # Shoes core, maintained as subtree-derived code (prefix: shoes/).
-    # Keep integration changes focused so upstream merges stay reviewable.
-    "shoes",
-    # Our additions live outside it.
+    # The shoes core is maintained in the sibling shoes-plus repository and is
+    # consumed below as a path dependency, so it is not duplicated here. Cargo
+    # requires workspace members to live below this workspace root.
     "crates/shoes-api",
     "crates/shoes-engine",
     # The node-agent rewrite: ACP wire contract, then the agent itself.
@@ -18,13 +17,13 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-shoes = { path = "shoes" }
+shoes = { path = "../shoes-plus" }
 shoes-api = { path = "crates/shoes-api" }
 shoes-engine = { path = "crates/shoes-engine" }
 acp-proto = { path = "crates/acp-proto" }
 node-agent = { path = "crates/node-agent" }
 
-# Versions use "*" to match upstream shoes/Cargo.toml's convention; Cargo.lock
+# Versions use "*" to match ../shoes-plus/Cargo.toml's convention; Cargo.lock
 # at the workspace root is the single source of truth for resolved versions.
 arc-swap = "*"
 async-trait = "*"
@@ -83,7 +82,7 @@ protox = "*"
 tonic-prost-build = "*"
 
 # Profiles must live at the workspace root; a member's [profile] is ignored.
-# These mirror shoes/Cargo.toml so release builds keep upstream's characteristics.
+# These mirror ../shoes-plus/Cargo.toml so release builds keep its characteristics.
 [profile.release]
 opt-level = 3
 lto = "fat"

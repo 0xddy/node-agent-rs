@@ -20,7 +20,7 @@
 //!
 //! Fragmentation, `DISSOCIATE`, heartbeats and 0-RTT are left out; none of them
 //! affect who a connection is billed to. The wire formats are those in
-//! `shoes/src/tuic_server.rs`: the command constants at the top, `read_address` and
+//! `../shoes-plus/src/tuic_server.rs`: the command constants at the top, `read_address` and
 //! `serialize_address` for the address encoding, and the datagram header built in
 //! `run_udp_remote_to_local_datagram_loop`.
 //!

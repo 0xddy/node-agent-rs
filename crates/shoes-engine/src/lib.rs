@@ -9,12 +9,12 @@
 //!
 //! # Layering
 //!
-//! `shoes/` stays an **engine**. It gets extension points -- a trait to look a
+//! `../shoes-plus/` stays an **engine**. It gets extension points -- a trait to look a
 //! credential up, a per-user record to account against -- and nothing that decides
 //! policy, speaks a wire protocol to an operator, or manages a process. Concretely,
-//! nothing under `shoes/src/dynamic/` knows about HTTP, JSON, or a user database.
+//! nothing under `../shoes-plus/src/dynamic/` knows about HTTP, JSON, or a user database.
 //!
-//! The dependency list is the test, and it is easy to apply: `shoes/src/dynamic/`
+//! The dependency list is the test, and it is easy to apply: `../shoes-plus/src/dynamic/`
 //! added exactly one crate, `arc-swap`, for the pointer swap a reload is built on.
 //! That is a concurrency primitive of the same kind as the `tokio` already there. If
 //! a change to this module would need a transport or a store, it belongs out here
@@ -46,7 +46,7 @@
 //! | build resolvers | [`shoes::dns::build_dns_registry`] |
 //! | start listeners | [`shoes::tcp::tcp_server::start_servers_with_users`] |
 //!
-//! The footprint inside `shoes/`, which is what every future merge of upstream has
+//! The footprint inside `../shoes-plus/`, which is what every future merge of upstream has
 //! to survive, is roughly 3,200 new lines under `src/dynamic/` plus 28 touched files
 //! elsewhere. Those 28 are of four kinds:
 //!
@@ -70,7 +70,7 @@
 //!
 //! Two of those sites brought new wire-format code with them --
 //! `shadowsocks/eih.rs` for 2022 identity headers, `vmess/auth.rs` for auth ids --
-//! which lives inside `shoes/` on purpose: it is protocol, and putting it out here
+//! which lives inside `../shoes-plus/` on purpose: it is protocol, and putting it out here
 //! would mean a second implementation of a wire format in the tree.
 //!
 //! The third point is the only upstream *behaviour* change, and it is behaviour
@@ -1431,10 +1431,10 @@ impl Engine {
 /// use -- including `ServerConfig`'s hand-written `Deserialize` impl. No parallel
 /// JSON schema to maintain.
 ///
-/// The step order mirrors `shoes/src/main.rs:339`: certs are inlined *before*
+/// The step order mirrors `../shoes-plus/src/main.rs:339`: certs are inlined *before*
 /// validation. That order is load-bearing rather than cosmetic --
 /// `create_server_configs` reaches `embed_pem_from_map`, which `panic!`s on a PEM
-/// path it has not seen loaded (`shoes/src/config/pem.rs:466`). Skipping the
+/// path it has not seen loaded (`../shoes-plus/src/config/pem.rs:466`). Skipping the
 /// conversion turns any file-backed cert into a panicked request task instead of an
 /// error response.
 /// One inbound's startable configs, together with the DNS groups they reference.
@@ -1539,7 +1539,7 @@ async fn validate_server_config_payload(
         match config {
             Config::Server(server_config) => {
                 // `start_tcp_or_quic_servers` has `Transport::Udp => todo!()`
-                // (`shoes/src/tcp/tcp_server.rs:395`). Reject it here rather than
+                // (`../shoes-plus/src/tcp/tcp_server.rs:395`). Reject it here rather than
                 // letting a `todo!()` panic escape into the API task.
                 if matches!(server_config.transport, Transport::Udp) {
                     return Err(EngineError::Unsupported(

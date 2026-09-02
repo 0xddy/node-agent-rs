@@ -173,7 +173,9 @@ Hysteria2 client 的严格限制是：
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy -p node-agent --all-targets --locked -- -D warnings
-cargo clippy -p shoes --lib --locked -- -D warnings
+cargo fmt --manifest-path ..\shoes-plus\Cargo.toml --all -- --check
+cargo test --manifest-path ..\shoes-plus\Cargo.toml --all-targets --locked
+cargo clippy --manifest-path ..\shoes-plus\Cargo.toml --all-targets --locked --no-deps
 cargo build --release --locked -p node-agent --bin node-agent
 ```
 

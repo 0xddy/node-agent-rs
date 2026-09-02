@@ -23,7 +23,7 @@ tokio-util = { workspace = true }
 # Test-only, and only for the Hysteria2 suite: shoes ships no Hysteria2 *client*, so
 # unlike every other protocol the tests cannot borrow one from the crate under test
 # and must speak QUIC and HTTP/3 themselves. Versions are `*` and features mirror
-# `shoes/Cargo.toml` so the harness resolves to the same crates the server uses --
+# `../shoes-plus/Cargo.toml` so the harness resolves to the same crates the server uses --
 # two rustls crypto providers in one process would be a problem all of its own.
 [dev-dependencies]
 bytes = "*"

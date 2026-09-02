@@ -7,7 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Upstream pins nothing: `shoes/Cargo.toml` uses `*` for every version and
+  # Upstream pins nothing: `../shoes-plus/Cargo.toml` uses `*` for every version and
   # Cargo.lock at the workspace root is the single source of truth. Building with
   # `--locked` is what makes CI test the versions that were actually reviewed.
   CARGO_INCREMENTAL: 0
@@ -18,14 +18,32 @@ jobs:
     # SO_REUSEPORT, the TUN device -- are `cfg`'d out on Windows, so a Windows-only
     # run never compiles them. Developing on Windows and gating on Linux covers both.
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: node-agent-rs
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out node-agent-rs
+        uses: actions/checkout@v4
+        with:
+          path: node-agent-rs
+
+      - name: Check out shoes-plus
+        uses: actions/checkout@v4
+        with:
+          repository: 0xddy/shoes-plus
+          # Keep node-agent builds reproducible across shoes-plus main updates.
+          ref: 9a9eec6ec32534ad80dcea51fa7f13417e280ed4
+          path: shoes-plus
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            node-agent-rs -> target
+            shoes-plus -> target
 
       - name: Format
         run: cargo fmt --all --check
@@ -40,3 +58,15 @@ jobs:
       # test certificate.
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Format shoes-plus
+        working-directory: shoes-plus
+        run: cargo fmt --all --check
+
+      - name: Clippy shoes-plus
+        working-directory: shoes-plus
+        run: cargo clippy --all-targets --locked --no-deps
+
+      - name: Test shoes-plus
+        working-directory: shoes-plus
+        run: cargo test --all-targets --locked

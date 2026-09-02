@@ -17,7 +17,7 @@
 //! Fragmentation, congestion control, `Hysteria-CC-RX` and port hopping are left
 //! out; none of them affect who a connection is billed to. The small HTTP probe
 //! helper at the bottom does exercise the masquerade site. The wire formats are
-//! those in `shoes/src/hysteria2_server.rs` -- the frame
+//! those in `../shoes-plus/src/hysteria2_server.rs` -- the frame
 //! constant at `:840`, the status reply built at `:877`, and the datagram header
 //! described at `:422`.
 
@@ -131,7 +131,7 @@ pub struct Hysteria2Client {
     /// The HTTP/3 driver. Held for the client's whole life on purpose: h3 closes the
     /// QUIC connection underneath it when the driver is dropped, which would take the
     /// proxied streams with it. The server keeps its own half alive for the same
-    /// reason -- see the comment at `shoes/src/hysteria2_server.rs:70`.
+    /// reason -- see the comment at `../shoes-plus/src/hysteria2_server.rs:70`.
     driver: tokio::task::JoinHandle<()>,
     /// Also held rather than dropped: the endpoint owns the client's UDP socket.
     endpoint: quinn::Endpoint,
@@ -219,7 +219,7 @@ impl Hysteria2Client {
         // `wait_idle` is what drives the connection; nothing else polls it. It returns
         // as soon as the auth request finishes, and *dropping* the h3 connection closes
         // the QUIC connection underneath -- the trap the server documents at
-        // `shoes/src/hysteria2_server.rs:70`. So the task parks instead of ending,
+        // `../shoes-plus/src/hysteria2_server.rs:70`. So the task parks instead of ending,
         // holding the h3 half alive until `Drop` aborts it.
         let driver = tokio::spawn(async move {
             let _ = driver.wait_idle().await;

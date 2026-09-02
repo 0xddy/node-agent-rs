@@ -1,7 +1,13 @@
 # Dynamic engine: architecture
 
-How `node-agent-rust` turns upstream [`shoes`](https://github.com/cfal/shoes) — a config-file
-CLI — into an engine an API can drive, without making `shoes/` unmergeable.
+How `node-agent-rust` turns [`shoes-plus`](https://github.com/0xddy/shoes-plus) — a
+config-file CLI derived from upstream shoes — into an engine an API can drive without
+coupling application policy into the proxy core.
+
+> Repository layout (2026-08-31): the shoes core lives only in the sibling
+> `../shoes-plus/` repository and is loaded here as a Cargo path dependency. Older
+> design-history references to `shoes/` mean that repository's root, not a second
+> source copy under `node-agent-rust`.
 
 This is the design record: the boundaries, the invariants, and why each decision went
 the way it did. For *what is left to build*, see
@@ -22,17 +28,17 @@ We need three things it does not do:
 3. **swap rules and protocol settings** on a running listener without disturbing
    established connections.
 
-And one thing that must not change: `shoes/` remains subtree-derived and has to keep
-absorbing upstream releases. Every local line there is a line a future merge has to
-survive.
+And one thing that must not change: `../shoes-plus/` remains separately maintained and
+has to keep absorbing upstream releases. Every local line there is a line a future
+merge has to survive.
 
 So the governing rule is a seam, not a feature list:
 
-> **`shoes/` gets extension points. Everything that decides policy, speaks to an
+> **`../shoes-plus/` gets extension points. Everything that decides policy, speaks to an
 > operator, or stores a user lives outside it.**
 
-The test for "is this allowed inside `shoes/`" is dependency-shaped and easy to apply.
-`shoes/src/dynamic/` added exactly **one** crate: `arc-swap`, for the pointer swap a
+The test for "is this allowed inside `../shoes-plus/`" is dependency-shaped and easy to apply.
+`../shoes-plus/src/dynamic/` added exactly **one** crate: `arc-swap`, for the pointer swap a
 reload is built on — a concurrency primitive of the same kind as the `tokio` already
 there. Nothing in the module knows about HTTP, JSON, gRPC, or a database, and if a
 change would need one of those, it belongs in `crates/` instead.
@@ -52,13 +58,13 @@ change would need one of those, it belongs in `crates/` instead.
                                   │
                     ┌─────────────┴─────────────┐
                     ▼                           ▼
-   crates/shoes-api                  shoes/src/dynamic/  ── the extension points
+   crates/shoes-api           ../shoes-plus/src/dynamic/ ── the extension points
      InboundSpec, UserSpec,            UserRegistry, UserContext, ConnContext,
      InboundInfo, UserInfo             TrafficMeterStream, HandlerSlot, SelectorSlot,
      (vocabulary only)                 ServerHandle, StaticUserRegistry, credential
                                                   │
                                                   ▼
-                                       shoes/  ── the proxy engine (subtree)
+                                  ../shoes-plus/ ── the proxy engine repository
 ```
 
 | crate | role |
@@ -76,23 +82,23 @@ mergeable — and would make everyone who wanted a different transport fork it.
 name the types without linking the proxy engine. Nobody depending on `shoes-engine`
 needs to know it exists.
 
-### What went *inside* `shoes/` anyway, and why
+### What went *inside* `../shoes-plus/` anyway, and why
 
-Two substantial modules live inside `shoes/` rather than in `crates/`, and the reason
+Two substantial modules live inside `../shoes-plus/` rather than in `crates/`, and the reason
 is the same for both: **they are wire format**, and wire format belongs with the
 protocol that speaks it.
 
-- `shoes/src/shadowsocks/eih.rs` — Shadowsocks 2022 extensible identity headers. A
+- `../shoes-plus/src/shadowsocks/eih.rs` — Shadowsocks 2022 extensible identity headers. A
   multi-user 2022 server has a circularity to break: the salt says nothing about who
   the client is, and the session key it would need to decrypt something identifying is
   derived from the very PSK it is looking for. The identity header names the PSK
   before any of it is in use. That is protocol, not policy.
-- `shoes/src/vmess/auth.rs` — sealing and opening a VMess auth id. VMess sends 16 bytes
+- `../shoes-plus/src/vmess/auth.rs` — sealing and opening a VMess auth id. VMess sends 16 bytes
   encrypted under a key derived from the uuid, holding only a timestamp and a CRC32C.
   Recognising a user means trial-decrypting with each known key.
 
-Putting either outside `shoes/` would mean a second implementation of a wire format in
-the tree, and the two would drift. `shoes/src/dynamic/credential.rs` exists for exactly
+Putting either outside `../shoes-plus/` would mean a second implementation of a wire format,
+and the two would drift. `../shoes-plus/src/dynamic/credential.rs` exists for exactly
 the same reason at the boundary: it re-exports the derivations (`parse_uuid`,
 `trojan_password_hash`, `shadowsocks_psk_hash`, `VmessAuthKey`) so an out-of-crate
 registry indexes on precisely the bytes `StaticUserRegistry` does.
@@ -231,7 +237,7 @@ These are load-bearing. Breaking any of them is a security bug, not a style prob
 
 | | `StaticUserRegistry` | `MemoryUserRegistry` |
 |---|---|---|
-| lives in | `shoes/src/dynamic/` | `crates/shoes-engine/` |
+| lives in | `../shoes-plus/src/dynamic/` | `crates/shoes-engine/` |
 | built from | one inbound's own config credential | the API |
 | structure | immutable `FxHashMap` | sharded `DashMap` |
 | mutable | no | yes, while serving |
@@ -704,21 +710,21 @@ lacking it, and TUIC's uni-stream packet header missing its two leading bytes.
 
 ## 8. Footprint
 
-What a future `git subtree` merge of upstream has to survive, measured against
-`master`:
+What a future upstream merge in the `shoes-plus` repository has to survive, measured
+against its upstream base:
 
 | area | size |
 |---|---|
-| `shoes/src/dynamic/` (entirely new) | ~3,200 lines |
-| the rest of `shoes/` | 28 files, +2,381 / −746 |
+| `../shoes-plus/src/dynamic/` (entirely new) | ~3,200 lines |
+| the rest of `../shoes-plus/` | 28 files, +2,381 / −746 |
 | `crates/` | ~11,800 lines, of which ~6,800 are tests |
 
-Inside `shoes/`, outside the new module, the changes are of four kinds:
+Inside `../shoes-plus/`, outside the new module, the changes are of four kinds:
 
 1. **Visibility widenings** — `pub mod tcp;`, `pub mod socket_util;`,
    `pub mod dynamic;`, exporting `DnsRegistry`; plus the `arc-swap` dependency and
-   `[profile.release]` moved to the workspace root, because Cargo ignores profiles in
-   a non-root member. `shoes/Cargo.toml` also carries a package-scoped
+   `[profile.release]` mirrored at the node-agent workspace root, because dependency
+   package profiles do not control the top-level build. `../shoes-plus/Cargo.toml` also carries a package-scoped
    `[lints.clippy]` allowing `absurd_extreme_comparisons`: three of upstream's VMess
    tests assert `length_mask <= u16::MAX` on a value that is already a `u16`, which
    clippy denies by default — that made `cargo clippy --workspace --all-targets` fail
@@ -758,7 +764,7 @@ For review checklists and for the next protocol conversion.
 7. A hot handler reload changes what the next logical flow sees, never a live one.
    A full Box/forced reload instead uses the explicit hard-remove path and closes the
    entire previous connection tree before any candidate inbound starts.
-8. `shoes/src/dynamic/` adds no dependency an *application* would need — no
+8. `../shoes-plus/src/dynamic/` adds no dependency an *application* would need — no
    transport, no serialisation format, no store. (`arc-swap` is the one crate it did
    add, and it is a concurrency primitive.)
 9. An inbound that cannot use a `users` list refuses one — including one whose

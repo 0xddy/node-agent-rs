@@ -11,8 +11,13 @@ listener, and blocks forever: users and rules are fixed for the life of the proc
 - **`node-agent`** — the shipped daemon: a drop-in replacement for the Go ACP node agent,
   running shoes where the Go agent embedded sing-box.
 
-`shoes/` remains subtree-derived from upstream. Integration changes stay focused so
-upstream merges remain reviewable.
+The shoes core has a single source of truth in the sibling
+[`shoes-plus`](https://github.com/0xddy/shoes-plus) repository. This workspace loads it through the Cargo
+path dependency `../shoes-plus`; no second copy is kept here. In the standard local
+layout, clone both repositories under the same parent directory.
+
+Local builds use that sibling working tree directly. CI and release builds check out
+the pinned compatible `shoes-plus` revision beside this repository.
 
 ## Engine
 
@@ -92,20 +97,20 @@ Releases come from the manual **Release node-agent** workflow: raw binaries plus
 
 | path | what |
 |---|---|
-| `shoes/` | upstream subtree. **Never restructure.** Extension points in `shoes/src/dynamic/`. |
+| `../shoes-plus/` | separately maintained shoes core. Extension points live in `src/dynamic/`. |
 | `crates/shoes-engine/` | `Engine`, the user registry, the acceptance suites. What an embedder links. |
 | `crates/shoes-api/` | argument and report types, split out so a conversion layer need not link the engine. |
 | `crates/acp-proto/` | ACP protobuf, topology digest, Go-compatible HMAC. |
 | `crates/node-agent/` | ACP session, topology compiler, transactional runtime, port hopping, telemetry, logs. |
 | `docs/` | the design record. |
 
-Wire formats stay in `shoes/`, runtime control in `shoes-engine`, panel policy in
+Wire formats stay in `../shoes-plus/`, runtime control in `shoes-engine`, panel policy in
 `node-agent`. `shoes-engine` knows nothing about ACP or gRPC.
 
 ## Docs
 
 - [dynamic-engine-design.md](docs/dynamic-engine-design.md) — architecture; §9 collects
-  the invariants. Read it before touching `shoes/src/dynamic/` or adding a protocol.
+  the invariants. Read it before touching `../shoes-plus/src/dynamic/` or adding a protocol.
 - [dynamic-engine-plan.md](docs/dynamic-engine-plan.md) — the conversion schedule.
 - [node-agent-panel-compatibility.md](docs/node-agent-panel-compatibility.md) (中文) —
   bootstrap TOML, the topology support matrix, and every rejection case.
@@ -122,6 +127,15 @@ cargo clippy --workspace --all-targets --locked
 
 ```bash
 cargo test --workspace --locked
+```
+
+Because `shoes-plus` is a sibling path dependency rather than a workspace member, its
+own gates use its manifest and lock file:
+
+```bash
+cargo fmt --manifest-path ../shoes-plus/Cargo.toml --all -- --check
+cargo clippy --manifest-path ../shoes-plus/Cargo.toml --all-targets --locked --no-deps
+cargo test --manifest-path ../shoes-plus/Cargo.toml --all-targets --locked
 ```
 
 `--all-targets` is load-bearing: without it the ~15,000 lines of acceptance suite are
@@ -151,8 +165,8 @@ Items 4 and 5 are the ones that keep getting broken.
 
 Post-auth: `UserSpec.max_conns`, 512 UDP sessions per Hysteria2/TUIC connection, 256
 AnyTLS streams per session, 256 HTTP/2 streams. Pre-auth:
-`shoes/src/tcp/handshake_gate.rs` caps handshakes in flight per listener (1024 total, 64
-per source IP). Replay: `shoes/src/replay_filter.rs` (Shadowsocks 60s salts, VMess 240s
+`../shoes-plus/src/tcp/handshake_gate.rs` caps handshakes in flight per listener (1024 total, 64
+per source IP). Replay: `../shoes-plus/src/replay_filter.rs` (Shadowsocks 60s salts, VMess 240s
 auth ids). Each is a const with its reasoning in the doc comment. A per-IP rate limiter,
 a replay-filter capacity cap and UDP session LRU were evaluated and deliberately not
 built — not oversights.

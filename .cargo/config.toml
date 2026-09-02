@@ -1,8 +1,7 @@
 # Cargo reads .cargo/config.toml from the directory it is invoked in and that
-# directory's ancestors -- never from a package directory. Now that shoes is a
-# workspace member, shoes/.cargo/config.toml is dead for any build started from
-# the workspace root, so its settings have to be mirrored here. The original file
-# is left in place untouched so upstream merges stay clean.
+# directory's ancestors -- never from a dependency package. Since shoes is loaded
+# from ../shoes-plus, settings needed by node-agent builds must live here rather
+# than relying on ../shoes-plus/.cargo/config.toml.
 
 # Static linking for musl targets
 [target.'cfg(target_env = "musl")']
