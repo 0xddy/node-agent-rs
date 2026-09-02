@@ -36,9 +36,9 @@ async fn upload_and_download_bandwidths_negotiate_independently() {
         ("both", 100, 200, 20_000_000, false, 25_000_000, false),
         ("download-only", 0, 37, 4_000_000, false, 4_625_000, false),
         ("upload-only", 80, 0, 20_000_000, false, 0, false),
-        // Numeric zero is uncapped. It deliberately does not force the client's
-        // upload half onto BBR the way the literal `auto` value would.
-        ("uncapped", 100, 0, 0, false, 0, false),
+        // sing-quic couples an RX=0 request to bandwidth detection in both
+        // directions, so the response is `auto` rather than numeric zero.
+        ("auto", 100, 37, 0, false, 0, true),
         ("ignored", 0, 0, 20_000_000, true, 0, true),
     ];
 

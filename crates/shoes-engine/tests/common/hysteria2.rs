@@ -12,14 +12,12 @@
 //! * the HTTP/3 auth exchange (`POST https://hysteria/auth`, `hysteria-auth: <pw>`,
 //!   success being the protocol's non-standard status **233**),
 //! * the TCP request frame (`0x401`, address, padding) and its status reply,
-//! * unfragmented UDP over QUIC datagrams.
+//! * unfragmented UDP over QUIC datagrams,
+//! * the negotiated client-side Brutal controller used by sustained-upload tests.
 //!
-//! Fragmentation, congestion control, `Hysteria-CC-RX` and port hopping are left
-//! out; none of them affect who a connection is billed to. The small HTTP probe
-//! helper at the bottom does exercise the masquerade site. The wire formats are
-//! those in `../shoes-plus/src/hysteria2_server.rs` -- the frame
-//! constant at `:840`, the status reply built at `:877`, and the datagram header
-//! described at `:422`.
+//! Fragmentation and port hopping are left out. The small HTTP probe helper at the
+//! bottom does exercise the masquerade site. The wire formats are those in
+//! `../shoes-plus/src/hysteria2_server.rs`.
 
 #![allow(dead_code)]
 
@@ -90,28 +88,49 @@ impl rustls::client::danger::ServerCertVerifier for NoVerification {
 
 /// Built once: a `ClientConfig` carries a whole crypto provider, and rebuilding one
 /// per connection is slow enough to show up in a suite that opens dozens.
-fn client_config() -> quinn::ClientConfig {
-    static CONFIG: OnceLock<quinn::ClientConfig> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-            let algorithms = provider.signature_verification_algorithms;
+fn client_config(brutal_capable: bool) -> quinn::ClientConfig {
+    static DEFAULT_CONFIG: OnceLock<quinn::ClientConfig> = OnceLock::new();
+    static BRUTAL_CONFIG: OnceLock<quinn::ClientConfig> = OnceLock::new();
+    let slot = if brutal_capable {
+        &BRUTAL_CONFIG
+    } else {
+        &DEFAULT_CONFIG
+    };
+    slot.get_or_init(|| {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let algorithms = provider.signature_verification_algorithms;
 
-            let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-                // QUIC is TLS 1.3 only, and naming that here is what lets
-                // `QuicClientConfig::try_from` accept the config.
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .expect("tls 1.3 should be available")
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerification { algorithms }))
-                .with_no_client_auth();
-            tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            // QUIC is TLS 1.3 only, and naming that here is what lets
+            // `QuicClientConfig::try_from` accept the config.
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("tls 1.3 should be available")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerification { algorithms }))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
 
-            let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-                .expect("the tls config should be usable for quic");
-            quinn::ClientConfig::new(Arc::new(quic))
-        })
-        .clone()
+        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+            .expect("the tls config should be usable for quic");
+        let mut config = quinn::ClientConfig::new(Arc::new(quic));
+        if brutal_capable {
+            // A real Hysteria2 client has to install the switchable controller
+            // before the QUIC handshake, then activates it only after auth has
+            // returned the server's receive ceiling.  Most tests do not need
+            // that machinery; upload-pressure tests do, otherwise they exercise
+            // Quinn's default controller rather than the Hysteria2 upload path.
+            let mut transport = quinn::TransportConfig::default();
+            transport
+                .send_window(16 * 1024 * 1024)
+                .receive_window((20_u32 * 1024 * 1024).into())
+                .stream_receive_window((8_u32 * 1024 * 1024).into())
+                .congestion_controller_factory(Arc::new(shoes::hysteria2::brutal::BrutalConfig))
+                .initial_rtt(Duration::from_millis(100));
+            config.transport_config(Arc::new(transport));
+        }
+        config
+    })
+    .clone()
 }
 
 // --------------------------------------------------------------------------- client
@@ -128,6 +147,10 @@ pub struct Hysteria2Client {
     pub advertised_receive_bps: u64,
     /// Whether the response asked the client to keep bandwidth detection (BBR).
     pub advertised_receive_auto: bool,
+    /// Client-to-server rate selected after applying both peers' ceilings.
+    ///
+    /// Zero means the test client retained its default congestion controller.
+    pub negotiated_send_bps: u64,
     /// The HTTP/3 driver. Held for the client's whole life on purpose: h3 closes the
     /// QUIC connection underneath it when the driver is dropped, which would take the
     /// proxied streams with it. The server keeps its own half alive for the same
@@ -142,6 +165,11 @@ pub struct Hysteria2Client {
 }
 
 impl Hysteria2Client {
+    /// Snapshot the underlying QUIC path for throughput/liveness diagnostics.
+    pub fn stats(&self) -> quinn::ConnectionStats {
+        self.connection.stats()
+    }
+
     /// Connects and authenticates, or fails.
     ///
     /// A wrong password is *not* an error from the QUIC handshake: the server answers
@@ -166,6 +194,32 @@ impl Hysteria2Client {
             server,
             password,
             receive_bps,
+            0,
+            false,
+        )
+        .await
+    }
+
+    /// Connects while declaring fixed receive and send rates in bytes per second.
+    ///
+    /// The send half mirrors a production Hysteria2 client: its switchable Brutal
+    /// controller is installed before QUIC starts and activated after authentication,
+    /// capped by the server's `Hysteria-CC-RX` response.  This matters for sustained
+    /// uploads; merely putting the header on the wire only tests the server's download
+    /// direction.
+    pub async fn connect_with_rates_bps(
+        server: SocketAddr,
+        password: &str,
+        receive_bps: u64,
+        send_bps: u64,
+    ) -> io::Result<Self> {
+        Self::connect_over(
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?,
+            server,
+            password,
+            receive_bps,
+            send_bps,
+            true,
         )
         .await
     }
@@ -195,7 +249,7 @@ impl Hysteria2Client {
             )),
             runtime,
         )?;
-        Self::connect_over(endpoint, server, password, 0).await
+        Self::connect_over(endpoint, server, password, 0, 0, false).await
     }
 
     async fn connect_over(
@@ -203,9 +257,11 @@ impl Hysteria2Client {
         server: SocketAddr,
         password: &str,
         receive_bps: u64,
+        send_bps: u64,
+        brutal_capable: bool,
     ) -> io::Result<Self> {
         let connecting = endpoint
-            .connect_with(client_config(), server, "e2e.test")
+            .connect_with(client_config(brutal_capable), server, "e2e.test")
             .map_err(|e| io::Error::other(format!("quic connect rejected: {e}")))?;
         let connection = deadline(connecting)
             .await?
@@ -269,12 +325,25 @@ impl Hysteria2Client {
         let advertised_receive_bps = advertised_receive_header
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        let negotiated_send_bps = if advertised_receive_auto || send_bps == 0 {
+            0
+        } else if advertised_receive_bps == 0 {
+            send_bps
+        } else {
+            send_bps.min(advertised_receive_bps)
+        };
+        if negotiated_send_bps != 0 {
+            shoes::hysteria2::brutal::activate(&connection, negotiated_send_bps).map_err(
+                |error| io::Error::other(format!("could not activate client Brutal: {error}")),
+            )?;
+        }
 
         Ok(Self {
             connection,
             udp_enabled,
             advertised_receive_bps,
             advertised_receive_auto,
+            negotiated_send_bps,
             driver,
             endpoint,
             requests,
@@ -497,7 +566,7 @@ pub async fn request(
     let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
     let connection = deadline(
         endpoint
-            .connect_with(client_config(), server, "e2e.test")
+            .connect_with(client_config(false), server, "e2e.test")
             .map_err(|e| io::Error::other(format!("quic connect rejected: {e}")))?,
     )
     .await?

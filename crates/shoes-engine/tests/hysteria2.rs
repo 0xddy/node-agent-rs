@@ -343,6 +343,90 @@ async fn one_connection_carries_many_streams_for_one_user() {
     checks.finish();
 }
 
+/// A speed test opens many streams at once and may cancel the whole batch as soon
+/// as it has a result. Upload limiting must not turn those abandoned reads into a
+/// shared queue that stalls the next stream on the same QUIC connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canceled_parallel_uploads_leave_no_rate_debt_on_the_connection() {
+    const UPLOAD_LIMIT_BPS: u64 = 1_000_000;
+    const STREAMS: usize = 32;
+    const PAYLOAD: usize = 32 * 1024;
+    const PROBE_DEADLINE: Duration = Duration::from_millis(900);
+
+    let engine = engine().await;
+    let sink = Sink::start("sink").await;
+    let hy = free_addr();
+    engine
+        .add_inbound(dynamic("hy2", hysteria2_inbound(hy, false)))
+        .await
+        .expect("the unobfuscated Hysteria2 inbound should start");
+
+    let mut alice = password_user("alice", ALICE);
+    alice.upload_limit_bps = Some(UPLOAD_LIMIT_BPS);
+    engine
+        .add_user("hy2", alice)
+        .expect("the upload-limited user should be accepted");
+
+    let client = hy2::Hysteria2Client::connect(hy, ALICE)
+        .await
+        .expect("alice should authenticate");
+    let rx_before = engine
+        .get_user("hy2", "alice")
+        .expect("alice should be visible")
+        .rx;
+
+    let command = format!("{PAYLOAD} 0\n");
+    let payload = vec![b'x'; PAYLOAD];
+    let mut uploads = Vec::with_capacity(STREAMS);
+    for index in 0..STREAMS {
+        let mut stream = client
+            .open_tcp(sink.address)
+            .await
+            .unwrap_or_else(|error| panic!("upload stream {index} should open: {error}"));
+        stream
+            .write_all(command.as_bytes())
+            .await
+            .unwrap_or_else(|error| panic!("upload stream {index} command failed: {error}"));
+        stream
+            .write_all(&payload)
+            .await
+            .unwrap_or_else(|error| panic!("upload stream {index} payload failed: {error}"));
+        uploads.push(stream);
+    }
+
+    // Give every server-side copy task a scheduling turn. Under the old
+    // post-read reservation each of them could pull a full buffer and enqueue
+    // future debt; the cancellation below then left that debt behind.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let pressure_bytes = engine
+        .get_user("hy2", "alice")
+        .expect("alice should remain visible")
+        .rx
+        .saturating_sub(rx_before);
+    assert!(
+        pressure_bytes >= 125_000,
+        "the upload batch did not reach the one-second opening burst: {pressure_bytes} bytes"
+    );
+
+    for mut stream in uploads {
+        let _ = stream.send.reset(0u32.into());
+        let _ = stream.recv.stop(0u32.into());
+    }
+
+    let started = std::time::Instant::now();
+    let probe = tokio::time::timeout(PROBE_DEADLINE, async {
+        let mut stream = client.open_tcp(sink.address).await?;
+        stream.write_all(b"who\n").await?;
+        stream.read_line().await
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(probe, Ok(Ok(ref name)) if name == "sink"),
+        "a tiny same-connection probe took {elapsed:?} after canceling {STREAMS} uploads: {probe:?}"
+    );
+}
+
 /// A failed outbound setup is a logical-stream failure, not a successful Hysteria2
 /// handshake followed by EOF and not a reason to retire the shared QUIC connection.
 #[tokio::test(flavor = "multi_thread")]
