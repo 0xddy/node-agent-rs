@@ -392,6 +392,40 @@ impl Hysteria2Client {
         Ok(Hysteria2Stream { send, recv })
     }
 
+    /// Opens a proxied TCP stream the way sing-quic's `clientConn.Write` does, and
+    /// does not wait for the response.
+    ///
+    /// This is the shape a real client produces and [`open_tcp`](Self::open_tcp) does
+    /// not: the request frame is written in **one** write with the first payload
+    /// chunk appended, it carries sing-quic's 64..512 bytes of padding, and nothing
+    /// reads the TCP response until the application first reads. An upload therefore
+    /// keeps filling the stream while the server is still resolving and dialling,
+    /// which a harness that waits for status first never exercises.
+    pub async fn open_tcp_fast_open(
+        &self,
+        dest: SocketAddr,
+        payload: &[u8],
+    ) -> io::Result<Hysteria2Stream> {
+        let (mut send, recv) = deadline(self.connection.open_bi())
+            .await?
+            .map_err(|e| io::Error::other(format!("could not open a stream: {e}")))?;
+
+        let address = dest.to_string();
+        // `tcpRequestPadding` in sing-quic's `internal/protocol/padding.go`.
+        let padding_len = rand_range(64, 512);
+        let mut request = varint(FRAME_TYPE_TCP_REQUEST);
+        request.extend_from_slice(&varint(address.len() as u64));
+        request.extend_from_slice(address.as_bytes());
+        request.extend_from_slice(&varint(padding_len as u64));
+        request.extend(std::iter::repeat_n(b'a', padding_len));
+        request.extend_from_slice(payload);
+        deadline(send.write_all(&request))
+            .await?
+            .map_err(stream_err)?;
+
+        Ok(Hysteria2Stream { send, recv })
+    }
+
     /// Sends one unfragmented datagram to `dest` within `session`.
     pub async fn send_udp(
         &self,
@@ -464,6 +498,30 @@ impl Hysteria2Stream {
         deadline(self.send.write_all(data))
             .await?
             .map_err(stream_err)
+    }
+
+    /// Consumes the TCP response, the way `clientConn.Read` does on its first read.
+    ///
+    /// Separate from [`Hysteria2Client::open_tcp_fast_open`] for the same reason it
+    /// is separate in sing-quic: a real client does not wait for status before it
+    /// starts uploading.
+    pub async fn read_tcp_response(&mut self) -> io::Result<()> {
+        let mut status = [0u8; 1];
+        deadline(self.recv.read_exact(&mut status))
+            .await?
+            .map_err(stream_err)?;
+        if status[0] != 0 {
+            return Err(io::Error::other("the proxy refused the connection"));
+        }
+        // [varint message length] [message] [varint padding length] [padding]
+        for _ in 0..2 {
+            let length = read_varint(&mut self.recv).await?;
+            let mut discard = vec![0u8; length as usize];
+            deadline(self.recv.read_exact(&mut discard))
+                .await?
+                .map_err(stream_err)?;
+        }
+        Ok(())
     }
 
     /// Reads up to the next `\n`, trimmed, mirroring [`super::read_line`].
@@ -716,4 +774,14 @@ pub async fn udp_burst(
         }
     }
     Ok(echoed)
+}
+
+/// A padding length in `[min, max)`, matching sing-quic's `padding.String()`.
+fn rand_range(min: usize, max: usize) -> usize {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    min + nanos % (max - min)
 }
