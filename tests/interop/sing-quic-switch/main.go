@@ -1,5 +1,5 @@
-// sing-quic-switch exercises a normal download-to-upload transition through one
-// official sing-quic HY2 client. All addresses must be numeric loopback addresses.
+// sing-quic-switch exercises normal file transfers through one official HY2
+// client. All addresses must be numeric loopback addresses.
 package main
 
 import (
@@ -7,12 +7,11 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -23,98 +22,108 @@ import (
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
-const (
-	streams       = 4
-	downloadBytes = 128 * 1024 * 1024
-	uploadBytes   = 32 * 1024 * 1024
-	chunkBytes    = 64 * 1024
-)
+const chunkBytes = 64 * 1024
 
 func main() {
-	if err := run(); err != nil {
+	options, err := parseOptions(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Println(usage)
+		return
+	}
+	if err == nil {
+		err = run(options)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "sing-quic-switch:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	if len(os.Args) != 4 {
-		return errors.New("usage: sing-quic-switch HY2_LOOPBACK_ADDR TCP_LOOPBACK_ADDR TEST_PASSWORD")
-	}
-	server, err := loopbackAddress(os.Args[1])
-	if err != nil {
-		return fmt.Errorf("HY2 server: %w", err)
-	}
-	target, err := loopbackAddress(os.Args[2])
-	if err != nil {
-		return fmt.Errorf("TCP target: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+func run(options options) (runErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), options.timeout)
 	defer cancel()
-	client, err := hysteria2.NewClient(hysteria2.ClientOptions{
-		Context:       ctx,
-		Dialer:        &singleTransportDialer{},
-		Logger:        logger.NOP(),
-		ServerAddress: server,
-		Password:      os.Args[3],
-		TLSConfig: &testTLSConfig{
-			config: &tls.Config{
-				ServerName:         "localhost",
-				InsecureSkipVerify: true, // Test certificates, loopback destinations only.
-			},
-			timeout: 15 * time.Second,
-		},
-		// Zero bandwidth selects automatic congestion control. UDP forwarding
-		// is unused; the QUIC transport remains UDP as required by HY2.
-		UDPDisabled: true,
-	})
+	client, err := newClient(ctx, options.server, options.password)
 	if err != nil {
-		return fmt.Errorf("create client: %w", err)
+		return fmt.Errorf("create main client: %w", err)
 	}
 	defer client.CloseWithError(context.Canceled)
-	stopCancel := context.AfterFunc(ctx, func() { _ = client.CloseWithError(ctx.Err()) })
-	defer stopCancel()
+	defer closeOnCancellation(ctx, client)()
 
-	if err := phase(ctx, client, target, "download", 0, downloadBytes); err != nil {
-		return err
+	fmt.Printf("config streams=%d download_bytes_per_stream=%d upload_bytes_per_stream=%d rounds=%d timeout=%s stream_timeout=%s chunk_bytes=%d independent_probe=%t\n",
+		options.streams, options.download, options.upload, options.rounds, options.timeout, options.streamTimeout, chunkBytes, options.probePassword != "")
+	var label atomic.Value
+	label.Store("round=0 phase=setup")
+	if options.probePassword != "" {
+		monitor, err := startProbeMonitor(ctx, options, &label)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			monitor.stop()
+			if err := monitor.report(); err != nil && runErr == nil {
+				runErr = err
+			}
+		}()
 	}
-	// No sleep or new HY2 Client between phases: exercise immediate direction change.
-	if err := phase(ctx, client, target, "upload", uploadBytes, 1); err != nil {
-		return err
+
+	for round := 1; round <= options.rounds; round++ {
+		for _, stage := range []struct {
+			name          string
+			send, receive int64
+		}{
+			{"download", 0, options.download},
+			{"upload", options.upload, 1},
+		} {
+			if (stage.name == "download" && options.download == 0) || (stage.name == "upload" && options.upload == 0) {
+				continue
+			}
+			label.Store(fmt.Sprintf("round=%d phase=%s", round, stage.name))
+			if err := phase(ctx, client, options, round, stage.name, stage.send, stage.receive); err != nil {
+				return err
+			}
+		}
+		// No sleep or new main Client between phases or rounds.
 	}
-	conn, err := dial(ctx, client, target)
-	if err != nil {
-		return fmt.Errorf("probe dial: %w", err)
+	label.Store(fmt.Sprintf("round=%d phase=final", options.rounds))
+	started := time.Now()
+	if err := probeOnce(ctx, client, options.target, options.probeTimeout); err != nil {
+		return fmt.Errorf("main final probe: %w", err)
 	}
-	defer conn.Close()
-	if err := writeAll(conn, []byte("who\n")); err != nil {
-		return fmt.Errorf("probe write: %w", err)
-	}
-	line, err := bufio.NewReaderSize(conn, 4096).ReadSlice('\n')
-	if err != nil {
-		return fmt.Errorf("probe read: %w", err)
-	}
-	if string(line) != "bounded-peer\n" {
-		return fmt.Errorf("unexpected probe response: %q", line)
-	}
-	fmt.Printf("probe=%s\n", strings.TrimSuffix(string(line), "\n"))
-	return nil
+	fmt.Printf("probe=bounded-peer user=main latency=%s eof=ok\n", time.Since(started))
+	return ctx.Err()
 }
 
-func loopbackAddress(value string) (M.Socksaddr, error) {
-	address, err := netip.ParseAddrPort(value)
-	if err != nil || !address.Addr().IsLoopback() || address.Port() == 0 {
-		return M.Socksaddr{}, errors.New("expected a numeric loopback IP with a nonzero port")
-	}
-	return M.SocksaddrFromNetIP(address), nil
+func newClient(ctx context.Context, server M.Socksaddr, password string) (*hysteria2.Client, error) {
+	return hysteria2.NewClient(hysteria2.ClientOptions{
+		Context: ctx, Dialer: &singleTransportDialer{}, Logger: logger.NOP(),
+		ServerAddress: server, Password: password,
+		TLSConfig: &testTLSConfig{
+			config:  &tls.Config{ServerName: "localhost", InsecureSkipVerify: true}, // Loopback test certificates only.
+			timeout: 15 * time.Second,
+		},
+		// Zero bandwidth selects automatic congestion control. The QUIC
+		// transport uses UDP; application UDP forwarding is unused.
+		UDPDisabled: true,
+	})
 }
 
-// The SDK normally reconnects transparently. Refuse a second underlying UDP
-// transport so a closed QUIC connection cannot silently turn this into a new-
-// connection test. The actual socket implementation is sing's SystemDialer.
-type singleTransportDialer struct {
-	dials atomic.Uint32
+// Join a started cancellation callback so it cannot outlive run/monitor cleanup.
+func closeOnCancellation(ctx context.Context, client *hysteria2.Client) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		_ = client.CloseWithError(ctx.Err())
+	})
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
 }
+
+// Refuse a second UDP transport: the SDK's automatic reconnect must not hide
+// a failed existing QUIC connection. The actual socket uses SystemDialer.
+type singleTransportDialer struct{ dials atomic.Uint32 }
 
 func (d *singleTransportDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	if network != "udp" || !destination.Addr.IsLoopback() {
@@ -130,15 +139,14 @@ func (*singleTransportDialer) ListenPacket(context.Context, M.Socksaddr) (net.Pa
 	return nil, errors.New("port hopping and realm sockets are not used by this test")
 }
 
-func dial(ctx context.Context, client *hysteria2.Client, target M.Socksaddr) (net.Conn, error) {
-	conn, err := client.DialConn(ctx, target)
+func dial(ctx context.Context, client *hysteria2.Client, target M.Socksaddr, timeout time.Duration) (net.Conn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := client.DialConn(dialCtx, target)
 	if err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(90 * time.Second)
-	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
-		deadline = contextDeadline
-	}
+	deadline, _ := dialCtx.Deadline()
 	if err := conn.SetDeadline(deadline); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -146,41 +154,60 @@ func dial(ctx context.Context, client *hysteria2.Client, target M.Socksaddr) (ne
 	return conn, nil
 }
 
-func phase(ctx context.Context, client *hysteria2.Client, target M.Socksaddr, name string, sendBytes, receiveBytes int64) error {
-	started := time.Now()
-	results := make(chan error, streams)
-	for stream := 0; stream < streams; stream++ {
-		go func() {
-			results <- transfer(ctx, client, target, sendBytes, receiveBytes)
-		}()
+func phase(ctx context.Context, client *hysteria2.Client, options options, round int, name string, sendBytes, receiveBytes int64) error {
+	progress := newPhaseProgress(time.Now(), options.streams)
+	results := make(chan error, options.streams)
+	for stream := 0; stream < options.streams; stream++ {
+		go func(index int) {
+			err := transfer(ctx, client, options.target, options.streamTimeout, sendBytes, receiveBytes, func(n int) {
+				progress.record(index, int64(n), time.Now())
+			})
+			progress.finishStream(index, time.Now(), err == nil)
+			results <- err
+		}(stream)
 	}
-	for stream := 0; stream < streams; stream++ {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var firstErr error
+	ctxDone := ctx.Done()
+	for remaining := options.streams; remaining > 0; {
 		select {
 		case err := <-results:
-			if err != nil {
+			remaining--
+			if err != nil && firstErr == nil {
+				firstErr = err
 				_ = client.CloseWithError(err)
-				return fmt.Errorf("%s: %w", name, err)
 			}
-		case <-ctx.Done():
-			return fmt.Errorf("%s: %w", name, ctx.Err())
+		case <-ctxDone:
+			ctxDone = nil
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			_ = client.CloseWithError(ctx.Err())
+		case <-ticker.C:
+			progress.print("progress", round, name, time.Now(), "running")
 		}
 	}
-	bytes := receiveBytes
-	if sendBytes > 0 {
-		bytes = sendBytes
+	// All workers have exited, including siblings after any failure or timeout.
+	status := "ok"
+	if firstErr != nil {
+		status = "error"
 	}
-	fmt.Printf("%s streams=%d bytes=%d elapsed=%s\n", name, streams, streams*bytes, time.Since(started))
+	progress.print("phase_summary", round, name, time.Now(), status)
+	progress.printStreams(round, name)
+	if firstErr != nil {
+		return fmt.Errorf("round %d %s: %w", round, name, firstErr)
+	}
 	return nil
 }
 
-func transfer(ctx context.Context, client *hysteria2.Client, target M.Socksaddr, sendBytes, receiveBytes int64) error {
-	conn, err := dial(ctx, client, target)
+func transfer(ctx context.Context, client *hysteria2.Client, target M.Socksaddr, timeout time.Duration, sendBytes, receiveBytes int64, progress func(int)) error {
+	conn, err := dial(ctx, client, target, timeout)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
-	command := fmt.Sprintf("%d %d\n", sendBytes, receiveBytes)
-	if err := writeAll(conn, []byte(command)); err != nil {
+	if err := writeAll(conn, []byte(fmt.Sprintf("%d %d\n", sendBytes, receiveBytes)), nil); err != nil {
 		return fmt.Errorf("command: %w", err)
 	}
 	buffer := make([]byte, chunkBytes)
@@ -189,32 +216,76 @@ func transfer(ctx context.Context, client *hysteria2.Client, target M.Socksaddr,
 	}
 	for remaining := sendBytes; remaining > 0; {
 		n := min(int64(len(buffer)), remaining)
-		if err := writeAll(conn, buffer[:n]); err != nil {
-			return fmt.Errorf("upload after %d bytes: %w", sendBytes-remaining, err)
+		if err := writeAll(conn, buffer[:n], progress); err != nil {
+			return fmt.Errorf("upload after at least %d bytes: %w", sendBytes-remaining, err)
 		}
 		remaining -= n
 	}
+	sawEOF := false
 	for remaining := receiveBytes; remaining > 0; {
-		n := min(int64(len(buffer)), remaining)
-		if _, err := io.ReadFull(conn, buffer[:n]); err != nil {
-			return fmt.Errorf("download after %d bytes: %w", receiveBytes-remaining, err)
-		}
+		n, err := conn.Read(buffer[:min(int64(len(buffer)), remaining)])
 		for _, value := range buffer[:n] {
 			if value != 'y' {
 				return fmt.Errorf("unexpected target data after %d bytes", receiveBytes-remaining)
 			}
 		}
-		remaining -= n
+		remaining -= int64(n)
+		if sendBytes == 0 && n > 0 {
+			progress(n)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && remaining == 0 {
+				sawEOF = true
+				break
+			}
+			return fmt.Errorf("receive after %d bytes: %w", receiveBytes-remaining, err)
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
 	}
-	if n, err := conn.Read(buffer[:1]); n != 0 || !errors.Is(err, io.EOF) {
-		return fmt.Errorf("expected transfer EOF, got bytes=%d err=%v", n, err)
+	if !sawEOF {
+		if err := expectEOF(conn); err != nil {
+			return fmt.Errorf("transfer: %w", err)
+		}
 	}
 	return nil
 }
 
-func writeAll(writer io.Writer, data []byte) error {
+func probeOnce(ctx context.Context, client *hysteria2.Client, target M.Socksaddr, timeout time.Duration) error {
+	conn, err := dial(ctx, client, target, timeout)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	if err := writeAll(conn, []byte("who\n"), nil); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	reader := bufio.NewReaderSize(conn, 4096)
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	if string(line) != "bounded-peer\n" {
+		return fmt.Errorf("unexpected response: %q", line)
+	}
+	return expectEOF(reader)
+}
+
+func expectEOF(reader io.Reader) error {
+	var tail [1]byte
+	if n, err := reader.Read(tail[:]); n != 0 || !errors.Is(err, io.EOF) {
+		return fmt.Errorf("expected EOF, got bytes=%d err=%v", n, err)
+	}
+	return nil
+}
+
+func writeAll(writer io.Writer, data []byte, progress func(int)) error {
 	for len(data) > 0 {
 		n, err := writer.Write(data)
+		if n > 0 && progress != nil {
+			progress(n)
+		}
 		if err != nil {
 			return err
 		}
@@ -226,8 +297,7 @@ func writeAll(writer io.Writer, data []byte) error {
 	return nil
 }
 
-// Minimal adapter for sing's TLS interface; no sing-box configuration machinery
-// or forked transport is required for this official-client interoperability test.
+// Minimal adapter for sing's TLS interface; no sing-box configuration machinery.
 type testTLSConfig struct {
 	config  *tls.Config
 	timeout time.Duration
