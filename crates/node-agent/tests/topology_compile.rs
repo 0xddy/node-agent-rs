@@ -946,26 +946,37 @@ fn hysteria_bandwidth_directions_are_independent() {
         let protocol = &output.runtime.inbounds[0].spec.config["protocol"];
         assert_eq!(protocol["up_mbps"], up);
         assert_eq!(protocol["down_mbps"], down);
-        assert_eq!(protocol["ignore_client_bandwidth"], false);
+        assert_eq!(protocol["ignore_client_bandwidth"], true);
     }
 }
 
 #[test]
 fn hysteria_ignore_client_bandwidth_reaches_shoes() {
-    let mut config = hysteria_config("hy2", 14432);
-    config.ignore_client_bandwidth = true;
-    let output = compile_with_warnings(&topology(vec![node(
-        "node",
-        HYSTERIA2_SALAMANDER_ID,
-        config,
-        vec![active_user("alice", "password")],
-    )]))
-    .expect("ignore-client-bandwidth configuration");
+    for ignore_client_bandwidth in [None, Some(true), Some(false)] {
+        let mut config = hysteria_config("hy2", 14432);
+        if let Some(ignore) = ignore_client_bandwidth {
+            config.ignore_client_bandwidth = ignore;
+        }
+        let mut config = serde_json::to_value(config).expect("encode provider");
+        if ignore_client_bandwidth.is_none() {
+            config
+                .as_object_mut()
+                .unwrap()
+                .remove("ignore_client_bandwidth");
+        }
+        let output = compile_with_warnings(&topology(vec![node(
+            "node",
+            HYSTERIA2_SALAMANDER_ID,
+            config,
+            vec![active_user("alice", "password")],
+        )]))
+        .expect("ignore-client-bandwidth configuration");
 
-    assert_eq!(
-        output.runtime.inbounds[0].spec.config["protocol"]["ignore_client_bandwidth"],
-        true
-    );
+        assert_eq!(
+            output.runtime.inbounds[0].spec.config["protocol"]["ignore_client_bandwidth"],
+            ignore_client_bandwidth.unwrap_or(true)
+        );
+    }
 }
 
 #[tokio::test]

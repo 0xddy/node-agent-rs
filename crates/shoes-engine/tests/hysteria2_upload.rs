@@ -75,6 +75,74 @@ async fn upload(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zero_server_bandwidth_allows_uploads_past_receive_windows() {
+    const UPLOAD_BYTES: usize = 24 * 1024 * 1024;
+    let engine = engine().await;
+    let sink = Sink::start("large-upload-sink").await;
+
+    for ignore_client_bandwidth in [false, true] {
+        let server = free_addr();
+        let tag = format!("hy2-zero-{ignore_client_bandwidth}");
+        let mut config = hysteria2_inbound_with_bandwidth(server, 0, 0, false);
+        config["protocol"]["ignore_client_bandwidth"] = serde_json::json!(ignore_client_bandwidth);
+        engine
+            .add_inbound(dynamic(&tag, config))
+            .await
+            .expect("the zero-bandwidth inbound should start");
+        engine
+            .add_user(&tag, password_user("alice", PASSWORD))
+            .expect("alice should be accepted");
+
+        let client = Hysteria2Client::connect_with_rates_bps(server, PASSWORD, SEND_BPS, SEND_BPS)
+            .await
+            .expect("alice should authenticate");
+        assert_eq!(client.advertised_receive_auto, ignore_client_bandwidth);
+        assert_eq!(
+            client.negotiated_send_bps,
+            if ignore_client_bandwidth { 0 } else { SEND_BPS }
+        );
+
+        // Cross both the 8 MiB stream window and the 20 MiB connection window.
+        // Fast open also exercises a client sending before it reads TCP status.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stream = client
+                .open_tcp_fast_open(sink.address, format!("{UPLOAD_BYTES} 1\n").as_bytes())
+                .await?;
+            let chunk = vec![b'x'; CHUNK_SIZE];
+            for _ in 0..UPLOAD_BYTES / CHUNK_SIZE {
+                stream
+                    .send
+                    .write_all(&chunk)
+                    .await
+                    .map_err(io::Error::other)?;
+            }
+            stream.read_tcp_response().await?;
+            let mut acknowledgement = [0u8; 1];
+            stream
+                .recv
+                .read_exact(&mut acknowledgement)
+                .await
+                .map_err(io::Error::other)?;
+            assert_eq!(acknowledgement, [b'y']);
+            Ok::<(), io::Error>(())
+        })
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "ignore_client_bandwidth={ignore_client_bandwidth}: {result:?}; path={:?}",
+            client.stats().path
+        );
+        assert_eq!(
+            tokio::time::timeout(PROBE_TIMEOUT, name_on(&client, sink.address))
+                .await
+                .expect("the connection should remain responsive")
+                .expect("the next stream should succeed"),
+            sink.name
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_brutal_upload_does_not_wedge_the_connection_or_inbound() {
     let mut checks = Checks::new("hysteria2 sustained upload liveness");
     let engine = engine().await;

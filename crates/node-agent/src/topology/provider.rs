@@ -57,7 +57,7 @@ pub struct RealityHandshake {
     pub server_port: u16,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hysteria2SalamanderConfig {
     #[serde(rename = "type")]
@@ -71,7 +71,7 @@ pub struct Hysteria2SalamanderConfig {
     pub up_mbps: i64,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub down_mbps: i64,
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// Ignore bandwidth advertised by clients by default.
     pub ignore_client_bandwidth: bool,
     pub obfs: Hysteria2ObfsConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,6 +79,25 @@ pub struct Hysteria2SalamanderConfig {
     pub tls: Hysteria2TlsConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbounds: Vec<OutboundConfig>,
+}
+
+impl Default for Hysteria2SalamanderConfig {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            tag: String::new(),
+            listen: String::new(),
+            listen_port: 0,
+            port_hopping: String::new(),
+            up_mbps: 0,
+            down_mbps: 0,
+            ignore_client_bandwidth: true,
+            obfs: Hysteria2ObfsConfig::default(),
+            masquerade: None,
+            tls: Hysteria2TlsConfig::default(),
+            outbounds: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
