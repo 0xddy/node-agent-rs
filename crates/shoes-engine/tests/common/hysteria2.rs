@@ -170,6 +170,21 @@ impl Hysteria2Client {
         self.connection.stats()
     }
 
+    /// Test-only noncompliant behavior: disregard `Hysteria-CC-RX: auto` and force
+    /// a fixed upload rate after authentication. The client must have connected
+    /// with `connect_with_rates_bps` so its switchable controller is installed.
+    pub fn force_brutal_send_bps(&self, bytes_per_second: u64) -> io::Result<()> {
+        shoes::hysteria2::brutal::activate(&self.connection, bytes_per_second)
+    }
+
+    /// Submit an application DATAGRAM without the Hysteria2 framing helper, for
+    /// malformed-input isolation tests. QUIC's bounded send queue still applies.
+    pub fn send_raw_datagram(&self, payload: Bytes) -> io::Result<()> {
+        self.connection
+            .send_datagram(payload)
+            .map_err(io::Error::other)
+    }
+
     /// Connects and authenticates, or fails.
     ///
     /// A wrong password is *not* an error from the QUIC handshake: the server answers

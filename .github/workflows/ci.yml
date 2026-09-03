@@ -32,7 +32,7 @@ jobs:
         with:
           repository: 0xddy/shoes-plus
           # Keep node-agent builds reproducible across shoes-plus main updates.
-          ref: e4bff6fab51e7d249ec3e3e8910424069fb151c7
+          ref: 88fe2b98c7a047e4354a8e057a5034d9a10c6815
           path: shoes-plus
 
       - uses: dtolnay/rust-toolchain@stable
@@ -70,3 +70,7 @@ jobs:
       - name: Test shoes-plus
         working-directory: shoes-plus
         run: cargo test --all-targets --locked
+
+      - name: Test vendored QUIC datagram accounting
+        working-directory: shoes-plus
+        run: cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib connection::datagrams::tests
