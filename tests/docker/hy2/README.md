@@ -52,6 +52,30 @@ not proven binary provenance; the output explicitly records this distinction.
    connection, for 6 GiB downloaded and 3 GiB uploaded.
 4. Leave the container idle for 30 seconds and make another small transfer.
 
+Use `-Suite concurrency` to compare stream concurrency separately from QUIC
+connection count. Each case downloads 1 GiB and immediately uploads 1 GiB:
+
+1. One QUIC connection with one stream per phase.
+2. One QUIC connection with sixteen streams per phase (64 MiB each).
+3. Eight QUIC connections with two streams each per phase (64 MiB each).
+
+The same connections persist across each case's direction change. Payload
+starts only after all streams are ready. The suite retains the initial check,
+independent Bob probes, and final idle/check sequence. Each main connection is
+also probed after its transfers. This compares normal completed transfers;
+it does not reproduce every browser Speedtest stream cancellation pattern.
+
+Use `-Suite cancel` to exercise application cancellation: download for three
+seconds, close only those logical streams using the official client's normal
+`Close`, then immediately upload 240 MiB on the same QUIC connection. Run once
+with one stream, then three rounds with fifteen streams (16 MiB uploaded per
+stream). Fifteen old downloads, fifteen new uploads, and Bob fit the target's
+32-task cap while remote cleanup overlaps the direction switch. The client requires actual payload before cancellation and treats
+premature EOF, remote resets, and transport errors as failures. The fixture can
+report failed target writes when downloads are intentionally cancelled; those
+counts must be interpreted alongside the client's cancellation and probe logs.
+This is a bounded cancellation check, not the Speedtest website itself.
+
 Data is generated and checked in bounded chunks. Each Go invocation refuses
 automatic transport reconnection, so a replacement QUIC connection cannot hide
 a failed direction switch. An independent Bob user is probed during transfers;

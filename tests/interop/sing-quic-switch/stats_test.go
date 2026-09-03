@@ -7,7 +7,7 @@ import (
 
 func TestProgressReportsStalledStreamWhileSiblingMoves(t *testing.T) {
 	start := time.Unix(0, 0)
-	stats := newPhaseProgress(start, 2)
+	stats := newPhaseProgress(start, 1, 2)
 	stats.record(0, 10, start.Add(time.Second))
 	stats.record(1, 20, start.Add(2*time.Second))
 	stats.record(1, 30, start.Add(3*time.Second))
@@ -19,7 +19,7 @@ func TestProgressReportsStalledStreamWhileSiblingMoves(t *testing.T) {
 
 func TestProgressIncludesEOFTailAndFreezesFinishedStream(t *testing.T) {
 	start := time.Unix(0, 0)
-	stats := newPhaseProgress(start, 2)
+	stats := newPhaseProgress(start, 1, 2)
 	stats.record(0, 10, start.Add(time.Second))
 	stats.finishStream(0, start.Add(4*time.Second), true)
 	stats.record(1, 20, start.Add(5*time.Second))
@@ -35,7 +35,7 @@ func TestProgressIncludesEOFTailAndFreezesFinishedStream(t *testing.T) {
 
 func TestProgressOutOfOrderTimestampDoesNotInflateAggregateGap(t *testing.T) {
 	start := time.Unix(0, 0)
-	stats := newPhaseProgress(start, 2)
+	stats := newPhaseProgress(start, 1, 2)
 	stats.record(0, 10, start.Add(2*time.Second))
 	stats.record(1, 20, start.Add(time.Second))
 	stats.record(0, 30, start.Add(4*time.Second))
@@ -43,6 +43,27 @@ func TestProgressOutOfOrderTimestampDoesNotInflateAggregateGap(t *testing.T) {
 	snapshot := stats.snapshot(start.Add(5 * time.Second))
 	if snapshot.bytes != 60 || snapshot.maxGap != 2*time.Second {
 		t.Fatalf("out-of-order or empty progress changed accounting: %+v", snapshot)
+	}
+}
+
+func TestProgressSeparatesQUICConnectionsAndFinishedStreams(t *testing.T) {
+	start := time.Unix(0, 0)
+	stats := newPhaseProgress(start, 2, 2)
+	stats.record(0, 10, start.Add(time.Second))
+	stats.finishStream(0, start.Add(2*time.Second), true)
+	stats.record(1, 20, start.Add(3*time.Second))
+	stats.record(2, 30, start.Add(2*time.Second))
+	stats.record(3, 40, start.Add(4*time.Second))
+	snapshot := stats.snapshot(start.Add(6 * time.Second))
+	if snapshot.bytes != 100 || snapshot.maxConnectionGap != 3*time.Second || snapshot.maxStreamGap != 4*time.Second || snapshot.eofs != 1 {
+		t.Fatalf("connection and stream stalls were conflated: %+v", snapshot)
+	}
+	if stats.connections[0].bytes != 30 || stats.connections[1].bytes != 70 || stats.connections[0].finished {
+		t.Fatalf("connection finished before all its streams: %+v", stats.connections)
+	}
+	stats.finishStream(1, start.Add(7*time.Second), true)
+	if !stats.connections[0].finished || !stats.connections[0].eof || stats.connections[0].gap(start.Add(20*time.Second)) != 4*time.Second {
+		t.Fatalf("completed connection did not freeze: %+v", stats.connections[0])
 	}
 }
 

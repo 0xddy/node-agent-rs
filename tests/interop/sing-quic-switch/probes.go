@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sagernet/quic-go"
 )
+
+var errProbeCleanup = errors.New("independent probe monitor cleanup")
 
 type probeSummary struct {
 	count, errors int
@@ -23,7 +28,8 @@ type probeMonitor struct {
 }
 
 func startProbeMonitor(ctx context.Context, options options, label *atomic.Value) (*probeMonitor, error) {
-	probeCtx, cancel := context.WithCancel(ctx)
+	probeCtx, cancelCause := context.WithCancelCause(ctx)
+	cancel := func() { cancelCause(errProbeCleanup) }
 	client, err := newClient(probeCtx, options.server, options.probePassword)
 	if err != nil {
 		cancel()
@@ -58,15 +64,55 @@ func startProbeMonitor(ctx context.Context, options options, label *atomic.Value
 				started := time.Now()
 				err := probeOnce(probeCtx, client, options.target, options.probeTimeout)
 				elapsed := time.Since(started)
-				if probeCtx.Err() != nil {
-					fmt.Printf("independent_probe %s latency=%s status=cancelled\n", phase, elapsed)
+				if !monitor.recordCompleted(phase, elapsed, context.Cause(probeCtx), err) {
 					return
 				}
-				monitor.record(phase, elapsed, err)
 			}
 		}
 	}()
 	return monitor, nil
+}
+
+// Context cancellation can race with a completed probe result. Keep successes,
+// timeouts, remote closes and unrelated IO errors even when cleanup has begun.
+func (p *probeMonitor) recordCompleted(label string, latency time.Duration, cause, err error) bool {
+	if cause == errProbeCleanup && isLocalProbeCleanupError(err) {
+		fmt.Printf("independent_probe %s latency=%s status=cancelled\n", label, latency)
+		return false
+	}
+	p.record(label, latency, err)
+	return true
+}
+
+func isLocalProbeCleanupError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == context.Canceled {
+		return true
+	}
+	// CloseWithError in this pinned sing-quic version closes the QUIC with
+	// local application code 0 and an empty message. Do not accept generic
+	// net.ErrClosed, an EOF mapping, or a remote QUIC close as evidence.
+	if appErr, ok := err.(*quic.ApplicationError); ok {
+		return !appErr.Remote && appErr.ErrorCode == 0 && appErr.ErrorMessage == ""
+	}
+	if multiple, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := multiple.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !isLocalProbeCleanupError(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isLocalProbeCleanupError(wrapped.Unwrap())
+	}
+	return false
 }
 
 func (p *probeMonitor) record(label string, latency time.Duration, err error) {

@@ -32,7 +32,7 @@ jobs:
         with:
           repository: 0xddy/shoes-plus
           # Keep node-agent builds reproducible across shoes-plus main updates.
-          ref: d65b024a35e9a3b7d4dda88260924efdf69f4257
+          ref: b6c98ea44732c61cd6d996fb45f12618bd311c4f
           path: shoes-plus
 
       - uses: dtolnay/rust-toolchain@stable
@@ -74,3 +74,7 @@ jobs:
       - name: Test vendored QUIC transport
         working-directory: shoes-plus
         run: cargo test --manifest-path vendor/quinn-proto/Cargo.toml --locked --lib
+
+      - name: Test vendored QUIC async driver
+        working-directory: shoes-plus
+        run: cargo test --manifest-path vendor/quinn/Cargo.toml --locked --lib

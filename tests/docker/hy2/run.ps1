@@ -8,6 +8,7 @@ param(
     [string] $GoClient,
     [string] $RunDirectory,
     [string] $BuildProxy,
+    [ValidateSet('transfer', 'concurrency', 'cancel')] [string] $Suite = 'transfer',
     [switch] $Offline,
     [switch] $SkipBuild,
     [ValidateRange(1, 65535)] [int] $HostPort = 18443,
@@ -96,6 +97,7 @@ Write-Json (Join-Path $RunDirectory 'run.json') ([ordered]@{
     host_udp_address = "127.0.0.1:$HostPort"; skip_build = [bool]$SkipBuild; offline = [bool]$Offline
     idle_seconds = $IdleSeconds; observe_interval_seconds = $ObserveIntervalSeconds
     final_report_wait_seconds = $FinalReportWaitSeconds
+    suite = $Suite
     binary_provenance = $(if ($SkipBuild) { 'preexisting volume; source revisions not verified' } else { 'compiled from mounted working trees in this run' })
 })
 
@@ -112,7 +114,7 @@ try {
             '--mount', "type=bind,source=$CorePath,target=/workspace/shoes-plus,readonly",
             '--mount', "type=volume,source=$TargetVolume,target=/build",
             '--mount', "type=volume,source=$RegistryVolume,target=/usr/local/cargo/registry",
-            '--env', 'CARGO_TARGET_DIR=/build', '--env', 'CARGO_INCREMENTAL=0',
+            '--env', 'CARGO_TARGET_DIR=/build', '--env', 'CARGO_INCREMENTAL=0', '--env', "CARGO_BUILD_JOBS=$BuildCpus",
             '--workdir', '/workspace/node-agent-rs'
         )
         if ($BuildProxy) {
@@ -201,8 +203,23 @@ try {
     }
 
     Run-ClientStage 'baseline' @('--streams', '1', '--download', '1KiB', '--upload', '1KiB', '--rounds', '1', '--timeout', '1m', '--stream-timeout', '30s')
-    Run-ClientStage 'upload-2gib' @('--streams', '1', '--download', '0', '--upload', '2GiB', '--rounds', '1', '--timeout', '15m', '--stream-timeout', '10m')
-    Run-ClientStage 'download-upload-three-rounds' @('--streams', '4', '--download', '512MiB', '--upload', '256MiB', '--rounds', '3', '--timeout', '30m', '--stream-timeout', '10m')
+    if ($Suite -eq 'cancel') {
+        # Abort only the logical download streams, retaining each HY2/QUIC
+        # transport for the following upload and final connectivity probe.
+        Run-ClientStage 'cancel-one-stream-then-upload' @('--connections', '1', '--streams', '1', '--download', '1GiB', '--cancel-download-after', '3s', '--upload', '240MiB', '--rounds', '1', '--timeout', '5m', '--stream-timeout', '1m')
+        # 15 old downloads + 15 new uploads + Bob fit the fixture's 32-task
+        # cap even if remote cleanup overlaps the immediate direction switch.
+        Run-ClientStage 'cancel-fifteen-streams-three-rounds' @('--connections', '1', '--streams', '15', '--download', '128MiB', '--cancel-download-after', '3s', '--upload', '16MiB', '--rounds', '3', '--timeout', '5m', '--stream-timeout', '1m')
+    } elseif ($Suite -eq 'concurrency') {
+        # Keep each direction at 1 GiB in every case. TCP stream concurrency
+        # and the number of underlying QUIC connections are separate variables.
+        Run-ClientStage 'one-connection-one-stream' @('--connections', '1', '--streams', '1', '--download', '1GiB', '--upload', '1GiB', '--rounds', '1', '--timeout', '15m', '--stream-timeout', '10m')
+        Run-ClientStage 'one-connection-sixteen-streams' @('--connections', '1', '--streams', '16', '--download', '64MiB', '--upload', '64MiB', '--rounds', '1', '--timeout', '15m', '--stream-timeout', '10m')
+        Run-ClientStage 'eight-connections-two-streams' @('--connections', '8', '--streams', '2', '--download', '64MiB', '--upload', '64MiB', '--rounds', '1', '--timeout', '15m', '--stream-timeout', '10m')
+    } else {
+        Run-ClientStage 'upload-2gib' @('--streams', '1', '--download', '0', '--upload', '2GiB', '--rounds', '1', '--timeout', '15m', '--stream-timeout', '10m')
+        Run-ClientStage 'download-upload-three-rounds' @('--streams', '4', '--download', '512MiB', '--upload', '256MiB', '--rounds', '3', '--timeout', '30m', '--stream-timeout', '10m')
+    }
     Write-Host "Observing idle resource recovery for $IdleSeconds seconds"
     Start-Sleep -Seconds $IdleSeconds
     Run-ClientStage 'after-idle' @('--streams', '1', '--download', '1KiB', '--upload', '1KiB', '--rounds', '1', '--timeout', '1m', '--stream-timeout', '30s')

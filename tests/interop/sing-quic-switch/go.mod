@@ -3,6 +3,7 @@ module node-agent-rs.test/sing-quic-switch
 go 1.25.0
 
 require (
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7
 	github.com/sagernet/sing v0.9.0-beta.4
 	github.com/sagernet/sing-quic v0.7.0-beta.4
 )
@@ -18,7 +19,6 @@ require (
 	github.com/libp2p/go-netroute v0.2.1 // indirect
 	github.com/metacubex/utls v1.8.7 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621 // indirect
 	golang.org/x/net v0.56.0 // indirect
