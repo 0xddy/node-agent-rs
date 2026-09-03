@@ -32,7 +32,7 @@ jobs:
         with:
           repository: 0xddy/shoes-plus
           # Keep node-agent builds reproducible across shoes-plus main updates.
-          ref: d618ce7a2f5c4205392c502d6ad39224be747a6d
+          ref: e4bff6fab51e7d249ec3e3e8910424069fb151c7
           path: shoes-plus
 
       - uses: dtolnay/rust-toolchain@stable

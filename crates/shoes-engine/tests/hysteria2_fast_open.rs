@@ -30,7 +30,9 @@ const CHUNK: usize = 64 * 1024;
 /// Counts every byte that arrives, with no request line to read first: a fast-open
 /// stream's payload begins immediately.
 async fn counting_sink() -> (SocketAddr, Arc<AtomicU64>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the sink");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the sink");
     let address = listener.local_addr().expect("read back the sink address");
     let received = Arc::new(AtomicU64::new(0));
 

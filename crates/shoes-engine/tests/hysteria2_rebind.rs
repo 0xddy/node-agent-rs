@@ -135,7 +135,11 @@ async fn survives_a_rebinding(num_endpoints: Option<usize>) -> Result<(), String
     // cannot be blamed on the relay.
     match tokio::time::timeout(Duration::from_secs(5), reaches(&client, &sink)).await {
         Ok(Ok(name)) if name == "rebind-sink" => {}
-        other => return Err(format!("the connection was not usable before rebinding: {other:?}")),
+        other => {
+            return Err(format!(
+                "the connection was not usable before rebinding: {other:?}"
+            ));
+        }
     }
 
     path.rebind.store(true, Ordering::SeqCst);

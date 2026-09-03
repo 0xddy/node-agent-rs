@@ -87,3 +87,9 @@ tonic-prost-build = "*"
 opt-level = 3
 lto = "fat"
 strip = true
+
+[patch.crates-io]
+# Cargo only reads patches from the workspace root. Keep these aligned with
+# shoes-plus so its receive-reassembly fix and bounded ingress apply here too.
+quinn = { path = "../shoes-plus/vendor/quinn" }
+quinn-proto = { path = "../shoes-plus/vendor/quinn-proto" }
