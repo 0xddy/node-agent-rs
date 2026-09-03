@@ -299,7 +299,8 @@ struct Entry {
     /// Derived from `uuid` once, here, because VMess auth ids can only be recognised
     /// by trial: deriving this per connection would mean an MD5, a KDF and an AES key
     /// schedule *per user* on every handshake.
-    vmess: Option<VmessAuthKey>,
+    /// Kept out of line so users without a uuid do not reserve an AES key schedule.
+    vmess: Option<Box<VmessAuthKey>>,
 }
 
 /// One removed accounting generation, including its recoverable final snapshot.
@@ -440,24 +441,29 @@ pub struct MemoryUserRegistry {
     /// the first `remove_user` future is cancelled, and a repeated call attaches to
     /// this same generation instead of losing its last billing result.
     draining: Arc<DashMap<Arc<str>, Arc<DrainingUser>>>,
-    /// wire uuid -> user. The index `find_uuid` hits.
-    by_uuid: DashMap<[u8; 16], Arc<Entry>>,
+    /// Protocol indexes are allocated only for the registry's immutable kinds.
+    /// Even an empty DashMap allocates its shards, so unused protocols would add
+    /// per-inbound overhead before any users connect. Parsed credentials and
+    /// enabled indexes come from the same kinds; writers rely on that invariant.
+    ///
+    /// wire uuid -> user. The index `find_uuid` hits (also shared by TUIC).
+    by_uuid: Option<DashMap<[u8; 16], Arc<Entry>>>,
     /// wire hash -> user. The index `find_trojan_hash` hits.
-    by_trojan_hash: DashMap<Box<[u8]>, Arc<Entry>>,
+    by_trojan_hash: Option<DashMap<Box<[u8]>, Arc<Entry>>>,
     /// cleartext password -> user. The index `find_password` hits.
-    by_password: DashMap<Box<str>, Arc<Entry>>,
+    by_password: Option<DashMap<Box<str>, Arc<Entry>>>,
     /// named psk -> user. The index `find_shadowsocks_psk_hash` hits.
-    by_psk_hash: DashMap<[u8; 16], Arc<Entry>>,
+    by_psk_hash: Option<DashMap<[u8; 16], Arc<Entry>>>,
     /// sha256(password) -> user. The index `find_password_sha256` hits.
-    by_anytls_hash: DashMap<[u8; 32], Arc<Entry>>,
+    by_anytls_hash: Option<DashMap<[u8; 32], Arc<Entry>>>,
     /// base64("id:password") -> user. The index `find_naive_basic` hits.
-    by_naive_encoded: DashMap<Box<[u8]>, Arc<Entry>>,
+    by_naive_encoded: Option<DashMap<Box<[u8]>, Arc<Entry>>>,
     /// How many live users' hashes start with each 8-byte prefix.
     ///
     /// A count rather than a set, because two users can share a prefix and removing
     /// one must not blind the probe to the other. Entries are dropped when the count
     /// reaches zero, so the map does not grow across rotations.
-    anytls_prefixes: DashMap<[u8; 8], usize>,
+    anytls_prefixes: Option<DashMap<[u8; 8], usize>>,
     /// Every uuid-bearing user, as an immutable snapshot for VMess to walk. Not an
     /// index -- there is nothing to index on -- so it is republished whole on each
     /// mutation. See the module docs.
@@ -480,16 +486,45 @@ impl MemoryUserRegistry {
             kinds,
             users: DashMap::new(),
             draining: Arc::new(DashMap::new()),
-            by_uuid: DashMap::new(),
-            by_trojan_hash: DashMap::new(),
-            by_password: DashMap::new(),
-            by_psk_hash: DashMap::new(),
-            by_anytls_hash: DashMap::new(),
-            anytls_prefixes: DashMap::new(),
-            by_naive_encoded: DashMap::new(),
+            by_uuid: kinds.uuid.then(DashMap::new),
+            by_trojan_hash: kinds.trojan_password.then(DashMap::new),
+            by_password: kinds.plain_password.then(DashMap::new),
+            by_psk_hash: matches!(kinds.shadowsocks_psk, ShadowsocksPsk::Len(_)).then(DashMap::new),
+            by_anytls_hash: kinds.anytls_password.then(DashMap::new),
+            anytls_prefixes: kinds.anytls_password.then(DashMap::new),
+            by_naive_encoded: kinds.naive_basic.then(DashMap::new),
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
             writer: Mutex::new(()),
         })
+    }
+
+    /// Build an unpublished registry, then publish its VMess snapshot once.
+    ///
+    /// Initial payloads require distinct ids. Reusing the insertion path preserves
+    /// the same credential validation and accounting settings as online upserts,
+    /// without rebuilding the full trial snapshot or allocating a discarded
+    /// `UserInfo` for every initial user. An error drops the unpublished registry.
+    pub(crate) fn from_users(
+        kinds: CredentialKinds,
+        users: Vec<UserSpec>,
+    ) -> EngineResult<Arc<Self>> {
+        let registry = Self::new(kinds);
+        {
+            let _writer = registry.lock_writer();
+            for user in users {
+                let id = user.resolved_id().ok_or_else(|| {
+                    EngineError::InvalidUser("a user needs an `id` or a `uuid`".into())
+                })?;
+                if registry.users.contains_key(id) {
+                    return Err(EngineError::InvalidUser(format!(
+                        "user {id} is listed twice"
+                    )));
+                }
+                registry.upsert_locked(user)?;
+            }
+            registry.republish_vmess();
+        }
+        Ok(registry)
     }
 
     pub fn kinds(&self) -> CredentialKinds {
@@ -520,7 +555,13 @@ impl MemoryUserRegistry {
         // Held across the whole check-then-write below, which is the only reason the
         // duplicate-credential check and the index retirement mean anything.
         let _writer = self.lock_writer();
+        let entry = self.upsert_locked(spec)?;
+        self.republish_vmess();
+        Ok(user_info(&entry.context))
+    }
 
+    /// Validate and insert under `writer`; the caller publishes the VMess snapshot.
+    fn upsert_locked(&self, spec: UserSpec) -> EngineResult<Arc<Entry>> {
         let id: Arc<str> = match spec.resolved_id() {
             Some(id) if !id.trim().is_empty() => id.into(),
             _ => {
@@ -590,7 +631,10 @@ impl MemoryUserRegistry {
             // VMess. One registry serves a whole inbound, and a TLS inbound can carry
             // VLESS on one SNI and VMess on another, so "is VMess in use here" is not
             // a question this type is in a position to answer.
-            vmess: credentials.uuid.as_ref().map(VmessAuthKey::new),
+            vmess: credentials
+                .uuid
+                .as_ref()
+                .map(|uuid| Box::new(VmessAuthKey::new(uuid))),
         });
 
         // Retire index keys the user no longer presents, or an old credential would
@@ -599,62 +643,96 @@ impl MemoryUserRegistry {
             if previous.uuid != entry.uuid
                 && let Some(uuid) = previous.uuid
             {
-                self.by_uuid.remove(&uuid);
+                self.by_uuid.as_ref().expect("uuid index").remove(&uuid);
             }
             if previous.trojan_hash != entry.trojan_hash
                 && let Some(hash) = &previous.trojan_hash
             {
-                self.by_trojan_hash.remove(hash);
+                self.by_trojan_hash
+                    .as_ref()
+                    .expect("trojan index")
+                    .remove(hash);
             }
             if previous.password != entry.password
                 && let Some(password) = &previous.password
             {
-                self.by_password.remove(password);
+                self.by_password
+                    .as_ref()
+                    .expect("password index")
+                    .remove(password);
             }
             if let Some(old) = &previous.shadowsocks
                 && entry.shadowsocks.as_ref().map(|new| new.hash) != Some(old.hash)
             {
-                self.by_psk_hash.remove(&old.hash);
+                self.by_psk_hash
+                    .as_ref()
+                    .expect("psk index")
+                    .remove(&old.hash);
             }
             if previous.anytls_hash != entry.anytls_hash
                 && let Some(hash) = previous.anytls_hash
             {
-                self.by_anytls_hash.remove(&hash);
+                self.by_anytls_hash
+                    .as_ref()
+                    .expect("anytls index")
+                    .remove(&hash);
                 self.release_anytls_prefix(&hash);
             }
             if previous.naive_encoded != entry.naive_encoded
                 && let Some(encoded) = &previous.naive_encoded
             {
-                self.by_naive_encoded.remove(encoded);
+                self.by_naive_encoded
+                    .as_ref()
+                    .expect("naive index")
+                    .remove(encoded);
             }
         }
 
         if let Some(uuid) = entry.uuid {
-            self.by_uuid.insert(uuid, entry.clone());
+            self.by_uuid
+                .as_ref()
+                .expect("uuid index")
+                .insert(uuid, entry.clone());
         }
         if let Some(hash) = &entry.trojan_hash {
-            self.by_trojan_hash.insert(hash.clone(), entry.clone());
+            self.by_trojan_hash
+                .as_ref()
+                .expect("trojan index")
+                .insert(hash.clone(), entry.clone());
         }
         if let Some(password) = &entry.password {
-            self.by_password.insert(password.clone(), entry.clone());
+            self.by_password
+                .as_ref()
+                .expect("password index")
+                .insert(password.clone(), entry.clone());
         }
         if let Some(shadowsocks) = &entry.shadowsocks {
-            self.by_psk_hash.insert(shadowsocks.hash, entry.clone());
+            self.by_psk_hash
+                .as_ref()
+                .expect("psk index")
+                .insert(shadowsocks.hash, entry.clone());
         }
         if let Some(encoded) = &entry.naive_encoded {
-            self.by_naive_encoded.insert(encoded.clone(), entry.clone());
+            self.by_naive_encoded
+                .as_ref()
+                .expect("naive index")
+                .insert(encoded.clone(), entry.clone());
         }
         if let Some(hash) = entry.anytls_hash
-            && self.by_anytls_hash.insert(hash, entry.clone()).is_none()
+            && self
+                .by_anytls_hash
+                .as_ref()
+                .expect("anytls index")
+                .insert(hash, entry.clone())
+                .is_none()
         {
             // Only on a genuinely new key: re-registering the same hash under the
             // same id must not double-count the prefix.
             self.claim_anytls_prefix(&hash);
         }
         self.users.insert(id, entry.clone());
-        self.republish_vmess();
 
-        Ok(user_info(&entry.context))
+        Ok(entry)
     }
 
     /// Removes a user, closes every connection authenticated as them, and returns
@@ -688,23 +766,38 @@ impl MemoryUserRegistry {
                         .insert(entry.context.id().clone(), generation.clone());
 
                     if let Some(uuid) = entry.uuid {
-                        self.by_uuid.remove(&uuid);
+                        self.by_uuid.as_ref().expect("uuid index").remove(&uuid);
                     }
                     if let Some(hash) = &entry.trojan_hash {
-                        self.by_trojan_hash.remove(hash);
+                        self.by_trojan_hash
+                            .as_ref()
+                            .expect("trojan index")
+                            .remove(hash);
                     }
                     if let Some(password) = &entry.password {
-                        self.by_password.remove(password);
+                        self.by_password
+                            .as_ref()
+                            .expect("password index")
+                            .remove(password);
                     }
                     if let Some(shadowsocks) = &entry.shadowsocks {
-                        self.by_psk_hash.remove(&shadowsocks.hash);
+                        self.by_psk_hash
+                            .as_ref()
+                            .expect("psk index")
+                            .remove(&shadowsocks.hash);
                     }
                     if let Some(hash) = entry.anytls_hash {
-                        self.by_anytls_hash.remove(&hash);
+                        self.by_anytls_hash
+                            .as_ref()
+                            .expect("anytls index")
+                            .remove(&hash);
                         self.release_anytls_prefix(&hash);
                     }
                     if let Some(encoded) = &entry.naive_encoded {
-                        self.by_naive_encoded.remove(encoded);
+                        self.by_naive_encoded
+                            .as_ref()
+                            .expect("naive index")
+                            .remove(encoded);
                     }
                     self.republish_vmess();
                     (generation, true)
@@ -806,7 +899,24 @@ impl MemoryUserRegistry {
             .iter()
             .map(|entry| taken_user_info(&entry.value().context))
             .collect();
-        infos.sort_by(|a, b| a.id.cmp(&b.id));
+        infos.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        infos
+    }
+
+    /// Takes every counter, but only allocates result records for users that
+    /// carried bytes. The swaps still close each user's billing period even
+    /// when it was empty; bytes arriving afterwards belong to the next sweep.
+    pub fn take_nonzero_traffic(&self) -> Vec<UserInfo> {
+        let mut infos: Vec<UserInfo> = self
+            .users
+            .iter()
+            .filter_map(|entry| {
+                let context = &entry.value().context;
+                let (tx, rx) = context.take_traffic();
+                (tx != 0 || rx != 0).then(|| taken_user_info_with_counters(context, tx, rx))
+            })
+            .collect();
+        infos.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         infos
     }
 
@@ -816,7 +926,7 @@ impl MemoryUserRegistry {
             .iter()
             .map(|entry| user_info(&entry.value().context))
             .collect();
-        infos.sort_by(|a, b| a.id.cmp(&b.id));
+        infos.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         infos
     }
 
@@ -1013,6 +1123,8 @@ impl MemoryUserRegistry {
     fn claim_anytls_prefix(&self, hash: &[u8; 32]) {
         *self
             .anytls_prefixes
+            .as_ref()
+            .expect("anytls prefix index")
             .entry(credential::password_sha256_prefix(hash))
             .or_insert(0) += 1;
     }
@@ -1020,8 +1132,11 @@ impl MemoryUserRegistry {
     /// Drop one, removing the entry entirely at zero so the map does not grow.
     fn release_anytls_prefix(&self, hash: &[u8; 32]) {
         let prefix = credential::password_sha256_prefix(hash);
-        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
-            self.anytls_prefixes.entry(prefix)
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self
+            .anytls_prefixes
+            .as_ref()
+            .expect("anytls prefix index")
+            .entry(prefix)
         {
             let count = entry.get_mut();
             *count = count.saturating_sub(1);
@@ -1032,33 +1147,43 @@ impl MemoryUserRegistry {
     }
 
     fn credential_owner_uuid(&self, uuid: &[u8; 16]) -> Option<Arc<str>> {
-        self.by_uuid.get(uuid).map(|e| e.context.id().clone())
+        self.by_uuid
+            .as_ref()?
+            .get(uuid)
+            .map(|e| e.context.id().clone())
     }
 
     fn credential_owner_trojan(&self, hash: &[u8]) -> Option<Arc<str>> {
         self.by_trojan_hash
+            .as_ref()?
             .get(hash)
             .map(|e| e.context.id().clone())
     }
 
     fn credential_owner_password(&self, password: &str) -> Option<Arc<str>> {
         self.by_password
+            .as_ref()?
             .get(password)
             .map(|e| e.context.id().clone())
     }
 
     fn credential_owner_psk(&self, hash: &[u8; 16]) -> Option<Arc<str>> {
-        self.by_psk_hash.get(hash).map(|e| e.context.id().clone())
+        self.by_psk_hash
+            .as_ref()?
+            .get(hash)
+            .map(|e| e.context.id().clone())
     }
 
     fn credential_owner_anytls(&self, hash: &[u8; 32]) -> Option<Arc<str>> {
         self.by_anytls_hash
+            .as_ref()?
             .get(hash)
             .map(|e| e.context.id().clone())
     }
 
     fn credential_owner_naive(&self, encoded: &[u8]) -> Option<Arc<str>> {
         self.by_naive_encoded
+            .as_ref()?
             .get(encoded)
             .map(|e| e.context.id().clone())
     }
@@ -1089,13 +1214,13 @@ impl MemoryUserRegistry {
 
 impl UserRegistry for MemoryUserRegistry {
     fn find_uuid(&self, uuid: &[u8; 16]) -> Option<Arc<UserContext>> {
-        let entry = self.by_uuid.get(uuid)?;
+        let entry = self.by_uuid.as_ref()?.get(uuid)?;
         let expected = entry.uuid.as_ref()?;
         entry.accept(&expected[..], &uuid[..])
     }
 
     fn find_trojan_hash(&self, hash: &[u8]) -> Option<Arc<UserContext>> {
-        let entry = self.by_trojan_hash.get(hash)?;
+        let entry = self.by_trojan_hash.as_ref()?.get(hash)?;
         let expected = entry.trojan_hash.as_deref()?;
         entry.accept(expected, hash)
     }
@@ -1106,7 +1231,7 @@ impl UserRegistry for MemoryUserRegistry {
     /// The map lookup found this entry by hash, which is not constant time and proves
     /// nothing; `accept` re-checks the bytes, same as every other lookup here.
     fn find_password(&self, password: &str) -> Option<Arc<UserContext>> {
-        let entry = self.by_password.get(password)?;
+        let entry = self.by_password.as_ref()?.get(password)?;
         let expected = entry.password.as_deref()?;
         entry.accept(expected.as_bytes(), password.as_bytes())
     }
@@ -1127,7 +1252,7 @@ impl UserRegistry for MemoryUserRegistry {
     /// names them without showing the sender is them. The handler admits it once the
     /// record layer opens a chunk. See the trait method's docs.
     fn find_shadowsocks_psk_hash(&self, hash: &[u8; 16]) -> Option<ShadowsocksIdentity> {
-        let entry = self.by_psk_hash.get(hash)?;
+        let entry = self.by_psk_hash.as_ref()?.get(hash)?;
         let credential = entry.shadowsocks.as_ref()?;
         let expected = &credential.hash;
         if expected.ct_eq(&hash[..]).unwrap_u8() == 0 || !entry.context.is_enabled() {
@@ -1149,7 +1274,7 @@ impl UserRegistry for MemoryUserRegistry {
     /// `parse_credentials` refuses, but a registry built for another protocol would
     /// hold -- is absent here rather than authenticated on their uuid alone.
     fn find_tuic_uuid(&self, uuid: &[u8; 16]) -> Option<TuicIdentity> {
-        let entry = self.by_uuid.get(uuid)?;
+        let entry = self.by_uuid.as_ref()?.get(uuid)?;
         let password = entry.tuic_password.clone()?;
         let expected = entry.uuid.as_ref()?;
         if expected.ct_eq(&uuid[..]).unwrap_u8() == 0 || !entry.context.is_enabled() {
@@ -1162,7 +1287,7 @@ impl UserRegistry for MemoryUserRegistry {
     }
 
     fn find_password_sha256(&self, hash: &[u8; 32]) -> Option<Arc<UserContext>> {
-        let entry = self.by_anytls_hash.get(hash)?;
+        let entry = self.by_anytls_hash.as_ref()?.get(hash)?;
         let expected = entry.anytls_hash.as_ref()?;
         entry.accept(&expected[..], &hash[..])
     }
@@ -1175,11 +1300,13 @@ impl UserRegistry for MemoryUserRegistry {
     /// an observable difference that leaks who has been suspended. See the trait
     /// method's docs.
     fn has_password_sha256_prefix(&self, prefix: &[u8; 8]) -> bool {
-        self.anytls_prefixes.contains_key(prefix)
+        self.anytls_prefixes
+            .as_ref()
+            .is_some_and(|prefixes| prefixes.contains_key(prefix))
     }
 
     fn find_naive_basic(&self, encoded: &[u8]) -> Option<Arc<UserContext>> {
-        let entry = self.by_naive_encoded.get(encoded)?;
+        let entry = self.by_naive_encoded.as_ref()?.get(encoded)?;
         let expected = entry.naive_encoded.as_deref()?;
         entry.accept(expected, encoded)
     }
@@ -1194,6 +1321,10 @@ fn taken_user_info(context: &UserContext) -> UserInfo {
     // The swaps decide the reported figure: they are the only reads that also
     // close the period, so each increment belongs to exactly one drain.
     let (tx, rx) = context.take_traffic();
+    taken_user_info_with_counters(context, tx, rx)
+}
+
+fn taken_user_info_with_counters(context: &UserContext, tx: u64, rx: u64) -> UserInfo {
     // Byte increments publish their observation time before incrementing the
     // counter. Read it after both swaps so every byte included above has also made
     // its timestamp visible to this snapshot.
@@ -1320,6 +1451,275 @@ mod tests {
         let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
         assert_eq!(registry.user_count(), 0);
         assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_none());
+    }
+
+    #[test]
+    fn absent_protocol_indexes_deny_lookups() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::NONE);
+        assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_none());
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID_A)).is_none());
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none()
+        );
+        assert!(registry.find_trojan_hash(b"unknown").is_none());
+        assert!(registry.find_password("unknown").is_none());
+        assert!(registry.find_shadowsocks_psk_hash(&[0; 16]).is_none());
+        assert!(registry.find_password_sha256(&[0; 32]).is_none());
+        assert!(!registry.has_password_sha256_prefix(&[0; 8]));
+        assert!(registry.find_naive_basic(b"unknown").is_none());
+
+        assert!(
+            registry
+                .credential_owner_uuid(&uuid_bytes(UUID_A))
+                .is_none()
+        );
+        assert!(registry.credential_owner_trojan(b"unknown").is_none());
+        assert!(registry.credential_owner_password("unknown").is_none());
+        assert!(registry.credential_owner_psk(&[0; 16]).is_none());
+        assert!(registry.credential_owner_anytls(&[0; 32]).is_none());
+        assert!(registry.credential_owner_naive(b"unknown").is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_password_indexes_rotate_and_remove_together() {
+        let mut kinds = CredentialKinds::UUID;
+        kinds.merge(CredentialKinds::TROJAN_PASSWORD);
+        kinds.merge(CredentialKinds::PLAIN_PASSWORD);
+        kinds.merge(CredentialKinds::ANYTLS_PASSWORD);
+        kinds.merge(CredentialKinds::NAIVE_BASIC);
+        let registry = MemoryUserRegistry::new(kinds);
+        registry
+            .upsert(tuic_spec("alice", UUID_A, "old-password"))
+            .unwrap();
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        alice.add_tx(23);
+
+        let lookups = |uuid: &str, password: &str| {
+            [
+                registry.find_uuid(&uuid_bytes(uuid)),
+                registry.find_trojan_hash(&credential::trojan_password_hash(password)),
+                registry.find_password(password),
+                registry.find_password_sha256(&credential::password_sha256(password)),
+                registry.find_naive_basic(&credential::naive_basic_credential("alice", password)),
+            ]
+        };
+        assert!(
+            lookups(UUID_A, "old-password")
+                .into_iter()
+                .all(|found| { found.is_some_and(|context| Arc::ptr_eq(&alice, &context)) })
+        );
+        assert!(registry.find_tuic_uuid(&uuid_bytes(UUID_A)).is_none());
+        assert!(registry.find_shadowsocks_psk_hash(&[0; 16]).is_none());
+
+        registry
+            .upsert(tuic_spec("alice", UUID_B, "new-password"))
+            .unwrap();
+        assert!(
+            lookups(UUID_A, "old-password")
+                .into_iter()
+                .all(|found| found.is_none())
+        );
+        assert!(
+            lookups(UUID_B, "new-password")
+                .into_iter()
+                .all(|found| { found.is_some_and(|context| Arc::ptr_eq(&alice, &context)) })
+        );
+        let old_prefix =
+            credential::password_sha256_prefix(&credential::password_sha256("old-password"));
+        let new_prefix =
+            credential::password_sha256_prefix(&credential::password_sha256("new-password"));
+        assert!(!registry.has_password_sha256_prefix(&old_prefix));
+        assert!(registry.has_password_sha256_prefix(&new_prefix));
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            &alice,
+            &registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .unwrap()
+                .user
+        ));
+
+        let final_info = registry.remove("mixed", "alice").await.unwrap();
+        assert_eq!(final_info.tx, 23);
+        assert!(alice.is_revoked());
+        assert!(
+            lookups(UUID_B, "new-password")
+                .into_iter()
+                .all(|found| found.is_none())
+        );
+        assert!(!registry.has_password_sha256_prefix(&new_prefix));
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_registry_preserves_authentication_and_online_mutations() {
+        let mut kinds = CredentialKinds::UUID;
+        kinds.merge(CredentialKinds::TROJAN_PASSWORD);
+        let mut alice_spec = uuid_spec("alice", UUID_A);
+        alice_spec.password = Some("alice-password".into());
+        alice_spec.max_conns = Some(3);
+        alice_spec.upload_limit_bps = Some(1024);
+        alice_spec.download_limit_bps = Some(2048);
+        let mut bob_spec = uuid_spec("bob", UUID_B);
+        bob_spec.enabled = false;
+        let registry = MemoryUserRegistry::from_users(
+            kinds,
+            vec![trojan_spec("carol", "carol-password"), bob_spec, alice_spec],
+        )
+        .unwrap();
+
+        assert_eq!(registry.len(), 3);
+        assert_eq!(registry.vmess_candidates.load().len(), 2);
+        let listed = registry.list();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|info| info.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob", "carol"]
+        );
+        assert_eq!(listed[0].max_conns, 3);
+        assert_eq!(listed[0].upload_limit_bps, 1024);
+        assert_eq!(listed[0].download_limit_bps, 2048);
+
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        let by_vmess = registry.find_vmess_auth_id(&vmess_auth_id(UUID_A)).unwrap();
+        assert!(Arc::ptr_eq(&alice, &by_vmess.user));
+        assert_eq!(by_vmess.timestamp, 1_700_000_000);
+        assert_eq!(
+            by_vmess.instruction_key,
+            *VmessAuthKey::new(&uuid_bytes(UUID_A)).instruction_key()
+        );
+        let alice_hash = credential::trojan_password_hash("alice-password");
+        assert!(Arc::ptr_eq(
+            &alice,
+            &registry.find_trojan_hash(&alice_hash).unwrap()
+        ));
+        assert!(
+            registry
+                .find_trojan_hash(&credential::trojan_password_hash("carol-password"))
+                .is_some()
+        );
+        assert!(registry.find_uuid(&uuid_bytes(UUID_B)).is_none());
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .is_none()
+        );
+
+        // The first online mutation must retain accounting and publish the new
+        // snapshot immediately, just as it does for an initially empty registry.
+        alice.add_tx(17);
+        let updated = registry.upsert(uuid_spec("alice", UUID_C)).unwrap();
+        assert_eq!(updated.tx, 17);
+        assert_eq!(updated.max_conns, 0);
+        assert_eq!(updated.upload_limit_bps, 0);
+        assert_eq!(updated.download_limit_bps, 0);
+        assert!(registry.find_uuid(&uuid_bytes(UUID_A)).is_none());
+        assert!(registry.find_trojan_hash(&alice_hash).is_none());
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_A))
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            &alice,
+            &registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_C))
+                .unwrap()
+                .user
+        ));
+
+        registry.upsert(uuid_spec("bob", UUID_B)).unwrap();
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_B))
+                .is_some()
+        );
+        let removed = registry.remove("in", "alice").await.unwrap();
+        assert_eq!(removed.tx, 17);
+        assert!(alice.is_revoked());
+        assert!(
+            registry
+                .find_vmess_auth_id(&vmess_auth_id(UUID_C))
+                .is_none()
+        );
+        assert_eq!(registry.vmess_candidates.load().len(), 1);
+    }
+
+    #[test]
+    fn bulk_registry_rejects_duplicate_ids_and_credentials() {
+        let err = MemoryUserRegistry::from_users(
+            CredentialKinds::UUID,
+            vec![uuid_spec("alice", UUID_A), uuid_spec("alice", UUID_B)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidUser(message) if message == "user alice is listed twice")
+        );
+
+        // An omitted id resolves to the uuid and must collide with an explicit id
+        // naming that same value, even when the credentials themselves differ.
+        let mut implicit_id = uuid_spec("unused", UUID_A);
+        implicit_id.id = None;
+        let err = MemoryUserRegistry::from_users(
+            CredentialKinds::UUID,
+            vec![implicit_id, uuid_spec(UUID_A, UUID_B)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidUser(message) if message == format!("user {UUID_A} is listed twice"))
+        );
+
+        let err = MemoryUserRegistry::from_users(
+            CredentialKinds::UUID,
+            vec![uuid_spec("alice", UUID_A), uuid_spec("bob", UUID_A)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EngineError::DuplicateCredential { id, owner } if id == "bob" && owner == "alice")
+        );
+    }
+
+    #[test]
+    fn bulk_registry_rejects_invalid_users() {
+        let mut no_credential = uuid_spec("bob", UUID_B);
+        no_credential.uuid = None;
+        for invalid in [
+            uuid_spec("bob", "not-a-uuid"),
+            uuid_spec("   ", UUID_B),
+            trojan_spec("bob", "password-on-a-uuid-inbound"),
+            no_credential,
+        ] {
+            let single_error = MemoryUserRegistry::new(CredentialKinds::UUID)
+                .upsert(invalid.clone())
+                .unwrap_err();
+            let bulk_error = MemoryUserRegistry::from_users(
+                CredentialKinds::UUID,
+                vec![uuid_spec("alice", UUID_A), invalid],
+            )
+            .unwrap_err();
+            assert_eq!(bulk_error.to_string(), single_error.to_string());
+        }
+
+        let mut missing_id = trojan_spec("unused", "password");
+        missing_id.id = None;
+        let err =
+            MemoryUserRegistry::from_users(CredentialKinds::TROJAN_PASSWORD, vec![missing_id])
+                .unwrap_err();
+        assert!(
+            matches!(err, EngineError::InvalidUser(message) if message == "a user needs an `id` or a `uuid`")
+        );
     }
 
     #[tokio::test]
@@ -2589,6 +2989,73 @@ mod tests {
                 .iter()
                 .all(|u| u.tx == 0 && u.rx == 0)
         );
+    }
+
+    #[test]
+    fn nonzero_sweep_skips_idle_users_and_preserves_period_metadata() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        registry.upsert(uuid_spec("bob", UUID_B)).unwrap();
+        registry.upsert(uuid_spec("idle", UUID_C)).unwrap();
+        assert!(registry.take_nonzero_traffic().is_empty());
+
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        let bob = registry.find_uuid(&uuid_bytes(UUID_B)).unwrap();
+        let connection = ConnContext::new();
+        assert!(connection.bind_authenticated(Arc::clone(&alice)));
+        alice.add_tx(10);
+        bob.add_rx(20);
+        let observed_at = alice.last_traffic_observed_at_unix_millis();
+
+        let swept = registry.take_nonzero_traffic();
+        let reported: Vec<_> = swept.iter().map(|u| (u.id.as_str(), u.tx, u.rx)).collect();
+        assert_eq!(reported, [("alice", 10, 0), ("bob", 0, 20)]);
+        assert_eq!(swept[0].last_traffic_observed_at_unix_millis, observed_at);
+        assert_eq!((swept[0].conns, swept[0].total_conns), (1, 1));
+        assert!(registry.take_nonzero_traffic().is_empty());
+        assert_eq!(registry.take_all_traffic().len(), 3);
+        assert!(registry.find_uuid(&uuid_bytes(UUID_C)).is_some());
+
+        alice.add_rx(7);
+        let next = registry.take_nonzero_traffic();
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            (next[0].id.as_str(), next[0].tx, next[0].rx),
+            ("alice", 0, 7)
+        );
+    }
+
+    #[test]
+    fn nonzero_sweeps_preserve_bytes_during_concurrent_increments() {
+        let registry = MemoryUserRegistry::new(CredentialKinds::UUID);
+        registry.upsert(uuid_spec("alice", UUID_A)).unwrap();
+        let alice = registry.find_uuid(&uuid_bytes(UUID_A)).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let mut totals = (0, 0);
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..10_000 {
+                    alice.add_tx(3);
+                    alice.add_rx(5);
+                }
+            });
+            barrier.wait();
+            for _ in 0..100 {
+                for info in registry.take_nonzero_traffic() {
+                    totals.0 += info.tx;
+                    totals.1 += info.rx;
+                }
+            }
+            writer.join().unwrap();
+        });
+        for info in registry.take_nonzero_traffic() {
+            totals.0 += info.tx;
+            totals.1 += info.rx;
+        }
+        assert_eq!(totals, (30_000, 50_000));
+        assert!(registry.take_nonzero_traffic().is_empty());
     }
 
     use std::sync::atomic;

@@ -104,17 +104,20 @@ impl TrafficQueue {
         reports: Vec<Report>,
     ) -> usize {
         let mut queued = 0;
-        for (index, report) in reports.iter().enumerate() {
-            let wire = report_to_proto(report);
-            let sent = tokio::select! {
+        let mut reports = reports.into_iter();
+        while let Some(report) = reports.next() {
+            // Retain ownership until capacity is reserved so cancellation can
+            // restore this report along with the remaining batch.
+            let permit = tokio::select! {
                 biased;
-                () = cancel.cancelled() => false,
-                result = self.report_sender.send(wire) => result.is_ok(),
+                () = cancel.cancelled() => None,
+                result = self.report_sender.reserve() => result.ok(),
             };
-            if !sent {
-                aggregator.restore(reports[index..].iter().cloned());
+            let Some(permit) = permit else {
+                aggregator.restore(std::iter::once(report).chain(reports));
                 return queued;
-            }
+            };
+            permit.send(report_to_proto(report));
             queued += 1;
         }
         queued
@@ -360,15 +363,16 @@ async fn consume_reports(
     }
 }
 
-fn report_to_proto(report: &Report) -> TrafficReport {
+fn report_to_proto(report: Report) -> TrafficReport {
+    let observed_at_unix = report.observed_at_unix();
     TrafficReport {
-        machine_id: report.machine_id.clone(),
-        node_id: report.node_id.clone(),
-        user_id: report.user_id.clone(),
-        protocol: report.protocol.clone(),
+        machine_id: report.machine_id,
+        node_id: report.node_id,
+        user_id: report.user_id,
+        protocol: report.protocol,
         uplink_bytes: report.uplink_bytes,
         downlink_bytes: report.downlink_bytes,
-        observed_at_unix: report.observed_at_unix(),
+        observed_at_unix,
     }
 }
 
@@ -405,7 +409,7 @@ mod tests {
 
     #[test]
     fn protobuf_mapping_preserves_identity_bytes_and_timestamp() {
-        let wire = report_to_proto(&report("user", 10));
+        let wire = report_to_proto(report("user", 10));
         assert_eq!(wire.machine_id, "machine");
         assert_eq!(wire.node_id, "node");
         assert_eq!(wire.user_id, "user");
@@ -419,21 +423,105 @@ mod tests {
         let aggregator = Aggregator::new(1);
         let queue = TrafficQueue::with_capacity(1);
         let cancel = CancellationToken::new();
-        let reports = vec![report("one", 1), report("two", 2)];
+        let reports = vec![report("one", 1), report("two", 2), report("three", 3)];
         let task_cancel = cancel.clone();
         let enqueue = queue.enqueue(&task_cancel, &aggregator, reports);
         tokio::pin!(enqueue);
 
         tokio::select! {
+            biased;
             _ = &mut enqueue => panic!("second report unexpectedly fit in a one-slot queue"),
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            _ = tokio::task::yield_now() => {}
         }
+        assert_eq!(queue.queued_len(), 1);
+        // Counters can accrue while enqueue waits for capacity. Restoring the
+        // suffix must add to them without duplicating the already queued prefix.
+        aggregator.observe(TrafficEvent {
+            machine_id: "machine".into(),
+            node_id: "node".into(),
+            user_id: "two".into(),
+            protocol: "vless".into(),
+            uplink_bytes: 10,
+            downlink_bytes: 20,
+            observed_at: Some(UNIX_EPOCH + Duration::from_secs(1_235)),
+        });
         cancel.cancel();
         assert_eq!(enqueue.await, 1);
         let restored = aggregator.flush_all();
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].user_id, "two");
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].user_id, "three");
+        assert_eq!(
+            (restored[0].uplink_bytes, restored[0].downlink_bytes),
+            (3, 4)
+        );
+        assert_eq!(restored[1].user_id, "two");
+        assert_eq!(
+            (restored[1].uplink_bytes, restored[1].downlink_bytes),
+            (12, 23)
+        );
         assert_eq!(queue.queued_len(), 1);
+        assert_eq!(
+            queue.consumer.reports.lock().await.try_recv().unwrap(),
+            report_to_proto(report("one", 1))
+        );
+        assert!(aggregator.flush_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_queue_restores_the_unqueued_suffix() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(1);
+        let cancel = CancellationToken::new();
+        let reports = vec![report("one", 1), report("two", 2), report("three", 3)];
+        let enqueue = queue.enqueue(&cancel, &aggregator, reports);
+        tokio::pin!(enqueue);
+
+        tokio::select! {
+            biased;
+            _ = &mut enqueue => panic!("second report unexpectedly fit in a one-slot queue"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let mut receiver = queue.consumer.reports.lock().await;
+        receiver.close();
+        assert_eq!(enqueue.await, 1);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            report_to_proto(report("one", 1))
+        );
+        assert!(receiver.try_recv().is_err());
+
+        let mut expected = vec![report("three", 3), report("two", 2)];
+        for report in &mut expected {
+            report.observed_at = UNIX_EPOCH + Duration::from_secs(1_200);
+        }
+        assert_eq!(aggregator.flush_all(), expected);
+        assert!(aggregator.flush_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn already_cancelled_enqueue_restores_the_entire_batch() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(3);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        assert_eq!(
+            queue
+                .enqueue(
+                    &cancel,
+                    &aggregator,
+                    vec![report("one", 1), report("two", 2), report("three", 3)],
+                )
+                .await,
+            0
+        );
+        assert_eq!(queue.queued_len(), 0);
+        let mut expected = vec![report("one", 1), report("three", 3), report("two", 2)];
+        for report in &mut expected {
+            report.observed_at = UNIX_EPOCH + Duration::from_secs(1_200);
+        }
+        assert_eq!(aggregator.flush_all(), expected);
+        assert!(aggregator.flush_all().is_empty());
     }
 
     #[tokio::test]
@@ -441,7 +529,7 @@ mod tests {
         let aggregator = Aggregator::new(1);
         let queue = TrafficQueue::with_capacity(1);
         let cancel = CancellationToken::new();
-        let expected = report_to_proto(&report("one", 11));
+        let expected = report_to_proto(report("one", 11));
         assert_eq!(
             queue
                 .enqueue(&cancel, &aggregator, vec![report("one", 11)])
@@ -476,7 +564,7 @@ mod tests {
         let aggregator = Aggregator::new(1);
         let queue = TrafficQueue::with_capacity(1);
         let cancel = CancellationToken::new();
-        let expected = report_to_proto(&report("one", 21));
+        let expected = report_to_proto(report("one", 21));
         assert_eq!(
             queue
                 .enqueue(&cancel, &aggregator, vec![report("one", 21)])
@@ -488,7 +576,7 @@ mod tests {
         let (dummy_consumed, _dummy_ack) = oneshot::channel();
         blocked_sender
             .send(OutgoingReport {
-                report: report_to_proto(&report("already-buffered", 1)),
+                report: report_to_proto(report("already-buffered", 1)),
                 consumed: dummy_consumed,
             })
             .await
@@ -536,7 +624,7 @@ mod tests {
         let aggregator = Aggregator::new(1);
         let queue = TrafficQueue::with_capacity(1);
         let cancel = CancellationToken::new();
-        let expected = report_to_proto(&report("one", 31));
+        let expected = report_to_proto(report("one", 31));
         assert_eq!(
             queue
                 .enqueue(&cancel, &aggregator, vec![report("one", 31)])

@@ -255,7 +255,56 @@ async fn refresh_replaces_all_users_and_noop_only_advances_revision() {
         .unwrap();
     assert_eq!(changes, Default::default());
     assert_eq!(manager.current_revision(), Some(20));
+    assert_eq!(manager.current_topology().snapshot.unwrap().revision, 20);
     assert_eq!(lock(&runtime.applied).len(), 2);
+}
+
+#[tokio::test]
+async fn loaded_users_pages_preserve_order_and_bound_the_requested_range() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let manager = TopologyManager::new("machine-1", runtime);
+    let users: Vec<_> = (0..5)
+        .map(|index| user(&format!("user-{index}"), &format!("credential-{index}")))
+        .collect();
+    manager
+        .apply_initial(topology(1, users.clone()))
+        .await
+        .unwrap();
+
+    for (offset, limit, expected) in [
+        (0, 2, &users[..2]),
+        (4, 2, &users[4..]),
+        (5, 2, &users[5..]),
+        (u64::MAX, usize::MAX, &users[5..]),
+        (0, 0, &users[..0]),
+        (2, usize::MAX, &users[2..]),
+    ] {
+        let (total, page) = manager
+            .loaded_users_page("node-1", offset, limit)
+            .await
+            .unwrap();
+        assert_eq!(total, users.len());
+        assert_eq!(page.as_slice(), expected);
+    }
+    assert_eq!(manager.loaded_users("node-1").await.unwrap(), users);
+    let error = manager
+        .loaded_users_page("missing", 0, 2)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), TopologyErrorKind::InvalidMutation);
+    assert_eq!(
+        error.to_string(),
+        "node missing not found in loaded topology"
+    );
+
+    manager
+        .refresh_node_users("node-1", Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.loaded_users_page("node-1", 0, 2).await.unwrap(),
+        (0, Vec::new())
+    );
 }
 
 #[tokio::test]
@@ -1292,6 +1341,47 @@ async fn worker_sends_accepted_then_terminal_and_replays_ack_store() {
     assert_eq!(terminal.operation_id, "operation-second");
     assert_eq!(terminal.status, ControlAckStatus::Applied as i32);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn worker_preserves_command_payload_and_terminal_envelope() {
+    struct PayloadExecutor(Mutex<Option<ControlCommand>>);
+
+    #[async_trait]
+    impl CommandExecutor for PayloadExecutor {
+        async fn execute(&self, command: ControlCommand) -> TerminalResult {
+            *lock(&self.0) = Some(command);
+            TerminalResult::applied("payload executed")
+        }
+    }
+
+    let executor = Arc::new(PayloadExecutor(Mutex::new(None)));
+    let (worker, mut acks) =
+        ControlCommandWorker::spawn(executor.clone(), Arc::new(AckStore::new()));
+    let mut command = queued_command("snapshot", ControlCommandType::TopologySnapshot);
+    command.idempotency_key = "snapshot-operation".into();
+    command.legacy_payload = vec![7; 4096];
+    command.payload = Some(Payload::TopologySnapshot(acp_proto::TopologySnapshot {
+        machine_id: "machine-1".into(),
+        revision: 10,
+        ..Default::default()
+    }));
+    worker.submit(command.clone()).await.unwrap();
+    assert_eq!(
+        ack(&mut acks).await.status,
+        ControlAckStatus::Accepted as i32
+    );
+    let terminal = ack(&mut acks).await;
+
+    assert_eq!(lock(&executor.0).take(), Some(command.clone()));
+    assert_eq!(terminal.command_id, command.command_id);
+    assert_eq!(terminal.operation_id, command.operation_id);
+    assert_eq!(terminal.machine_id, command.machine_id);
+    assert_eq!(terminal.node_id, command.node_id);
+    assert_eq!(terminal.revision, command.revision);
+    assert_eq!(terminal.idempotency_key, command.idempotency_key);
+    assert_eq!(terminal.status, ControlAckStatus::Applied as i32);
+    assert_eq!(terminal.message, "payload executed");
 }
 
 #[tokio::test]

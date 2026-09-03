@@ -333,6 +333,24 @@ async fn loaded_users_normalizes_pagination_and_preserves_credentials() {
     assert_eq!(page.users.len(), 5);
     assert_eq!(page.users[0].user_id, "user-200");
 
+    let beyond_end = dispatch(
+        &services,
+        &controller,
+        request(
+            "users-beyond-end",
+            Some(Command::LoadedUsers(LoadedUsersRequest {
+                page: u32::MAX,
+                page_size: MAX_LOADED_USERS_PAGE_SIZE,
+            })),
+        ),
+    )
+    .await;
+    let Some(Payload::LoadedUsers(page)) = &beyond_end[0].payload else {
+        panic!("missing users page")
+    };
+    assert_eq!(page.total_size, 205);
+    assert!(page.users.is_empty());
+
     *services.users_error.lock().unwrap() = Some("node node-1 not found".into());
     let failed = dispatch(
         &services,
@@ -348,6 +366,64 @@ async fn loaded_users_normalizes_pagination_and_preserves_credentials() {
     .await;
     assert_eq!(failed[0].stage, "loaded_users");
     assert_eq!(failed[0].message, "node node-1 not found");
+}
+
+#[tokio::test]
+async fn loaded_users_requests_only_the_normalized_page_from_the_backend() {
+    struct PagedTopology;
+
+    #[async_trait]
+    impl RemoteTopology for PagedTopology {
+        async fn loaded_users(
+            &self,
+            _node_id: &str,
+        ) -> Result<Vec<UserCredential>, RemoteOperationError> {
+            panic!("a page request must not load every user");
+        }
+
+        async fn loaded_users_page(
+            &self,
+            node_id: &str,
+            offset: u64,
+            limit: usize,
+        ) -> Result<(usize, Vec<UserCredential>), RemoteOperationError> {
+            assert_eq!(node_id, "node-1");
+            assert_eq!((offset, limit), (200, 100));
+            Ok((205, (200..205).map(FakeServices::user).collect()))
+        }
+    }
+
+    let services = Arc::new(FakeServices::default());
+    let dependencies =
+        RemoteControlDependencies::new(Arc::new(PagedTopology), services.clone(), services);
+    let (sender, mut receiver) = mpsc::channel(1);
+    handle_remote_control_request(
+        CancellationToken::new(),
+        target(),
+        dependencies,
+        RemoteController::new(),
+        request(
+            "users-page",
+            Some(Command::LoadedUsers(LoadedUsersRequest {
+                page: 3,
+                page_size: MAX_LOADED_USERS_PAGE_SIZE + 1,
+            })),
+        ),
+        sender,
+    )
+    .await;
+    let response = receiver.recv().await.unwrap();
+    assert_eq!(
+        response.status,
+        RemoteControlResponseStatus::Completed as i32
+    );
+    let Some(Payload::LoadedUsers(page)) = response.payload else {
+        panic!("missing users page")
+    };
+    assert_eq!((page.page, page.page_size, page.total_size), (3, 100, 205));
+    assert_eq!(page.users.len(), 5);
+    assert_eq!(page.users[0].credential, "credential-200");
+    assert_eq!(page.users[4].user_id, "user-204");
 }
 
 #[tokio::test]
@@ -635,6 +711,220 @@ async fn periodic_disconnect_waits_for_local_transaction_before_releasing_attemp
             .periodic_attempt
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn replacement_periodic_scheduler_waits_for_attempt_completion_without_self_waking() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let controller = RemoteController::new();
+    controller.set_periodic(true, Duration::from_secs(60));
+    let old_cancel = CancellationToken::new();
+    let previous = controller.begin_periodic_attempt(&old_cancel).unwrap();
+    let previous_cancel = previous.cancel.clone();
+    let services = Arc::new(FakeServices::default());
+    let cancel = CancellationToken::new();
+    let mut replacement = Box::pin(run_periodic_user_pull(
+        cancel.clone(),
+        target(),
+        services.dependencies(),
+        controller.clone(),
+    ));
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(counter.clone());
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        replacement.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    assert_eq!(
+        counter.0.load(Ordering::SeqCst),
+        0,
+        "an occupied attempt must sleep instead of repeatedly yielding"
+    );
+    assert_eq!(services.sync_calls.load(Ordering::SeqCst), 0);
+
+    // Also exercise unwinding/abandonment of an attempt owner: its RAII cleanup
+    // must wake the replacement without falsely recording a successful pull.
+    drop(previous);
+    assert!(previous_cancel.is_cancelled());
+    assert!(counter.0.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        controller
+            .snapshot()
+            .periodic_user_pull_last_success_at_unix_milli,
+        0
+    );
+    controller.set_periodic(true, Duration::from_secs(60));
+    assert!(matches!(
+        replacement.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    assert_eq!(services.sync_calls.load(Ordering::SeqCst), 1);
+    cancel.cancel();
+    assert!(matches!(
+        replacement.as_mut().poll(&mut context),
+        Poll::Ready(())
+    ));
+}
+
+#[derive(Default)]
+struct BackpressureRuntime {
+    configured: AtomicBool,
+    applied: AtomicBool,
+    closed: AtomicBool,
+}
+
+#[async_trait]
+impl crate::topology::manager::TopologyRuntime for BackpressureRuntime {
+    async fn apply(
+        &self,
+        _: &crate::topology::MachineTopology,
+    ) -> Result<(), crate::topology::manager::TopologyError> {
+        self.applied.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn close_user_connections(&self, _: &str, _: &str) -> u64 {
+        0
+    }
+    fn current_config(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    async fn configure_reload(
+        &self,
+        _: &crate::topology::MachineTopology,
+    ) -> Result<(), crate::topology::manager::TopologyError> {
+        self.configured.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), crate::topology::manager::TopologyError> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl RemoteRuntime for BackpressureRuntime {
+    fn current_config(&self) -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+struct BackpressurePanel;
+
+#[async_trait]
+impl crate::control::TopologyFetcher for BackpressurePanel {
+    async fn fetch_machine_topology(
+        &self,
+    ) -> Result<crate::topology::MachineTopology, crate::control::FetchError> {
+        Ok(crate::topology::MachineTopology {
+            machine_id: "machine-1".into(),
+            revision: 1,
+            ..Default::default()
+        })
+    }
+
+    async fn fetch_node_users(
+        &self,
+        _: &str,
+    ) -> Result<Vec<UserCredential>, crate::control::FetchError> {
+        Ok(Vec::new())
+    }
+}
+
+async fn reload_with_response_backpressure(initially_full: bool) {
+    let runtime = Arc::new(BackpressureRuntime::default());
+    let manager = Arc::new(crate::topology::manager::TopologyManager::new(
+        "machine-1",
+        runtime.clone(),
+    ));
+    let fetcher = Arc::new(PanelRemoteFetcher::new(
+        Arc::new(BackpressurePanel),
+        manager.clone(),
+    ));
+    let dependencies = RemoteControlDependencies::new(manager.clone(), runtime.clone(), fetcher);
+    let controller = RemoteController::new();
+    let session_cancel = CancellationToken::new();
+    let stream_cancel = session_cancel.child_token();
+    let (sender, _receiver) = mpsc::channel(REMOTE_RESPONSE_QUEUE_SIZE);
+    // Four accepted stages leave StartInstance blocked after port configuration.
+    let occupied = REMOTE_RESPONSE_QUEUE_SIZE - if initially_full { 0 } else { 4 };
+    for _ in 0..occupied {
+        sender.send(RemoteControlResponse::default()).await.unwrap();
+    }
+    let task = tokio::spawn(handle_remote_control_request(
+        stream_cancel.clone(),
+        target(),
+        dependencies,
+        controller.clone(),
+        request(
+            "backpressure",
+            Some(Command::ReloadSingBox(ReloadSingBoxRequest {})),
+        ),
+        sender,
+    ));
+    let expected_stage = if initially_full {
+        RELOAD_STAGE_PULL_CONFIGURATION
+    } else {
+        RELOAD_STAGE_START_INSTANCE
+    };
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+        if controller.snapshot().reload_stage == expected_stage {
+            break;
+        }
+    }
+    assert_eq!(controller.snapshot().reload_stage, expected_stage);
+    assert_eq!(runtime.configured.load(Ordering::SeqCst), !initially_full);
+    assert!(!runtime.applied.load(Ordering::SeqCst));
+
+    tokio::time::timeout(RELOAD_PROGRESS_SEND_TIMEOUT + Duration::from_secs(1), task)
+        .await
+        .expect("response backpressure retained the topology lock")
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(10), manager.close())
+        .await
+        .expect("close remained blocked by progress reporting")
+        .unwrap();
+    assert!(stream_cancel.is_cancelled());
+    assert!(
+        !session_cancel.is_cancelled(),
+        "only the remote stream should retire"
+    );
+    assert!(
+        runtime.applied.load(Ordering::SeqCst),
+        "the owned transaction must finish even when progress delivery fails"
+    );
+    assert!(runtime.closed.load(Ordering::SeqCst));
+    assert_eq!(manager.current_revision(), Some(1));
+    let state = controller.snapshot();
+    assert!(!state.reload_in_progress);
+    assert_eq!(
+        state.last_reload.unwrap().outcome,
+        ReloadSingBoxOutcome::Succeeded as i32
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_response_queue_cannot_retain_topology_lock_or_block_close() {
+    reload_with_response_backpressure(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn backpressure_after_port_configuration_still_completes_the_owned_reload() {
+    reload_with_response_backpressure(false).await;
 }
 
 #[tokio::test]
@@ -935,6 +1225,7 @@ machine_secret = "secret"
     .unwrap();
     let services = Arc::new(FakeServices::default());
     *services.config.lock().unwrap() = b"diagnostic".to_vec();
+    let controller = RemoteController::new();
     let client_cancel = CancellationToken::new();
     let runner_cancel = client_cancel.clone();
     let runner = tokio::spawn(run_remote_control_stream(
@@ -943,7 +1234,7 @@ machine_secret = "secret"
         authenticator,
         target(),
         services.dependencies(),
-        RemoteController::new(),
+        controller.clone(),
     ));
 
     let metadata = tokio::time::timeout(Duration::from_secs(1), metadata_receiver.recv())
@@ -988,12 +1279,46 @@ machine_secret = "secret"
         "current sing-box configuration returned"
     );
 
+    // The panel can send tiny requests much faster than a local transaction
+    // completes. Admission must stop before spawning request 17, even though
+    // the bounded response queue is empty and the transport remains healthy.
+    services.sync_block.store(true, Ordering::SeqCst);
+    for index in 0..=MAX_CONCURRENT_REMOTE_REQUESTS {
+        request_sender
+            .send(Ok(request(
+                &format!("bounded-sync-{index}"),
+                Some(Command::SyncUsers(SyncUsersRequest {})),
+            )))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while services.sync_calls.load(Ordering::SeqCst) < MAX_CONCURRENT_REMOTE_REQUESTS {
+            services.sync_called.notified().await;
+        }
+    })
+    .await
+    .expect("request slots never filled");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        services.sync_calls.load(Ordering::SeqCst),
+        MAX_CONCURRENT_REMOTE_REQUESTS
+    );
+    assert_eq!(controller.inner.request_slots.available_permits(), 0);
+
     client_cancel.cancel();
     tokio::time::timeout(Duration::from_secs(1), runner)
         .await
         .expect("remote stream ignored cancellation")
         .unwrap()
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controller.inner.request_slots.available_permits() != MAX_CONCURRENT_REMOTE_REQUESTS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled requests retained their admission slots");
     server_cancel.cancel();
     server.await.unwrap();
 }

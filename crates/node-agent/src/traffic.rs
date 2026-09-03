@@ -158,31 +158,30 @@ impl Aggregator {
 
     fn flush_inner(&self, force: bool) -> Vec<Report> {
         let now = (self.clock)();
-        let mut reports = {
+        let mut reports = Vec::new();
+        {
             let mut state = self.state();
-            let mut reports = Vec::with_capacity(state.counters.len());
-            state.counters.retain(|key, value| {
+            for (key, value) in state.counters.extract_if(|_, value| {
+                (value.uplink == 0 && value.downlink == 0)
+                    || force
+                    || self.should_report(value, now)
+            }) {
                 if value.uplink == 0 && value.downlink == 0 {
-                    return false;
-                }
-                if !force && !self.should_report(value, now) {
-                    return true;
+                    continue;
                 }
                 reports.push(Report {
-                    machine_id: key.machine_id.clone(),
-                    node_id: key.node_id.clone(),
-                    user_id: key.user_id.clone(),
-                    protocol: key.protocol.clone(),
+                    machine_id: key.machine_id,
+                    node_id: key.node_id,
+                    user_id: key.user_id,
+                    protocol: key.protocol,
                     uplink_bytes: value.uplink,
                     downlink_bytes: value.downlink,
                     observed_at: observation_bucket_start(value.last_observed_at),
                 });
-                false
-            });
-            reports
-        };
+            }
+        }
 
-        reports.sort_by(|left, right| {
+        reports.sort_unstable_by(|left, right| {
             left.observed_at
                 .cmp(&right.observed_at)
                 .then_with(|| left.machine_id.cmp(&right.machine_id))

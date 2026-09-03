@@ -1197,25 +1197,7 @@ impl Engine {
         users: Vec<UserSpec>,
     ) -> EngineResult<Arc<MemoryUserRegistry>> {
         let kinds = Self::registry_kinds_for(server_configs)?;
-
-        let registry = MemoryUserRegistry::new(kinds);
-        for user in users {
-            // Reported by id, and every id in one payload must be distinct: an
-            // upsert would otherwise let a duplicate id in the same list silently
-            // overwrite an earlier entry.
-            let id = user
-                .resolved_id()
-                .ok_or_else(|| EngineError::InvalidUser("a user needs an `id` or a `uuid`".into()))?
-                .to_string();
-            if registry.get(&id).is_some() {
-                return Err(EngineError::InvalidUser(format!(
-                    "user {id} is listed twice"
-                )));
-            }
-            registry.upsert(user)?;
-        }
-
-        Ok(registry)
+        MemoryUserRegistry::from_users(kinds, users)
     }
 
     /// The credential forms a dynamic inbound's registry must answer, or the reason
@@ -1320,6 +1302,13 @@ impl Engine {
     /// where their last bytes are.
     pub fn take_inbound_traffic(&self, tag: &str) -> EngineResult<Vec<UserInfo>> {
         Ok(self.registry_for(tag)?.take_all_traffic())
+    }
+
+    /// Take traffic with the same per-user atomicity and removal behavior as
+    /// [`Self::take_inbound_traffic`], omitting zero-byte records before allocating
+    /// their IDs. Results are sorted by user ID.
+    pub fn take_nonzero_inbound_traffic(&self, tag: &str) -> EngineResult<Vec<UserInfo>> {
+        Ok(self.registry_for(tag)?.take_nonzero_traffic())
     }
 
     pub fn get_user(&self, tag: &str, id: &str) -> EngineResult<UserInfo> {
@@ -1478,12 +1467,11 @@ async fn validate_urltest_probe_dns_config(
     let Some(dns) = dns.filter(|dns| !dns.is_null()) else {
         return Ok(None);
     };
-    let encoded = serde_json::to_vec(dns).map_err(|error| {
+    let fingerprint = json_fingerprint(dns).map_err(|error| {
         EngineError::InvalidConfig(format!(
             "could not encode URLTest probe DNS section: {error}"
         ))
     })?;
-    let fingerprint = Sha256::digest(encoded).into();
     let payload = serde_json::json!({
         "address": "127.0.0.1:0",
         "protocol": {"type": "socks", "udp_enabled": false},
@@ -1569,9 +1557,29 @@ fn inline_dns_cache_key(config: &serde_json::Value) -> EngineResult<Option<Inlin
     let Some(dns) = config.get("dns").filter(|dns| !dns.is_null()) else {
         return Ok(None);
     };
-    let encoded = serde_json::to_vec(dns)
+    let fingerprint = json_fingerprint(dns)
         .map_err(|e| EngineError::InvalidConfig(format!("could not encode DNS section: {e}")))?;
-    Ok(Some(Sha256::digest(encoded).into()))
+    Ok(Some(fingerprint))
+}
+
+/// Preserve serialized-byte cache identity without allocating a JSON buffer.
+fn json_fingerprint(value: &serde_json::Value) -> serde_json::Result<InlineDnsCacheKey> {
+    struct HashWriter(Sha256);
+
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.0.finalize().into())
 }
 
 fn resolve_bind_targets(
@@ -2007,7 +2015,7 @@ mod dns_sharing_tests {
 
     #[test]
     fn inline_dns_cache_key_is_a_fixed_sha256_digest_without_raw_secrets() {
-        let secret = "dns-proxy-password-that-must-not-be-retained";
+        let secret = "dns-proxy-password-私密\"\\\n\u{0001}";
         let config = json!({
             "dns": {
                 "servers": [{
@@ -2029,6 +2037,23 @@ mod dns_sharing_tests {
         assert!(!format!("{key:?}").contains(secret));
         assert_eq!(inline_dns_cache_key(&json!({})).unwrap(), None);
         assert_eq!(inline_dns_cache_key(&json!({"dns": null})).unwrap(), None);
+    }
+
+    #[test]
+    fn streamed_json_fingerprint_matches_serialized_bytes() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!({
+                "tag": "解析器\"\\\n\u{0001}",
+                "nested": [null, true, {}, [u64::MAX, i64::MIN, 0.125]],
+                "long": "哈希".repeat(256),
+            }),
+        ] {
+            let expected: InlineDnsCacheKey =
+                Sha256::digest(serde_json::to_vec(&value).unwrap()).into();
+            assert_eq!(json_fingerprint(&value).unwrap(), expected);
+        }
     }
 
     #[tokio::test]

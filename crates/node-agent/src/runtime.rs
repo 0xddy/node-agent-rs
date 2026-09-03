@@ -16,7 +16,7 @@ use shoes_api::{InboundSpec, UserInfo, UserSpec};
 use shoes_engine::{Engine, EngineError, InboundReplayLease};
 use tokio_util::sync::CancellationToken;
 
-use crate::rule_set::{RuleSetLoader, RuleSetResource, RuleSetSource};
+use crate::rule_set::{PreparedRuleSets, RuleSetLoader, RuleSetResource, RuleSetSource};
 
 const MAX_PENDING_TRAFFIC_KEYS: usize = 65_536;
 
@@ -186,6 +186,12 @@ pub trait NodeRuntime: Send + Sync {
     async fn apply_config(&self, config: RuntimeConfig) -> Result<(), RuntimeError>;
     async fn reload_config(&self, config: RuntimeConfig) -> Result<ReloadStatus, RuntimeError>;
     fn current_config(&self) -> Vec<u8>;
+
+    /// Stop admitting/preparing new configurations before a caller waits for an
+    /// outer transaction lock. This only requests shutdown: an already-started
+    /// mutation must still finish, and `close` owns resource and traffic cleanup.
+    fn begin_close(&self) {}
+
     async fn close(&self) -> Result<(), RuntimeError>;
     fn connection_stats(&self, node_id: &str) -> ConnectionStats;
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64;
@@ -202,6 +208,10 @@ pub struct ShoesRuntime {
 struct RuntimeInner {
     engine: Engine,
     rule_sets: RuleSetLoader,
+    /// Order configuration preparation and last-good cache publication without
+    /// blocking traffic drains, connection kicks or shutdown on remote I/O.
+    configuration: tokio::sync::Mutex<()>,
+    closing: CancellationToken,
     apply: tokio::sync::Mutex<()>,
     rule_set_watcher: Mutex<RuleSetWatcherState>,
     state: RwLock<AppliedState>,
@@ -560,6 +570,8 @@ impl ShoesRuntime {
             inner: Arc::new(RuntimeInner {
                 engine,
                 rule_sets,
+                configuration: tokio::sync::Mutex::new(()),
+                closing: CancellationToken::new(),
                 apply: tokio::sync::Mutex::new(()),
                 rule_set_watcher: Mutex::new(RuleSetWatcherState::default()),
                 state: RwLock::new(AppliedState::default()),
@@ -583,16 +595,53 @@ impl ShoesRuntime {
         config: RuntimeConfig,
         force_reload: bool,
     ) -> Result<(), RuntimeError> {
-        let watcher_config = config.clone();
+        let _configuration = tokio::select! {
+            biased;
+            () = self.inner.closing.cancelled() => {
+                return Err(RuntimeError::unchanged(
+                    "runtime is closed",
+                    !self.inner.engine.list_inbounds().is_empty(),
+                ));
+            }
+            guard = self.inner.configuration.lock() => guard,
+        };
+        let prepared = self.prepare_rule_sets(&config, &self.inner.closing).await?;
+        let watcher_config = config
+            .rule_sets
+            .iter()
+            .any(|resource| matches!(resource.source, RuleSetSource::Remote { .. }))
+            .then(|| config.clone());
         let _apply = self.inner.apply.lock().await;
         // Topology changes are infrequent control-plane operations. Boxing the
         // large transaction future here keeps its state machine from being
         // embedded in every caller (including the public async-trait boundary).
-        let result = Box::pin(self.apply_transaction_locked(config, force_reload)).await;
+        let result = Box::pin(self.apply_transaction_locked(config, prepared, force_reload)).await;
         if result.is_ok() {
-            self.install_rule_set_watcher_locked(watcher_config);
+            match watcher_config {
+                Some(config) => self.install_rule_set_watcher_locked(config),
+                // A successful local-only configuration must also retire an
+                // older remote watcher, without keeping a duplicate config.
+                None => self.cancel_rule_set_watcher_locked(),
+            }
         }
         result
+    }
+
+    async fn prepare_rule_sets(
+        &self,
+        config: &RuntimeConfig,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedRuleSets, RuntimeError> {
+        self.inner
+            .rule_sets
+            .prepare_with_cancel(&config.rule_sets, cancel)
+            .await
+            .map_err(|error| {
+                RuntimeError::unchanged(
+                    format!("prepare route rule-set resources: {error}"),
+                    !self.inner.engine.list_inbounds().is_empty(),
+                )
+            })
     }
 
     /// The topology transaction itself. Callers must hold `inner.apply`.
@@ -603,24 +652,17 @@ impl ShoesRuntime {
     async fn apply_transaction_locked(
         &self,
         mut config: RuntimeConfig,
+        prepared: PreparedRuleSets,
         force_reload: bool,
     ) -> Result<(), RuntimeError> {
-        let resources = config.rule_sets.clone();
-        if self.read_state().closed {
-            return Err(RuntimeError::unchanged("runtime is closed", false));
+        // Close can overtake slow preparation. Never revive a closed runtime
+        // with a candidate that was downloaded before its shutdown boundary.
+        if self.inner.closing.is_cancelled() || self.read_state().closed {
+            return Err(RuntimeError::unchanged(
+                "runtime is closed",
+                !self.inner.engine.list_inbounds().is_empty(),
+            ));
         }
-
-        let prepared = self
-            .inner
-            .rule_sets
-            .prepare(&resources)
-            .await
-            .map_err(|error| {
-                RuntimeError::unchanged(
-                    format!("prepare route rule-set resources: {error}"),
-                    !self.inner.engine.list_inbounds().is_empty(),
-                )
-            })?;
         for inbound in &mut config.inbounds {
             prepared.rewrite_config(&mut inbound.spec.config);
         }
@@ -797,7 +839,7 @@ impl ShoesRuntime {
                 log::error!("remote route rule-set update interval cannot be zero");
                 return;
             }
-            let cancel = CancellationToken::new();
+            let cancel = self.inner.closing.child_token();
             watcher.cancel = Some(cancel.clone());
             (watcher.generation, cancel, interval)
         };
@@ -833,11 +875,32 @@ impl ShoesRuntime {
         generation: u64,
         config: RuntimeConfig,
     ) -> Option<Result<(), RuntimeError>> {
-        let _apply = self.inner.apply.lock().await;
+        let cancel = {
+            let watcher = self.rule_set_watcher();
+            if watcher.generation != generation {
+                return None;
+            }
+            watcher.cancel.clone()?
+        };
+        let _configuration = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return None,
+            guard = self.inner.configuration.lock() => guard,
+        };
         if !self.rule_set_watcher_is_active(generation) || self.read_state().closed {
             return None;
         }
-        Some(self.apply_transaction_locked(config, false).await)
+        let prepared = self.prepare_rule_sets(&config, &cancel).await;
+        let _apply = self.inner.apply.lock().await;
+        // A successful external apply or close may retire this watcher while
+        // it prepares. Discard its immutable snapshot instead of publishing it.
+        if !self.rule_set_watcher_is_active(generation) || self.read_state().closed {
+            return None;
+        }
+        Some(match prepared {
+            Ok(prepared) => self.apply_transaction_locked(config, prepared, false).await,
+            Err(error) => Err(error),
+        })
     }
 
     fn read_state(&self) -> RwLockReadGuard<'_, AppliedState> {
@@ -2020,6 +2083,7 @@ impl ShoesRuntime {
     }
 
     async fn close_owned(&self) -> Result<(), RuntimeError> {
+        self.inner.closing.cancel();
         let _apply = self.inner.apply.lock().await;
         self.cancel_rule_set_watcher_locked();
         let already_closed = self.read_state().closed;
@@ -2167,7 +2231,6 @@ impl ShoesRuntime {
 
     async fn drain_traffic_owned(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
         let _apply = self.inner.apply.lock().await;
-        let current = self.read_state().current.clone();
         // Pending receipts are already durable, so move them into this call's
         // transient result map and free the bounded retention budget before
         // touching live counters. The returned sweep is intentionally not capped:
@@ -2177,21 +2240,27 @@ impl ShoesRuntime {
         for receipt in pending_receipts {
             merge_traffic_entry(&mut drained, receipt);
         }
-        if let Some(current) = current {
-            for (tag, inbound) in &current.inbounds {
-                match self.inner.engine.take_inbound_traffic(tag) {
-                    Ok(users) => {
-                        for info in users {
-                            merge_traffic_entry(&mut drained, traffic_drain(inbound, info));
+        {
+            // The sweep has no await after taking `apply`, and engine counter
+            // reads never re-enter runtime state. Borrow the published config
+            // instead of cloning its user credentials and diagnostic payload.
+            let state = self.read_state();
+            if let Some(current) = &state.current {
+                for (tag, inbound) in &current.inbounds {
+                    match self.inner.engine.take_nonzero_inbound_traffic(tag) {
+                        Ok(users) => {
+                            for info in users {
+                                merge_traffic_entry(&mut drained, traffic_drain(inbound, info));
+                            }
                         }
-                    }
-                    Err(EngineError::Unsupported(_) | EngineError::UnknownTag(_)) => {}
-                    Err(error) => {
-                        // `take_inbound_traffic` fails before changing this tag's
-                        // counters. Returning successful receipts from other tags
-                        // is lossless and avoids trying to retain an arbitrarily
-                        // large topology inside the bounded pending map.
-                        log::error!("take traffic for inbound {tag}: {error}");
+                        Err(EngineError::Unsupported(_) | EngineError::UnknownTag(_)) => {}
+                        Err(error) => {
+                            // The engine sweep fails before changing this tag's
+                            // counters. Returning successful receipts from other tags
+                            // is lossless and avoids trying to retain an arbitrarily
+                            // large topology inside the bounded pending map.
+                            log::error!("take traffic for inbound {tag}: {error}");
+                        }
                     }
                 }
             }
@@ -2233,6 +2302,10 @@ async fn run_rule_set_watcher(
 
 #[async_trait]
 impl NodeRuntime for ShoesRuntime {
+    fn begin_close(&self) {
+        self.inner.closing.cancel();
+    }
+
     async fn apply_config(&self, config: RuntimeConfig) -> Result<(), RuntimeError> {
         let runtime = self.clone();
         tokio::spawn(async move { runtime.apply_external_owned(config, false).await })
@@ -2456,11 +2529,14 @@ fn credential_changed(left: &UserSpec, right: &UserSpec) -> bool {
 }
 
 fn update_spec(inbound: &NormalizedInbound) -> InboundSpec {
-    let mut spec = inbound.compiled.spec.clone();
     // Users are reconciled through their atomic endpoints.  Passing them to
-    // update_inbound is intentionally rejected by shoes-engine.
-    spec.users = None;
-    spec
+    // update_inbound is intentionally rejected by shoes-engine, so avoid copying
+    // credentials that would only be discarded here.
+    InboundSpec {
+        tag: inbound.compiled.spec.tag.clone(),
+        config: inbound.compiled.spec.config.clone(),
+        users: None,
+    }
 }
 
 fn traffic_drain(inbound: &NormalizedInbound, info: UserInfo) -> TrafficDrain {
@@ -3786,6 +3862,7 @@ mod tests {
         let alice = registry
             .find_uuid(&uuid_bytes(ALICE_UUID))
             .expect("alice resolves");
+        assert!(runtime.drain_traffic().await.unwrap().is_empty());
         alice.add_rx(11);
         alice.add_tx(22);
         let observed_at_millis = alice.last_traffic_observed_at_unix_millis();
@@ -4659,8 +4736,13 @@ mod tests {
         };
 
         let runtime = runtime().await;
+        let first = candidate(b"probe-first");
+        let prepared = runtime
+            .prepare_rule_sets(&first, &runtime.inner.closing)
+            .await
+            .expect("prepare initial probe rules");
         runtime
-            .apply_transaction_locked(candidate(b"probe-first"), false)
+            .apply_transaction_locked(first, prepared, false)
             .await
             .expect("the first probe-only rule-set uses its prepared snapshot");
         assert_eq!(runtime.current_config(), b"probe-first");
@@ -4676,8 +4758,13 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .body =
             br#"{"version":4,"rules":[{"domain":["invalid.example"],"port":[53]}]}"#.to_vec();
+        let refreshed = candidate(b"probe-invalid-refresh");
+        let prepared = runtime
+            .prepare_rule_sets(&refreshed, &runtime.inner.closing)
+            .await
+            .expect("prepare syntactically valid refreshed probe rules");
         let error = runtime
-            .apply_transaction_locked(candidate(b"probe-invalid-refresh"), false)
+            .apply_transaction_locked(refreshed, prepared, false)
             .await
             .expect_err("probe DNS must preflight the refreshed immutable snapshot");
         assert!(error.state_unchanged(), "unexpected error: {error}");
@@ -4691,6 +4778,121 @@ mod tests {
         runtime.close().await.expect("close runtime");
         server_cancel.cancel();
         server_task.await.expect("stop rule-set server");
+    }
+
+    #[tokio::test]
+    async fn slow_rule_preparation_allows_drains_kicks_and_close() {
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(b"before", vec![]))
+            .await
+            .unwrap();
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered, requested) = tokio::sync::oneshot::channel();
+        let server_cancel = CancellationToken::new();
+        let server_stop = server_cancel.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 512];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            entered.send(()).unwrap();
+            server_stop.cancelled().await;
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = temporary.path().join("slow.json");
+        let mut candidate = config(b"slow", vec![]);
+        candidate.rule_sets.push(RuleSetResource {
+            tag: "slow".into(),
+            format: "source".into(),
+            path: cache.clone(),
+            source: RuleSetSource::Remote {
+                url: format!("http://{address}/rules"),
+            },
+            update_interval: Duration::from_secs(60),
+        });
+        let apply_runtime = runtime.clone();
+        let applying = tokio::spawn(async move { apply_runtime.apply_config(candidate).await });
+        tokio::time::timeout(Duration::from_secs(2), requested)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!applying.is_finished());
+        let queued_runtime = runtime.clone();
+        let queued =
+            tokio::spawn(
+                async move { queued_runtime.apply_config(config(b"queued", vec![])).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert!(runtime.drain_traffic().await.unwrap().is_empty());
+            assert_eq!(runtime.close_user_connections("node", "user").await, 0);
+            assert_eq!(runtime.current_config(), b"before");
+            runtime.close().await.unwrap();
+        })
+        .await
+        .expect("remote downloads must not hold the mutation lock");
+        for task in [applying, queued] {
+            let error = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .expect_err("close invalidates prepared and queued candidates");
+            assert!(error.state_unchanged());
+        }
+        assert!(runtime.current_config().is_empty());
+        assert!(
+            !cache.exists(),
+            "cancelled preparation must not publish its cache"
+        );
+        server_cancel.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_rule_sets_retire_the_remote_watcher_and_reject_its_refresh() {
+        let (url, _server_state, server_cancel, server_task) =
+            start_rule_set_server(source_rule_set("local.example")).await;
+        let temporary = tempfile::tempdir().unwrap();
+        let watched = RuntimeConfig {
+            rule_sets: vec![RuleSetResource {
+                tag: "rules".into(),
+                format: "source".into(),
+                path: temporary.path().join("rules.json"),
+                source: RuleSetSource::Remote { url },
+                update_interval: Duration::from_secs(60),
+            }],
+            diagnostic_yaml: b"remote".to_vec(),
+            ..RuntimeConfig::default()
+        };
+        let runtime = runtime().await;
+        runtime.apply_config(watched.clone()).await.unwrap();
+        let (generation, cancel) = {
+            let watcher = runtime.rule_set_watcher();
+            (watcher.generation, watcher.cancel.clone().unwrap())
+        };
+
+        let mut local = watched.clone();
+        local.rule_sets[0].source = RuleSetSource::Local;
+        local.diagnostic_yaml = b"local".to_vec();
+        runtime.apply_config(local).await.unwrap();
+        assert!(cancel.is_cancelled());
+        {
+            let watcher = runtime.rule_set_watcher();
+            assert!(watcher.cancel.is_none());
+            assert_ne!(watcher.generation, generation);
+        }
+        assert!(
+            runtime
+                .refresh_rule_sets_owned(generation, watched)
+                .await
+                .is_none()
+        );
+        assert_eq!(runtime.current_config(), b"local");
+
+        runtime.close().await.unwrap();
+        server_cancel.cancel();
+        server_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

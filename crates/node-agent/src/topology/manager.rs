@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use acp_proto as pb;
@@ -128,6 +129,10 @@ pub trait TopologyRuntime: Send + Sync {
         Ok(())
     }
 
+    /// Signal preparation cancellation before waiting for the transaction lock.
+    /// Implementations must leave started mutations and final cleanup to `close`.
+    fn begin_close(&self) {}
+
     /// Composite implementations close platform-owned routing first and the
     /// data-plane runtime second, joining both errors before returning.
     async fn close(&self) -> Result<(), TopologyError> {
@@ -202,7 +207,36 @@ struct AdapterInner {
     runtime: Arc<dyn NodeRuntime>,
     port_router: Arc<dyn PortRouter>,
     operation: tokio::sync::Mutex<()>,
+    closing: AtomicBool,
     state: Mutex<AdapterState>,
+}
+
+impl AdapterInner {
+    /// Platform routers perform synchronous netlink/file I/O. Keep the owned
+    /// transaction waiting for completion, but never occupy a Tokio worker.
+    async fn reconcile_ports(&self, plan: &PortHoppingPlan) -> Result<(), PortRouterError> {
+        let router = Arc::clone(&self.port_router);
+        let plan = plan.clone();
+        tokio::task::spawn_blocking(move || router.reconcile(&plan))
+            .await
+            .map_err(port_task_failure)?
+    }
+
+    async fn close_ports(&self) -> Result<(), PortRouterError> {
+        let router = Arc::clone(&self.port_router);
+        tokio::task::spawn_blocking(move || router.close())
+            .await
+            .map_err(port_task_failure)?
+    }
+}
+
+fn port_task_failure(error: tokio::task::JoinError) -> PortRouterError {
+    // A panic may occur after a backend submitted a change. Treat the state as
+    // uncertain so the transaction attempts restoration rather than assuming
+    // that the old forwarding plan survived untouched.
+    Box::new(crate::porthopping::StateUncertainError::new(
+        std::io::Error::other(format!("port hopping worker failed: {error}")),
+    ))
 }
 
 /// Compiles topology, reconciles port hopping, and delegates the data-plane
@@ -240,6 +274,7 @@ impl NodeRuntimeTopologyAdapter {
                 runtime,
                 port_router,
                 operation: tokio::sync::Mutex::new(()),
+                closing: AtomicBool::new(false),
                 state: Mutex::new(AdapterState::default()),
             }),
         }
@@ -269,6 +304,11 @@ impl NodeRuntimeTopologyAdapter {
 
 #[async_trait]
 impl TopologyRuntime for NodeRuntimeTopologyAdapter {
+    fn begin_close(&self) {
+        self.inner.closing.store(true, Ordering::Release);
+        self.inner.runtime.begin_close();
+    }
+
     async fn apply(&self, topology: &MachineTopology) -> Result<(), TopologyError> {
         let inner = Arc::clone(&self.inner);
         let candidate = topology.clone();
@@ -312,13 +352,14 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                 (previous_plan, previous_config, previous_had_topology)
             };
 
-            if let Err(error) = inner.port_router.reconcile(&desired_plan) {
+            if let Err(error) = inner.reconcile_ports(&desired_plan).await {
                 return Err(port_configuration_failure(
                     &inner,
                     error,
                     &previous_plan,
                     previous_had_topology,
-                ));
+                )
+                .await);
             }
 
             if let Err(error) = inner.runtime.apply_config(output.runtime).await {
@@ -372,7 +413,7 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                     false,
                 )
             })?;
-            inner.port_router.reconcile(&plan).map_err(|error| {
+            inner.reconcile_ports(&plan).await.map_err(|error| {
                 TopologyError::runtime(
                     format!("reconcile current port hopping forwarding state: {error}"),
                     false,
@@ -392,8 +433,10 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
     async fn close(&self) -> Result<(), TopologyError> {
         let inner = Arc::clone(&self.inner);
         self.run_owned("topology close", async move {
+            inner.closing.store(true, Ordering::Release);
+            inner.runtime.begin_close();
             let _operation = inner.operation.lock().await;
-            let port_error = match inner.port_router.close() {
+            let port_error = match inner.close_ports().await {
                 Ok(()) => {
                     let mut state = inner
                         .state
@@ -506,7 +549,7 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                     false,
                 ));
             }
-            if let Err(error) = inner.port_router.reconcile(&pending.desired_plan) {
+            if let Err(error) = inner.reconcile_ports(&pending.desired_plan).await {
                 inner
                     .state
                     .lock()
@@ -517,7 +560,8 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                     error,
                     &pending.previous_plan,
                     pending.previous_had_topology,
-                ));
+                )
+                .await);
             }
             let mut state = inner
                 .state
@@ -555,7 +599,8 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                     &inner,
                     "forced reload candidate changed after port configuration",
                     &pending,
-                ));
+                )
+                .await);
             }
             if !pending.configured {
                 return Err(TopologyError::runtime(
@@ -611,7 +656,7 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
     }
 }
 
-fn port_configuration_failure(
+async fn port_configuration_failure(
     inner: &AdapterInner,
     error: PortRouterError,
     previous_plan: &PortHoppingPlan,
@@ -621,7 +666,7 @@ fn port_configuration_failure(
     if !crate::porthopping::is_state_uncertain(error.as_ref()) {
         return TopologyError::runtime(message, false);
     }
-    match inner.port_router.reconcile(previous_plan) {
+    match inner.reconcile_ports(previous_plan).await {
         Ok(()) if previous_had_topology => TopologyError::runtime_state(
             format!("{message}; previous forwarding state restored"),
             true,
@@ -639,7 +684,7 @@ fn port_configuration_failure(
     }
 }
 
-fn prepared_reload_protocol_failure(
+async fn prepared_reload_protocol_failure(
     inner: &AdapterInner,
     message: &str,
     pending: &PreparedReload,
@@ -647,7 +692,7 @@ fn prepared_reload_protocol_failure(
     if !pending.configured {
         return TopologyError::runtime(message, false);
     }
-    match inner.port_router.reconcile(&pending.previous_plan) {
+    match inner.reconcile_ports(&pending.previous_plan).await {
         Ok(()) if pending.previous_had_topology => TopologyError::runtime_state(
             format!("{message}; previous forwarding state restored"),
             true,
@@ -723,13 +768,20 @@ async fn runtime_transaction_failure_parts(
     mode: RuntimeFailureMode,
 ) -> TopologyError {
     let mut rollback_errors = Vec::with_capacity(2);
-    if let Err(error) = inner.port_router.reconcile(previous.port_hopping) {
+    if let Err(error) = inner.reconcile_ports(previous.port_hopping).await {
         rollback_errors.push(format!(
             "restore previous port hopping forwarding state: {error}"
         ));
     }
 
+    // During an explicit close, preparation can fail with the old runtime
+    // provably intact. Reapplying that same configuration is unnecessary and
+    // would now be rejected by begin_close. Keep ordinary rollback semantics
+    // unchanged otherwise, including recovery of an indeterminate mutation.
+    let closing_with_intact_runtime =
+        inner.closing.load(Ordering::Acquire) && (failure.unchanged || failure.rolled_back);
     let should_restore_runtime = previous.config.is_some()
+        && !closing_with_intact_runtime
         && match mode {
             RuntimeFailureMode::OrdinaryApply => true,
             // `running` is only a liveness hint: a failed per-inbound rollback can
@@ -1006,8 +1058,23 @@ impl TopologyManager {
     }
 
     pub async fn close(&self) -> Result<(), TopologyError> {
-        let _operation = self.operation.lock().await;
-        self.runtime.close().await
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // A slow download belongs to the operation currently holding this
+            // lock. Signal it before waiting, while retaining ownership of the
+            // eventual resource close even if this caller is cancelled.
+            manager.runtime.begin_close();
+            let _operation = manager.operation.lock().await;
+            manager.runtime.close().await
+        })
+        .await
+        .map_err(|error| {
+            TopologyError::runtime_state(
+                format!("topology close transaction task failed: {error}"),
+                false,
+                false,
+            )
+        })?
     }
 
     pub fn guard_revision(&self, incoming: u64) -> Result<(), TopologyError> {
@@ -1435,38 +1502,35 @@ impl TopologyManager {
             self.guard_revision_fence(base, target)?;
         }
         let target_revision = revision.target();
-        let mut next = self.read_published().topology.clone();
-        let node_index = next
-            .nodes
-            .iter()
-            .position(|node| node.node_id == node_id)
-            .ok_or_else(|| {
-                TopologyError::new(
-                    TopologyErrorKind::InvalidMutation,
-                    format!("node {node_id} not found for user refresh"),
-                )
-            })?;
-
-        if let Some(expected) = expected_current.as_deref() {
-            let current_changes = compare_node_users(expected, &next.nodes[node_index].users)?;
-            if current_changes.added != 0
-                || current_changes.updated != 0
-                || current_changes.deleted != 0
-            {
-                return Err(TopologyError::new(
-                    TopologyErrorKind::UsersChangedDuringRefresh,
-                    format!("node users changed during refresh: node={node_id}"),
-                ));
+        let (node_index, mut changes) = {
+            let published = self.read_published();
+            let node_index = published
+                .topology
+                .nodes
+                .iter()
+                .position(|node| node.node_id == node_id)
+                .ok_or_else(|| {
+                    TopologyError::new(
+                        TopologyErrorKind::InvalidMutation,
+                        format!("node {node_id} not found for user refresh"),
+                    )
+                })?;
+            let current_users = &published.topology.nodes[node_index].users;
+            if let Some(expected) = expected_current.as_deref() {
+                let current_changes = compare_node_users(expected, current_users)?;
+                if current_changes.added != 0
+                    || current_changes.updated != 0
+                    || current_changes.deleted != 0
+                {
+                    return Err(TopologyError::new(
+                        TopologyErrorKind::UsersChangedDuringRefresh,
+                        format!("node users changed during refresh: node={node_id}"),
+                    ));
+                }
             }
-        }
 
-        let mut changes = compare_node_users(&next.nodes[node_index].users, &users)?;
-        if target_revision > next.revision {
-            next.revision = target_revision;
-            if let Some(snapshot) = next.snapshot.as_mut() {
-                snapshot.revision = target_revision;
-            }
-        }
+            (node_index, compare_node_users(current_users, &users)?)
+        };
         if changes.added == 0 && changes.updated == 0 && changes.deleted == 0 {
             if target_revision > 0 {
                 let mut published = self.write_published();
@@ -1481,8 +1545,17 @@ impl TopologyManager {
             return Ok(changes);
         }
 
-        next.nodes[node_index].users.clone_from(&users);
+        // The operation lock keeps this candidate on the same publication that
+        // was compared above. Unchanged refreshes never clone the topology.
+        let mut next = self.read_published().topology.clone();
+        if target_revision > next.revision {
+            next.revision = target_revision;
+            if let Some(snapshot) = next.snapshot.as_mut() {
+                snapshot.revision = target_revision;
+            }
+        }
         replace_node_users(&mut next, &node_id, &users);
+        next.nodes[node_index].users = users;
         self.apply(next).await.map_err(|error| TopologyError {
             message: format!("apply refreshed users for node {node_id}: {error}"),
             ..error
@@ -1492,6 +1565,19 @@ impl TopologyManager {
     }
 
     pub async fn loaded_users(&self, node_id: &str) -> Result<Vec<UserCredential>, TopologyError> {
+        self.loaded_users_page(node_id, 0, usize::MAX)
+            .await
+            .map(|(_, users)| users)
+    }
+
+    /// Returns the total user count and an owned page from one published state.
+    /// Only credentials in the requested page are cloned.
+    pub async fn loaded_users_page(
+        &self,
+        node_id: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(usize, Vec<UserCredential>), TopologyError> {
         // Match Go's `LoadedUsers`: serialize against mutations so a fetch/CAS
         // loop observes a complete manager operation, never an intermediate one.
         let _operation = self.operation.lock().await;
@@ -1500,7 +1586,12 @@ impl TopologyManager {
             .nodes
             .iter()
             .find(|node| node.node_id == node_id)
-            .map(|node| node.users.clone())
+            .map(|node| {
+                let total = node.users.len();
+                let start = offset.min(total as u64) as usize;
+                let end = start.saturating_add(limit).min(total);
+                (total, node.users[start..end].to_vec())
+            })
             .ok_or_else(|| {
                 TopologyError::new(
                     TopologyErrorKind::InvalidMutation,
@@ -1913,6 +2004,189 @@ mod transaction_tests {
         current: Vec<u8>,
     }
 
+    #[tokio::test]
+    async fn blocking_port_operations_leave_the_async_worker_available() {
+        struct GatedRouter {
+            async_thread: std::thread::ThreadId,
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl PortRouter for GatedRouter {
+            fn reconcile(&self, _: &PortHoppingPlan) -> Result<(), PortRouterError> {
+                assert_ne!(std::thread::current().id(), self.async_thread);
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))?;
+                Ok(())
+            }
+            fn close(&self) -> Result<(), PortRouterError> {
+                assert_ne!(std::thread::current().id(), self.async_thread);
+                Ok(())
+            }
+        }
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let adapter = NodeRuntimeTopologyAdapter::with_router(
+            Arc::new(FakeRuntime::default()),
+            Arc::new(GatedRouter {
+                async_thread: std::thread::current().id(),
+                entered: Mutex::new(Some(entered)),
+                release: Mutex::new(receiver),
+            }),
+        );
+        let candidate = MachineTopology {
+            machine_id: "port-worker-test".into(),
+            ..MachineTopology::default()
+        };
+        let operation = adapter.apply(&candidate);
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => panic!("operation completed before port gate: {result:?}"),
+            result = waiting => result.unwrap(),
+        }
+        // This timer is driven by the same current-thread Tokio runtime. It can
+        // progress only if the synchronous router is running on another thread.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        release.send(()).unwrap();
+        operation.await.unwrap();
+        adapter.close().await.unwrap();
+    }
+
+    async fn close_manager_during_rule_download(drop_close_caller: bool) {
+        use std::task::Poll;
+
+        use tokio::io::AsyncReadExt;
+        use tokio_util::sync::CancellationToken;
+
+        let runtime = Arc::new(crate::runtime::ShoesRuntime::bootstrap().await.unwrap());
+        let router = Arc::new(FakeRouter::default());
+        let adapter = Arc::new(NodeRuntimeTopologyAdapter::with_router(
+            runtime.clone(),
+            router.clone(),
+        ));
+        let manager = Arc::new(TopologyManager::new("close-download-test", adapter.clone()));
+        let initial = MachineTopology {
+            machine_id: "close-download-test".into(),
+            revision: 1,
+            ..MachineTopology::default()
+        };
+        manager.apply_initial(initial.clone()).await.unwrap();
+        assert!(!runtime.current_config().is_empty());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered, requested) = tokio::sync::oneshot::channel();
+        let stop_server = CancellationToken::new();
+        let _stop_on_drop = stop_server.clone().drop_guard();
+        let server_cancel = stop_server.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 512];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            entered.send(()).unwrap();
+            server_cancel.cancelled().await;
+        });
+        let unique = tempfile::tempdir().unwrap();
+        let mut candidate = initial;
+        candidate.revision = 2;
+        candidate.route = Some(crate::topology::Route {
+            rule_sets: vec![crate::topology::RouteRuleSet {
+                kind: "remote".into(),
+                tag: format!(
+                    "close-download-{}",
+                    unique.path().file_name().unwrap().to_string_lossy()
+                ),
+                format: "source".into(),
+                url: format!("http://{address}/rules"),
+                update_interval: "1m".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let cache = crate::compile::compile_with_warnings(&candidate)
+            .unwrap()
+            .runtime
+            .rule_sets[0]
+            .path
+            .clone();
+        assert!(!cache.exists());
+        let apply_manager = manager.clone();
+        let applying = tokio::spawn(async move { apply_manager.apply_initial(candidate).await });
+        tokio::time::timeout(Duration::from_secs(2), requested)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            manager.operation.try_lock().is_err(),
+            "the real topology operation must still own its lock during the HTTP read"
+        );
+
+        if drop_close_caller {
+            let mut closing = Box::pin(manager.close());
+            // One poll creates the owned close task. Dropping its caller before
+            // that task runs must not turn begin_close into an orphaned signal.
+            std::future::poll_fn(|context| {
+                assert!(closing.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(closing);
+        } else {
+            tokio::time::timeout(Duration::from_secs(1), manager.close())
+                .await
+                .expect("manager close waited for the HTTP timeout")
+                .unwrap();
+        }
+
+        let error = tokio::time::timeout(Duration::from_secs(1), applying)
+            .await
+            .expect("begin_close did not cancel preparation behind the topology lock")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            !error.to_string().contains("rollback incomplete"),
+            "closing must not redundantly reapply an unchanged runtime: {error}"
+        );
+        let _closed_operation =
+            tokio::time::timeout(Duration::from_secs(1), manager.operation.lock())
+                .await
+                .expect("the owned close did not reach its terminal state");
+        assert!(runtime.current_config().is_empty());
+        assert!(runtime.engine().list_inbounds().is_empty());
+        assert_eq!(
+            manager.current_revision(),
+            Some(1),
+            "cancelled preparation must not publish the candidate"
+        );
+        assert_eq!(adapter.state().active_topology.revision, 1);
+        assert_eq!(router.committed(), PortHoppingPlan::default());
+        assert!(
+            !cache.exists(),
+            "cancelled preparation must not advance last-good cache"
+        );
+        assert!(runtime.drain_traffic().await.unwrap().is_empty());
+        stop_server.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_close_cancels_download_before_waiting_for_the_topology_lock() {
+        close_manager_during_rule_download(false).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_manager_close_caller_still_cancels_download_and_finishes_close() {
+        close_manager_during_rule_download(true).await;
+    }
+
     struct ApplyGate {
         entered: Notify,
         permit: Semaphore,
@@ -2279,6 +2553,82 @@ mod transaction_tests {
         assert_eq!(manager.current_revision(), Some(1));
         assert_eq!(adapter.state().active_plan, expected_plan(20000));
         assert_eq!(router.committed(), expected_plan(20000));
+    }
+
+    #[tokio::test]
+    async fn noop_user_refresh_advances_publication_only_with_a_new_revision() {
+        let (manager, _adapter, runtime, _router) = fixture();
+        let mut initial = topology(10, "20000");
+        initial.snapshot = Some(crate::topology::to_snapshot(&initial));
+        manager.apply_initial(initial).await.unwrap();
+        let users = manager.loaded_users("node-hysteria").await.unwrap();
+        let initial_token = manager.publication_token().0;
+
+        let changes = manager
+            .refresh_node_users_if_current_at_revision_fence(
+                "node-hysteria",
+                users.clone(),
+                users.clone(),
+                10,
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(changes, UserRefreshChanges::default());
+        assert_eq!(manager.current_revision(), Some(20));
+        assert_eq!(manager.current_topology().snapshot.unwrap().revision, 20);
+        let advanced_token = manager.publication_token().0;
+        assert_ne!(advanced_token, initial_token);
+
+        for target_revision in [0, 10, 20] {
+            assert_eq!(
+                manager
+                    .refresh_node_users_if_current_at_revision(
+                        "node-hysteria",
+                        users.clone(),
+                        users.clone(),
+                        target_revision,
+                    )
+                    .await
+                    .unwrap(),
+                UserRefreshChanges::default()
+            );
+            assert_eq!(manager.current_revision(), Some(20));
+            assert_eq!(manager.publication_token().0, advanced_token);
+        }
+
+        let mut stale_users = users.clone();
+        stale_users[0].credential = "stale-password".into();
+        let stale_users_error = manager
+            .refresh_node_users_if_current_at_revision(
+                "node-hysteria",
+                users.clone(),
+                stale_users,
+                30,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale_users_error.kind(),
+            TopologyErrorKind::UsersChangedDuringRefresh
+        );
+        let stale_revision_error = manager
+            .refresh_node_users_if_current_at_revision_fence(
+                "node-hysteria",
+                users.clone(),
+                users,
+                10,
+                30,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            stale_revision_error.kind(),
+            TopologyErrorKind::RevisionMismatch
+        );
+        assert_eq!(manager.current_revision(), Some(20));
+        assert_eq!(manager.publication_token().0, advanced_token);
+        assert_eq!(runtime.apply_calls(), 1);
     }
 
     #[tokio::test]

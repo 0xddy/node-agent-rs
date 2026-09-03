@@ -727,7 +727,7 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
             if cancellation.is_cancelled() {
                 break;
             }
-            let generic = command_from_proto(&command);
+            let generic = ack_command_from_proto(&command);
             if !generic.idempotency_key.is_empty()
                 && let Ok(Some(replay)) = acknowledgements.replay(&generic)
             {
@@ -745,11 +745,13 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
             }
 
             let executor = executor.clone();
-            let execution_command = command.clone();
+            // The lane only needs the reply envelope after execution. Transfer
+            // the topology/delta payload to its task instead of retaining a copy.
+            let mut acknowledgement = proto_ack(&command, AckStatus::Accepted, String::new());
             let execution_cancellation = cancellation.clone();
             let joined = tokio::spawn(async move {
                 executor
-                    .execute_with_cancel(execution_command, execution_cancellation)
+                    .execute_with_cancel(command, execution_cancellation)
                     .await
             })
             .await;
@@ -799,13 +801,11 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
                         ..Ack::default()
                     })
             };
-            if send_lane_ack(
-                &output,
-                &cancellation,
-                proto_ack(&command, terminal.status, terminal.message),
-            )
-            .await
-            .is_err()
+            acknowledgement.status = proto_ack_status(terminal.status);
+            acknowledgement.message = terminal.message;
+            if send_lane_ack(&output, &cancellation, acknowledgement)
+                .await
+                .is_err()
             {
                 break;
             }
@@ -825,7 +825,8 @@ async fn send_lane_ack(
     }
 }
 
-fn command_from_proto(command: &ControlCommand) -> Command {
+// AckStore only uses delivery metadata, never the command payload or type.
+fn ack_command_from_proto(command: &ControlCommand) -> Command {
     Command {
         command_id: command.command_id.clone(),
         operation_id: command.operation_id.clone(),
@@ -833,11 +834,7 @@ fn command_from_proto(command: &ControlCommand) -> Command {
         node_id: command.node_id.clone(),
         revision: command.revision,
         idempotency_key: command.idempotency_key.clone(),
-        command_type: ControlCommandType::try_from(command.r#type).map_or_else(
-            |_| command.r#type.to_string(),
-            |kind| kind.as_str_name().to_string(),
-        ),
-        payload: command.legacy_payload.clone(),
+        ..Command::default()
     }
 }
 
@@ -853,14 +850,18 @@ fn proto_ack(
         node_id: command.node_id.clone(),
         revision: command.revision,
         idempotency_key: command.idempotency_key.clone(),
-        status: match status {
-            AckStatus::Accepted => ControlAckStatus::Accepted,
-            AckStatus::Applied => ControlAckStatus::Applied,
-            AckStatus::Failed => ControlAckStatus::Failed,
-            AckStatus::RolledBack => ControlAckStatus::RolledBack,
-        } as i32,
+        status: proto_ack_status(status),
         message: message.into(),
     }
+}
+
+fn proto_ack_status(status: AckStatus) -> i32 {
+    (match status {
+        AckStatus::Accepted => ControlAckStatus::Accepted,
+        AckStatus::Applied => ControlAckStatus::Applied,
+        AckStatus::Failed => ControlAckStatus::Failed,
+        AckStatus::RolledBack => ControlAckStatus::RolledBack,
+    }) as i32
 }
 
 const fn uses_refresh_lane(command_type: i32) -> bool {

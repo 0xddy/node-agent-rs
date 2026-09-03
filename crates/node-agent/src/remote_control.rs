@@ -20,7 +20,7 @@ use acp_proto::{
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Notify, OwnedMutexGuard, mpsc};
+use tokio::sync::{Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,8 @@ mod adapter;
 pub use adapter::{PanelRemoteFetcher, RuntimeRemoteView};
 
 pub const REMOTE_RESPONSE_QUEUE_SIZE: usize = 64;
+const MAX_CONCURRENT_REMOTE_REQUESTS: usize = 16;
+const RELOAD_PROGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 pub const REMOTE_CONFIG_CHUNK_SIZE: usize = 64 * 1024;
 pub const REMOTE_RELOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 pub const REMOTE_SYNC_USERS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -89,6 +91,20 @@ pub trait RemoteTopology: Send + Sync {
         &self,
         node_id: &str,
     ) -> Result<Vec<UserCredential>, RemoteOperationError>;
+
+    /// Returns the total user count and a page. Implementations with shared
+    /// storage can override this to copy only the requested credentials.
+    async fn loaded_users_page(
+        &self,
+        node_id: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(usize, Vec<UserCredential>), RemoteOperationError> {
+        let users = self.loaded_users(node_id).await?;
+        let total = users.len();
+        let start = offset.min(total as u64) as usize;
+        Ok((total, users.into_iter().skip(start).take(limit).collect()))
+    }
 }
 
 #[async_trait]
@@ -98,6 +114,17 @@ impl RemoteTopology for crate::topology::manager::TopologyManager {
         node_id: &str,
     ) -> Result<Vec<UserCredential>, RemoteOperationError> {
         crate::topology::manager::TopologyManager::loaded_users(self, node_id)
+            .await
+            .map_err(|error| RemoteOperationError::new(error.to_string()))
+    }
+
+    async fn loaded_users_page(
+        &self,
+        node_id: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<(usize, Vec<UserCredential>), RemoteOperationError> {
+        crate::topology::manager::TopologyManager::loaded_users_page(self, node_id, offset, limit)
             .await
             .map_err(|error| RemoteOperationError::new(error.to_string()))
     }
@@ -236,6 +263,7 @@ pub struct RemoteController {
 struct ControllerInner {
     state: Mutex<ControllerState>,
     reload_gate: Arc<tokio::sync::Mutex<()>>,
+    request_slots: Arc<Semaphore>,
     periodic_wake: Notify,
 }
 
@@ -266,6 +294,7 @@ impl RemoteController {
             inner: Arc::new(ControllerInner {
                 state: Mutex::new(ControllerState::default()),
                 reload_gate: Arc::new(tokio::sync::Mutex::new(())),
+                request_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_REMOTE_REQUESTS)),
                 periodic_wake: Notify::new(),
             }),
         }
@@ -322,7 +351,7 @@ impl RemoteController {
         }
         let snapshot = snapshot_state(&state);
         drop(state);
-        self.inner.periodic_wake.notify_one();
+        self.inner.periodic_wake.notify_waiters();
         snapshot
     }
 
@@ -334,7 +363,7 @@ impl RemoteController {
         }
     }
 
-    fn begin_periodic_attempt(&self, parent: &CancellationToken) -> Option<CancellationToken> {
+    fn begin_periodic_attempt(&self, parent: &CancellationToken) -> Option<PeriodicAttempt> {
         let mut state = self.inner.state.lock().expect("remote state poisoned");
         if !state.periodic_enabled || state.periodic_attempt.is_some() {
             return None;
@@ -343,7 +372,11 @@ impl RemoteController {
         state.periodic_attempt = Some(attempt.clone());
         state.periodic_last_attempt = Some(SystemTime::now());
         state.periodic_next_attempt = None;
-        Some(attempt)
+        Some(PeriodicAttempt {
+            controller: self.clone(),
+            cancel: attempt,
+            finished: false,
+        })
     }
 
     fn finish_periodic_attempt(&self, error: Option<&RemoteOperationError>, was_cancelled: bool) {
@@ -359,6 +392,39 @@ impl RemoteController {
         }
         if state.periodic_enabled {
             state.periodic_next_attempt = Some(SystemTime::now() + state.periodic_interval);
+        }
+        drop(state);
+        self.inner.periodic_wake.notify_waiters();
+    }
+}
+
+/// A retired stream may still be completing its local transaction. Keep its
+/// attempt registered until that owner finishes, and wake replacement streams
+/// without polling. Unwinding must not leave the process-scoped slot occupied.
+struct PeriodicAttempt {
+    controller: RemoteController,
+    cancel: CancellationToken,
+    finished: bool,
+}
+
+impl PeriodicAttempt {
+    fn finish(mut self, error: Option<&RemoteOperationError>, was_cancelled: bool) {
+        self.controller
+            .finish_periodic_attempt(error, was_cancelled);
+        self.finished = true;
+    }
+}
+
+impl Drop for PeriodicAttempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancel.cancel();
+            self.controller.finish_periodic_attempt(
+                Some(&RemoteOperationError::new(
+                    "periodic user pull task stopped",
+                )),
+                true,
+            );
         }
     }
 }
@@ -462,12 +528,26 @@ impl ReloadProgressReporter {
     pub async fn report(&self, stage: ReloadProgressStage) -> bool {
         let stage = stage.as_str();
         self.controller.set_reload_stage(stage);
-        self.sink
-            .send(
+        // The topology transaction awaits progress while holding its operation
+        // lock. A slow response consumer must not retain that lock indefinitely,
+        // including between port configuration and instance replacement. Retire
+        // only this remote stream; its owned transaction still reaches a terminal
+        // state and publishes the result through the process-scoped controller.
+        match tokio::time::timeout(
+            RELOAD_PROGRESS_SEND_TIMEOUT,
+            self.sink.send(
                 &self.request_id,
                 response(RemoteControlResponseStatus::Progress, stage, stage, None),
-            )
-            .await
+            ),
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(_) => {
+                self.sink.stream_cancel.cancel();
+                false
+            }
+        }
     }
 }
 
@@ -576,28 +656,25 @@ async fn handle_loaded_users(
     requested_page_size: u32,
     sink: &ResponseSink,
 ) {
-    let users = match dependencies.topology.loaded_users(&target.node_id).await {
-        Ok(users) => users,
-        Err(error) => {
-            send_failure(sink, request_id, "loaded_users", &error.to_string()).await;
-            return;
-        }
-    };
     let page = requested_page.max(1);
     let page_size = if (1..=MAX_LOADED_USERS_PAGE_SIZE).contains(&requested_page_size) {
         requested_page_size
     } else {
         DEFAULT_LOADED_USERS_PAGE_SIZE
     };
-    let start = u64::from(page - 1)
-        .saturating_mul(u64::from(page_size))
-        .min(users.len() as u64) as usize;
-    let end = start.saturating_add(page_size as usize).min(users.len());
-    let items = users[start..end]
-        .iter()
-        .cloned()
-        .map(remote_user_credential)
-        .collect();
+    let offset = u64::from(page - 1).saturating_mul(u64::from(page_size));
+    let (total, users) = match dependencies
+        .topology
+        .loaded_users_page(&target.node_id, offset, page_size as usize)
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            send_failure(sink, request_id, "loaded_users", &error.to_string()).await;
+            return;
+        }
+    };
+    let items = users.into_iter().map(remote_user_credential).collect();
     sink.send(
         request_id,
         response(
@@ -608,7 +685,7 @@ async fn handle_loaded_users(
                 users: items,
                 page,
                 page_size,
-                total_size: users.len() as u32,
+                total_size: total as u32,
             })),
         ),
     )
@@ -888,10 +965,15 @@ async fn run_periodic_user_pull(
     controller: RemoteController,
 ) {
     while !stream_cancel.is_cancelled() {
+        // Register before inspecting state so a concurrent attempt completion or
+        // setting change cannot be lost between the check and the wait.
+        let wake = controller.inner.periodic_wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
         let schedule = controller.periodic_schedule();
         if !schedule.enabled {
             tokio::select! {
-                () = controller.inner.periodic_wake.notified() => continue,
+                () = &mut wake => continue,
                 () = stream_cancel.cancelled() => return,
             }
         }
@@ -902,26 +984,29 @@ async fn run_periodic_user_pull(
             if !delay.is_zero() {
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
-                    () = controller.inner.periodic_wake.notified() => continue,
+                    () = &mut wake => continue,
                     () = stream_cancel.cancelled() => return,
                 }
             }
         }
 
-        let Some(attempt_cancel) = controller.begin_periodic_attempt(&stream_cancel) else {
-            tokio::task::yield_now().await;
+        let Some(attempt) = controller.begin_periodic_attempt(&stream_cancel) else {
+            tokio::select! {
+                () = &mut wake => {}
+                () = stream_cancel.cancelled() => return,
+            }
             continue;
         };
-        // `attempt_cancel` is a child of the stream token (and is also
+        // The attempt token is a child of the stream token (and is also
         // signalled when the setting changes). The fetcher observes it while
         // reading the panel, but a local transaction is always awaited to
         // completion before the attempt state is released.
         let result = dependencies
             .fetcher
-            .sync_users(attempt_cancel.clone(), &target.node_id)
+            .sync_users(attempt.cancel.clone(), &target.node_id)
             .await;
-        let cancelled = attempt_cancel.is_cancelled() || stream_cancel.is_cancelled();
-        controller.finish_periodic_attempt(result.as_ref().err(), cancelled);
+        let cancelled = attempt.cancel.is_cancelled() || stream_cancel.is_cancelled();
+        attempt.finish(result.as_ref().err(), cancelled);
     }
 }
 
@@ -937,6 +1022,9 @@ pub async fn run_remote_control_stream(
     controller: RemoteController,
 ) -> Result<(), SessionError> {
     let stream_cancel = shutdown.child_token();
+    // Dropping/aborting the outer stream must also stop detached request panel
+    // reads and response waits. Cancellation never aborts an owned transaction.
+    let _stream_cancel_on_drop = stream_cancel.clone().drop_guard();
     let (response_sender, response_receiver) = mpsc::channel(REMOTE_RESPONSE_QUEUE_SIZE);
     let outgoing = ReceiverStream::new(response_receiver);
     let mut client = RemoteControlServiceClient::new(authenticator.intercepted_channel(channel));
@@ -955,9 +1043,34 @@ pub async fn run_remote_control_stream(
     ));
 
     let outcome = loop {
+        // Admit before reading/spawning another request, so neither suspended
+        // task stacks nor full configuration snapshots can grow without bound.
+        // Slots belong to the controller and remain bounded across reconnects.
+        let request_permit = tokio::select! {
+            permit = acquire_request_slot(&controller, &stream_cancel) => permit,
+            () = response_sender.closed() => {
+                break Err(SessionError::Rpc(tonic::Status::unavailable(
+                    "remote control response stream closed",
+                )));
+            }
+        };
+        let Some(request_permit) = request_permit else {
+            break if shutdown.is_cancelled() {
+                Ok(())
+            } else {
+                Err(SessionError::Rpc(tonic::Status::unavailable(
+                    "remote control response stream closed",
+                )))
+            };
+        };
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break Ok(()),
+            () = stream_cancel.cancelled() => {
+                break Err(SessionError::Rpc(tonic::Status::unavailable(
+                    "remote control response stream closed",
+                )));
+            }
             message = requests.message() => match message {
                 Ok(Some(request)) => {
                     let request_cancel = stream_cancel.clone();
@@ -966,6 +1079,7 @@ pub async fn run_remote_control_stream(
                     let request_controller = controller.clone();
                     let request_responses = response_sender.clone();
                     let task = tokio::spawn(async move {
+                        let _request_permit = request_permit;
                         handle_remote_control_request(
                             request_cancel,
                             request_target,
@@ -989,11 +1103,6 @@ pub async fn run_remote_control_stream(
                     "remote control response stream closed",
                 )));
             }
-            () = stream_cancel.cancelled() => {
-                break Err(SessionError::Rpc(tonic::Status::unavailable(
-                    "remote control response stream closed",
-                )));
-            }
         }
     };
 
@@ -1003,6 +1112,17 @@ pub async fn run_remote_control_stream(
     // remains owned by the periodic task and must not be aborted midway.
     let _ = (&mut periodic).await;
     outcome
+}
+
+async fn acquire_request_slot(
+    controller: &RemoteController,
+    stream_cancel: &CancellationToken,
+) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        () = stream_cancel.cancelled() => None,
+        permit = controller.inner.request_slots.clone().acquire_owned() => permit.ok(),
+    }
 }
 
 fn monitor_request_task(task: JoinHandle<()>) {

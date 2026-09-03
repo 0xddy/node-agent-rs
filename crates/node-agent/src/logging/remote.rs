@@ -99,21 +99,68 @@ impl RemoteBroker {
     }
 
     pub fn publish(&self, text: impl Into<String>) {
-        let line = RemoteLine {
-            sequence: self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
-            captured_at: (self.clock)(),
-            text: truncate_utf8(text.into(), REMOTE_LINE_MAX_BYTES),
+        self.publish_lazy(|| text.into());
+    }
+
+    fn publish_lazy(&self, text: impl FnOnce() -> String) {
+        let captured_at = (self.clock)();
+        // Conversion is caller-controlled (Into<String> can itself log or
+        // subscribe), so neither conversion nor its destructor may run under a
+        // broker lock. A short first pass preserves allocation-free idle logs.
+        let has_subscribers = {
+            let mut state = self.state();
+            state.subscribers.retain(|_, weak| {
+                weak.upgrade()
+                    .is_some_and(|subscription| !subscription.state().closed)
+            });
+            if state.subscribers.is_empty() {
+                self.sequence.fetch_add(1, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
         };
+        if !has_subscribers {
+            return;
+        }
+        let mut text = Some(truncate_utf8(text(), REMOTE_LINE_MAX_BYTES));
+        let mut pending: Option<(Arc<SubscriptionInner>, RemoteLine)> = None;
 
         // Go holds the broker lock while delivering to each subscriber. Preserve
         // that ordering: every live subscriber observes the same total sequence.
-        self.state().subscribers.retain(|_, weak| {
+        let mut state = self.state();
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        state.subscribers.retain(|_, weak| {
             let Some(subscription) = weak.upgrade() else {
                 return false;
             };
-            subscription.enqueue(line.clone());
+            if subscription.state().closed {
+                return false;
+            }
+
+            // Delay one delivery so the last subscriber can own the original
+            // text. A single subscriber therefore needs no copy at all.
+            if let Some((previous, line)) = pending.as_mut() {
+                previous.enqueue(line.clone());
+                *previous = subscription;
+            } else {
+                let text = text
+                    .take()
+                    .expect("text is moved only to the first subscriber");
+                pending = Some((
+                    subscription,
+                    RemoteLine {
+                        sequence,
+                        captured_at,
+                        text,
+                    },
+                ));
+            }
             true
         });
+        if let Some((subscription, line)) = pending {
+            subscription.enqueue(line);
+        }
     }
 
     fn remove(&self, id: u64) {
@@ -242,24 +289,32 @@ pub fn publish_remote(source: &str, message: &str) {
     let message = message.strip_suffix('\r').unwrap_or(message);
     for line in message.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if source.is_empty() {
-            default_broker().publish(line);
-        } else {
-            default_broker().publish(format!("[{source}] {line}"));
-        }
+        default_broker().publish_lazy(|| {
+            if source.is_empty() {
+                line.to_owned()
+            } else {
+                format!("[{source}] {line}")
+            }
+        });
     }
 }
 
 fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
-    if max_bytes == 0 || value.len() <= max_bytes {
-        return value;
+    if max_bytes != 0 && value.len() > max_bytes {
+        let mut end = max_bytes;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
     }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+    // Queue limits account for text length. Discard unused capacity before
+    // transferring this buffer so a short or truncated line cannot retain an
+    // arbitrarily large original allocation.
+    if value.capacity() > value.len() {
+        value.into_boxed_str().into_string()
+    } else {
+        value
     }
-    value.truncate(end);
-    value
 }
 
 fn new_source_id() -> String {
@@ -287,6 +342,122 @@ mod tests {
         assert_eq!(dropped, 0);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "after");
+    }
+
+    #[test]
+    fn publish_skips_text_without_live_subscribers() {
+        let broker = broker();
+        broker.publish_lazy(|| panic!("no subscriber needs text"));
+
+        let closed = broker.subscribe();
+        closed.close();
+        // Include stale entries to check that neither a closed subscription nor
+        // an expired weak reference triggers formatting.
+        {
+            let mut state = broker.state();
+            state
+                .subscribers
+                .insert(closed.inner.id, Arc::downgrade(&closed.inner));
+            state.subscribers.insert(u64::MAX, Weak::new());
+        }
+        broker.publish_lazy(|| panic!("closed subscribers do not need text"));
+        assert!(broker.state().subscribers.is_empty());
+
+        let subscription = broker.subscribe();
+        broker.publish_lazy(|| "visible".to_owned());
+        let (lines, dropped) = subscription.drain(1, 100);
+        assert_eq!(dropped, 0);
+        assert_eq!(lines[0].sequence, 3);
+        assert_eq!(lines[0].text, "visible");
+    }
+
+    #[test]
+    fn public_text_conversion_can_reenter_the_broker() {
+        struct ReentrantText(Arc<RemoteBroker>);
+        impl From<ReentrantText> for String {
+            fn from(text: ReentrantText) -> Self {
+                // Check before entering again: a regression fails instead of
+                // hanging the test process on the old non-reentrant mutex.
+                assert!(text.0.state.try_lock().is_ok());
+                let subscription = text.0.subscribe();
+                text.0.publish("nested");
+                assert_eq!(subscription.drain(1, 100).0[0].text, "nested");
+                String::from("outer")
+            }
+        }
+
+        let broker = broker();
+        let subscription = broker.subscribe();
+        broker.publish(ReentrantText(Arc::clone(&broker)));
+        let (lines, _) = subscription.drain(2, 100);
+        assert_eq!(lines[0].text, "nested");
+        assert_eq!(lines[1].text, "outer");
+        assert_eq!((lines[0].sequence, lines[1].sequence), (1, 2));
+    }
+
+    #[test]
+    fn single_subscriber_keeps_owned_text_buffer() {
+        let broker = broker();
+        let subscription = broker.subscribe();
+        let text = String::from("owned remote log line");
+        let pointer = text.as_ptr();
+        let capacity = text.capacity();
+        assert_eq!(capacity, text.len());
+
+        broker.publish(text);
+
+        let (lines, dropped) = subscription.drain(1, 100);
+        assert_eq!(dropped, 0);
+        assert_eq!(lines[0].text, "owned remote log line");
+        assert_eq!(lines[0].text.as_ptr(), pointer);
+        assert_eq!(lines[0].text.capacity(), capacity);
+    }
+
+    #[test]
+    fn short_line_does_not_retain_oversized_capacity() {
+        let broker = broker();
+        let subscription = broker.subscribe();
+        let mut text = String::with_capacity(REMOTE_QUEUE_MAX_BYTES);
+        text.push_str("short");
+
+        broker.publish(text);
+
+        let (lines, dropped) = subscription.drain(1, 100);
+        assert_eq!(dropped, 0);
+        assert_eq!(lines[0].text, "short");
+        assert_eq!(lines[0].text.capacity(), lines[0].text.len());
+    }
+
+    #[test]
+    fn fan_out_preserves_lines_and_moves_one_original_buffer() {
+        let broker = broker();
+        let subscriptions = [broker.subscribe(), broker.subscribe(), broker.subscribe()];
+        let text = String::from("shared remote log line");
+        let pointer = text.as_ptr();
+        let builds = std::cell::Cell::new(0);
+        broker.publish_lazy(|| {
+            builds.set(builds.get() + 1);
+            text
+        });
+        broker.publish("next line");
+
+        let batches = subscriptions.map(|subscription| {
+            let (lines, dropped) = subscription.drain(2, 100);
+            assert_eq!(dropped, 0);
+            assert_eq!(lines.len(), 2);
+            assert_eq!((lines[0].sequence, lines[1].sequence), (1, 2));
+            lines
+        });
+        assert_eq!(builds.get(), 1);
+        assert_eq!(batches[0], batches[1]);
+        assert_eq!(batches[1], batches[2]);
+        assert_eq!(
+            batches
+                .iter()
+                .filter(|lines| lines[0].text.as_ptr() == pointer)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -324,6 +495,11 @@ mod tests {
             lines
                 .iter()
                 .all(|line| line.text.len() <= REMOTE_LINE_MAX_BYTES)
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.text.capacity() == line.text.len())
         );
     }
 

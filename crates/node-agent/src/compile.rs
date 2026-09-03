@@ -189,11 +189,9 @@ pub fn compile_with_warnings(topology: &MachineTopology) -> Result<CompileOutput
     }
     let warnings: Vec<String> = warnings.into_iter().collect();
     let diagnostic_yaml = diagnostic_yaml(topology, &inbounds, &outbounds, &warnings)?;
-    let dns_client_fingerprint = Sha256::digest(
-        serde_json::to_vec(&(&topology.dns, &topology.route, &topology.outbounds))
-            .expect("typed global topology always serializes to JSON"),
-    )
-    .into();
+    let dns_client_fingerprint =
+        json_fingerprint(&(&topology.dns, &topology.route, &topology.outbounds))
+            .expect("typed global topology always serializes to JSON");
     Ok(CompileOutput {
         runtime: RuntimeConfig {
             inbounds,
@@ -510,6 +508,26 @@ fn serialized_json_len(value: &Value) -> Result<usize, CompileError> {
         CompileError::new(format!("measure projected client-chain JSON: {error}"))
     })?;
     Ok(counter.bytes)
+}
+
+/// Feed the serializer's original bytes into the digest without retaining JSON.
+struct JsonHashWriter<'a>(&'a mut Sha256);
+
+impl io::Write for JsonHashWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_fingerprint<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    serde_json::to_writer(JsonHashWriter(&mut hasher), value)?;
+    Ok(hasher.finalize().into())
 }
 
 fn prepare_outbound_client_chains<'a>(
@@ -1262,15 +1280,15 @@ fn compile_urltest_action<'a>(
         chains.extend(member_chains);
     }
 
-    let identity_source =
-        serde_json::to_vec(&(&outbound.tag, &chains, &selection)).map_err(|error| {
+    let identity_fingerprint =
+        json_fingerprint(&(&outbound.tag, &chains, &selection)).map_err(|error| {
             CompileError::new(format!(
                 "urltest outbound {:?} could not derive its runtime identity: {error}",
                 outbound.tag
             ))
         })?;
     let mut shared_id = String::from("node-agent-urltest-v1:");
-    for byte in Sha256::digest(identity_source) {
+    for byte in identity_fingerprint {
         write!(&mut shared_id, "{byte:02x}").expect("writing to a String cannot fail");
     }
     selection
@@ -2003,9 +2021,8 @@ fn dns_reject_flood_state_key(rule: &DnsRule, index: usize) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"node-agent/acp-dns-reject-flood/v1\0");
     hasher.update((index as u64).to_be_bytes());
-    hasher.update(
-        serde_json::to_vec(rule).expect("the typed ACP DNS rule always serializes to JSON"),
-    );
+    serde_json::to_writer(JsonHashWriter(&mut hasher), rule)
+        .expect("the typed ACP DNS rule always serializes to JSON");
     let mut key = String::from("__acp_dns_reject_v1_");
     for byte in hasher.finalize() {
         write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
@@ -2399,14 +2416,14 @@ fn compile_users(node: &NodeInstance, protocol: &str) -> Result<Vec<UserSpec>, C
             )));
         }
         let reported_id = if user.user_id.is_empty() {
-            user.name.clone()
+            user.name.as_str()
         } else {
-            user.user_id.clone()
+            user.user_id.as_str()
         };
         let identity = if reported_id.is_empty() && protocol == "vless" {
-            user.credential.clone()
+            user.credential.as_str()
         } else {
-            reported_id.clone()
+            reported_id
         };
         if identity.is_empty() {
             return Err(CompileError::new(format!(
@@ -2414,14 +2431,14 @@ fn compile_users(node: &NodeInstance, protocol: &str) -> Result<Vec<UserSpec>, C
                 node.node_id
             )));
         }
-        if !identities.insert(identity.clone()) {
+        if !identities.insert(identity) {
             return Err(CompileError::new(format!(
                 "node {} lists user {:?} twice",
                 node.node_id, identity
             )));
         }
         users.push(UserSpec {
-            id: (!reported_id.is_empty()).then_some(reported_id),
+            id: (!reported_id.is_empty()).then(|| reported_id.to_owned()),
             uuid: (protocol == "vless").then(|| user.credential.clone()),
             password: (protocol == "hysteria2").then(|| user.credential.clone()),
             enabled: true,
@@ -3597,6 +3614,66 @@ fn redact_in_place(value: &mut Value) {
         }
         Value::Array(values) => values.iter_mut().for_each(redact_in_place),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn streamed_json_fingerprint_matches_serialized_bytes() {
+        let chains = json!([{
+            "protocol": {"type": "trojan", "password": "私密\"\\\n\u{0001}"},
+            "metadata": {"empty": [], "unset": null, "enabled": true},
+            "limits": [u64::MAX, i64::MIN, 0.125],
+            "long": "哈希".repeat(256),
+        }]);
+        let selection = json!({"url": "https://例子.invalid/探测", "interval": 30});
+        let identity = ("代理", &chains, &selection);
+        let expected: [u8; 32] = Sha256::digest(serde_json::to_vec(&identity).unwrap()).into();
+
+        assert_eq!(json_fingerprint(&identity).unwrap(), expected);
+        assert_eq!(
+            json_fingerprint("私密\"\\\n").unwrap(),
+            <[u8; 32]>::from(Sha256::digest(serde_json::to_vec("私密\"\\\n").unwrap()))
+        );
+    }
+
+    #[test]
+    fn streamed_json_fingerprint_preserves_serialization_errors() {
+        let invalid_keys = BTreeMap::from([(vec![1, 2], "invalid JSON object key")]);
+        let expected = serde_json::to_vec(&invalid_keys).unwrap_err();
+        let actual = json_fingerprint(&invalid_keys).unwrap_err();
+
+        assert_eq!(actual.classify(), expected.classify());
+        assert_eq!(actual.to_string(), expected.to_string());
+    }
+
+    #[test]
+    fn streamed_dns_reject_key_preserves_prefix_and_rule_index() {
+        let rule = DnsRule {
+            domain: vec!["例子.invalid".into()],
+            domain_regex: vec![r#"^escaped\.\"example$"#.into()],
+            action: "reject".into(),
+            no_drop: true,
+            ..DnsRule::default()
+        };
+        for index in [0, 1, usize::MAX] {
+            let mut expected = Sha256::new();
+            expected.update(b"node-agent/acp-dns-reject-flood/v1\0");
+            expected.update((index as u64).to_be_bytes());
+            expected.update(serde_json::to_vec(&rule).unwrap());
+            let expected_hex: String = expected
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(
+                dns_reject_flood_state_key(&rule, index),
+                format!("__acp_dns_reject_v1_{expected_hex}")
+            );
+        }
     }
 }
 

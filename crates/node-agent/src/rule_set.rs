@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RULE_SET_BYTES: usize = 64 * 1024 * 1024;
@@ -385,8 +386,22 @@ impl RuleSetLoader {
         &self,
         resources: &[RuleSetResource],
     ) -> Result<PreparedRuleSets, RuleSetError> {
+        self.prepare_with_cancel(resources, &CancellationToken::new())
+            .await
+    }
+
+    /// Cancellation interrupts network waits, but filesystem publication steps
+    /// finish before it is observed so they cannot strand a partial snapshot.
+    pub(crate) async fn prepare_with_cancel(
+        &self,
+        resources: &[RuleSetResource],
+        cancel: &CancellationToken,
+    ) -> Result<PreparedRuleSets, RuleSetError> {
         let mut prepared = PreparedRuleSetBuilder::default();
         for resource in resources {
+            if cancel.is_cancelled() {
+                return Err(RuleSetError::new("route rule-set preparation cancelled"));
+            }
             match &resource.source {
                 RuleSetSource::Local => {
                     let bytes = read_resource(resource).await?;
@@ -395,7 +410,7 @@ impl RuleSetLoader {
                         .await?;
                 }
                 RuleSetSource::Remote { url } => {
-                    let (bytes, publish) = self.prepare_remote(resource, url).await?;
+                    let (bytes, publish) = self.prepare_remote(resource, url, cancel).await?;
                     prepared
                         .push(&self.snapshot_root, resource, &bytes, publish)
                         .await?;
@@ -407,6 +422,9 @@ impl RuleSetLoader {
                 }
             }
         }
+        if cancel.is_cancelled() {
+            return Err(RuleSetError::new("route rule-set preparation cancelled"));
+        }
         Ok(prepared.finish())
     }
 
@@ -414,6 +432,7 @@ impl RuleSetLoader {
         &self,
         resource: &RuleSetResource,
         url: &str,
+        cancel: &CancellationToken,
     ) -> Result<(Vec<u8>, bool), RuleSetError> {
         recover_interrupted_publication(&resource.path, &resource.tag).await?;
         if cache_is_fresh(&resource.path, resource.update_interval).await {
@@ -444,8 +463,14 @@ impl RuleSetLoader {
                 RuleSetError::new(format!("route rule-set {}: {error}", resource.tag))
             })?;
             Ok::<_, RuleSetError>(bytes)
-        }
-        .await;
+        };
+        let fetch = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(RuleSetError::new("route rule-set preparation cancelled"));
+            }
+            result = fetch => result,
+        };
 
         match fetch {
             Ok(bytes) => Ok((bytes, true)),

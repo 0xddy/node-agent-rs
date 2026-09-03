@@ -1,14 +1,17 @@
-//! Process-wide logger feeding stdout, remote subscribers, then the local file.
+//! Process-wide logger with bounded, asynchronous local output.
 
 use std::backtrace::Backtrace;
+use std::fmt::{self, Write as _};
 use std::io::{self, Write as _};
 use std::panic::PanicHookInfo;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock, TryLockError};
+use std::time::Duration;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+use super::writer::{CLOSE_WAIT, LocalWriter, MAX_LINE_BYTES};
 use super::{
     DEFAULT_LOG_FILE_PATH, DEFAULT_MAX_LOG_BACKUPS, DEFAULT_MAX_LOG_FILE_BYTES, RotatingFile,
     publish_remote,
@@ -18,6 +21,7 @@ struct LoggerState {
     configured: bool,
     debug_enabled: bool,
     file: Option<Arc<RotatingFile>>,
+    writer: Option<Arc<LocalWriter>>,
 }
 
 struct AgentLogger {
@@ -29,6 +33,7 @@ static LOGGER: AgentLogger = AgentLogger {
         configured: false,
         debug_enabled: false,
         file: None,
+        writer: None,
     }),
 };
 static INSTALL_LOCK: Mutex<bool> = Mutex::new(false);
@@ -52,39 +57,52 @@ pub fn configure(debug_mode: bool, log_file_path: impl AsRef<Path>) -> io::Resul
     )?);
     install_logger()?;
 
-    let old_file = {
+    {
         let mut state = LOGGER
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let writer = match state.writer.as_ref() {
+            Some(writer) if !writer.finished() => {
+                writer.replace_file(Arc::clone(&file))?;
+                Arc::clone(writer)
+            }
+            _ => LocalWriter::spawn(io::stdout(), Some(Arc::clone(&file)))?,
+        };
+        state.writer = Some(writer);
+        state.file = Some(file);
         state.configured = true;
         state.debug_enabled = debug_mode;
-        state.file.replace(file)
-    };
+    }
     log::set_max_level(if debug_mode {
         LevelFilter::Debug
     } else {
         LevelFilter::Info
     });
-    if let Some(old_file) = old_file {
-        let _ = old_file.close();
-    }
     Ok(())
 }
 
+/// Stops admission and waits up to two seconds for queued local logs. A stalled
+/// writer remains the sole writer until it exits; configuration will return
+/// `WouldBlock` instead of creating additional blocked threads.
 pub fn close() {
-    let old_file = {
+    let writer = {
         let mut state = LOGGER
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.configured = false;
         state.debug_enabled = false;
-        state.file.take()
+        let writer = state.writer.clone();
+        if let Some(writer) = &writer {
+            writer.seal();
+        }
+        state.file.take();
+        writer
     };
     log::set_max_level(LevelFilter::Info);
-    if let Some(file) = old_file {
-        let _ = file.close();
+    if let Some(writer) = writer {
+        writer.wait_finished(CLOSE_WAIT);
     }
 }
 
@@ -166,47 +184,48 @@ impl Log for AgentLogger {
     }
 
     fn log(&self, record: &Record<'_>) {
-        let (configured, debug_mode, file) = {
+        let (configured, debug_mode, writer) = {
             let state = self
                 .state
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (state.configured, state.debug_enabled, state.file.clone())
+            (state.configured, state.debug_enabled, state.writer.clone())
         };
         if !enabled(record.level(), debug_mode) {
             return;
         }
 
-        let timestamp = chrono::Local::now().format("%Y/%m/%d %H:%M:%S%.6f");
+        let now = chrono::Local::now();
+        let timestamp = now.format("%Y/%m/%d %H:%M:%S%.6f");
         let level_prefix = match record.level() {
             Level::Debug | Level::Trace => "[debug] ",
             _ => "",
         };
-        let line = format!("{timestamp} {level_prefix}{}\n", record.args());
+        let mut line = BoundedLine::new();
+        let _ = write!(line, "{timestamp} {level_prefix}{}", record.args());
+        let line = line.finish();
 
-        // Keep the file last. A full or failed disk must not prevent stdout or
-        // a live panel subscriber from receiving the line.
-        let _ = io::stdout().lock().write_all(line.as_bytes());
+        // A stalled local sink cannot block a live panel subscriber. Both queues
+        // have independent bounds, and no output I/O runs on this calling thread.
         if configured {
             publish_remote("node-agent", &line);
-            if let Some(file) = file
-                && let Err(error) = file.write_all(line.as_bytes())
-            {
-                let _ = writeln!(io::stderr().lock(), "write log file: {error}");
-            }
+        }
+        if let Some(writer) = writer {
+            writer.enqueue(line);
         }
     }
 
     fn flush(&self) {
-        let file = self
+        let writer = self
             .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .file
+            .writer
             .clone();
-        let _ = io::stdout().lock().flush();
-        if let Some(file) = file {
-            let _ = file.sync();
+        // Coalesce flush requests; normal callers never wait behind output I/O.
+        // `close` is the bounded, draining shutdown operation.
+        if let Some(writer) = writer {
+            writer.request_flush();
         }
     }
 }
@@ -216,40 +235,88 @@ impl AgentLogger {
         let timestamp = chrono::Local::now().format("%Y/%m/%d %H:%M:%S%.6f");
         let line = format!("{timestamp} {report}\n");
 
-        // Do not call the normal logger from a panic hook: the panic may have
-        // occurred while it held one of these locks. Non-blocking lock attempts
-        // preserve the important Go property that the process always exits.
-        let _ = io::stdout().lock().write_all(line.as_bytes());
-        let _ = io::stdout().lock().flush();
-        let (configured, file) = match self.state.try_read() {
-            Ok(state) => (state.configured, state.file.clone()),
+        // A panic may happen under a logger/file lock. Even an unlocked file or
+        // pipe can stall in the OS, so emergency I/O gets a separate thread and a
+        // short deadline before the hook exits the process.
+        let file = match self.state.try_read() {
+            Ok(state) => state.file.clone(),
             Err(TryLockError::Poisoned(poisoned)) => {
                 let state = poisoned.into_inner();
-                (state.configured, state.file.clone())
+                state.file.clone()
             }
-            Err(TryLockError::WouldBlock) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
-                    "panic log unavailable: process logger is busy"
-                );
-                return;
+            Err(TryLockError::WouldBlock) => None,
+        };
+        let (done, finished) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("node-agent-panic-log".into())
+            .spawn(move || {
+                if let Some(file) = file {
+                    let _ = file.try_write_all(line.as_bytes());
+                    let _ = file.try_sync();
+                }
+                let _ = io::stderr().lock().write_all(line.as_bytes());
+                let _ = io::stderr().lock().flush();
+                let _ = done.send(());
+            });
+        if spawned.is_ok() {
+            let _ = finished.recv_timeout(Duration::from_millis(250));
+        }
+    }
+}
+
+/// Bound allocation while formatting, rather than allocating an arbitrary
+/// `Display` result and truncating it afterwards.
+struct BoundedLine {
+    text: String,
+    truncated: bool,
+}
+
+impl BoundedLine {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            truncated: false,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            const SUFFIX: &str = " [truncated]";
+            let mut end = self.text.len().min(MAX_LINE_BYTES - 1 - SUFFIX.len());
+            while !self.text.is_char_boundary(end) {
+                end -= 1;
             }
-        };
-        if !configured {
-            let _ = io::stderr().lock().write_all(line.as_bytes());
-            return;
+            self.text.truncate(end);
+            self.reserve(SUFFIX.len() + 1);
+            self.text.push_str(SUFFIX);
         }
-        let Some(file) = file else {
-            let _ = io::stderr().lock().write_all(line.as_bytes());
-            return;
-        };
-        if let Err(error) = file.try_write_all(line.as_bytes()) {
-            let _ = writeln!(io::stderr().lock(), "write panic log file: {error}");
-            return;
+        self.reserve(1);
+        self.text.push('\n');
+        self.text.into_boxed_str().into_string()
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        let required = self.text.len() + additional;
+        if required > self.text.capacity() {
+            let capacity = required
+                .max(self.text.capacity().saturating_mul(2))
+                .min(MAX_LINE_BYTES);
+            self.text.reserve_exact(capacity - self.text.len());
         }
-        if let Err(error) = file.try_sync() {
-            let _ = writeln!(io::stderr().lock(), "sync panic log file: {error}");
+    }
+}
+
+impl fmt::Write for BoundedLine {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let available = MAX_LINE_BYTES - 1 - self.text.len();
+        let mut end = available.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
         }
+        self.reserve(end);
+        self.text.push_str(&text[..end]);
+        self.truncated |= end != text.len();
+        Ok(())
     }
 }
 
@@ -272,6 +339,83 @@ mod tests {
         assert!(!enabled(Level::Debug, false));
         assert!(enabled(Level::Debug, true));
         assert!(!enabled(Level::Trace, true));
+    }
+
+    #[test]
+    fn formatting_bounds_large_utf8_lines_before_queueing() {
+        let mut line = BoundedLine::new();
+        for _ in 0..MAX_LINE_BYTES {
+            write!(line, "界").unwrap();
+            assert!(line.text.capacity() <= MAX_LINE_BYTES);
+        }
+        let line = line.finish();
+        assert!(line.len() <= MAX_LINE_BYTES);
+        assert_eq!(line.len(), line.capacity());
+        assert!(line.ends_with(" [truncated]\n"));
+
+        let mut short = BoundedLine::new();
+        write!(short, "hello {}", 42).unwrap();
+        assert_eq!(short.finish(), "hello 42\n");
+    }
+
+    #[test]
+    fn a_stalled_local_writer_does_not_block_remote_logs() {
+        use std::sync::mpsc;
+
+        struct BlockedOutput {
+            entered: Option<mpsc::SyncSender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl io::Write for BlockedOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let writer = LocalWriter::spawn(
+            BlockedOutput {
+                entered: Some(entered_tx),
+                release: release_rx,
+            },
+            None,
+        )
+        .unwrap();
+        writer.enqueue(String::from("blocked\n"));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let logger = AgentLogger {
+            state: RwLock::new(LoggerState {
+                configured: true,
+                debug_enabled: false,
+                file: None,
+                writer: Some(Arc::clone(&writer)),
+            }),
+        };
+        let subscription = super::super::subscribe_remote();
+        logger.log(
+            &Record::builder()
+                .level(Level::Info)
+                .args(format_args!("remote survives blocked local output"))
+                .build(),
+        );
+        let (lines, _) = subscription.drain(1024, 1 << 20);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("remote survives blocked local output"))
+        );
+        writer.seal();
+        release_tx.send(()).unwrap();
+        assert!(writer.wait_finished(Duration::from_secs(2)));
     }
 
     #[test]

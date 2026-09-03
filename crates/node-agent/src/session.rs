@@ -9,7 +9,6 @@
 
 use std::fmt;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -776,9 +775,6 @@ where
     Ok(())
 }
 
-type BoxStreamFuture = Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + 'static>>;
-type StreamRunner = Arc<dyn Fn(CancellationToken) -> BoxStreamFuture + Send + Sync + 'static>;
-
 /// One authenticated session's cancellation domain. Auxiliary streams reconnect
 /// independently, but `Unauthenticated` invalidates the shared session; the control
 /// stream is critical and any exit invalidates it.
@@ -817,7 +813,6 @@ impl StreamGroup {
         Fut: Future<Output = Result<(), SessionError>> + Send + 'static,
     {
         let name = name.into();
-        let runner: StreamRunner = Arc::new(move |cancel| Box::pin(runner(cancel)));
         let cancel = self.cancel.clone();
         let policy = self.policy;
         self.tasks.spawn(async move {
@@ -909,11 +904,15 @@ impl Drop for StreamGroup {
     }
 }
 
-async fn run_auxiliary_stream(
+async fn run_auxiliary_stream<F, Fut>(
     cancel: CancellationToken,
-    runner: StreamRunner,
+    runner: F,
     policy: RetryPolicy,
-) -> Result<(), SessionError> {
+) -> Result<(), SessionError>
+where
+    F: Fn(CancellationToken) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<(), SessionError>> + Send,
+{
     let mut backoff = ExponentialBackoff::new(policy.initial, policy.max);
     while !cancel.is_cancelled() {
         let started_at = Instant::now();

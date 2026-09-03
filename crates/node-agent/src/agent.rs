@@ -131,11 +131,29 @@ impl Agent {
 
     /// Runs until the supplied process token is cancelled or a process-scoped
     /// background task exits unexpectedly.
+    ///
+    /// Dropping or aborting the caller requests the same ordered shutdown. The
+    /// owned supervisor finishes runtime close and final traffic delivery even
+    /// when there is no longer a caller waiting for its result.
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) -> Result<(), AgentError> {
+        let shutdown = shutdown.child_token();
+        let _cancel_on_drop = shutdown.clone().drop_guard();
+        tokio::spawn(self.run_owned(shutdown))
+            .await
+            .map_err(|error| {
+                AgentError::Background(format!("agent supervisor task failed: {error}"))
+            })?
+    }
+
+    async fn run_owned(self: Arc<Self>, shutdown: CancellationToken) -> Result<(), AgentError> {
         // This token is intentionally detached from `shutdown`: the panel
         // session must remain alive while final traffic is delivered.
         let session_shutdown = CancellationToken::new();
         let flusher_shutdown = CancellationToken::new();
+        // These guards also signal the children if the supervisor unwinds.
+        // Normal shutdown below still controls their order explicitly.
+        let _cancel_sessions = session_shutdown.clone().drop_guard();
+        let _cancel_flusher = flusher_shutdown.clone().drop_guard();
 
         let mut flusher = self.spawn_traffic_flusher(flusher_shutdown.clone());
         let mut sessions = self.spawn_panel_sessions(session_shutdown.clone());
@@ -510,7 +528,161 @@ async fn wait_for_task<T>(task: &mut JoinHandle<T>, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::runtime::{ConnectionStats, ReloadStatus, RuntimeConfig, TrafficDrain};
+    use crate::topology::MachineTopology;
     use crate::traffic::TrafficEvent;
+
+    struct LifecycleRuntime {
+        events: Mutex<Vec<&'static str>>,
+        apply_started: tokio::sync::Notify,
+        allow_apply: tokio::sync::Semaphore,
+        close_calls: AtomicUsize,
+    }
+
+    impl LifecycleRuntime {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                apply_started: tokio::sync::Notify::new(),
+                allow_apply: tokio::sync::Semaphore::new(0),
+                close_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeRuntime for LifecycleRuntime {
+        async fn apply_config(&self, _config: RuntimeConfig) -> Result<(), RuntimeError> {
+            self.events.lock().unwrap().push("apply started");
+            self.apply_started.notify_one();
+            self.allow_apply.acquire().await.unwrap().forget();
+            self.events.lock().unwrap().push("apply finished");
+            Ok(())
+        }
+
+        async fn reload_config(&self, config: RuntimeConfig) -> Result<ReloadStatus, RuntimeError> {
+            self.apply_config(config).await?;
+            Ok(ReloadStatus {
+                running: true,
+                rolled_back: false,
+            })
+        }
+
+        fn current_config(&self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        async fn close(&self) -> Result<(), RuntimeError> {
+            self.events.lock().unwrap().push("close");
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn connection_stats(&self, _node_id: &str) -> ConnectionStats {
+            ConnectionStats::default()
+        }
+
+        async fn close_user_connections(&self, _node_id: &str, _user_id: &str) -> u64 {
+            0
+        }
+
+        async fn drain_traffic(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
+            self.events.lock().unwrap().push("traffic drain");
+            Ok(Vec::new())
+        }
+    }
+
+    fn lifecycle_agent(
+        address: std::net::SocketAddr,
+        runtime: Arc<LifecycleRuntime>,
+    ) -> Arc<Agent> {
+        let config = crate::config::parse(&format!(
+            "panel_grpc_endpoint = \"grpc://{address}\"\nmachine_id = \"machine\"\nnode_id = \"node\"\nmachine_secret = \"test-secret\"\n"
+        ))
+        .unwrap();
+        Agent::with_runtime(config, runtime)
+    }
+
+    async fn wait_for_agent_release(agent: &std::sync::Weak<Agent>) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while agent.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("all process tasks must release the agent after shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_run_future_stops_owned_background_tasks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime = Arc::new(LifecycleRuntime::new());
+        let agent = lifecycle_agent(listener.local_addr().unwrap(), runtime.clone());
+        let weak = Arc::downgrade(&agent);
+        let shutdown = CancellationToken::new();
+        let mut run = Box::pin(agent.run(shutdown.clone()));
+        std::future::poll_fn(|cx| {
+            assert!(run.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::task::yield_now().await;
+        drop(run);
+        wait_for_agent_release(&weak).await;
+        assert!(
+            !shutdown.is_cancelled(),
+            "only this run's child token is cancelled"
+        );
+        assert_eq!(runtime.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*runtime.events.lock().unwrap(), ["close", "traffic drain"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_run_waits_for_topology_then_closes_before_tail_traffic() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime = Arc::new(LifecycleRuntime::new());
+        let agent = lifecycle_agent(listener.local_addr().unwrap(), runtime.clone());
+        let topologies = agent.topologies.clone();
+        let applying = tokio::spawn(async move {
+            topologies
+                .apply_initial(MachineTopology {
+                    machine_id: "machine".into(),
+                    revision: 1,
+                    ..Default::default()
+                })
+                .await
+        });
+        runtime.apply_started.notified().await;
+        let weak = Arc::downgrade(&agent);
+        let run = tokio::spawn(agent.run(CancellationToken::new()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            // The panel runner's Arc proves the supervisor and its children ran.
+            while weak.strong_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        tokio::time::advance(BACKGROUND_SHUTDOWN_LIMIT + Duration::from_secs(1)).await;
+        assert!(
+            !applying.is_finished(),
+            "the accepted topology transaction must not be aborted"
+        );
+        assert_eq!(runtime.close_calls.load(Ordering::SeqCst), 0);
+        runtime.allow_apply.add_permits(1);
+        applying.await.unwrap().unwrap();
+        wait_for_agent_release(&weak).await;
+        assert_eq!(
+            *runtime.events.lock().unwrap(),
+            ["apply started", "apply finished", "close", "traffic drain"]
+        );
+        assert_eq!(runtime.close_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn digest_match_is_the_only_fast_path() {

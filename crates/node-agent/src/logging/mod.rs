@@ -6,6 +6,7 @@ mod remote;
 mod stream;
 #[cfg(windows)]
 mod windows_permissions;
+mod writer;
 
 pub use file::{
     DEFAULT_LOG_FILE_PATH, DEFAULT_MAX_LOG_BACKUPS, DEFAULT_MAX_LOG_FILE_BYTES, RotatingFile,
