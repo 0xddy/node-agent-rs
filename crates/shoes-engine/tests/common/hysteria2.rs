@@ -170,6 +170,10 @@ impl Hysteria2Client {
         self.connection.stats()
     }
 
+    pub fn close_reason(&self) -> Option<quinn::ConnectionError> {
+        self.connection.close_reason()
+    }
+
     /// Test-only noncompliant behavior: disregard `Hysteria-CC-RX: auto` and force
     /// a fixed upload rate after authentication. The client must have connected
     /// with `connect_with_rates_bps` so its switchable controller is installed.

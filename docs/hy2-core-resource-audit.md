@@ -15,6 +15,8 @@
 - [sing-box、sing-quic、quic-go、Xray 与本机 Go node-agent 对照源码](hy2-reference-controls.md)：版本、官方代码链接、参数分支和逐阶段控制。
 - [当前 Rust HY2 应用层控制](hy2-application-controls.md)：准入、TCP/UDP 生命周期、资源持有、取消以及未完成验证的边界。
 
+后续用户反馈 2 GB 上传成功，但 Speedtest 下载切换上传仍可能断网；对应的 [ACK 调度、BBR 与官方 Go 互通复盘](hysteria2-speedtest-transition.md)记录了追加修复与验证。
+
 ## 1. 必须分别约束的资源路径
 
 ```mermaid

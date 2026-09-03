@@ -26,6 +26,7 @@ tokio-util = { workspace = true }
 # `../shoes-plus/Cargo.toml` so the harness resolves to the same crates the server uses --
 # two rustls crypto providers in one process would be a problem all of its own.
 [dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
 bytes = "*"
 h3 = "*"
 h3-quinn = "*"
