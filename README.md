@@ -1,63 +1,116 @@
-# node-agent-rust
+# node-agent-rs
 
-English | [中文](README.zh-CN.md)
+[![CI](https://github.com/0xddy/node-agent-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/0xddy/node-agent-rs/actions/workflows/ci.yml)
+![Rust Edition](https://img.shields.io/badge/Rust-2024-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-Upstream [`shoes`](https://github.com/cfal/shoes) reads a YAML file, starts every
-listener, and blocks forever: users and rules are fixed for the life of the process.
-`node-agent-rust` keeps that behaviour and adds two things on top:
+`node-agent-rs` 是基于 Rust 和 `shoes-plus` 代理内核的 ACP 节点代理，负责接收面板配置、管理代理入站与用户，并上报流量和节点状态。项目同时提供可嵌入的 `shoes-engine`，适用于集中式节点管理和自定义控制面集成。
 
-- **`shoes-engine`** — an `Engine` driven programmatically. Comes up with no inbounds and
-  no users, populated over whatever API the embedder already speaks.
-- **`node-agent`** — the shipped daemon: a drop-in replacement for the Go ACP node agent,
-  running shoes where the Go agent embedded sing-box.
+## 核心特性
 
-The shoes core has a single source of truth in the sibling
-[`shoes-plus`](https://github.com/0xddy/shoes-plus) repository. This workspace loads it through the Cargo
-path dependency `../shoes-plus`; no second copy is kept here. In the standard local
-layout, clone both repositories under the same parent directory.
+- **ACP 面板集成**：通过 gRPC 完成节点认证、拓扑同步、控制指令、流量上报、遥测和日志传输，兼容现有 Go agent 的扁平 TOML 引导配置。
+- **事务式配置应用**：将面板拓扑编译为内存中的运行配置，执行校验、应用和失败回滚；根据变更内容选择热更新或监听器重建。
+- **动态用户管理**：支持在线添加、更新、停用和删除用户，提供用户级并发连接限制、上传及下载速率限制。
+- **流量与运行观测**：按用户聚合流量增量，支持上报阈值、节点遥测、本地日志轮转和面板日志流。
+- **路由与出站编排**：支持规则路由、DNS 策略、远程规则集、代理链和 URLTest 出站选择。
+- **Hysteria2 端口跳跃**：在 Linux 上通过原生 netlink/nftables 后端管理端口重定向。
 
-Local builds use that sibling working tree directly. CI and release builds check out
-the pinned compatible `shoes-plus` revision beside this repository.
+### 协议能力
 
-## Engine
+| 使用入口 | 支持内容 |
+| --- | --- |
+| ACP 面板入站 | `vless-reality-vision@1`、`hysteria2-salamander@1` |
+| `shoes-engine` 动态用户认证 | VLESS、VMess、Trojan、Shadowsocks 2022（AES-128-GCM / AES-256-GCM）、Hysteria2、TUIC、AnyTLS、NaiveProxy |
 
-```rust
-let engine = Engine::bootstrap().await?;
+## 架构与技术栈
 
-engine.add_inbound(InboundSpec {
-    tag: "vless-443".into(),
-    config: serde_json::json!({
-        "address": "0.0.0.0:443",
-        "protocol": {"type": "vless", "udp_enabled": true},
-    }),
-    users: Some(vec![]),          // dynamic mode, nobody admitted yet
-}).await?;
-
-engine.add_user("vless-443", UserSpec {
-    id: Some("alice".into()),
-    uuid: Some("b85798ef-e9dc-46a4-9a87-8da4499d36d0".into()),
-    password: None,
-    enabled: true,
-    max_conns: None,
-    upload_limit_bps: None,
-    download_limit_bps: None,
-})?;                              // live on the next handshake
-
-let period = engine.take_inbound_traffic("vless-443")?;
+```text
+ACP 面板
+   │ gRPC / Protobuf
+   ▼
+node-agent        认证、会话、拓扑编译、事务应用、运行数据上报
+   │ shoes-api
+   ▼
+shoes-engine      入站生命周期、用户注册表、连接控制、流量计量
+   │
+   ▼
+shoes-plus        代理协议、传输、路由、DNS、出站拨号
 ```
 
-Users are added, suspended and removed on a live listener, each with its own credential
-and byte counters. Suspending refuses new handshakes and leaves current sessions alone;
-removing closes the user's sessions and collects final counters. Rules and protocol
-settings swap without dropping established connections.
+| 组件 | 职责与技术 |
+| --- | --- |
+| `crates/node-agent` | 节点守护进程；Tokio 异步运行时、Tonic gRPC、TOML 引导配置 |
+| `crates/acp-proto` | ACP Protobuf 定义、拓扑摘要、兼容 Go 的 HMAC 认证；Prost 与 protox 代码生成 |
+| `crates/shoes-api` | 入站、用户、状态与流量报告的公共数据类型 |
+| `crates/shoes-engine` | 可嵌入的 Rust 引擎；动态用户管理、配置更新与流量统计 |
+| `../shoes-plus` | 同级仓库中的代理内核；rustls TLS、Quinn QUIC 及多协议数据面 |
 
-Registry-backed protocols: VLESS, VMess, Trojan, Shadowsocks 2022, Hysteria2, TUIC,
-AnyTLS, NaiveProxy. Snell is out — it has no multi-user identity. With no registry
-injected, a plain YAML config authenticates exactly as upstream.
+工作区采用 Rust 2024 Edition，通过 Cargo 路径依赖引用 `../shoes-plus`。依赖版本由工作区 `Cargo.lock` 固定，CI 与发布流程使用固定的兼容内核提交。
 
-## node-agent
+## 安装与运行
 
-Reads the same flat bootstrap TOML as the Go agent, unchanged:
+### 环境准备
+
+- Rust stable 工具链与 Cargo。
+- Git，以及目标平台的 C/C++ 构建工具链和 CMake。
+- ACP 面板地址，以及面板分配的 `machine_id`、`node_id` 和 `machine_secret`。
+- 使用 Linux 端口跳跃功能时，准备 nftables 内核支持及 `CAP_NET_ADMIN` 权限。
+
+### 从源码构建
+
+将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交：
+
+```bash
+git clone https://github.com/0xddy/node-agent-rs.git
+git clone https://github.com/0xddy/shoes-plus.git
+git -C shoes-plus checkout f010c624b063e6c4fb1a9702cc6ac564895ebb8a
+cd node-agent-rs
+cargo build --release --locked -p node-agent --bin node-agent
+```
+
+目录结构：
+
+```text
+workspace/
+├── node-agent-rs/
+│   ├── Cargo.toml
+│   └── crates/
+└── shoes-plus/
+    ├── Cargo.toml
+    └── vendor/
+```
+
+### 启动节点
+
+在项目根目录创建下文所示的 `node-agent.toml`，填写面板连接信息后启动。
+
+Linux / macOS：
+
+```bash
+./target/release/node-agent ./node-agent.toml
+```
+
+Windows PowerShell：
+
+```powershell
+.\target\release\node-agent.exe .\node-agent.toml
+```
+
+启动后，节点向面板认证并同步拓扑，由面板管理入站、用户和路由配置。
+
+### 发布构建
+
+`Release node-agent` 工作流生成各平台可执行文件及 `SHA256SUMS` 校验文件，发布入口为 [GitHub Releases](https://github.com/0xddy/node-agent-rs/releases)。
+
+| 平台 | 架构 |
+| --- | --- |
+| Linux GNU | x86_64、aarch64 |
+| Windows MSVC | x86_64 |
+| macOS | x86_64、aarch64 |
+
+## 配置与使用示例
+
+### 引导配置
 
 ```toml
 panel_grpc_endpoint = "grpcs://panel.example.com:443"
@@ -68,69 +121,58 @@ machine_secret = "replace-with-machine-secret"
 ca_cert_path = ""
 tls_insecure_skip_verify = false
 debug = false
-log_file_path = "node-agent.log"
+log_file_path = "runtime/node-agent.log"
 traffic_report_min_delta_bytes = 26214400
 ```
 
-```bash
-cargo build --release --locked -p node-agent --bin node-agent
-```
+| 字段 | 默认值 / 要求 | 说明 |
+| --- | --- | --- |
+| `panel_grpc_endpoint` | 必填 | 面板 gRPC 地址，格式为 `grpcs://主机:端口` 或 `grpc://主机:端口` |
+| `machine_id` | 必填 | 面板分配的机器标识 |
+| `node_id` | 必填 | 面板分配的节点标识 |
+| `machine_secret` | 必填 | 节点与面板认证使用的共享密钥 |
+| `ca_cert_path` | `""` | 使用 `grpcs://` 时可设置自定义 CA 证书路径；默认使用系统信任根 |
+| `tls_insecure_skip_verify` | `false` | TLS 证书校验开关；`false` 表示执行证书校验 |
+| `debug` | `false` | 启用调试日志 |
+| `log_file_path` | `""` | 本地日志路径；留空时使用 `runtime/node-agent.log` |
+| `traffic_report_min_delta_bytes` | `26214400` | 流量增量上报阈值，单位为字节，默认 25 MiB，取值为正整数 |
+
+`grpcs://` 使用 TLS 连接。面板拓扑承载业务配置，TOML 用于设置面板连接、节点身份和本地运行参数。
+
+### 查看版本
 
 ```bash
-./target/release/node-agent ./node-agent.toml
+./target/release/node-agent version
+./target/release/node-agent version --json
 ```
 
-Panel topology stays the only source of business config: it is compiled in memory into
-shoes inbounds and applied transactionally, rolling back on any failed step. A session
-runs five streams — control, traffic, telemetry, log, remote control. Providers are
-`vless-reality-vision@1` and `hysteria2-salamander@1`. Hysteria2 port hopping uses a
-native nftables backend on Linux; other platforms reject a non-empty plan instead of
-ignoring it.
+Windows 下使用 `.\target\release\node-agent.exe` 执行相同子命令。
 
-`node-agent dev` is not implemented. Never run the Go and Rust agents on the same
-`machine_id` / `node_id` at once.
+### 集成动态引擎
 
-Releases come from the manual **Release node-agent** workflow: raw binaries plus
-`SHA256SUMS` for linux-gnu x86_64/aarch64, windows-msvc x86_64, macOS x86_64/aarch64.
+自定义控制面可依赖 `shoes-api` 和 `shoes-engine`，通过以下接口管理运行中的代理服务：
 
-## Layout
+| 操作 | 接口 |
+| --- | --- |
+| 初始化引擎 | `Engine::bootstrap().await` |
+| 创建入站 | `engine.add_inbound(spec).await` |
+| 添加或更新用户 | `engine.add_user(tag, user)` |
+| 删除用户并关闭其连接 | `engine.remove_user(tag, id).await` |
+| 提取用户流量增量 | `engine.take_inbound_traffic(tag)` |
 
-| path | what |
-|---|---|
-| `../shoes-plus/` | separately maintained shoes core. Extension points live in `src/dynamic/`. |
-| `crates/shoes-engine/` | `Engine`, the user registry, the acceptance suites. What an embedder links. |
-| `crates/shoes-api/` | argument and report types, split out so a conversion layer need not link the engine. |
-| `crates/acp-proto/` | ACP protobuf, topology digest, Go-compatible HMAC. |
-| `crates/node-agent/` | ACP session, topology compiler, transactional runtime, port hopping, telemetry, logs. |
-| `docs/` | the design record. |
+`InboundSpec.users` 设置为 `Some(vec![])` 时启用动态用户注册表，随后通过用户接口添加凭据。`UserSpec` 的 `max_conns` 控制用户并发连接数，`upload_limit_bps` 和 `download_limit_bps` 分别控制客户端视角的上传与下载速率，单位为 bit/s。
 
-Wire formats stay in `../shoes-plus/`, runtime control in `shoes-engine`, panel policy in
-`node-agent`. `shoes-engine` knows nothing about ACP or gRPC.
+## 开发与验证
 
-## Docs
-
-- [dynamic-engine-design.md](docs/dynamic-engine-design.md) — architecture; §9 collects
-  the invariants. Read it before touching `../shoes-plus/src/dynamic/` or adding a protocol.
-- [dynamic-engine-plan.md](docs/dynamic-engine-plan.md) — the conversion schedule.
-- [node-agent-panel-compatibility.md](docs/node-agent-panel-compatibility.md) (中文) —
-  bootstrap TOML, the topology support matrix, and every rejection case.
-
-## Gates
+在工作区根目录执行：
 
 ```bash
 cargo fmt --all --check
-```
-
-```bash
 cargo clippy --workspace --all-targets --locked
-```
-
-```bash
 cargo test --workspace --locked
 ```
 
-Because `shoes-plus` is a sibling path dependency rather than a workspace member, its
-own gates use its manifest and lock file:
+同步修改 `shoes-plus` 时，对其运行独立检查：
 
 ```bash
 cargo fmt --manifest-path ../shoes-plus/Cargo.toml --all -- --check
@@ -138,35 +180,7 @@ cargo clippy --manifest-path ../shoes-plus/Cargo.toml --all-targets --locked --n
 cargo test --manifest-path ../shoes-plus/Cargo.toml --all-targets --locked
 ```
 
-`--all-targets` is load-bearing: without it the ~15,000 lines of acceptance suite are
-never linted. CI runs these on Linux, since unix sockets, `SO_REUSEPORT` and TUN are
-`cfg`'d out on Windows. The suites need no network. ACP compatibility is gated separately
-by the Go panel's `TestRustNodeAgentCompatibility` against a release binary.
+## 相关文档
 
-## Adding a protocol
-
-1. A registry lookup replaces the inline credential comparison; with no registry, the
-   config's own credential becomes a one-user `StaticUserRegistry`.
-2. A disabled user is reported absent, never present-but-denied.
-3. Admission happens exactly once after sufficient protocol proof, so counting and
-   removable-connection registration are atomic.
-4. `note_auth` only on bytes that could not have been copied off the wire. TUIC, VMess
-   and Shadowsocks 2022 count in the handler after an unforgeable step instead.
-5. A `users` list governs every target in the tree; a sibling that authenticates nobody
-   refuses the whole inbound.
-6. `Arc<ConnContext>` wherever metering crosses a `tokio::spawn`; tracked users fail
-   closed without it.
-7. An end-to-end suite under `crates/shoes-engine/tests/`, all three gates clean, and a
-   commit message naming any pre-existing bug the suite flushed out.
-
-Items 4 and 5 are the ones that keep getting broken.
-
-## Limits
-
-Post-auth: `UserSpec.max_conns`, 512 UDP sessions per Hysteria2/TUIC connection, 256
-AnyTLS streams per session, 256 HTTP/2 streams. Pre-auth:
-`../shoes-plus/src/tcp/handshake_gate.rs` caps handshakes in flight per listener (1024 total, 64
-per source IP). Replay: `../shoes-plus/src/replay_filter.rs` (Shadowsocks 60s salts, VMess 240s
-auth ids). Each is a const with its reasoning in the doc comment. A per-IP rate limiter,
-a replay-filter capacity cap and UDP session LRU were evaluated and deliberately not
-built — not oversights.
+- [动态引擎设计](docs/dynamic-engine-design.md)
+- [面板配置与拓扑支持矩阵](docs/node-agent-panel-compatibility.md)
