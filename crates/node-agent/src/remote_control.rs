@@ -20,7 +20,7 @@ use acp_proto::{
 };
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedMutexGuard, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -1013,6 +1013,9 @@ async fn run_periodic_user_pull(
 /// Opens the authenticated bidirectional stream, dispatches each request in its
 /// own task, serialises all responses through a bounded queue, and runs the
 /// process-scoped periodic pull scheduler for this session generation.
+/// At most 16 requests execute across all generations. Excess requests receive
+/// a `Failed` response with stage `busy`; if that rejection cannot be queued,
+/// the stream retires. Admission never suspends detection of panel EOF/errors.
 pub async fn run_remote_control_stream(
     shutdown: CancellationToken,
     channel: Channel,
@@ -1043,26 +1046,6 @@ pub async fn run_remote_control_stream(
     ));
 
     let outcome = loop {
-        // Admit before reading/spawning another request, so neither suspended
-        // task stacks nor full configuration snapshots can grow without bound.
-        // Slots belong to the controller and remain bounded across reconnects.
-        let request_permit = tokio::select! {
-            permit = acquire_request_slot(&controller, &stream_cancel) => permit,
-            () = response_sender.closed() => {
-                break Err(SessionError::Rpc(tonic::Status::unavailable(
-                    "remote control response stream closed",
-                )));
-            }
-        };
-        let Some(request_permit) = request_permit else {
-            break if shutdown.is_cancelled() {
-                Ok(())
-            } else {
-                Err(SessionError::Rpc(tonic::Status::unavailable(
-                    "remote control response stream closed",
-                )))
-            };
-        };
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break Ok(()),
@@ -1073,6 +1056,19 @@ pub async fn run_remote_control_stream(
             }
             message = requests.message() => match message {
                 Ok(Some(request)) => {
+                    if request.request_id.is_empty() {
+                        continue;
+                    }
+                    // Keep reading when all owners are busy: EOF/errors must
+                    // still cancel panel reads and allow this stream to retire.
+                    // Reject excess work without spawning tasks or buffering
+                    // requests, and keep the slots shared across reconnects.
+                    let Ok(request_permit) = controller.inner.request_slots.clone().try_acquire_owned() else {
+                        if let Err(error) = reject_busy_request(&response_sender, &request.request_id) {
+                            break Err(error);
+                        }
+                        continue;
+                    };
                     let request_cancel = stream_cancel.clone();
                     let request_target = target.clone();
                     let request_dependencies = dependencies.clone();
@@ -1114,15 +1110,27 @@ pub async fn run_remote_control_stream(
     outcome
 }
 
-async fn acquire_request_slot(
-    controller: &RemoteController,
-    stream_cancel: &CancellationToken,
-) -> Option<OwnedSemaphorePermit> {
-    tokio::select! {
-        biased;
-        () = stream_cancel.cancelled() => None,
-        permit = controller.inner.request_slots.clone().acquire_owned() => permit.ok(),
-    }
+fn reject_busy_request(
+    sender: &mpsc::Sender<RemoteControlResponse>,
+    request_id: &str,
+) -> Result<(), SessionError> {
+    let mut rejection = response(
+        RemoteControlResponseStatus::Failed,
+        "busy",
+        "too many remote control requests are running; retry later",
+        None,
+    );
+    rejection.request_id = request_id.to_string();
+    sender.try_send(rejection).map_err(|error| {
+        SessionError::Rpc(match error {
+            mpsc::error::TrySendError::Full(_) => tonic::Status::resource_exhausted(
+                "remote control response queue is full; cannot reject excess request",
+            ),
+            mpsc::error::TrySendError::Closed(_) => {
+                tonic::Status::unavailable("remote control response stream closed")
+            }
+        })
+    })
 }
 
 fn monitor_request_task(task: JoinHandle<()>) {

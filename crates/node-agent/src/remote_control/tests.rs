@@ -1177,11 +1177,23 @@ fn verify_metadata(metadata: &MetadataMap) -> Result<SessionFields, Status> {
     Ok(fields)
 }
 
-#[tokio::test]
-async fn tonic_stream_is_authenticated_bidirectional_concurrent_and_cancel_safe() {
+struct TestRemoteStream {
+    request_sender: mpsc::Sender<Result<RemoteControlRequest, Status>>,
+    response_receiver: mpsc::UnboundedReceiver<RemoteControlResponse>,
+    metadata_receiver: mpsc::UnboundedReceiver<SessionFields>,
+    client_cancel: CancellationToken,
+    runner: JoinHandle<Result<(), SessionError>>,
+    server_cancel: CancellationToken,
+    server: JoinHandle<()>,
+}
+
+async fn start_test_remote_stream(
+    services: &Arc<FakeServices>,
+    controller: &RemoteController,
+) -> TestRemoteStream {
     let (request_sender, request_receiver) = mpsc::channel(8);
-    let (response_sender, mut response_receiver) = mpsc::unbounded_channel();
-    let (metadata_sender, mut metadata_receiver) = mpsc::unbounded_channel();
+    let (response_sender, response_receiver) = mpsc::unbounded_channel();
+    let (metadata_sender, metadata_receiver) = mpsc::unbounded_channel();
     let panel = MockRemotePanel {
         requests: Arc::new(Mutex::new(Some(request_receiver))),
         responses: response_sender,
@@ -1223,9 +1235,6 @@ machine_secret = "secret"
         },
     )
     .unwrap();
-    let services = Arc::new(FakeServices::default());
-    *services.config.lock().unwrap() = b"diagnostic".to_vec();
-    let controller = RemoteController::new();
     let client_cancel = CancellationToken::new();
     let runner_cancel = client_cancel.clone();
     let runner = tokio::spawn(run_remote_control_stream(
@@ -1236,6 +1245,32 @@ machine_secret = "secret"
         services.dependencies(),
         controller.clone(),
     ));
+
+    TestRemoteStream {
+        request_sender,
+        response_receiver,
+        metadata_receiver,
+        client_cancel,
+        runner,
+        server_cancel,
+        server,
+    }
+}
+
+#[tokio::test]
+async fn tonic_stream_is_authenticated_bidirectional_concurrent_and_cancel_safe() {
+    let services = Arc::new(FakeServices::default());
+    *services.config.lock().unwrap() = b"diagnostic".to_vec();
+    let controller = RemoteController::new();
+    let TestRemoteStream {
+        request_sender,
+        mut response_receiver,
+        mut metadata_receiver,
+        client_cancel,
+        runner,
+        server_cancel,
+        server,
+    } = start_test_remote_stream(&services, &controller).await;
 
     let metadata = tokio::time::timeout(Duration::from_secs(1), metadata_receiver.recv())
         .await
@@ -1280,8 +1315,8 @@ machine_secret = "secret"
     );
 
     // The panel can send tiny requests much faster than a local transaction
-    // completes. Admission must stop before spawning request 17, even though
-    // the bounded response queue is empty and the transport remains healthy.
+    // completes. Request 17 must receive an explicit rejection without spawning
+    // another task or suspending reads from the healthy transport.
     services.sync_block.store(true, Ordering::SeqCst);
     for index in 0..=MAX_CONCURRENT_REMOTE_REQUESTS {
         request_sender
@@ -1299,7 +1334,17 @@ machine_secret = "secret"
     })
     .await
     .expect("request slots never filled");
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    let rejected = tokio::time::timeout(Duration::from_secs(1), response_receiver.recv())
+        .await
+        .expect("excess request was silently discarded")
+        .unwrap();
+    assert_eq!(
+        rejected.request_id,
+        format!("bounded-sync-{MAX_CONCURRENT_REMOTE_REQUESTS}")
+    );
+    assert_eq!(rejected.status, RemoteControlResponseStatus::Failed as i32);
+    assert_eq!(rejected.stage, "busy");
+    assert!(rejected.payload.is_none());
     assert_eq!(
         services.sync_calls.load(Ordering::SeqCst),
         MAX_CONCURRENT_REMOTE_REQUESTS
@@ -1321,6 +1366,168 @@ machine_secret = "secret"
     .expect("cancelled requests retained their admission slots");
     server_cancel.cancel();
     server.await.unwrap();
+}
+
+async fn saturated_stream_observes_panel_end(
+    excess_requests: usize,
+    panel_error: bool,
+    finish_local_transaction: bool,
+) {
+    let services = Arc::new(FakeServices::default());
+    services.sync_block.store(true, Ordering::SeqCst);
+    services
+        .sync_finish_after_cancel
+        .store(finish_local_transaction, Ordering::SeqCst);
+    let controller = RemoteController::new();
+    let TestRemoteStream {
+        request_sender,
+        mut response_receiver,
+        mut metadata_receiver,
+        client_cancel,
+        mut runner,
+        server_cancel,
+        server,
+    } = start_test_remote_stream(&services, &controller).await;
+    tokio::time::timeout(Duration::from_secs(1), metadata_receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    for index in 0..MAX_CONCURRENT_REMOTE_REQUESTS {
+        request_sender
+            .send(Ok(request(
+                &format!("active-{index}"),
+                Some(Command::SyncUsers(SyncUsersRequest {})),
+            )))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while services.sync_calls.load(Ordering::SeqCst) < MAX_CONCURRENT_REMOTE_REQUESTS {
+            services.sync_called.notified().await;
+        }
+    })
+    .await
+    .expect("request slots never filled");
+    assert_eq!(controller.inner.request_slots.available_permits(), 0);
+    request_sender
+        .send(Ok(request(
+            "",
+            Some(Command::SyncUsers(SyncUsersRequest {})),
+        )))
+        .await
+        .unwrap();
+
+    // Queue excess requests immediately before EOF. A single request lookahead
+    // that waits for capacity would still leave EOF hidden behind this backlog.
+    for index in 0..excess_requests {
+        request_sender
+            .send(Ok(request(
+                &format!("excess-{index}"),
+                Some(Command::SyncUsers(SyncUsersRequest {})),
+            )))
+            .await
+            .unwrap();
+    }
+    if panel_error {
+        request_sender
+            .send(Err(Status::aborted("panel stopped the stream")))
+            .await
+            .unwrap();
+    }
+    drop(request_sender);
+
+    // The panel keeps reading the opposite side of this bidirectional stream,
+    // so response_sender.closed() cannot stand in for polling panel EOF/errors.
+    let outcome = tokio::time::timeout(Duration::from_secs(1), &mut runner).await;
+    if outcome.is_err() {
+        client_cancel.cancel();
+        services
+            .sync_release
+            .add_permits(MAX_CONCURRENT_REMOTE_REQUESTS);
+        let _ = runner.await;
+        server_cancel.cancel();
+        server.await.unwrap();
+        panic!("saturated remote stream ignored panel EOF/error");
+    }
+    let Err(SessionError::Rpc(status)) = outcome.unwrap().unwrap() else {
+        panic!("panel termination must retire the remote stream")
+    };
+    assert_eq!(
+        status.code(),
+        if panel_error {
+            tonic::Code::Aborted
+        } else {
+            tonic::Code::Unavailable
+        }
+    );
+    assert!(
+        !client_cancel.is_cancelled(),
+        "parent session must remain live"
+    );
+    if finish_local_transaction {
+        assert_eq!(
+            controller.inner.request_slots.available_permits(),
+            0,
+            "retiring a stream must retain its owned local transactions and slots"
+        );
+        services
+            .sync_release
+            .add_permits(MAX_CONCURRENT_REMOTE_REQUESTS);
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controller.inner.request_slots.available_permits() != MAX_CONCURRENT_REMOTE_REQUESTS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("panel termination did not cancel outstanding reads");
+    assert_eq!(
+        services.sync_calls.load(Ordering::SeqCst),
+        MAX_CONCURRENT_REMOTE_REQUESTS
+    );
+    for index in 0..excess_requests {
+        let rejection = tokio::time::timeout(Duration::from_secs(1), response_receiver.recv())
+            .await
+            .expect("excess request was silently discarded")
+            .unwrap();
+        assert_eq!(rejection.request_id, format!("excess-{index}"));
+        assert_eq!(rejection.status, RemoteControlResponseStatus::Failed as i32);
+        assert_eq!(rejection.stage, "busy");
+        assert!(rejection.payload.is_none());
+    }
+    server_cancel.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn saturated_tonic_stream_observes_panel_eof() {
+    saturated_stream_observes_panel_end(0, false, false).await;
+}
+
+#[tokio::test]
+async fn saturated_tonic_stream_rejects_queued_requests_then_observes_eof() {
+    saturated_stream_observes_panel_end(4, false, false).await;
+}
+
+#[tokio::test]
+async fn saturated_tonic_stream_observes_panel_error() {
+    saturated_stream_observes_panel_end(0, true, false).await;
+}
+
+#[tokio::test]
+async fn saturated_tonic_stream_keeps_local_transactions_owned_after_eof() {
+    saturated_stream_observes_panel_end(0, false, true).await;
+}
+
+#[test]
+fn overload_rejection_retires_a_stream_if_the_response_queue_is_full() {
+    let (sender, _receiver) = mpsc::channel(1);
+    sender.try_send(RemoteControlResponse::default()).unwrap();
+    let Err(SessionError::Rpc(status)) = reject_busy_request(&sender, "excess") else {
+        panic!("a full response queue must retire the overloaded stream")
+    };
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
 }
 
 #[test]

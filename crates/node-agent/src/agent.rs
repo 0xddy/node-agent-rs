@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use acp_proto::ControlAck;
+use acp_proto::{ControlAck, ControlCommand};
 
 use crate::cli::AGENT_VERSION;
 use crate::config::Config;
@@ -444,44 +445,58 @@ async fn cancel_and_finish_at_deadline<T>(
     }
 }
 
-/// Consumes commands and worker acknowledgements without coupling execution to
-/// tonic's receive task. Acknowledgements are biased so ACCEPTED/terminal frames
-/// already queued by a worker are flushed before more commands are drained.
+/// Keeps ACK forwarding active while command submission waits for queue space.
+/// Both directions are borrowed futures so cancellation also interrupts their
+/// channel waits without abandoning an already-started worker transaction.
 async fn run_control_stream(
     cancel: CancellationToken,
-    mut control: OpenedControlStream,
+    control: OpenedControlStream,
+    worker: ControlCommandWorker,
+    acknowledgements: mpsc::Receiver<ControlAck>,
+) -> Result<(), SessionError> {
+    let (ack_sender, commands, _) = control.into_parts();
+    run_control_stream_parts(cancel, commands, ack_sender, worker, acknowledgements).await
+}
+
+async fn run_control_stream_parts(
+    cancel: CancellationToken,
+    mut commands: impl Stream<Item = Result<ControlCommand, tonic::Status>> + Unpin,
+    ack_sender: mpsc::Sender<ControlAck>,
     worker: ControlCommandWorker,
     mut acknowledgements: mpsc::Receiver<ControlAck>,
 ) -> Result<(), SessionError> {
-    loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                worker.cancel();
-                return Ok(());
-            }
-            acknowledgement = acknowledgements.recv() => {
-                let Some(acknowledgement) = acknowledgement else {
-                    worker.cancel();
-                    return Err(SessionError::CriticalStreamEnded(
-                        "control acknowledgement worker closed".into(),
-                    ));
-                };
-                control.send_ack(acknowledgement).await?;
-            }
-            command = control.message() => {
-                let Some(command) = command? else {
-                    worker.cancel();
-                    return Err(SessionError::CriticalStreamEnded(
-                        "control stream closed by panel".into(),
-                    ));
-                };
-                worker.submit(command).await.map_err(|error| {
+    let forward_acks = async {
+        while let Some(acknowledgement) = acknowledgements.recv().await {
+            ack_sender
+                .send(acknowledgement)
+                .await
+                .map_err(|_| SessionError::ControlStreamClosed)?;
+        }
+        Err(SessionError::CriticalStreamEnded(
+            "control acknowledgement worker closed".into(),
+        ))
+    };
+    let submit_commands = async {
+        while let Some(command) = commands.next().await {
+            worker
+                .submit(command.map_err(SessionError::Rpc)?)
+                .await
+                .map_err(|error| {
                     session_task_error("control command submission", error.to_string())
                 })?;
-            }
         }
-    }
+        Err(SessionError::CriticalStreamEnded(
+            "control stream closed by panel".into(),
+        ))
+    };
+    let result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Ok(()),
+        result = forward_acks => result,
+        result = submit_commands => result,
+    };
+    worker.cancel();
+    result
 }
 
 fn topology_resync_required(local_digest: Option<&str>, panel_digest: &str) -> bool {
@@ -524,6 +539,9 @@ async fn wait_for_task<T>(task: &mut JoinHandle<T>, name: &str) {
         let _ = task.await;
     }
 }
+
+#[cfg(test)]
+mod control_tests;
 
 #[cfg(test)]
 mod tests {
