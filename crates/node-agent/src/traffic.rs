@@ -1,9 +1,9 @@
 //! Per-user traffic aggregation and report thresholds.
 //!
 //! Runtime counters are deltas, not cumulative snapshots.  This layer merges
-//! those deltas by the ACP identity tuple, keeps low-volume traffic until it is
-//! worth sending (or becomes old), and can add reports back after a full output
-//! queue.  `restore` is additive so observations made during a failed enqueue
+//! those deltas by the ACP identity tuple and UTC hour, keeps low-volume traffic
+//! until it is worth sending (or becomes old), and can add reports back after a
+//! full output queue. `restore` is additive so observations made during a failed enqueue
 //! are never overwritten.
 
 use std::collections::HashMap;
@@ -12,14 +12,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod stream;
 
+#[cfg(test)]
+mod hour_tests;
+
 pub use stream::{
     FINAL_TRAFFIC_FLUSH_LIMIT, TRAFFIC_FLUSH_INTERVAL, TRAFFIC_QUEUE_SIZE, TrafficQueue,
     collect_runtime_traffic, run_traffic_flusher, run_traffic_stream,
 };
 
 pub const DEFAULT_REPORT_DELTA_BYTES: u64 = 25 * 1024 * 1024;
+/// Maximum age before small traffic is eligible; delivery may take longer.
 pub const DEFAULT_MAX_REPORT_DELAY: Duration = Duration::from_secs(30 * 60);
 const OBSERVATION_BUCKET_SECONDS: i64 = 60;
+const AGGREGATION_BUCKET_SECONDS: i64 = 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficEvent {
@@ -42,6 +47,8 @@ pub struct Report {
     pub uplink_bytes: u64,
     pub downlink_bytes: u64,
     pub observed_at: SystemTime,
+    /// Local retry age and priority, independent of the wire timestamp's minute rounding.
+    first_observed_at: SystemTime,
 }
 
 impl Report {
@@ -57,6 +64,7 @@ struct CounterKey {
     node_id: String,
     user_id: String,
     protocol: String,
+    observation_hour: i64,
 }
 
 struct CounterValue {
@@ -116,12 +124,14 @@ impl Aggregator {
             node_id: event.node_id,
             user_id: event.user_id,
             protocol: event.protocol,
+            observation_hour: unix_seconds(observed_at).div_euclid(AGGREGATION_BUCKET_SECONDS),
         };
         add_locked(
             &mut self.state().counters,
             key,
             event.uplink_bytes,
             event.downlink_bytes,
+            observed_at,
             observed_at,
         );
     }
@@ -148,9 +158,12 @@ impl Aggregator {
                     node_id: report.node_id,
                     user_id: report.user_id,
                     protocol: report.protocol,
+                    observation_hour: unix_seconds(report.observed_at)
+                        .div_euclid(AGGREGATION_BUCKET_SECONDS),
                 },
                 report.uplink_bytes,
                 report.downlink_bytes,
+                report.first_observed_at,
                 report.observed_at,
             );
         }
@@ -177,13 +190,17 @@ impl Aggregator {
                     uplink_bytes: value.uplink,
                     downlink_bytes: value.downlink,
                     observed_at: observation_bucket_start(value.last_observed_at),
+                    first_observed_at: value.first_observed_at,
                 });
             }
         }
 
         reports.sort_unstable_by(|left, right| {
-            left.observed_at
-                .cmp(&right.observed_at)
+            // Keep the oldest unreported traffic first even when that user
+            // continues sending while an earlier enqueue is being restored.
+            left.first_observed_at
+                .cmp(&right.first_observed_at)
+                .then_with(|| left.observed_at.cmp(&right.observed_at))
                 .then_with(|| left.machine_id.cmp(&right.machine_id))
                 .then_with(|| left.node_id.cmp(&right.node_id))
                 .then_with(|| left.user_id.cmp(&right.user_id))
@@ -215,19 +232,20 @@ fn add_locked(
     key: CounterKey,
     uplink: u64,
     downlink: u64,
+    first_observed_at: SystemTime,
     observed_at: SystemTime,
 ) {
     let value = counters.entry(key).or_insert(CounterValue {
         uplink: 0,
         downlink: 0,
-        first_observed_at: observed_at,
+        first_observed_at,
         last_observed_at: observed_at,
     });
     // Go uint64 addition wraps. The real engine counter cannot approach this in
     // one process lifetime, but spelling it out keeps debug and release identical.
     value.uplink = value.uplink.wrapping_add(uplink);
     value.downlink = value.downlink.wrapping_add(downlink);
-    value.first_observed_at = value.first_observed_at.min(observed_at);
+    value.first_observed_at = value.first_observed_at.min(first_observed_at);
     value.last_observed_at = value.last_observed_at.max(observed_at);
 }
 
@@ -364,6 +382,7 @@ mod tests {
             uplink_bytes: 10,
             downlink_bytes: 20,
             observed_at: observation_bucket_start(now),
+            first_observed_at: now,
         }]);
         aggregator.observe(event(now, 5, 0));
         let reports = aggregator.flush();

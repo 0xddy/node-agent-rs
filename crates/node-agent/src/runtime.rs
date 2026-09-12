@@ -257,8 +257,12 @@ impl From<&TrafficDrain> for TrafficDrainKey {
     }
 }
 
+// Reservations are per accounting identity, before the final receipt's time is
+// known. Within that identity, retain each observation hour separately.
+type TrafficDrainEntries = BTreeMap<TrafficDrainKey, BTreeMap<Option<i128>, TrafficDrain>>;
+
 struct PendingTraffic {
-    entries: BTreeMap<TrafficDrainKey, TrafficDrain>,
+    entries: TrafficDrainEntries,
     reserved: BTreeSet<TrafficDrainKey>,
     max_keys: usize,
 }
@@ -330,16 +334,27 @@ impl PendingTraffic {
     }
 
     fn drain(&mut self) -> Vec<TrafficDrain> {
-        std::mem::take(&mut self.entries).into_values().collect()
+        std::mem::take(&mut self.entries)
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+            .collect()
     }
 }
 
-fn merge_traffic_entry(entries: &mut BTreeMap<TrafficDrainKey, TrafficDrain>, drain: TrafficDrain) {
+fn merge_traffic_entry(entries: &mut TrafficDrainEntries, drain: TrafficDrain) {
     if drain.uplink_bytes == 0 && drain.downlink_bytes == 0 {
         return;
     }
     let key = TrafficDrainKey::from(&drain);
-    if let Some(existing) = entries.get_mut(&key) {
+    let hour = drain.observed_at.map(|observed_at| {
+        let unix_nanos = match observed_at.duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos() as i128,
+            Err(error) => -(error.duration().as_nanos() as i128),
+        };
+        unix_nanos.div_euclid(Duration::from_secs(60 * 60).as_nanos() as i128)
+    });
+    let hours = entries.entry(key).or_default();
+    if let Some(existing) = hours.get_mut(&hour) {
         existing.uplink_bytes = existing.uplink_bytes.saturating_add(drain.uplink_bytes);
         existing.downlink_bytes = existing.downlink_bytes.saturating_add(drain.downlink_bytes);
         existing.observed_at = match (existing.observed_at, drain.observed_at) {
@@ -347,7 +362,7 @@ fn merge_traffic_entry(entries: &mut BTreeMap<TrafficDrainKey, TrafficDrain>, dr
             (left, right) => left.or(right),
         };
     } else {
-        entries.insert(key, drain);
+        hours.insert(hour, drain);
     }
 }
 
@@ -1069,8 +1084,8 @@ impl ShoesRuntime {
             };
             // Reserve and take one receipt at a time. A topology with more than
             // MAX_PENDING_TRAFFIC_KEYS zero-traffic users therefore remains legal,
-            // while every non-zero receipt is still guaranteed bounded storage
-            // before its counter is zeroed.
+            // while every non-zero receipt belongs to a reserved accounting
+            // identity before its counter is zeroed.
             for user in users {
                 let reservation = self.reserve_traffic(old, &user.id).map_err(|error| {
                     StepFailure::unchanged(format!(
@@ -2265,7 +2280,10 @@ impl ShoesRuntime {
                 }
             }
         }
-        Ok(drained.into_values().collect())
+        Ok(drained
+            .into_values()
+            .flat_map(BTreeMap::into_values)
+            .collect())
     }
 }
 
@@ -3931,6 +3949,99 @@ mod tests {
             drained[0].observed_at,
             Some(UNIX_EPOCH + Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn pending_traffic_keeps_hours_separate_under_one_identity_reservation() {
+        let mut pending = PendingTraffic::new(1);
+        let record = |down: u64, at: u64| TrafficDrain {
+            inbound_tag: "edge".to_string(),
+            node_id: "node-a".to_string(),
+            protocol: "vless".to_string(),
+            user_id: "alice".to_string(),
+            uplink_bytes: 0,
+            downlink_bytes: down,
+            observed_at: Some(UNIX_EPOCH + Duration::from_secs(at)),
+        };
+        let download_bytes = 30_u64 * 1024 * 1024 * 1024;
+        let before_midnight = 23 * 60 * 60 + 30 * 60;
+        let after_midnight = 25 * 60 * 60;
+        let first = record(download_bytes, before_midnight);
+        let key = TrafficDrainKey::from(&first);
+        let owns_reservation = pending.reserve(&key).unwrap();
+        assert!(owns_reservation);
+        pending.merge_reserved(first, owns_reservation);
+
+        // The identity already owns capacity; another hour must not consume a
+        // second identity reservation or merge into the earlier receipt.
+        let owns_reservation = pending.reserve(&key).unwrap();
+        assert!(!owns_reservation);
+        pending.merge_reserved(record(1, after_midnight), owns_reservation);
+        pending.merge(record(2, before_midnight + 10)).unwrap();
+        let mut other_key = key;
+        other_key.user_id = "bob".to_string();
+        assert!(pending.reserve(&other_key).is_err());
+
+        let drained = pending.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0], record(download_bytes + 2, before_midnight + 10));
+        assert_eq!(drained[1], record(1, after_midnight));
+        assert!(pending.drain().is_empty());
+        assert!(pending.reserved.is_empty());
+        assert!(pending.reserve(&other_key).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn traffic_sweep_keeps_historical_tail_separate_from_live_counter() {
+        let address = free_addrs(1)[0];
+        let runtime = runtime().await;
+        runtime
+            .apply_config(config(
+                b"with-alice",
+                vec![compiled(
+                    "edge",
+                    "node-a",
+                    vless(address),
+                    Some(vec![user("alice", ALICE_UUID)]),
+                )],
+            ))
+            .await
+            .unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(12 * 60 * 60);
+        let old_download = TrafficDrain {
+            inbound_tag: "edge".to_string(),
+            node_id: "node-a".to_string(),
+            protocol: "vless".to_string(),
+            user_id: "alice".to_string(),
+            uplink_bytes: 0,
+            downlink_bytes: 30_u64 * 1024 * 1024 * 1024,
+            observed_at: Some(old_time),
+        };
+        runtime
+            .pending_traffic()
+            .merge(old_download.clone())
+            .unwrap();
+        let alice = runtime
+            .engine()
+            .get_inbound("edge")
+            .unwrap()
+            .users()
+            .unwrap()
+            .find_uuid(&uuid_bytes(ALICE_UUID))
+            .unwrap();
+        alice.add_rx(1);
+        let live_observed_at =
+            UNIX_EPOCH + Duration::from_millis(alice.last_traffic_observed_at_unix_millis());
+
+        let drained = runtime.drain_traffic().await.unwrap();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0], old_download);
+        assert_eq!(drained[1].user_id, "alice");
+        assert_eq!(drained[1].uplink_bytes, 1);
+        assert_eq!(drained[1].downlink_bytes, 0);
+        assert_eq!(drained[1].observed_at, Some(live_observed_at));
+        assert!(runtime.drain_traffic().await.unwrap().is_empty());
+        runtime.close().await.unwrap();
     }
 
     #[test]

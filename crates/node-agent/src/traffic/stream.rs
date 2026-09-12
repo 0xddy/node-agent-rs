@@ -95,23 +95,39 @@ impl TrafficQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Queues reports in order. If cancellation or closure stops the enqueue,
-    /// the unqueued suffix is added back to the aggregator.
+    /// Queues reports in order, waiting for capacity until cancelled or closed.
+    /// The unqueued suffix is added back to the aggregator.
     pub async fn enqueue(
         &self,
         cancel: &CancellationToken,
         aggregator: &Aggregator,
         reports: Vec<Report>,
     ) -> usize {
+        self.enqueue_inner(cancel, aggregator, reports, true).await
+    }
+
+    async fn enqueue_inner(
+        &self,
+        cancel: &CancellationToken,
+        aggregator: &Aggregator,
+        reports: Vec<Report>,
+        wait_for_capacity: bool,
+    ) -> usize {
         let mut queued = 0;
         let mut reports = reports.into_iter();
         while let Some(report) = reports.next() {
             // Retain ownership until capacity is reserved so cancellation can
             // restore this report along with the remaining batch.
-            let permit = tokio::select! {
-                biased;
-                () = cancel.cancelled() => None,
-                result = self.report_sender.reserve() => result.ok(),
+            let permit = if cancel.is_cancelled() {
+                None
+            } else if wait_for_capacity {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = self.report_sender.reserve() => result.ok(),
+                }
+            } else {
+                self.report_sender.try_reserve().ok()
             };
             let Some(permit) = permit else {
                 aggregator.restore(std::iter::once(report).chain(reports));
@@ -124,10 +140,14 @@ impl TrafficQueue {
     }
 
     pub async fn flush(&self, cancel: &CancellationToken, aggregator: &Aggregator) -> usize {
-        self.enqueue(cancel, aggregator, aggregator.flush()).await
+        // A full output queue must not block the next runtime counter drain.
+        // Preserve the unqueued reports for the next periodic attempt instead.
+        self.enqueue_inner(cancel, aggregator, aggregator.flush(), false)
+            .await
     }
 
     pub async fn flush_all(&self, cancel: &CancellationToken, aggregator: &Aggregator) -> usize {
+        // Shutdown has no later tick, so keep waiting within its existing limit.
         self.enqueue(cancel, aggregator, aggregator.flush_all())
             .await
     }
@@ -391,6 +411,7 @@ mod tests {
             uplink_bytes: value,
             downlink_bytes: value + 1,
             observed_at: UNIX_EPOCH + Duration::from_secs(1_234),
+            first_observed_at: UNIX_EPOCH + Duration::from_secs(1_234),
         }
     }
 
@@ -416,6 +437,170 @@ mod tests {
         assert_eq!(wire.protocol, "vless");
         assert_eq!((wire.uplink_bytes, wire.downlink_bytes), (10, 11));
         assert_eq!(wire.observed_at_unix, 1_234);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_periodic_queue_preserves_completed_download_hour() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(2);
+        let cancel = CancellationToken::new();
+        for user in ["buffered-1", "buffered-2"] {
+            queue
+                .report_sender
+                .try_send(report_to_proto(report(user, 1)))
+                .unwrap();
+        }
+
+        let night = UNIX_EPOCH + Duration::from_secs(90 * 60);
+        let afternoon = UNIX_EPOCH + Duration::from_secs(13 * 60 * 60);
+        let download = 30 * 1024 * 1024 * 1024;
+        let observe = |observed_at, uplink_bytes, downlink_bytes| {
+            aggregator.observe(TrafficEvent {
+                machine_id: "machine".into(),
+                node_id: "node".into(),
+                user_id: "user".into(),
+                protocol: "vless".into(),
+                uplink_bytes,
+                downlink_bytes,
+                observed_at: Some(observed_at),
+            });
+        };
+        observe(night, 0, download);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), queue.flush(&cancel, &aggregator))
+                .await
+                .expect("periodic flush blocked on the full queue"),
+            0
+        );
+
+        observe(afternoon, 1, 0);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), queue.flush(&cancel, &aggregator))
+                .await
+                .expect("the next periodic flush blocked on the full queue"),
+            0
+        );
+        let mut receiver = queue.consumer.reports.lock().await;
+        receiver.try_recv().unwrap();
+        receiver.try_recv().unwrap();
+        assert_eq!(queue.flush(&cancel, &aggregator).await, 2);
+
+        let night_report = receiver.try_recv().unwrap();
+        assert_eq!(night_report.observed_at_unix, 90 * 60);
+        assert_eq!(
+            (night_report.uplink_bytes, night_report.downlink_bytes),
+            (0, download)
+        );
+        let afternoon_report = receiver.try_recv().unwrap();
+        assert_eq!(afternoon_report.observed_at_unix, 13 * 60 * 60);
+        assert_eq!(
+            (
+                afternoon_report.uplink_bytes,
+                afternoon_report.downlink_bytes
+            ),
+            (1, 0)
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(aggregator.flush_all().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_flush_restores_only_the_unqueued_suffix() {
+        let aggregator = Aggregator::new(1);
+        let queue = TrafficQueue::with_capacity(2);
+        let cancel = CancellationToken::new();
+        queue
+            .report_sender
+            .try_send(report_to_proto(report("buffered", 1)))
+            .unwrap();
+        aggregator.restore([report("1", 1), report("2", 2), report("3", 3)]);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), queue.flush(&cancel, &aggregator))
+                .await
+                .expect("periodic flush waited instead of restoring its suffix"),
+            1
+        );
+        let mut receiver = queue.consumer.reports.lock().await;
+        assert_eq!(receiver.try_recv().unwrap().user_id, "buffered");
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(first.user_id, "1");
+        assert_eq!((first.uplink_bytes, first.downlink_bytes), (1, 2));
+
+        assert_eq!(queue.flush(&cancel, &aggregator).await, 2);
+        for (user, value) in [("2", 2), ("3", 3)] {
+            let queued = receiver.try_recv().unwrap();
+            assert_eq!(queued.user_id, user);
+            assert_eq!(
+                (queued.uplink_bytes, queued.downlink_bytes),
+                (value, value + 1)
+            );
+        }
+        assert!(receiver.try_recv().is_err());
+        assert!(aggregator.flush_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn periodic_flush_restores_reports_when_cancelled_or_closed() {
+        for cancelled in [true, false] {
+            let aggregator = Aggregator::new(1);
+            let queue = TrafficQueue::with_capacity(2);
+            let cancel = CancellationToken::new();
+            if cancelled {
+                cancel.cancel();
+            } else {
+                queue.consumer.reports.lock().await.close();
+            }
+            aggregator.restore([report("1", 1), report("2", 2)]);
+
+            assert_eq!(queue.flush(&cancel, &aggregator).await, 0);
+            assert_eq!(queue.queued_len(), 0);
+            let restored = aggregator.flush_all();
+            assert_eq!(restored.len(), 2);
+            for (restored, value) in restored.iter().zip([1, 2]) {
+                assert_eq!(
+                    (restored.uplink_bytes, restored.downlink_bytes),
+                    (value, value + 1)
+                );
+                assert_eq!(restored.observed_at_unix(), 1_200);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_flush_waits_for_capacity_and_emits_below_threshold_reports() {
+        let aggregator =
+            Aggregator::with_clock(u64::MAX, || UNIX_EPOCH + Duration::from_secs(1_234));
+        let queue = TrafficQueue::with_capacity(1);
+        let cancel = CancellationToken::new();
+        queue
+            .report_sender
+            .try_send(report_to_proto(report("buffered", 1)))
+            .unwrap();
+        aggregator.restore([report("1", 1), report("2", 2)]);
+        assert!(aggregator.flush().is_empty());
+        let flush = queue.flush_all(&cancel, &aggregator);
+        tokio::pin!(flush);
+
+        tokio::select! {
+            biased;
+            _ = &mut flush => panic!("final flush returned without waiting for capacity"),
+            _ = tokio::task::yield_now() => {}
+        }
+        let consume = async {
+            let mut receiver = queue.consumer.reports.lock().await;
+            for user in ["buffered", "1", "2"] {
+                assert_eq!(receiver.recv().await.unwrap().user_id, user);
+            }
+        };
+        let (queued, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(flush, consume)
+        })
+        .await
+        .expect("final flush did not finish after queue capacity became available");
+        assert_eq!(queued, 2);
+        assert_eq!(queue.queued_len(), 0);
+        assert!(aggregator.flush_all().is_empty());
     }
 
     #[tokio::test]
