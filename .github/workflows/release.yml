@@ -89,10 +89,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             executable: node-agent.exe
             extension: .exe
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            executable: node-agent
-            extension: ""
           - runner: macos-15
             target: aarch64-apple-darwin
             executable: node-agent
@@ -245,7 +241,6 @@ jobs:
             "node-agent-${VERSION}-x86_64-unknown-linux-gnu"
             "node-agent-${VERSION}-aarch64-unknown-linux-gnu"
             "node-agent-${VERSION}-x86_64-pc-windows-msvc.exe"
-            "node-agent-${VERSION}-x86_64-apple-darwin"
             "node-agent-${VERSION}-aarch64-apple-darwin"
           )
 
@@ -269,8 +264,8 @@ jobs:
           )
 
           asset_count="$(find release-assets -maxdepth 1 -type f | wc -l)"
-          if [[ "${asset_count}" -ne 6 ]]; then
-            echo "::error::Expected 5 binaries and SHA256SUMS, found ${asset_count} release assets."
+          if [[ "${asset_count}" -ne 5 ]]; then
+            echo "::error::Expected 4 binaries and SHA256SUMS, found ${asset_count} release assets."
             exit 1
           fi
 
@@ -304,7 +299,6 @@ jobs:
             "release-assets/node-agent-${VERSION}-x86_64-unknown-linux-gnu"
             "release-assets/node-agent-${VERSION}-aarch64-unknown-linux-gnu"
             "release-assets/node-agent-${VERSION}-x86_64-pc-windows-msvc.exe"
-            "release-assets/node-agent-${VERSION}-x86_64-apple-darwin"
             "release-assets/node-agent-${VERSION}-aarch64-apple-darwin"
             "release-assets/SHA256SUMS"
           )
@@ -337,7 +331,7 @@ jobs:
             echo
             echo "- Release: [${TAG}](${RELEASE_URL})"
             echo "- Commit: ${GITHUB_SHA}"
-            echo "- Assets: 5 raw platform binaries plus SHA256SUMS"
+            echo "- Assets: 4 raw platform binaries plus SHA256SUMS"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   cleanup:
