@@ -2021,6 +2021,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-prost",
  "url",
  "windows",
 ]

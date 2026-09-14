@@ -135,6 +135,19 @@ message TelemetrySnapshot {
   string sing_box_state = 8;
   repeated NetworkInterfaceTelemetry network_interfaces = 9;
   repeated DiskUsageTelemetry disk_usages = 13;
+  string agent_instance_id = 14;
+  uint64 sample_seq = 15;
+  uint64 sample_elapsed_ms = 16;
+  bool cpu_valid = 17;
+  bool memory_valid = 18;
+  bool connection_stats_valid = 19;
+  int64 disk_collected_at_unix_ms = 20;
+  bool disk_valid = 21;
+  // Distinguishes an empty interface inventory from a failed enumeration.
+  bool network_interfaces_valid = 22;
+  // Process elapsed time when the one-time stream response headers arrived.
+  // Fixed for this stream; samples older than this baseline are discarded.
+  uint64 stream_started_elapsed_ms = 23;
 }
 
 message NetworkInterfaceTelemetry {
@@ -146,6 +159,8 @@ message NetworkInterfaceTelemetry {
   uint64 rx_packets = 6;
   uint64 tx_packets = 7;
   bool is_up = 8;
+  uint32 interface_index = 9;
+  bool counters_valid = 10;
 }
 
 message DiskUsageTelemetry {

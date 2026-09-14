@@ -15,7 +15,7 @@ use acp_proto::log_service_server::{LogService, LogServiceServer};
 use acp_proto::remote_control_request;
 use acp_proto::remote_control_response;
 use acp_proto::remote_control_service_server::{RemoteControlService, RemoteControlServiceServer};
-use acp_proto::telemetry_service_server::{TelemetryService, TelemetryServiceServer};
+use acp_proto::telemetry_service_server::TelemetryService;
 use acp_proto::traffic_service_server::{TrafficService, TrafficServiceServer};
 use acp_proto::{
     ControlAck, ControlAckStatus, ControlCommand, ControlCommandType, DiagnosticsCommand,
@@ -38,6 +38,10 @@ use tokio_util::sync::CancellationToken;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+
+#[path = "support/telemetry.rs"]
+mod telemetry_transport;
+use telemetry_transport::TelemetryHeaderServer;
 
 const MACHINE_ID: &str = "machine-1";
 const NODE_ID: &str = "node-1";
@@ -223,6 +227,14 @@ impl TelemetryService for MockPanel {
         self.authenticated("telemetry", request.metadata())?;
         let mut snapshots = request.into_inner();
         if let Some(snapshot) = snapshots.message().await? {
+            if snapshot.agent_instance_id.is_empty()
+                || snapshot.sample_seq == 0
+                || snapshot.sample_elapsed_ms < snapshot.stream_started_elapsed_ms
+            {
+                return Err(Status::invalid_argument(
+                    "invalid telemetry sample identity or clock",
+                ));
+            }
             let _ = self.events.send(PanelEvent::Telemetry(snapshot));
         }
         while snapshots.message().await?.is_some() {}
@@ -349,6 +361,10 @@ impl NodeRuntime for FakeRuntime {
         ConnectionStats::default()
     }
 
+    fn connection_stats_snapshot(&self, node_id: &str) -> Option<ConnectionStats> {
+        Some(self.connection_stats(node_id))
+    }
+
     async fn close_user_connections(&self, _node_id: &str, _user_id: &str) -> u64 {
         0
     }
@@ -435,7 +451,7 @@ async fn full_agent_session_authenticates_converges_runs_all_streams_and_shuts_d
             .add_service(ConfigServiceServer::new(panel.clone()))
             .add_service(ControlServiceServer::new(panel.clone()))
             .add_service(TrafficServiceServer::new(panel.clone()))
-            .add_service(TelemetryServiceServer::new(panel.clone()))
+            .add_service(TelemetryHeaderServer::new(panel.clone()))
             .add_service(LogServiceServer::new(panel.clone()))
             .add_service(RemoteControlServiceServer::new(panel))
             .serve_with_incoming_shutdown(incoming, panel_token.cancelled_owned())

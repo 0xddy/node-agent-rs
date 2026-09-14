@@ -22,7 +22,7 @@ use acp_proto::config_service_server::{ConfigService, ConfigServiceServer};
 use acp_proto::control_service_server::{ControlService, ControlServiceServer};
 use acp_proto::log_service_server::{LogService, LogServiceServer};
 use acp_proto::remote_control_service_server::{RemoteControlService, RemoteControlServiceServer};
-use acp_proto::telemetry_service_server::{TelemetryService, TelemetryServiceServer};
+use acp_proto::telemetry_service_server::TelemetryService;
 use acp_proto::traffic_service_server::{TrafficService, TrafficServiceServer};
 use acp_proto::*;
 use node_agent::session::{
@@ -41,6 +41,10 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_util::sync::CancellationToken;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
+
+#[path = "../tests/support/telemetry.rs"]
+mod telemetry_transport;
+use telemetry_transport::TelemetryHeaderServer;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 const MACHINE: &str = "hy2-container-machine";
@@ -667,7 +671,7 @@ async fn main() -> Result<(), Error> {
         .add_service(ConfigServiceServer::new(panel.clone()))
         .add_service(ControlServiceServer::new(panel.clone()))
         .add_service(TrafficServiceServer::new(panel.clone()))
-        .add_service(TelemetryServiceServer::new(panel.clone()))
+        .add_service(TelemetryHeaderServer::new(panel.clone()))
         .add_service(LogServiceServer::new(panel.clone()))
         .add_service(RemoteControlServiceServer::new(panel.clone()))
         .serve_with_incoming_shutdown(

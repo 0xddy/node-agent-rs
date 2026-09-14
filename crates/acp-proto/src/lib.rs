@@ -29,7 +29,10 @@ pub mod hex;
 /// the same commit that re-copies the file -- that is the point. The test below
 /// fails loudly rather than letting the two drift into a wire incompatibility
 /// that only shows up against a live panel.
-pub const PROTO_SHA256: &str = "631d4ccf9a5a475d6d73c6ee483680a472f75b83a7c405acd2c22191d8d35ac3";
+pub const PROTO_SHA256: &str = "9f26d4b631df7329bef1ff721cbaf441beedf5aa6538a804fcd65af62714fa63";
+
+/// Marks the one-time telemetry clock handshake; individual samples have no ACK.
+pub const TELEMETRY_READY_METADATA_KEY: &str = "x-acp-telemetry-ready";
 
 /// Generated protobuf messages and gRPC clients for `package acp.v1`.
 // Prost and Tonic own this expansion. Lint the hand-written boundary around it,

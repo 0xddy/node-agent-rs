@@ -194,6 +194,11 @@ pub trait NodeRuntime: Send + Sync {
 
     async fn close(&self) -> Result<(), RuntimeError>;
     fn connection_stats(&self, node_id: &str) -> ConnectionStats;
+    /// A telemetry snapshot, or `None` when runtime statistics are unavailable.
+    /// Implementations opt in so a missing provider does not report a valid zero.
+    fn connection_stats_snapshot(&self, _node_id: &str) -> Option<ConnectionStats> {
+        None
+    }
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64;
 
     /// Takes both queued tail counters and every live user's current counters.
@@ -2208,6 +2213,34 @@ impl ShoesRuntime {
         }
     }
 
+    fn telemetry_connection_stats(&self, node_id: &str) -> Option<ConnectionStats> {
+        if node_id.is_empty() || self.inner.closing.is_cancelled() {
+            return None;
+        }
+        // A concurrent topology publication must not stall the telemetry sampler.
+        let state = self.inner.state.try_read().ok()?;
+        let current = state.current.as_ref()?;
+        let mut active_connections = 0u64;
+        let mut online = BTreeSet::new();
+        for (tag, inbound) in &current.inbounds {
+            if inbound.compiled.node_id != node_id {
+                continue;
+            }
+            // A disappearing registry means this is a partial snapshot. Retry
+            // at the next sample rather than publishing misleading zero counts.
+            for user in self.inner.engine.list_users(tag).ok()? {
+                active_connections = active_connections.saturating_add(user.conns);
+                if user.conns > 0 {
+                    online.insert(user.id);
+                }
+            }
+        }
+        Some(ConnectionStats {
+            active_connections,
+            online_users: online.len() as u64,
+        })
+    }
+
     async fn close_user_connections_owned(&self, target: &UserConnectionTarget) -> u64 {
         if target.node_id.is_empty() || target.user_id.is_empty() {
             return 0;
@@ -2359,6 +2392,10 @@ impl NodeRuntime for ShoesRuntime {
 
     fn connection_stats(&self, node_id: &str) -> ConnectionStats {
         self.connection_stats_owned(node_id)
+    }
+
+    fn connection_stats_snapshot(&self, node_id: &str) -> Option<ConnectionStats> {
+        self.telemetry_connection_stats(node_id)
     }
 
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64 {
@@ -4594,6 +4631,28 @@ mod tests {
         );
         drop(fresh);
         runtime.close().await.expect("close runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn telemetry_stats_distinguish_unavailable_from_empty_without_waiting_for_reload() {
+        let runtime = runtime().await;
+        assert!(runtime.connection_stats_snapshot("").is_none());
+        runtime
+            .apply_config(config(b"empty", Vec::new()))
+            .await
+            .expect("apply empty runtime");
+        let empty = runtime
+            .connection_stats_snapshot("node-a")
+            .expect("ready runtime");
+        assert_eq!(empty.active_connections, 0);
+        assert_eq!(empty.online_users, 0);
+        {
+            let _publishing = runtime.inner.state.write().unwrap();
+            assert!(runtime.connection_stats_snapshot("node-a").is_none());
+        }
+        assert!(runtime.connection_stats_snapshot("node-a").is_some());
+        runtime.close().await.expect("close runtime");
+        assert!(runtime.connection_stats_snapshot("node-a").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

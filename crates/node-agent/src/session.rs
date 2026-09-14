@@ -816,7 +816,7 @@ impl StreamGroup {
         let cancel = self.cancel.clone();
         let policy = self.policy;
         self.tasks.spawn(async move {
-            run_auxiliary_stream(cancel, runner, policy)
+            run_auxiliary_stream(cancel, &name, runner, policy)
                 .await
                 .map_err(|error| SessionError::stream(name, error))
         });
@@ -906,6 +906,7 @@ impl Drop for StreamGroup {
 
 async fn run_auxiliary_stream<F, Fut>(
     cancel: CancellationToken,
+    name: &str,
     runner: F,
     policy: RetryPolicy,
 ) -> Result<(), SessionError>
@@ -922,12 +923,14 @@ where
         }
         let error = result.expect_err("checked above");
         if error.is_unauthenticated() {
+            log::warn!("{name}已停止：{error}；将重新建立面板会话");
             return Err(error);
         }
         if started_at.elapsed() > policy.stable_after {
             backoff.reset();
         }
         let delay = backoff.next_delay();
+        log::warn!("{name}已断开：{error}；{delay:?} 后重连");
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
             () = cancel.cancelled() => return Ok(()),

@@ -34,7 +34,7 @@ use crate::session::{
     AuthenticatedSession, OpenedControlStream, PanelClient, SessionError, StreamGroup,
     run_panel_sessions,
 };
-use crate::telemetry::run_telemetry_stream;
+use crate::telemetry::TelemetryReporter;
 use crate::topology::manager::{TopologyError, TopologyManager};
 use crate::traffic::{
     Aggregator, FINAL_TRAFFIC_FLUSH_LIMIT, TrafficQueue, collect_runtime_traffic,
@@ -85,6 +85,7 @@ pub struct Agent {
     traffic_queue: TrafficQueue,
     acknowledgements: Arc<AckStore>,
     remote_controller: RemoteController,
+    telemetry: Arc<TelemetryReporter>,
 }
 
 impl Agent {
@@ -109,16 +110,23 @@ impl Agent {
             config.machine_id.clone(),
             runtime.clone(),
         ));
+        let policy = Arc::new(PolicyState::new());
+        let telemetry = Arc::new(TelemetryReporter::new(
+            config.machine_id.clone(),
+            config.node_id.clone(),
+            policy.clone(),
+        ));
         Arc::new(Self {
             traffic: Arc::new(Aggregator::new(config.traffic_report_min_delta_bytes)),
             config: Arc::new(config),
             panel,
             runtime,
             topologies,
-            policy: Arc::new(PolicyState::new()),
+            policy,
             traffic_queue: TrafficQueue::new(),
             acknowledgements: Arc::new(AckStore::new()),
             remote_controller: RemoteController::new(),
+            telemetry,
         })
     }
 
@@ -151,19 +159,33 @@ impl Agent {
         // session must remain alive while final traffic is delivered.
         let session_shutdown = CancellationToken::new();
         let flusher_shutdown = CancellationToken::new();
+        let sampling_shutdown = shutdown.child_token();
         // These guards also signal the children if the supervisor unwinds.
         // Normal shutdown below still controls their order explicitly.
         let _cancel_sessions = session_shutdown.clone().drop_guard();
         let _cancel_flusher = flusher_shutdown.clone().drop_guard();
+        let _cancel_sampling = sampling_shutdown.clone().drop_guard();
 
+        let mut sampling = self
+            .telemetry
+            .clone()
+            .start_sampling(sampling_shutdown.clone(), self.runtime.clone());
         let mut flusher = self.spawn_traffic_flusher(flusher_shutdown.clone());
         let mut sessions = self.spawn_panel_sessions(session_shutdown.clone());
         let mut sessions_running = true;
         let mut flusher_running = true;
+        let mut sampling_running = true;
 
         let trigger_error = tokio::select! {
             biased;
             () = shutdown.cancelled() => None,
+            joined = &mut sampling => {
+                sampling_running = false;
+                Some(match joined {
+                    Ok(()) => AgentError::Background("telemetry sampler stopped unexpectedly".into()),
+                    Err(error) => AgentError::Background(format!("telemetry sampler failed: {error}")),
+                })
+            }
             joined = &mut flusher => {
                 flusher_running = false;
                 Some(background_result("traffic flusher", joined))
@@ -176,6 +198,10 @@ impl Agent {
 
         log::info!("node-agent 收到停止请求，准备关闭");
 
+        sampling_shutdown.cancel();
+        if sampling_running {
+            wait_for_task(&mut sampling, "遥测采样任务").await;
+        }
         flusher_shutdown.cancel();
         if flusher_running {
             wait_for_task(&mut flusher, "流量汇总任务").await;
@@ -340,22 +366,13 @@ impl Agent {
             )
         });
 
-        let telemetry_channel = session.channel();
+        let telemetry = self.telemetry.clone();
+        let telemetry_panel = self.panel.clone();
         let telemetry_auth = session.authenticator().clone();
-        let machine_id = self.config.machine_id.clone();
-        let node_id = self.config.node_id.clone();
-        let policy = self.policy.clone();
-        let runtime = self.runtime.clone();
         group.start_auxiliary("telemetry stream", move |cancel| {
-            run_telemetry_stream(
-                cancel,
-                telemetry_channel.clone(),
-                telemetry_auth.clone(),
-                machine_id.clone(),
-                node_id.clone(),
-                policy.clone(),
-                runtime.clone(),
-            )
+            telemetry
+                .clone()
+                .run_stream(cancel, telemetry_panel.clone(), telemetry_auth.clone())
         });
 
         let log_channel = session.channel();
