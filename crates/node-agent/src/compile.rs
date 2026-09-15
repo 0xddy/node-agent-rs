@@ -2175,9 +2175,7 @@ fn inbound_protocol_sniff_enabled(node: &NodeInstance) -> Result<bool, CompileEr
                 })?;
             Ok(config.sniff)
         }
-        // The panel's Hysteria2 provider has no sniff switch. The Rust engine
-        // performs bounded, demand-driven sniffing whenever a protocol matcher is
-        // present, so there is no provider option to gate here.
+        // Match the Go provider's default sniff policy independently of analytics.
         HYSTERIA2_SALAMANDER_ID => Ok(true),
         _ => Ok(false),
     }
@@ -2392,7 +2390,8 @@ fn compile_hysteria2(
             "key": cfg.tls.private_key_pem,
             "alpn_protocols": "h3"
         },
-        "protocol": Value::Object(protocol)
+        "protocol": Value::Object(protocol),
+        "sniff": true
     });
     Ok(CompiledInbound {
         node_id: node.node_id.clone(),

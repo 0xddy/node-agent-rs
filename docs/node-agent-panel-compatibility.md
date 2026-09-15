@@ -1,6 +1,6 @@
 # Rust node-agent 面板兼容边界
 
-更新日期：2026-09-14
+更新日期：2026-09-15
 
 ## 结论
 
@@ -23,6 +23,10 @@
 采样独立于网络发送，只保留最新样本。重连丢弃握手前和超过 6 秒的旧样本；CPU、内存、连接数、网卡计数和磁盘均携带有效性标记。硬件信息每 5 分钟刷新，磁盘每分钟刷新并保留实际采集时间；慢系统调用不阻塞控制流和流量记账。
 
 使用新版面板时，需要同时更新 Rust agent；缺少实例 ID 和采样序号的旧版遥测会被面板拒绝。Docker 联调入口和实测结果见 [遥测 Docker 测试](telemetry-docker-results.md)。
+
+## 流量分类与用户画像
+
+兼容 Go agent 的 `TrafficAnalysisService.AnalysisStream`、节点分析配置与遥测分析状态。每次主会话重新建立都会读取 `GetMachineConfig`；分析配置不参与公共拓扑摘要或代理编译，单独改变开关无需重拉用户或重建入站。分析使用独立连接、有界分钟汇聚与发送限速，配置失败及主会话断开时暂停，不补报断连期间的数据。配置、限额和统计口径见[流量分析](traffic-analysis.md)。
 
 ## 引导 TOML
 
@@ -63,7 +67,7 @@ shoes 不认识 ACP protobuf、machine/node ID 或面板资源 ID。既有 shoes
 | 能力 | 状态 |
 |---|---|
 | ACP 认证、控制流、两阶段 ACK、拓扑 digest | 已实现 |
-| Config / Control / Traffic / Telemetry / Log / Remote gRPC service | 已实现 |
+| Config / Control / Traffic / TrafficAnalysis / Telemetry / Log / Remote gRPC service | 已实现 |
 | VLESS + REALITY + Vision 入站 | 已实现 |
 | Hysteria2 + Salamander + Brutal + masquerade 入站 | 已实现 |
 | 动态用户、限速、连接数、踢线、凭据轮换 | 已实现 |
@@ -84,7 +88,7 @@ shoes 不认识 ACP protobuf、machine/node ID 或面板资源 ID。既有 shoes
 - 顶层直接条件与 `rule_set` 的混写；destination-address 与 destination-port 分别按 sing-box 的类别状态合并，同类别可由直接字段或规则集命中，不同类别仍保持 AND
 - `route`、`reject`、`reject-drop`、`final`
 
-VLESS provider 的 `sniff` 开关会被显式传入 shoes：`true` 与 Go 一样对每条 TCP 流执行有界嗅探，因此即使原始目标是 IP，domain-only 规则也能使用 HTTP Host / TLS SNI；`false` 明确关闭嗅探。Hysteria2 没有面板 sniff 开关，保持 shoes 的 Auto 模式，只在存在 `protocol` 规则时自动启用。嗅探限制为 300 ms / 64 KiB，读取的首包字节会完整回放；带 SNI/Host/protocol metadata 的 TCP 判定单独绕过 destination-only cache，普通 TCP/UDP 仍可缓存，因此同一 IP:port 上不同 SNI 不会串用决定，也不会让大规则集的 UDP 路由退化成全量线性扫描。
+VLESS provider 的 `sniff` 开关会被显式传入 shoes：`true` 与 Go 一样对每条 TCP 流执行有界嗅探，因此即使原始目标是 IP，domain-only 规则也能使用 HTTP Host / TLS SNI；`false` 明确关闭嗅探。Hysteria2 默认开启 sniff，与 Go agent 对齐，分析开关不改变该设置。TCP 嗅探限制为 300 ms / 64 KiB，读取的首包字节会完整回放；带 SNI/Host/protocol metadata 的 TCP 判定单独绕过 destination-only cache，普通 TCP/UDP 仍可缓存，因此同一 IP:port 上不同 SNI 不会串用决定，也不会让大规则集的 UDP 路由退化成全量线性扫描。UDP 新增的被动协议识别仅服务于分析，按实际目标独立维护有界状态，不增加 QUIC 协议路由条件支持；细节见[流量分析](traffic-analysis.md)。
 
 SOCKS5、HTTP CONNECT、Snell 等等待隧道应答的客户端会先收到并 flush 成功应答，再读取应用首包，因而不再固定空等 300 ms。这个时序意味着：仅在确实需要继续读取首包时，客户端可能先看到隧道成功，随后因 sniff 后命中的 reject 或出站连接失败而被关闭；不需要继续读取时仍保留“出站成功后再应答”的原时序。普通 TCP、generic QUIC、Hysteria2、TUIC、TUN，以及 VLESS h2mux 的每个 TCP 子流使用相同的 metadata 与 replay 路径；h2mux 不能再绕过 `protocol` / SNI / Host 规则。只有不会在已接受物理连接内继续产生独立路由工作的 inbound 才使用 logical-flow RCU：新 flow 原子读取当前 selector/handler 与 resolver generation，已经运行的 flow 保持其原代直至结束。SOCKS/Mixed UDP、启用 UDP 的 Hysteria2、TUIC 以及可承载 mux 子流的协议会明确拒绝原地 reload；node-agent 随后走 hard replacement 并关闭旧 connection tree，因此旧 association 不能靠持续创建新 destination 绕过更新后的规则。
 

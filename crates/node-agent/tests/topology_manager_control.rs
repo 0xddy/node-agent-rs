@@ -1753,6 +1753,7 @@ impl acp_proto::config_service_server::ConfigService for ConfigPanel {
                 provider_id: "provider".into(),
                 provider_config_version: 1,
                 provider_config_json: b"{}".to_vec(),
+                traffic_analysis: None,
             }],
             ..Default::default()
         }))

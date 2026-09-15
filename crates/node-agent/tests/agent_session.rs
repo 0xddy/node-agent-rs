@@ -22,7 +22,7 @@ use acp_proto::{
     GetMachineConfigRequest, HelloRequest, ListUsersRequest, ListUsersResponse, MachineConfig,
     NodeLogBatch, NodeLogCommand, NodeLogCommandType, RemoteControlRequest, RemoteControlResponse,
     RemoteControlResponseStatus, RemoteControlStatusRequest, Session, StreamClosed,
-    TelemetrySnapshot, TopologySnapshot, TrafficReport,
+    TelemetrySnapshot, TrafficReport,
 };
 use async_trait::async_trait;
 use node_agent::agent::Agent;
@@ -130,11 +130,7 @@ impl ConfigService for MockPanel {
                 "unexpected topology fetch identity",
             ));
         }
-        Ok(Response::new(MachineConfig {
-            machine_id: MACHINE_ID.into(),
-            revision: 1,
-            ..Default::default()
-        }))
+        Ok(Response::new(machine_config()))
     }
 
     async fn list_users(
@@ -142,9 +138,8 @@ impl ConfigService for MockPanel {
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
         self.authenticated("list_users", request.metadata())?;
-        Err(Status::failed_precondition(
-            "zero-node topology must not request users",
-        ))
+        assert_eq!(request.get_ref().node_id, NODE_ID);
+        Ok(Response::new(ListUsersResponse::default()))
     }
 }
 
@@ -424,13 +419,35 @@ traffic_report_min_delta_bytes = 1
     .expect("valid test configuration")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn full_agent_session_authenticates_converges_runs_all_streams_and_shuts_down() {
-    let snapshot = TopologySnapshot {
+fn machine_config() -> MachineConfig {
+    use node_agent::topology::provider::{CURRENT_CONFIG_VERSION, VLESS_REALITY_VISION_ID};
+    MachineConfig {
         machine_id: MACHINE_ID.into(),
         revision: 1,
+        nodes: vec![acp_proto::NodeConfig {
+            node_id: NODE_ID.into(),
+            provider_id: VLESS_REALITY_VISION_ID.into(),
+            provider_config_version: CURRENT_CONFIG_VERSION,
+            provider_config_json: serde_json::to_vec(&serde_json::json!({
+                "type": "vless", "tag": NODE_ID, "listen": "127.0.0.1", "listen_port": 19443,
+                "flow": "xtls-rprx-vision", "tls": {
+                    "enabled": true, "server_name": "example.com", "reality": {
+                        "enabled": true, "handshake": { "server": "example.com", "server_port": 443 },
+                        "private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "short_id": ["0123456789abcdef"]
+                    }
+                }
+            })).unwrap(),
+            ..Default::default()
+        }],
         ..Default::default()
-    };
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_agent_session_authenticates_converges_runs_all_streams_and_shuts_down() {
+    let snapshot = node_agent::topology::from_machine_config(MACHINE_ID, Some(&machine_config()))
+        .snapshot
+        .expect("wire snapshot");
     let digest: Arc<str> = Arc::from(acp_proto::digest::sum(Some(&snapshot)));
     let (event_sender, mut events) = mpsc::unbounded_channel();
     let panel = MockPanel {
@@ -478,7 +495,7 @@ async fn full_agent_session_authenticates_converges_runs_all_streams_and_shuts_d
     let mut log_publish = tokio::time::interval(Duration::from_millis(25));
 
     while !(hello_seen
-        && methods.len() == 6
+        && methods.len() == 7
         && ready_seen
         && diagnostics_statuses.len() == 2
         && telemetry_seen
@@ -550,7 +567,15 @@ async fn full_agent_session_authenticates_converges_runs_all_streams_and_shuts_d
 
     assert_eq!(
         methods,
-        BTreeSet::from(["config", "control", "log", "remote", "telemetry", "traffic"])
+        BTreeSet::from([
+            "config",
+            "control",
+            "list_users",
+            "log",
+            "remote",
+            "telemetry",
+            "traffic"
+        ])
     );
     assert_eq!(nonces.len(), methods.len());
     assert_eq!(
@@ -563,7 +588,7 @@ async fn full_agent_session_authenticates_converges_runs_all_streams_and_shuts_d
 
     let applied = runtime.applied();
     assert_eq!(applied.len(), 1, "initial convergence applies exactly once");
-    assert!(applied[0].inbounds.is_empty());
+    assert_eq!(applied[0].inbounds.len(), 1);
     assert!(!applied[0].diagnostic_yaml.is_empty());
 
     agent_shutdown.cancel();

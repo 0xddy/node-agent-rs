@@ -6,6 +6,7 @@
 //! between panel state, nftables port hopping, and the live shoes engine.
 
 pub mod agent;
+pub mod analysis;
 pub mod backoff;
 pub mod cli;
 pub mod compile;

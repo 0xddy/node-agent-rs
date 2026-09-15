@@ -32,6 +32,7 @@ pub fn from_machine_config(
                 provider_config_version: node.provider_config_version,
                 provider_config_json: node.provider_config_json.clone(),
                 users: Vec::new(),
+                traffic_analysis: node.traffic_analysis,
             })
             .collect(),
         outbounds: config.outbounds.clone(),
@@ -273,6 +274,9 @@ impl From<&NodeInstance> for pb::NodeTopology {
             provider_config_version: node.provider_config_version,
             provider_config_json: node.provider_config.as_bytes().to_vec(),
             users: node.users.iter().map(pb::UserCredential::from).collect(),
+            // Analysis configuration is managed by the authenticated session,
+            // and must never enter runtime compilation or rollback state.
+            traffic_analysis: None,
         }
     }
 }

@@ -22,11 +22,14 @@ path = "src/main.rs"
 
 [dependencies]
 acp-proto.workspace = true
+arc-swap.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 if-addrs.workspace = true
 log.workspace = true
 mimalloc.workspace = true
+prost.workspace = true
+psl = "2"
 rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

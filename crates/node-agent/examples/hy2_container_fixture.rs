@@ -600,6 +600,7 @@ async fn main() -> Result<(), Error> {
             provider_id: HYSTERIA2_SALAMANDER_ID.into(),
             provider_config_version: CURRENT_CONFIG_VERSION,
             provider_config_json: serde_json::to_vec(&provider_json)?,
+            traffic_analysis: None,
         }],
         ..Default::default()
     };
@@ -622,6 +623,7 @@ async fn main() -> Result<(), Error> {
             provider_config_version: CURRENT_CONFIG_VERSION,
             provider_config_json: config.nodes[0].provider_config_json.clone(),
             users: users.clone(),
+            traffic_analysis: None,
         }],
         ..Default::default()
     };

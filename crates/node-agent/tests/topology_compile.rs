@@ -506,6 +506,7 @@ fn machine_config_fallback_id_does_not_change_snapshot_digest_input() {
             provider_id: VLESS_REALITY_VISION_ID.into(),
             provider_config_version: 1,
             provider_config_json: br#"{}"#.to_vec(),
+            traffic_analysis: None,
         }],
         ..acp_proto::MachineConfig::default()
     };
@@ -527,6 +528,7 @@ fn machine_config_fallback_id_does_not_change_snapshot_digest_input() {
             provider_config_version: 1,
             provider_config_json: br#"{}"#.to_vec(),
             users: vec![],
+            traffic_analysis: None,
         }],
         ..acp_proto::TopologySnapshot::default()
     };
@@ -538,6 +540,45 @@ fn machine_config_fallback_id_does_not_change_snapshot_digest_input() {
         digest(&topology),
         Some(acp_proto::digest::sum(Some(&panel_snapshot)))
     );
+}
+
+#[test]
+fn analysis_changes_stay_in_the_wire_snapshot_and_do_not_change_runtime_compilation() {
+    let mut config = acp_proto::MachineConfig {
+        machine_id: "machine-a".into(),
+        revision: 1,
+        nodes: vec![acp_proto::NodeConfig {
+            node_id: "node-a".into(),
+            provider_id: VLESS_REALITY_VISION_ID.into(),
+            provider_config_version: CURRENT_CONFIG_VERSION,
+            provider_config_json: serde_json::to_vec(&vless_config("vless-edge", 14430)).unwrap(),
+            traffic_analysis: Some(acp_proto::analysis::default_config(false)),
+        }],
+        ..Default::default()
+    };
+    let disabled = from_machine_config("machine-a", Some(&config));
+    config.nodes[0].traffic_analysis = Some(acp_proto::analysis::default_config(true));
+    let enabled = from_machine_config("machine-a", Some(&config));
+    assert!(
+        enabled.snapshot.as_ref().unwrap().nodes[0]
+            .traffic_analysis
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+    assert_eq!(enabled.nodes, disabled.nodes);
+    assert_eq!(digest(&enabled), digest(&disabled));
+    assert_eq!(
+        compile_with_warnings(&enabled)
+            .unwrap()
+            .runtime
+            .diagnostic_yaml,
+        compile_with_warnings(&disabled)
+            .unwrap()
+            .runtime
+            .diagnostic_yaml,
+    );
+    assert!(to_snapshot(&enabled).nodes[0].traffic_analysis.is_none());
 }
 
 #[tokio::test]
@@ -595,9 +636,9 @@ async fn both_protocols_compile_to_engine_accepted_native_shoes_json() {
         .iter()
         .find(|inbound| inbound.protocol == "hysteria2")
         .unwrap();
-    assert!(
-        hysteria2.spec.config.get("sniff").is_none(),
-        "Hysteria2 has no provider sniff switch and must retain Shoes auto mode"
+    assert_eq!(
+        hysteria2.spec.config["sniff"], true,
+        "Hysteria2 defaults to bounded sniff independently of the analysis switch"
     );
     let user = &vless.spec.users.as_ref().unwrap()[0];
     assert_eq!(user.upload_limit_bps, Some(1_000_000));

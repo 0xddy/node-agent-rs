@@ -16,6 +16,11 @@ service TrafficService {
   rpc TrafficStream(stream TrafficReport) returns (StreamClosed);
 }
 
+// Best-effort analytics: batches have no application acknowledgement or replay.
+service TrafficAnalysisService {
+  rpc AnalysisStream(stream TrafficAnalysisBatch) returns (StreamClosed);
+}
+
 service TelemetryService {
   rpc TelemetryStream(stream TelemetrySnapshot) returns (StreamClosed);
 }
@@ -148,6 +153,79 @@ message TelemetrySnapshot {
   // Process elapsed time when the one-time stream response headers arrived.
   // Fixed for this stream; samples older than this baseline are discarded.
   uint64 stream_started_elapsed_ms = 23;
+  TrafficAnalysisStatus traffic_analysis = 24;
+}
+
+message TrafficAnalysisConfig {
+  bool enabled = 1;
+  uint32 sample_interval_seconds = 2;
+  uint32 batch_max_entries = 3;
+  uint32 batch_max_bytes = 4;
+  uint64 queue_max_bytes = 5;
+  uint32 queue_max_age_seconds = 6;
+  uint64 send_bytes_per_second = 7;
+  uint64 send_burst_bytes = 8;
+  uint32 send_timeout_millis = 9;
+  uint32 minute_max_domain_keys = 10;
+  uint32 max_udp_targets = 11;
+  uint32 max_udp_targets_per_session = 12;
+  uint64 memory_max_bytes = 13;
+}
+
+message TrafficAnalysisBatch {
+  string agent_instance_id = 1;
+  uint64 epoch = 2;
+  uint64 sequence = 3;
+  int64 generated_at_unix = 4;
+  repeated TrafficAnalysisUserMinute user_minutes = 5;
+  repeated TrafficAnalysisDomainMinute domain_minutes = 6;
+}
+
+message TrafficAnalysisUserMinute {
+  string user_id = 1;
+  int64 minute_at_unix = 2;
+  string proxy_protocol = 3;
+  string network = 4;
+  uint64 uplink_bytes = 5;
+  uint64 downlink_bytes = 6;
+  uint64 identified_uplink_bytes = 7;
+  uint64 identified_downlink_bytes = 8;
+  uint64 started_sessions = 9;
+  string node_id = 10;
+}
+
+message TrafficAnalysisDomainMinute {
+  string user_id = 1;
+  int64 minute_at_unix = 2;
+  string proxy_protocol = 3;
+  string network = 4;
+  string domain = 5;
+  string root_domain = 6;
+  string app_protocol = 7;
+  string domain_source = 8;
+  uint64 uplink_bytes = 9;
+  uint64 downlink_bytes = 10;
+  uint64 target_sessions = 11;
+  string node_id = 12;
+}
+
+message TrafficAnalysisStatus {
+  bool enabled = 1;
+  uint64 epoch = 2;
+  uint64 tracked_connections = 3;
+  uint64 udp_targets = 4;
+  uint64 buffered_domain_keys = 5;
+  uint64 queue_bytes = 6;
+  uint64 queued_batches = 7;
+  uint64 sent_batches = 8;
+  uint64 dropped_batches = 9;
+  uint64 dropped_entries = 10;
+  uint64 limited_events = 11;
+  int64 last_send_at_unix = 12;
+  uint64 send_failures = 13;
+  int64 last_sample_at_unix = 14;
+  map<string, uint64> dropped_by_reason = 15;
+  uint64 memory_bytes = 16;
 }
 
 message NetworkInterfaceTelemetry {
@@ -328,6 +406,7 @@ message NodeConfig {
   string provider_id = 2;
   uint32 provider_config_version = 3;
   bytes provider_config_json = 4;
+  TrafficAnalysisConfig traffic_analysis = 5;
 }
 
 message TopologySnapshot {
@@ -594,6 +673,7 @@ message NodeTopology {
   uint32 provider_config_version = 3;
   bytes provider_config_json = 4;
   repeated UserCredential users = 5;
+  TrafficAnalysisConfig traffic_analysis = 6;
 }
 
 message UserMutation {

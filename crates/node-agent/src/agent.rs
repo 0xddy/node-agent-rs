@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use acp_proto::{ControlAck, ControlCommand};
 
+use crate::analysis::{Collector, SendLimiter, SessionAnalysisGuard, run_analysis_stream};
 use crate::cli::AGENT_VERSION;
 use crate::config::Config;
 use crate::control::{
@@ -86,6 +87,7 @@ pub struct Agent {
     acknowledgements: Arc<AckStore>,
     remote_controller: RemoteController,
     telemetry: Arc<TelemetryReporter>,
+    analysis: Arc<Collector>,
 }
 
 impl Agent {
@@ -116,6 +118,9 @@ impl Agent {
             config.node_id.clone(),
             policy.clone(),
         ));
+        let analysis = Collector::new(acp_proto::auth::new_nonce(16));
+        telemetry.set_analysis(analysis.clone());
+        runtime.set_analysis_collector(analysis.clone());
         Arc::new(Self {
             traffic: Arc::new(Aggregator::new(config.traffic_report_min_delta_bytes)),
             config: Arc::new(config),
@@ -127,6 +132,7 @@ impl Agent {
             acknowledgements: Arc::new(AckStore::new()),
             remote_controller: RemoteController::new(),
             telemetry,
+            analysis,
         })
     }
 
@@ -136,6 +142,10 @@ impl Agent {
 
     pub fn runtime(&self) -> &Arc<dyn NodeRuntime> {
         &self.runtime
+    }
+
+    pub fn analysis(&self) -> &Arc<Collector> {
+        &self.analysis
     }
 
     /// Runs until the supplied process token is cancelled or a process-scoped
@@ -271,6 +281,9 @@ impl Agent {
         self: Arc<Self>,
         attempt_cancel: CancellationToken,
     ) -> Result<(), SessionError> {
+        let epoch = self.analysis.begin_session();
+        let _analysis_guard = SessionAnalysisGuard::new(self.analysis.clone(), epoch);
+        let expected_publication = self.topologies.publication_token();
         let local_revision = self.topologies.current_revision().unwrap_or(0);
         let local_digest = self.topologies.current_digest();
         let channel = self.panel.dial().await?;
@@ -282,10 +295,29 @@ impl Agent {
 
         let control = session.open_control_stream().await?;
         let panel_digest = control.panel_digest().to_string();
-        let fetcher: Arc<dyn TopologyFetcher> = Arc::new(PanelTopologyFetcher::new(
+        let panel_fetcher = Arc::new(PanelTopologyFetcher::new(
             self.config.machine_id.clone(),
             session.clone(),
         ));
+        let machine_config = tokio::select! {
+            biased;
+            () = attempt_cancel.cancelled() => return Ok(()),
+            result = panel_fetcher.fetch_machine_config() => result.map_err(|error| {
+                session_task_error("session configuration", error.to_string())
+            })?,
+        };
+        let analysis_config = machine_config
+            .nodes
+            .iter()
+            .find(|node| node.node_id == self.config.node_id)
+            .ok_or_else(|| {
+                session_task_error(
+                    "session configuration",
+                    "current node missing from machine configuration",
+                )
+            })?
+            .traffic_analysis;
+        let fetcher: Arc<dyn TopologyFetcher> = panel_fetcher.clone();
         let executor = Arc::new(TopologyCommandExecutor::with_policy(
             self.topologies.clone(),
             fetcher.clone(),
@@ -293,9 +325,20 @@ impl Agent {
         ));
 
         if topology_resync_required(local_digest.as_deref(), &panel_digest) {
-            let message = executor.sync_initial().await.map_err(|message| {
-                session_task_error("initial topology synchronization", message)
-            })?;
+            let topology = tokio::select! {
+                biased;
+                () = attempt_cancel.cancelled() => return Ok(()),
+                result = panel_fetcher.fetch_configured_topology(&machine_config, None) => result.map_err(|error| {
+                    session_task_error("initial topology users", error.to_string())
+                })?,
+            };
+            let message = self
+                .topologies
+                .apply_authoritative_if_unchanged(topology, expected_publication)
+                .await
+                .map_err(|error| {
+                    session_task_error("initial topology synchronization", error.to_string())
+                })?;
             log::info!("{message}");
         } else {
             self.topologies.reconcile_current().await.map_err(|error| {
@@ -325,13 +368,18 @@ impl Agent {
         control
             .confirm_ready(&current_digest, current_revision)
             .await?;
+        if attempt_cancel.is_cancelled()
+            || !self.analysis.configure(epoch, analysis_config.as_ref())
+        {
+            return Ok(());
+        }
 
         log::info!(
             "node-agent 已连接面板：地址={}，机器={}",
             self.config.panel_grpc_endpoint,
             self.config.machine_id
         );
-        self.run_session_streams(attempt_cancel, session, control, fetcher, executor)
+        self.run_session_streams(attempt_cancel, session, control, fetcher, executor, epoch)
             .await
     }
 
@@ -342,6 +390,7 @@ impl Agent {
         control: OpenedControlStream,
         fetcher: Arc<dyn TopologyFetcher>,
         executor: Arc<TopologyCommandExecutor>,
+        epoch: u64,
     ) -> Result<(), SessionError> {
         let mut group = StreamGroup::new(&attempt_cancel);
         let group_cancel = group.cancellation_token();
@@ -350,9 +399,36 @@ impl Agent {
             self.acknowledgements.clone(),
             group_cancel.clone(),
         );
+        let analysis = self.analysis.clone();
         group.start_session_critical("control stream", move |cancel| async move {
+            let _guard = SessionAnalysisGuard::new(analysis, epoch);
             run_control_stream(cancel, control, worker, acknowledgements).await
         });
+
+        let analysis = self.analysis.clone();
+        group.start_session_critical("analysis sampler", move |cancel| async move {
+            let _guard = SessionAnalysisGuard::new(analysis.clone(), epoch);
+            analysis.run_sampling(&cancel).await;
+            Ok(())
+        });
+        if self.analysis.config().enabled {
+            let limiter = Arc::new(tokio::sync::Mutex::new(SendLimiter::new(
+                &self.analysis.config(),
+            )));
+            let analysis = self.analysis.clone();
+            let panel = self.panel.clone();
+            let auth = session.authenticator().clone();
+            group.start_auxiliary("analysis stream", move |cancel| {
+                run_analysis_stream(
+                    cancel,
+                    panel.clone(),
+                    auth.clone(),
+                    analysis.clone(),
+                    epoch,
+                    limiter.clone(),
+                )
+            });
+        }
 
         let traffic_channel = session.channel();
         let traffic_auth = session.authenticator().clone();

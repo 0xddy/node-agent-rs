@@ -6,7 +6,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use acp_proto::config_service_client::ConfigServiceClient;
-use acp_proto::{GetMachineConfigRequest, ListUsersRequest};
+use acp_proto::{GetMachineConfigRequest, ListUsersRequest, MachineConfig};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -171,24 +171,35 @@ impl PanelTopologyFetcher {
         )))
     }
 
-    async fn machine_topology(
-        &self,
-        reporter: Option<&ReloadReporter>,
-    ) -> Result<MachineTopology, FetchError> {
+    /// Read once on every authenticated session, even when the topology digest
+    /// matches. Runtime-independent analysis settings are excluded from that digest.
+    pub async fn fetch_machine_config(&self) -> Result<MachineConfig, FetchError> {
         let mut client = ConfigServiceClient::new(self.session.authenticated_channel());
         let request = GetMachineConfigRequest {
             machine_id: self.machine_id.clone(),
             session_id: self.session.descriptor().session_id.clone(),
         };
         // Explicit per-unary 10s fence, for the same reason as ListUsers above.
-        let config = bounded_unary("get machine topology", client.get_machine_config(request))
-            .await?
-            .into_inner();
+        let config = bounded_unary(
+            "get machine configuration",
+            client.get_machine_config(request),
+        )
+        .await?
+        .into_inner();
+        Ok(config)
+    }
+
+    /// Reuse the session's configuration; fetch users only for topology convergence.
+    pub async fn fetch_configured_topology(
+        &self,
+        config: &MachineConfig,
+        reporter: Option<&ReloadReporter>,
+    ) -> Result<MachineTopology, FetchError> {
         if let Some(reporter) = reporter {
             reporter.report(ReloadStage::PullUsers).await;
         }
 
-        let mut topology = from_machine_config(self.machine_id.clone(), Some(&config));
+        let mut topology = from_machine_config(self.machine_id.clone(), Some(config));
         let node_ids: Vec<String> = topology
             .nodes
             .iter()
@@ -200,6 +211,14 @@ impl PanelTopologyFetcher {
             replace_node_users(&mut topology, node_id, &users);
         }
         Ok(topology)
+    }
+
+    async fn machine_topology(
+        &self,
+        reporter: Option<&ReloadReporter>,
+    ) -> Result<MachineTopology, FetchError> {
+        let config = self.fetch_machine_config().await?;
+        self.fetch_configured_topology(&config, reporter).await
     }
 }
 

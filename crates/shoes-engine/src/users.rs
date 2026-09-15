@@ -409,6 +409,7 @@ impl Entry {
 
 /// A user table that can be mutated while the inbound it belongs to is serving.
 pub struct MemoryUserRegistry {
+    analysis: OnceLock<Arc<shoes::dynamic::analysis::AnalysisUserContext>>,
     kinds: CredentialKinds,
     /// Serialises `upsert` and `remove`, and nothing else.
     ///
@@ -483,6 +484,7 @@ impl std::fmt::Debug for MemoryUserRegistry {
 impl MemoryUserRegistry {
     pub fn new(kinds: CredentialKinds) -> Arc<Self> {
         Arc::new(Self {
+            analysis: OnceLock::new(),
             kinds,
             users: DashMap::new(),
             draining: Arc::new(DashMap::new()),
@@ -496,6 +498,17 @@ impl MemoryUserRegistry {
             vmess_candidates: ArcSwap::from_pointee(Vec::new()),
             writer: Mutex::new(()),
         })
+    }
+
+    pub(crate) fn set_analysis_context(
+        &self,
+        context: Arc<shoes::dynamic::analysis::AnalysisUserContext>,
+    ) {
+        let _writer = self.lock_writer();
+        let _ = self.analysis.set(context.clone());
+        for entry in &self.users {
+            entry.context.set_analysis_context(context.clone());
+        }
     }
 
     /// Build an unpublished registry, then publish its VMess snapshot once.
@@ -605,6 +618,9 @@ impl MemoryUserRegistry {
             Some(entry) => entry.context.clone(),
             None => UserContext::new(id.clone()),
         };
+        if let Some(analysis) = self.analysis.get() {
+            context.set_analysis_context(analysis.clone());
+        }
         context.set_enabled(enabled);
         // Applied on every upsert, so an update that omits the field clears a
         // previously set ceiling rather than silently keeping it. `UserSpec` is a

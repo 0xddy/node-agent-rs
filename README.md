@@ -12,6 +12,7 @@
 - **事务式配置应用**：将面板拓扑编译为内存中的运行配置，执行校验、应用和失败回滚；根据变更内容选择热更新或监听器重建。
 - **动态用户管理**：支持在线添加、更新、停用和删除用户，提供用户级并发连接限制、上传及下载速率限制。
 - **流量与运行观测**：按用户聚合流量增量；每 3 秒采集节点遥测，携带采样序号、单调时间和数据有效性，重连仅发送新鲜样本；支持本地日志轮转和面板日志流。
+- **流量分类与用户画像**：由面板下发分析开关，将 HTTP / TLS / QUIC 流量按用户和域名分钟汇总，通过独立 gRPC 连接有界上报；忽略其他及未识别协议，与全部业务的套餐扣量分离，兼容 Go agent 的采集协议和配置限额。详见[流量分析](docs/traffic-analysis.md)。
 - **路由与出站编排**：支持规则路由、DNS 策略、远程规则集、代理链和 URLTest 出站选择。
 - **Hysteria2 端口跳跃**：在 Linux 上通过原生 netlink/nftables 后端管理端口重定向。
 
@@ -63,7 +64,7 @@ shoes-plus        代理协议、传输、路由、DNS、出站拨号
 ```bash
 git clone https://github.com/0xddy/node-agent-rs.git
 git clone https://github.com/0xddy/shoes-plus.git
-git -C shoes-plus checkout f010c624b063e6c4fb1a9702cc6ac564895ebb8a
+git -C shoes-plus checkout 32e58642cab6c5b2e1c8fda24fdc3907ae6af112
 cd node-agent-rs
 cargo build --release --locked -p node-agent --bin node-agent
 ```

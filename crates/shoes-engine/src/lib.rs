@@ -114,6 +114,9 @@ use shoes::tcp::tcp_server::start_servers_with_users_and_replay_scope_resolved;
 
 pub use error::{EngineError, EngineResult};
 pub use inbound::InboundSlot;
+pub use shoes::dynamic::analysis::{
+    AnalysisFlow, AnalysisMetadata, AnalysisObserver, AnalysisTarget,
+};
 /// The vocabulary of [`Engine`]'s own method signatures, re-exported so that an
 /// embedder needs exactly one dependency to write against it.
 ///
@@ -318,6 +321,7 @@ impl<'a> CandidateResolvers<'a> {
 }
 
 struct EngineInner {
+    analysis: Arc<shoes::dynamic::analysis::AnalysisSlot>,
     /// Unique authority carried by replay leases. It is deliberately separate from
     /// the EngineInner Arc so retaining a lease cannot keep listeners alive.
     replay_identity: Arc<()>,
@@ -486,6 +490,7 @@ impl Engine {
 
         Ok(Self {
             inner: Arc::new(EngineInner {
+                analysis: Arc::new(shoes::dynamic::analysis::AnalysisSlot::default()),
                 replay_identity: Arc::new(()),
                 control: tokio::sync::Mutex::new(ControlState {
                     client_chain_groups: ClientChainGroupRegistry::default(),
@@ -498,6 +503,12 @@ impl Engine {
                 bound: DashMap::new(),
             }),
         })
+    }
+
+    /// Observe routed payloads across all current and future inbounds without
+    /// reloading listeners or modifying billing counters.
+    pub fn set_analysis_observer(&self, observer: Option<Arc<dyn AnalysisObserver>>) {
+        self.inner.analysis.set(observer);
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -749,6 +760,14 @@ impl Engine {
             Some(users) => Some(Self::build_user_registry(&server_configs, users)?),
             None => None,
         };
+        if let Some(registry) = &registry {
+            registry.set_analysis_context(Arc::new(
+                shoes::dynamic::analysis::AnalysisUserContext {
+                    slot: self.inner.analysis.clone(),
+                    inbound_tag: tag.clone(),
+                },
+            ));
+        }
 
         // Preserve the existing error priority without retaining the lock across
         // name resolution. The definitive check is repeated after resolution to

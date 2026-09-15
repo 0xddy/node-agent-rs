@@ -5,8 +5,8 @@ mod stream;
 
 pub use collector::{DiskUsage, HostCollector, HostSnapshot, NetworkInterface};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use acp_proto::{DiskUsageTelemetry, NetworkInterfaceTelemetry, TelemetrySnapshot};
@@ -31,6 +31,7 @@ pub struct TelemetryReporter {
     instance_id: String,
     sequence: AtomicU64,
     latest: watch::Sender<Option<Arc<TelemetrySnapshot>>>,
+    analysis: OnceLock<Arc<crate::analysis::Collector>>,
 }
 
 impl TelemetryReporter {
@@ -44,7 +45,12 @@ impl TelemetryReporter {
             instance_id: acp_proto::auth::new_nonce(16),
             sequence: AtomicU64::new(0),
             latest,
+            analysis: OnceLock::new(),
         }
+    }
+
+    pub fn set_analysis(&self, analysis: Arc<crate::analysis::Collector>) {
+        let _ = self.analysis.set(analysis);
     }
 
     pub fn start_sampling(
@@ -123,6 +129,12 @@ impl TelemetryReporter {
         snapshot.sample_seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         snapshot.sample_elapsed_ms = elapsed_ms;
         snapshot.connection_stats_valid = stats_valid;
+        // Minute aggregation may be busy normalizing many domains. Optional
+        // analysis diagnostics must never delay the host telemetry heartbeat.
+        snapshot.traffic_analysis = self
+            .analysis
+            .get()
+            .and_then(|collector| collector.try_status());
         // Publication never waits, including while disconnected or flow-controlled.
         self.latest.send_replace(Some(Arc::new(snapshot)));
     }

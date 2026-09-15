@@ -9,7 +9,7 @@
 //! port of `src/api/topologydigest/digest.go`:
 //!
 //! ```text
-//! clone -> revision = 0 -> stable-sort nodes by node_id
+//! clone -> revision = 0 -> exclude node traffic_analysis -> stable-sort nodes by node_id
 //!       -> stable-sort each node's users by user_id
 //!       -> deterministic proto marshal -> SHA-256 -> lowercase hex
 //! ```
@@ -49,6 +49,8 @@ pub fn sum(snapshot: Option<&TopologySnapshot>) -> String {
         .nodes
         .sort_by(|left, right| left.node_id.cmp(&right.node_id));
     for node in &mut normalized.nodes {
+        // Analysis is a separately refreshed side channel, not proxy topology.
+        node.traffic_analysis = None;
         node.users
             .sort_by(|left, right| left.user_id.cmp(&right.user_id));
     }
@@ -79,6 +81,7 @@ mod tests {
             provider_config_version: 1,
             provider_config_json: br#"{"listen_port":443}"#.to_vec(),
             users,
+            traffic_analysis: None,
         }
     }
 
@@ -133,6 +136,22 @@ mod tests {
         };
 
         assert_eq!(sum(Some(&at_seven)), sum(Some(&at_nine)));
+    }
+
+    #[test]
+    fn analysis_config_is_excluded_without_mutating_the_snapshot() {
+        let mut snapshot = populated();
+        let before = sum(Some(&snapshot));
+        snapshot.nodes[0].traffic_analysis = Some(crate::analysis::default_config(true));
+        snapshot.nodes[1].traffic_analysis = Some(crate::TrafficAnalysisConfig {
+            enabled: false,
+            batch_max_entries: 7,
+            ..Default::default()
+        });
+
+        assert_eq!(sum(Some(&snapshot)), before);
+        assert_eq!(sum(Some(&snapshot)), GO_DIGEST_POPULATED);
+        assert!(snapshot.nodes[0].traffic_analysis.as_ref().unwrap().enabled);
     }
 
     #[test]

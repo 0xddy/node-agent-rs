@@ -15,6 +15,7 @@
 //! The fourth, the control-stream handshake sequence, is session behaviour and
 //! lives in the agent crate.
 
+pub mod analysis;
 pub mod auth;
 pub mod digest;
 /// Lowercase hex, shared with the agent crate: it decodes the panel's
@@ -29,7 +30,7 @@ pub mod hex;
 /// the same commit that re-copies the file -- that is the point. The test below
 /// fails loudly rather than letting the two drift into a wire incompatibility
 /// that only shows up against a live panel.
-pub const PROTO_SHA256: &str = "9f26d4b631df7329bef1ff721cbaf441beedf5aa6538a804fcd65af62714fa63";
+pub const PROTO_SHA256: &str = "69d78cc437b4784102f9292375f608f135f2053f76c78576c0203d2b6c5c030c";
 
 /// Marks the one-time telemetry clock handshake; individual samples have no ACK.
 pub const TELEMETRY_READY_METADATA_KEY: &str = "x-acp-telemetry-ready";
@@ -42,6 +43,10 @@ pub mod v1 {
     tonic::include_proto!("acp.v1");
 }
 
+pub use analysis::{
+    default_config as default_traffic_analysis_config,
+    normalize_config as normalize_traffic_analysis_config,
+};
 pub use v1::*;
 
 #[cfg(test)]
@@ -64,13 +69,13 @@ mod tests {
     }
 
     #[test]
-    fn generated_surface_keeps_all_seven_clients_and_server_traits() {
+    fn generated_surface_keeps_all_eight_clients_and_server_traits() {
         use crate::v1::*;
 
         // Mentioning every server trait makes this fail at compile time if the
         // test-only mock surface is accidentally disabled again.
         #[allow(dead_code)]
-        fn server_traits_exist<A, C, T, M, L, R, G>()
+        fn server_traits_exist<A, C, T, M, L, R, G, N>()
         where
             A: auth_service_server::AuthService,
             C: control_service_server::ControlService,
@@ -79,6 +84,7 @@ mod tests {
             L: log_service_server::LogService,
             R: remote_control_service_server::RemoteControlService,
             G: config_service_server::ConfigService,
+            N: traffic_analysis_service_server::TrafficAnalysisService,
         {
         }
 
@@ -90,6 +96,11 @@ mod tests {
             >(),
             std::any::type_name::<
                 traffic_service_client::TrafficServiceClient<tonic::transport::Channel>,
+            >(),
+            std::any::type_name::<
+                traffic_analysis_service_client::TrafficAnalysisServiceClient<
+                    tonic::transport::Channel,
+                >,
             >(),
             std::any::type_name::<
                 telemetry_service_client::TelemetryServiceClient<tonic::transport::Channel>,
@@ -105,7 +116,7 @@ mod tests {
                 config_service_client::ConfigServiceClient<tonic::transport::Channel>,
             >(),
         ];
-        assert_eq!(clients.len(), 7);
+        assert_eq!(clients.len(), 8);
 
         let proto = include_str!("../proto/acp.proto");
         assert_eq!(
@@ -113,14 +124,14 @@ mod tests {
                 .lines()
                 .filter(|line| line.trim_start().starts_with("service "))
                 .count(),
-            7
+            8
         );
         assert_eq!(
             proto
                 .lines()
                 .filter(|line| line.trim_start().starts_with("rpc "))
                 .count(),
-            8,
+            9,
             "ConfigService is the one service with two methods"
         );
     }

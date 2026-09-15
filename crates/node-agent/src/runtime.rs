@@ -183,6 +183,8 @@ impl std::error::Error for RuntimeError {}
 /// running each mutation in an owned task behind one apply mutex.
 #[async_trait]
 pub trait NodeRuntime: Send + Sync {
+    /// Analysis is process state and must never participate in topology rollback.
+    fn set_analysis_collector(&self, _collector: Arc<crate::analysis::Collector>) {}
     async fn apply_config(&self, config: RuntimeConfig) -> Result<(), RuntimeError>;
     async fn reload_config(&self, config: RuntimeConfig) -> Result<ReloadStatus, RuntimeError>;
     fn current_config(&self) -> Vec<u8>;
@@ -226,6 +228,57 @@ struct RuntimeInner {
     /// Final counters from users whose registry entry no longer exists.  Keeping
     /// them here until `drain_traffic` takes them closes the remove-vs-flush hole.
     pending_traffic: Mutex<PendingTraffic>,
+}
+
+struct RuntimeAnalysisObserver {
+    runtime: Weak<RuntimeInner>,
+    collector: Arc<crate::analysis::Collector>,
+}
+
+impl shoes_engine::AnalysisObserver for RuntimeAnalysisObserver {
+    fn enabled(&self) -> bool {
+        self.collector.is_active()
+    }
+
+    fn generation(&self) -> u64 {
+        self.collector.active_epoch()
+    }
+
+    fn register(
+        &self,
+        metadata: shoes_engine::AnalysisMetadata,
+    ) -> Option<Arc<dyn shoes_engine::AnalysisFlow>> {
+        let runtime = self.runtime.upgrade()?;
+        let (node_id, proxy_protocol) = {
+            let state = runtime
+                .state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.closed {
+                return None;
+            }
+            let config = state.current.as_ref().or(state.recovery.as_ref())?;
+            let inbound = config.inbounds.get(&metadata.inbound_tag)?;
+            (
+                inbound.compiled.node_id.clone(),
+                inbound.compiled.protocol.clone(),
+            )
+        };
+        let flow = self.collector.register_at_epoch(
+            metadata.generation,
+            crate::analysis::Metadata {
+                node_id,
+                user_id: metadata.user_id,
+                proxy_protocol,
+                network: metadata.network.to_owned(),
+                domain: metadata.domain.unwrap_or_default(),
+                app_protocol: metadata.app_protocol.unwrap_or_default().to_owned(),
+                destination: metadata.destination.clone(),
+                sniff_destination: metadata.sniff_destination,
+            },
+        )?;
+        Some(flow)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2353,6 +2406,15 @@ async fn run_rule_set_watcher(
 
 #[async_trait]
 impl NodeRuntime for ShoesRuntime {
+    fn set_analysis_collector(&self, collector: Arc<crate::analysis::Collector>) {
+        self.inner
+            .engine
+            .set_analysis_observer(Some(Arc::new(RuntimeAnalysisObserver {
+                runtime: Arc::downgrade(&self.inner),
+                collector,
+            })));
+    }
+
     fn begin_close(&self) {
         self.inner.closing.cancel();
     }
