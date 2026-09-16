@@ -28,9 +28,11 @@ enabled = true
 
 这里的 Web 是基于当前嗅探能力的筛选口径：TLS / QUIC 也可能承载其他加密应用，DNS over HTTPS 等无法仅凭协议标签与普通 HTTPS 分开。它不等于解密后的请求级网站访问识别。
 
-域名使用已完成的 sniff 元数据或连接目标，不在计数回调中再次解析协议。域名规范化后通过 Public Suffix List 得到主域名。UDP 按实际目标归属，首个被识别目标的域名不能继承到整个 association；只有已确认 Web 协议但域名未知的流量才进入 `unknown`，未识别协议不纳入分析。会话数与域名目标会话数分别统计。
+节点保留已完成的 sniff 观测，不在计数回调中再次解析协议。`domain` 是原始可见 HTTP Host / TLS 或 QUIC SNI，`destination_domain` 单独保存原始请求目标域名；没有观测或请求目标为 IP 时，相应字段为空。大小写、尾点、Unicode 等原样上报，节点只检查 253 字节上限、UTF-8 与 NUL 边界；域名有效性、规范化、主域名提取和站点归属交给面板。协议保留旧 `root_domain`、`domain_source` 字段编号和名称，不再发送这两个字段。
 
-TLS / QUIC ClientHello 包含 ECH 扩展（包括 GREASE ECH）时，分析不使用外层 SNI，与 Go 节点保持一致；目的地本身是域名时仍可使用该域名，否则记为 `unknown`。此处理只影响分析，已有路由继续使用原来的嗅探结果。
+TLS / QUIC ClientHello 包含 `0xfe0d` 扩展时，保留可见外层 SNI 并设置 `ech_present`，包括 GREASE ECH；这个标记不代表 ECH 被接受或已识别加密后的站点。可见域名、请求目标域名和 ECH 标记是独立的分钟聚合维度，已有路由继续使用原来的嗅探结果。
+
+UDP 按实际目标归属，首个被识别目标的域名不能继承到整个 association。用户汇总中的 `identified_*_bytes` 表示可见或请求域名任一非空的字节数，不代表验证过的站点归属；细分预算耗尽也保留这一计数。已确认 Web 协议但没有域名的记录仍保留协议，细分超限时汇入空域名、空请求域名、`ech_present=false`、`app_protocol=unknown` 的降级记录。会话数与域名目标会话数分别统计。
 
 TCP 沿用 300 ms 总超时和首包缓存回放，Hysteria2 默认开启 sniff；VLESS 继续遵循面板 provider 的 sniff 设置，分析开关不改变代理路由。UDP 的协议识别是有界、被动的分析采集：每个目标只检查最初的有限数据，最多 8 包、64 KiB，QUIC CRYPTO 重组最多 16 KiB、64 个碎片。它不会等待额外 UDP 数据，不会因识别超时关闭 association，也不提供新增 QUIC 协议路由能力。识别预算用尽后业务流量继续正常转发，未确认 Web 协议的目标不再参与分析。
 
@@ -59,9 +61,9 @@ UDP 待识别资源同时计入子预算与总预算，包含尚未出现 Web �
 
 ## 配套内核版本
 
-本功能依赖 `shoes-plus` 的分析观察接口、嗅探边界和 UDP 目标归属改动。配套内核已提交并推送为 `32e58642cab6c5b2e1c8fda24fdc3907ae6af112`；`.github/workflows/ci.yml`、`.github/workflows/release.yml` 和 README 的源码构建示例均固定到该提交。
+本次同步对应 Go agent `d74fc89b40293b8f08cf066e822b5952a7f43c53`。配套 `shoes-plus` 使用已发布基线 `32e58642cab6c5b2e1c8fda24fdc3907ae6af112`，并应用本仓库的 `patches/shoes-plus-raw-observations.patch`；`.github/workflows/ci.yml`、`.github/workflows/release.yml` 和 README 的源码构建示例均执行相同的补丁步骤。
 
-本地构建时，将同级 `../shoes-plus` 工作区切换到上述提交。以后同时更新两个仓库时，应先推送内核，再同步工作流和 README 中的完整 SHA，确保 CI、发布包与本地验证使用一致的内核版本。
+本地构建时，在上述干净基线上应用补丁一次；已经包含这些改动的工作区无需重复应用。补丁随本仓库保存，使构建不依赖尚未发布的内核提交。以后内核发布包含此补丁的新提交时，可将固定 SHA 更新到该提交并删除补丁及应用步骤。
 
 ## 验证
 
@@ -81,6 +83,6 @@ cargo test --manifest-path ../shoes-plus/Cargo.toml --lib routing::protocol::tes
 
 `shoes-engine` 分析测试通过真实 TCP 和 Hysteria2 UDP 转发验证域名、上下行字节及多目标 association 归属。内核测试覆盖包装对象预算释放、预算拒绝后继续转发、QUIC 分片隔离与原包不变，以及 TCP 嗅探的总超时和缓存回放。
 
-`analysis_web_only` 使用真实 VLESS 转发验证 HTTP 进入分析，而 SSH、FTP、原始 TCP、DNS/UDP 不产生分析记录；同时核对所有协议的字节仍完整进入原有计费计数。TLS 回归测试验证 ECH 只清除分析域名，保留完整转发字节和计费。采集器测试还覆盖混合 UDP 目标、QUIC 首包待识别计数、未知协议和重连会话数。
+`analysis_web_only` 使用真实 VLESS 转发验证 HTTP 进入分析，而 SSH、FTP、原始 TCP、DNS/UDP 不产生分析记录；同时核对所有协议的字节仍完整进入原有计费计数。TLS 回归测试验证 ECH 保留可见 SNI、单独上报标记，并保持完整转发字节和计费。采集器测试还覆盖原始域名与请求域名的独立聚合、混合 UDP 目标、QUIC 首包待识别计数、未知协议和重连会话数。
 
 这些功能测试不替代部署规模下的持续压测；吞吐、CPU 和内存表现应分别在 sniff 关闭、sniff 开启、分析开启三组条件下测量。

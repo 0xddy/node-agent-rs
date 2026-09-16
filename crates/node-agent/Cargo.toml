@@ -29,7 +29,6 @@ if-addrs.workspace = true
 log.workspace = true
 mimalloc.workspace = true
 prost.workspace = true
-psl = "2"
 rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

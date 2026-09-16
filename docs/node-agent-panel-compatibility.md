@@ -1,6 +1,6 @@
 # Rust node-agent 面板兼容边界
 
-更新日期：2026-09-15
+更新日期：2026-09-16
 
 ## 结论
 
@@ -27,6 +27,8 @@
 ## 流量分类与用户画像
 
 兼容 Go agent 的 `TrafficAnalysisService.AnalysisStream`、节点分析配置与遥测分析状态。每次主会话重新建立都会读取 `GetMachineConfig`；分析配置不参与公共拓扑摘要或代理编译，单独改变开关无需重拉用户或重建入站。分析使用独立连接、有界分钟汇聚与发送限速，配置失败及主会话断开时暂停，不补报断连期间的数据。配置、限额和统计口径见[流量分析](traffic-analysis.md)。
+
+与 Go `d74fc89` 对齐，域名明细上报原始可见 `domain`、独立的 `destination_domain` 和 `ech_present`，不再发送 `root_domain`、`domain_source`。ECH（包括 GREASE）不会清除可见 SNI，站点归属与域名规范化由面板决定；`identified_*_bytes` 只表示有观测或请求域名的字节数。
 
 ## 引导 TOML
 

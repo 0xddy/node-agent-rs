@@ -1,1 +1,2 @@
 /crates/acp-proto/proto/acp.proto text eol=lf
+/patches/*.patch text eol=lf

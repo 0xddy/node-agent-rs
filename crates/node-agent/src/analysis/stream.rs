@@ -298,7 +298,7 @@ mod tests {
             .as_secs() as i64;
         collector.sample(now);
         for i in 0..domains {
-            let domain = format!("{i}.{}.example.com", "a".repeat(50));
+            let domain = format!("{i}.{}.Example.COM.", "a".repeat(50));
             let flow = collector
                 .register(super::super::Metadata {
                     node_id: "node".into(),
@@ -306,8 +306,12 @@ mod tests {
                     proxy_protocol: "vless".into(),
                     network: "tcp".into(),
                     domain,
+                    ech_present: true,
                     app_protocol: "tls".into(),
-                    destination: None,
+                    destination: Some(super::super::Target {
+                        host: "Requested.Example.".into(),
+                        port: 443,
+                    }),
                     sniff_destination: None,
                 })
                 .unwrap();
@@ -339,7 +343,18 @@ mod tests {
         assert_eq!(batch.epoch, epoch);
         assert_eq!(batch.user_minutes[0].uplink_bytes, 17);
         assert_eq!(batch.user_minutes[0].downlink_bytes, 39);
+        assert_eq!(batch.user_minutes[0].identified_uplink_bytes, 17);
+        assert_eq!(batch.user_minutes[0].identified_downlink_bytes, 39);
         assert_eq!(batch.domain_minutes[0].app_protocol, "tls");
+        assert_eq!(
+            batch.domain_minutes[0].domain,
+            format!("0.{}.Example.COM.", "a".repeat(50)),
+        );
+        assert_eq!(
+            batch.domain_minutes[0].destination_domain,
+            "Requested.Example.",
+        );
+        assert!(batch.domain_minutes[0].ech_present);
         assert!(
             !task.is_finished(),
             "no final response is required to continue sending"

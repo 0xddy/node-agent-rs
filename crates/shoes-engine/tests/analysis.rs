@@ -119,13 +119,16 @@ fn quic_initial(host: &'static str) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn routed_tcp_keeps_sniffed_domain_and_counts_payload_exactly() {
+async fn routed_tcp_keeps_raw_observations_across_override_and_counts_payload_exactly() {
     const USER: &str = "11111111-1111-4111-8111-111111111111";
-    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: www.youtube.com\r\n\r\n";
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: WWW.YouTube.COM.:8080\r\n\r\n";
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     let engine = engine().await;
     let address = free_addr();
-    let mut config = vless_inbound(address, true);
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let requested = "192.0.2.1:443".parse().unwrap();
+    let mut config = vless_inbound_with_rules(address, true, redirect_to(target_addr));
     config["sniff"] = serde_json::json!(true);
     engine.add_inbound(dynamic("vless", config)).await.unwrap();
     engine.add_user("vless", user("alice", USER)).unwrap();
@@ -134,8 +137,6 @@ async fn routed_tcp_keeps_sniffed_domain_and_counts_payload_exactly() {
     // Install after registry/listener creation: existing users must see it too.
     engine.set_analysis_observer(Some(observer.clone()));
     let leg = start_leg(&engine, "leg", vless_chain(address, USER)).await;
-    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target_addr = target.local_addr().unwrap();
     let upstream = tokio::spawn(async move {
         let (mut stream, _) = target.accept().await.unwrap();
         let mut bytes = vec![0; REQUEST.len()];
@@ -144,7 +145,7 @@ async fn routed_tcp_keeps_sniffed_domain_and_counts_payload_exactly() {
         stream.write_all(RESPONSE).await.unwrap();
         stream.shutdown().await.unwrap();
     });
-    let mut client = Socks::connect(leg, target_addr).await.unwrap();
+    let mut client = Socks::connect(leg, requested).await.unwrap();
     client.write_all(REQUEST).await.unwrap();
     let mut response = vec![0; RESPONSE.len()];
     client.read_exact(&mut response).await.unwrap();
@@ -167,8 +168,17 @@ async fn routed_tcp_keeps_sniffed_domain_and_counts_payload_exactly() {
     let (metadata, flow) = &flows[0];
     assert_eq!(metadata.inbound_tag, "vless");
     assert_eq!(metadata.user_id, "alice");
-    assert_eq!(metadata.domain.as_deref(), Some("www.youtube.com"));
+    assert_eq!(metadata.domain.as_deref(), Some("WWW.YouTube.COM."));
     assert_eq!(metadata.app_protocol, Some("http"));
+    assert!(!metadata.ech_present);
+    assert_eq!(
+        metadata.destination,
+        Some(AnalysisTarget {
+            host: "192.0.2.1".into(),
+            port: 443,
+        }),
+        "the requested destination must not be replaced by sniff or route override"
+    );
     assert_eq!(flow.upload.load(Ordering::Relaxed), REQUEST.len() as u64);
     assert_eq!(flow.download.load(Ordering::Relaxed), RESPONSE.len() as u64);
     let billed = engine.get_user("vless", "alice").unwrap();

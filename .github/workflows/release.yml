@@ -115,6 +115,14 @@ jobs:
           ref: 32e58642cab6c5b2e1c8fda24fdc3907ae6af112
           path: shoes-plus
 
+      - name: Apply shoes-plus observation update
+        shell: bash
+        run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-raw-observations.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-raw-observations.patch
+
+      - name: Apply HY2 upload half-close correction
+        shell: bash
+        run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:

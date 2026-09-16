@@ -46,8 +46,15 @@ impl shoes_engine::AnalysisFlow for Flow {
         self.cancel_token(token);
     }
 
-    fn finish_web(&self, token: u64, upload: u64, download: u64, target: Option<&Target>) {
-        self.finish_web_token(token, upload, download, target);
+    fn finish_web(
+        &self,
+        token: u64,
+        upload: u64,
+        download: u64,
+        target: Option<&Target>,
+        identified: bool,
+    ) {
+        self.finish_web_token(token, upload, download, target, identified);
     }
 
     fn close(&self) {
@@ -60,8 +67,9 @@ impl shoes_engine::AnalysisFlow for Flow {
         target: &Target,
         domain: Option<&str>,
         app_protocol: &str,
+        ech_present: bool,
     ) -> bool {
-        Flow::classify_target(self, token, target, domain, app_protocol)
+        Flow::classify_target(self, token, target, domain, app_protocol, ech_present)
     }
 
     fn discard_target(&self, token: u64, target: &Target) {

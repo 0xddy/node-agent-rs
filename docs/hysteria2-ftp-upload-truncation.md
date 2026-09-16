@@ -1,5 +1,9 @@
 # Hysteria2 uploads closed before the TCP response
 
+Follow-up (2026-09-16): cancellation after a successful TCP response exposed a
+separate truncation window. See the [FTPS/TS Docker investigation](hysteria2-ftps-ts-integrity.md)
+for the additional correction, before/after regression and real FTP/FTPS results.
+
 The reported setup is current node-agent-rs behind an OpenClash client, with FTP
 uploads leaving incomplete TS files. The exact observed file-size ceiling is
 unknown. The reproduction below establishes an upload-loss defect in the current

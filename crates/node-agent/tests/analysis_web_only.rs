@@ -22,10 +22,16 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 const UUID_BYTES: [u8; 16] = [
     0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
 ];
-const HTTP_REQUEST: &[u8] = b"GET /watch HTTP/1.1\r\nHost: www.youtube.com\r\n\r\n";
+const HTTP_REQUEST: &[u8] = b"GET /watch HTTP/1.1\r\nHost: WWW.YouTube.COM.:8080\r\n\r\n";
 const HTTP_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
 
 async fn fixture() -> (ShoesRuntime, Arc<Collector>, u64, SocketAddr) {
+    fixture_with_redirect(None).await
+}
+
+async fn fixture_with_redirect(
+    target: Option<SocketAddr>,
+) -> (ShoesRuntime, Arc<Collector>, u64, SocketAddr) {
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let inbound = reserved.local_addr().unwrap();
     let runtime = ShoesRuntime::bootstrap().await.unwrap();
@@ -34,6 +40,18 @@ async fn fixture() -> (ShoesRuntime, Arc<Collector>, u64, SocketAddr) {
     assert!(collector.configure(epoch, Some(&default_config(true))));
     runtime.set_analysis_collector(collector.clone());
     drop(reserved);
+    let mut inbound_config = json!({
+        "address": inbound.to_string(),
+        "sniff": true,
+        "protocol": { "type": "vless", "udp_enabled": true },
+    });
+    if let Some(target) = target {
+        inbound_config["rules"] = json!([{
+            "masks": "0.0.0.0/0",
+            "action": "allow",
+            "override_address": target.to_string(),
+        }]);
+    }
     runtime
         .apply_config(RuntimeConfig {
             inbounds: vec![CompiledInbound {
@@ -41,11 +59,7 @@ async fn fixture() -> (ShoesRuntime, Arc<Collector>, u64, SocketAddr) {
                 protocol: "vless".into(),
                 spec: InboundSpec {
                     tag: TAG.into(),
-                    config: json!({
-                        "address": inbound.to_string(),
-                        "sniff": true,
-                        "protocol": { "type": "vless", "udp_enabled": true },
-                    }),
+                    config: inbound_config,
                     users: Some(vec![
                         serde_json::from_value(json!({ "id": USER, "uuid": UUID })).unwrap(),
                     ]),
@@ -72,9 +86,19 @@ fn vless_request(target: SocketAddr, udp: bool) -> Vec<u8> {
 }
 
 async fn tcp_roundtrip(inbound: SocketAddr, request: &[u8], response: &[u8]) -> (u64, u64) {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let header = vless_request(target.local_addr().unwrap(), false);
+    tcp_roundtrip_to(inbound, target, header, request, response).await
+}
+
+async fn tcp_roundtrip_to(
+    inbound: SocketAddr,
+    target: TcpListener,
+    header: Vec<u8>,
+    request: &[u8],
+    response: &[u8],
+) -> (u64, u64) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let header = vless_request(target.local_addr().unwrap(), false);
         let header_len = header.len();
         let upstream_request = request.to_vec();
         let upstream_response = response.to_vec();
@@ -239,8 +263,10 @@ async fn real_web_payload_enters_analytics_and_all_protocols_remain_billable() {
     let domain = &batch.message.domain_minutes[0];
     assert_eq!(
         (&*domain.domain, &*domain.app_protocol),
-        ("www.youtube.com", "http")
+        ("WWW.YouTube.COM.", "http")
     );
+    assert!(domain.destination_domain.is_empty());
+    assert!(!domain.ech_present);
     assert_eq!(
         (domain.uplink_bytes, domain.downlink_bytes),
         (HTTP_REQUEST.len() as u64, HTTP_RESPONSE.len() as u64)
@@ -265,18 +291,57 @@ async fn only_non_web_traffic_produces_no_analytics_batch() {
     runtime.close().await.unwrap();
 }
 
-fn tls_client_hello(ech: bool) -> Vec<u8> {
-    let name = b"public.example.com";
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requested_domain_survives_sniffing_and_route_override() {
+    const REQUESTED_DOMAIN: &str = "Original.Example.";
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (runtime, collector, epoch, inbound) =
+        fixture_with_redirect(Some(target.local_addr().unwrap())).await;
+    let mut header = vec![0];
+    header.extend_from_slice(&UUID_BYTES);
+    header.extend_from_slice(&[0, 1]); // No addons, TCP command.
+    header.extend_from_slice(&443u16.to_be_bytes());
+    header.extend_from_slice(&[2, REQUESTED_DOMAIN.len() as u8]);
+    header.extend_from_slice(REQUESTED_DOMAIN.as_bytes());
+    let expected = tcp_roundtrip_to(inbound, target, header, HTTP_REQUEST, HTTP_RESPONSE).await;
+    assert_eq!(settled_billing(&runtime).await, expected);
+    seal_observed_minute(&collector);
+    let cancel = CancellationToken::new();
+    let batch = tokio::time::timeout(Duration::from_secs(2), collector.next(&cancel, epoch))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.message.user_minutes.len(), 1);
+    let user = &batch.message.user_minutes[0];
+    assert_eq!(user.identified_uplink_bytes, HTTP_REQUEST.len() as u64);
+    assert_eq!(user.identified_downlink_bytes, HTTP_RESPONSE.len() as u64);
+    assert_eq!(batch.message.domain_minutes.len(), 1);
+    let row = &batch.message.domain_minutes[0];
+    assert_eq!(row.domain, "WWW.YouTube.COM.");
+    assert_eq!(row.destination_domain, REQUESTED_DOMAIN);
+    assert_eq!(row.app_protocol, "http");
+    assert!(!row.ech_present);
+    assert_eq!(row.uplink_bytes, HTTP_REQUEST.len() as u64);
+    assert_eq!(row.downlink_bytes, HTTP_RESPONSE.len() as u64);
+    collector.complete(&batch, true);
+    runtime.close().await.unwrap();
+}
+
+fn tls_client_hello(ech_payload: Option<&[u8]>) -> Vec<u8> {
+    let name = b"Public.Example.COM.";
     let mut extensions = vec![0, 0];
     extensions.extend_from_slice(&((name.len() + 5) as u16).to_be_bytes());
     extensions.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
     extensions.push(0);
     extensions.extend_from_slice(&(name.len() as u16).to_be_bytes());
     extensions.extend_from_slice(name);
-    if ech {
-        // ECH is after SNI so an early-returning parser would misreport the
-        // public/cover name. GREASE presence uses the same conservative policy.
-        extensions.extend_from_slice(&[0xfe, 0x0d, 0, 4, 0, 1, 2, 3]);
+    if let Some(payload) = ech_payload {
+        // Both real ECH and GREASE use encrypted_client_hello. The observer
+        // reports extension presence without claiming access to the inner SNI.
+        // Keep it after SNI to catch a parser that returns before scanning it.
+        extensions.extend_from_slice(&[0xfe, 0x0d]);
+        extensions.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(payload);
     }
     let mut hello = vec![3, 3];
     hello.extend_from_slice(&[0; 32]);
@@ -291,16 +356,21 @@ fn tls_client_hello(ech: bool) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ech_outer_sni_is_unknown_while_tls_forwarding_and_billing_stay_intact() {
+async fn ech_and_grease_keep_outer_sni_while_tls_forwarding_and_billing_stay_intact() {
     let (runtime, collector, epoch, inbound) = fixture().await;
-    let normal = tls_client_hello(false);
-    let ech = tls_client_hello(true);
+    let normal = tls_client_hello(None);
+    let ech = tls_client_hello(Some(&[0, 0, 1, 0, 1, 7, 0, 2, 0xaa, 0xbb, 0, 2, 1, 2]));
+    let grease = tls_client_hello(Some(&[0, 0, 1, 0, 1, 99, 0, 2, 0xcc, 0xdd, 0, 3, 3, 4, 5]));
     let response = b"\x15\x03\x03\x00\x02\x02\x28";
     let normal_bill = tcp_roundtrip(inbound, &normal, response).await;
     let ech_bill = tcp_roundtrip(inbound, &ech, response).await;
+    let grease_bill = tcp_roundtrip(inbound, &grease, response).await;
     assert_eq!(
         settled_billing(&runtime).await,
-        (normal_bill.0 + ech_bill.0, normal_bill.1 + ech_bill.1),
+        (
+            normal_bill.0 + ech_bill.0 + grease_bill.0,
+            normal_bill.1 + ech_bill.1 + grease_bill.1,
+        ),
     );
     seal_observed_minute(&collector);
     let cancel = CancellationToken::new();
@@ -310,26 +380,31 @@ async fn ech_outer_sni_is_unknown_while_tls_forwarding_and_billing_stay_intact()
         .unwrap();
     assert_eq!(batch.message.user_minutes.len(), 1);
     let user = &batch.message.user_minutes[0];
-    assert_eq!(user.started_sessions, 2);
-    assert_eq!(user.uplink_bytes, (normal.len() + ech.len()) as u64);
-    assert_eq!(user.downlink_bytes, (2 * response.len()) as u64);
-    assert_eq!(user.identified_uplink_bytes, normal.len() as u64);
-    assert_eq!(user.identified_downlink_bytes, response.len() as u64);
+    assert_eq!(user.started_sessions, 3);
+    assert_eq!(
+        user.uplink_bytes,
+        (normal.len() + ech.len() + grease.len()) as u64
+    );
+    assert_eq!(user.downlink_bytes, (3 * response.len()) as u64);
+    assert_eq!(user.identified_uplink_bytes, user.uplink_bytes);
+    assert_eq!(user.identified_downlink_bytes, user.downlink_bytes);
     assert_eq!(batch.message.domain_minutes.len(), 2);
-    for (domain, source, expected_up) in [
-        ("public.example.com", "sniff", normal.len()),
-        ("unknown", "unknown", ech.len()),
+    for (ech_present, expected_up, sessions) in [
+        (false, normal.len(), 1),
+        (true, ech.len() + grease.len(), 2),
     ] {
         let row = batch
             .message
             .domain_minutes
             .iter()
-            .find(|row| row.domain == domain)
+            .find(|row| row.ech_present == ech_present)
             .unwrap();
+        assert_eq!(row.domain, "Public.Example.COM.");
+        assert!(row.destination_domain.is_empty());
         assert_eq!(row.app_protocol, "tls");
-        assert_eq!(row.domain_source, source);
+        assert_eq!(row.target_sessions, sessions);
         assert_eq!(row.uplink_bytes, expected_up as u64);
-        assert_eq!(row.downlink_bytes, response.len() as u64);
+        assert_eq!(row.downlink_bytes, sessions * response.len() as u64);
     }
     collector.complete(&batch, true);
     runtime.close().await.unwrap();

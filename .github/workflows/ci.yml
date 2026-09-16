@@ -35,6 +35,12 @@ jobs:
           ref: 32e58642cab6c5b2e1c8fda24fdc3907ae6af112
           path: shoes-plus
 
+      - name: Apply shoes-plus observation update
+        run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-raw-observations.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-raw-observations.patch
+
+      - name: Apply HY2 upload half-close correction
+        run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

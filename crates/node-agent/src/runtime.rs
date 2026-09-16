@@ -272,6 +272,7 @@ impl shoes_engine::AnalysisObserver for RuntimeAnalysisObserver {
                 proxy_protocol,
                 network: metadata.network.to_owned(),
                 domain: metadata.domain.unwrap_or_default(),
+                ech_present: metadata.ech_present,
                 app_protocol: metadata.app_protocol.unwrap_or_default().to_owned(),
                 destination: metadata.destination.clone(),
                 sniff_destination: metadata.sniff_destination,

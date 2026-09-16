@@ -30,7 +30,7 @@ pub mod hex;
 /// the same commit that re-copies the file -- that is the point. The test below
 /// fails loudly rather than letting the two drift into a wire incompatibility
 /// that only shows up against a live panel.
-pub const PROTO_SHA256: &str = "69d78cc437b4784102f9292375f608f135f2053f76c78576c0203d2b6c5c030c";
+pub const PROTO_SHA256: &str = "41a41cafb593652df3a77300b6e6958526ccc29a13297933aea55900c72a5fcf";
 
 /// Marks the one-time telemetry clock handshake; individual samples have no ACK.
 pub const TELEMETRY_READY_METADATA_KEY: &str = "x-acp-telemetry-ready";

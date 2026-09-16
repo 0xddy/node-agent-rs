@@ -46,7 +46,7 @@ shoes-plus        代理协议、传输、路由、DNS、出站拨号
 | `crates/shoes-engine` | 可嵌入的 Rust 引擎；动态用户管理、配置更新与流量统计 |
 | `../shoes-plus` | 同级仓库中的代理内核；rustls TLS、Quinn QUIC 及多协议数据面 |
 
-工作区采用 Rust 2024 Edition，通过 Cargo 路径依赖引用 `../shoes-plus`。依赖版本由工作区 `Cargo.lock` 固定，CI 与发布流程使用固定的兼容内核提交。
+工作区采用 Rust 2024 Edition，通过 Cargo 路径依赖引用 `../shoes-plus`。依赖版本由工作区 `Cargo.lock` 固定，CI 与发布流程使用固定的内核提交及本仓库中的配套补丁。
 
 ## 安装与运行
 
@@ -59,12 +59,13 @@ shoes-plus        代理协议、传输、路由、DNS、出站拨号
 
 ### 从源码构建
 
-将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交：
+将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交，再应用本仓库的原始域名观测补丁：
 
 ```bash
 git clone https://github.com/0xddy/node-agent-rs.git
 git clone https://github.com/0xddy/shoes-plus.git
 git -C shoes-plus checkout 32e58642cab6c5b2e1c8fda24fdc3907ae6af112
+git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-raw-observations.patch
 cd node-agent-rs
 cargo build --release --locked -p node-agent --bin node-agent
 ```

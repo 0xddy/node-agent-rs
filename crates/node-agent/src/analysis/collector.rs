@@ -58,7 +58,21 @@ fn unix_now() -> i64 {
 pub use shoes_engine::AnalysisTarget as Target;
 
 fn valid_target(target: &Target) -> bool {
-    !target.host.is_empty() && target.port != 0 && target.host.len() <= 253
+    !target.host.is_empty() && target.port != 0 && valid_observation_string(&target.host)
+}
+
+// Wire safety and resource bounds only; domain interpretation belongs to the panel.
+fn valid_observation_string(value: &str) -> bool {
+    value.len() <= 253 && !value.contains('\0')
+}
+
+fn has_destination_domain(target: &Target) -> bool {
+    let host = target
+        .host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(&target.host);
+    !target.host.is_empty() && host.parse::<IpAddr>().is_err()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,6 +84,7 @@ pub struct Metadata {
     /// The existing sniffer's hostname; never reparsed on the I/O path.
     pub domain: String,
     pub app_protocol: String,
+    pub ech_present: bool,
     pub destination: Option<Target>,
     pub sniff_destination: Option<Target>,
 }
@@ -97,6 +112,7 @@ impl Counters {
 struct Classification {
     domain: String,
     app: String,
+    ech_present: bool,
 }
 
 struct TargetState {
@@ -156,6 +172,7 @@ struct PacketState {
     targets: HashMap<Target, TargetState>,
     pending: HashMap<Target, PendingCounters>,
     unknown: Counters,
+    unknown_identified: Counters,
 }
 
 impl PacketState {
@@ -228,11 +245,18 @@ impl Flow {
     }
 
     pub fn finish_token(&self, epoch: u64, up: u64, down: u64, target: Option<&Target>) {
-        self.finish_observation(epoch, up, down, target, false);
+        self.finish_observation(epoch, up, down, target, None);
     }
 
-    pub fn finish_web_token(&self, epoch: u64, up: u64, down: u64, target: Option<&Target>) {
-        self.finish_observation(epoch, up, down, target, true);
+    pub fn finish_web_token(
+        &self,
+        epoch: u64,
+        up: u64,
+        down: u64,
+        target: Option<&Target>,
+        identified: bool,
+    ) {
+        self.finish_observation(epoch, up, down, target, Some(identified));
     }
 
     fn finish_observation(
@@ -241,7 +265,7 @@ impl Flow {
         up: u64,
         down: u64,
         target: Option<&Target>,
-        known_web: bool,
+        known_web: Option<bool>,
     ) {
         if epoch == 0 {
             return;
@@ -360,6 +384,7 @@ impl Flow {
         target: &Target,
         domain: Option<&str>,
         app_protocol: &str,
+        ech_present: bool,
     ) -> bool {
         let app_protocol = app_protocol.trim_ascii();
         if epoch == 0 || self.meta.network != "udp" {
@@ -368,7 +393,9 @@ impl Flow {
         let Some(collector) = self.collector.upgrade() else {
             return false;
         };
-        if !valid_target(target) || domain.is_some_and(|d| d.len() > 253) || app_protocol.len() > 64
+        if !valid_target(target)
+            || domain.is_some_and(|domain| !valid_observation_string(domain))
+            || app_protocol.len() > 64
         {
             collector.limited("invalid_metadata");
             return false;
@@ -397,14 +424,16 @@ impl Flow {
         let Some(web) = web_protocol(app_protocol) else {
             return false;
         };
+        let identified =
+            domain.is_some_and(|domain| !domain.is_empty()) || has_destination_domain(target);
         let config = collector.limits.load();
         if packets.targets.len() >= config.max_udp_targets_per_session as usize {
             collector.limited("target_limit");
-            self.promote_pending_unknown(state, &packets, pending);
+            self.promote_pending_unknown(state, &packets, pending, identified);
             return true;
         }
         if !collector.reserve_target(&config) {
-            self.promote_pending_unknown(state, &packets, pending);
+            self.promote_pending_unknown(state, &packets, pending, identified);
             return true;
         }
         let mut target_state = TargetState {
@@ -414,6 +443,7 @@ impl Flow {
             classification: Some(Classification {
                 domain: domain.unwrap_or_default().into(),
                 app: web.into(),
+                ech_present,
             }),
             _reservation: TargetReservation(self.collector.clone()),
         };
@@ -440,19 +470,30 @@ impl Flow {
         state: &FlowState,
         packets: &PacketState,
         pending: Option<PendingCounters>,
+        identified: bool,
     ) {
         if let Some(pending) = pending
             && pending.since.elapsed() <= PENDING_AGE
         {
-            self.record_unknown_web(state, packets, pending.up, pending.down);
+            self.record_unknown_web(state, packets, pending.up, pending.down, identified);
         }
     }
 
-    fn record_unknown_web(&self, state: &FlowState, packets: &PacketState, up: u64, down: u64) {
+    fn record_unknown_web(
+        &self,
+        state: &FlowState,
+        packets: &PacketState,
+        up: u64,
+        down: u64,
+        identified: bool,
+    ) {
         if up != 0 || down != 0 {
             state.counters.add(up, down);
             self.mark_web_seen(state);
             packets.unknown.add(up, down);
+            if identified {
+                packets.unknown_identified.add(up, down);
+            }
         }
     }
 
@@ -463,7 +504,7 @@ impl Flow {
         target: Option<&Target>,
         up: u64,
         down: u64,
-        known_web: bool,
+        known_web: Option<bool>,
     ) {
         if up == 0 && down == 0 {
             return;
@@ -473,7 +514,7 @@ impl Flow {
             return;
         }
         let Some(target) = target.filter(|t| valid_target(t)) else {
-            if target.is_some_and(|t| t.host.len() > 253) {
+            if target.is_some_and(|t| !valid_observation_string(&t.host)) {
                 collector.limited("invalid_metadata");
             }
             return;
@@ -499,8 +540,11 @@ impl Flow {
         }
         if let Some(target) = packets.targets.get_mut(target) {
             self.record_web_packet(state, target, up, down);
-        } else if initial_web || known_web {
-            self.record_unknown_web(state, &packets, up, down);
+        } else if initial_web || known_web.is_some() {
+            let identified = known_web.unwrap_or(false)
+                || has_destination_domain(target)
+                || (initial_web && !self.meta.domain.is_empty());
+            self.record_unknown_web(state, &packets, up, down, identified);
         } else {
             packets.expire_pending();
             if !packets.pending.contains_key(target) {
@@ -592,7 +636,7 @@ impl Observation {
                 if let Some(state) = state.as_ref().filter(|s| s.epoch == self.epoch) {
                     for (target, up, down) in packets {
                         self.flow
-                            .record_packet(&collector, state, Some(target), up, down, false);
+                            .record_packet(&collector, state, Some(target), up, down, None);
                     }
                 }
             }
@@ -631,20 +675,24 @@ impl From<&Metadata> for UserKey {
 struct DomainKey {
     user: UserKey,
     domain: String,
-    root: String,
+    destination: String,
     app: String,
-    source: String,
+    ech_present: bool,
 }
 
 impl DomainKey {
     fn unknown(user: UserKey) -> Self {
         Self {
             user,
-            domain: UNKNOWN.into(),
-            root: UNKNOWN.into(),
+            domain: String::new(),
+            destination: String::new(),
             app: UNKNOWN.into(),
-            source: UNKNOWN.into(),
+            ech_present: false,
         }
+    }
+
+    fn has_domain(&self) -> bool {
+        !self.domain.is_empty() || !self.destination.is_empty()
     }
 }
 
@@ -970,14 +1018,15 @@ impl Collector {
             (&metadata.app_protocol, 64),
         ];
         if lengths.iter().any(|(value, limit)| value.len() > *limit)
+            || !valid_observation_string(&metadata.domain)
             || metadata
                 .destination
                 .as_ref()
-                .is_some_and(|t| t.host.len() > 253)
+                .is_some_and(|t| !valid_observation_string(&t.host))
             || metadata
                 .sniff_destination
                 .as_ref()
-                .is_some_and(|t| t.host.len() > 253)
+                .is_some_and(|t| !valid_observation_string(&t.host))
         {
             self.limited("invalid_metadata");
             return None;
@@ -1014,6 +1063,7 @@ impl Collector {
             network: metadata.network.clone(),
             domain: metadata.domain.clone(),
             app_protocol: metadata.app_protocol.clone(),
+            ech_present: metadata.ech_present,
             destination: metadata.destination.clone(),
             sniff_destination: metadata.sniff_destination.clone(),
         };
@@ -1041,9 +1091,9 @@ impl Collector {
             network: key.user.network.clone(),
             minute_at_unix: bucket.minute,
             domain: key.domain.clone(),
-            root_domain: key.root.clone(),
+            destination_domain: key.destination.clone(),
             app_protocol: key.app.clone(),
-            domain_source: key.source.clone(),
+            ech_present: key.ech_present,
             ..Default::default()
         };
         bucket.domains.insert(key, row);
@@ -1089,7 +1139,9 @@ impl Collector {
         if up == 0 && down == 0 && started == 0 {
             return;
         }
-        if !bucket.domains.contains_key(&key) && (key.domain != UNKNOWN || key.app != UNKNOWN) {
+        if !bucket.domains.contains_key(&key)
+            && (key.has_domain() || key.app != UNKNOWN || key.ech_present)
+        {
             let full = bucket.domains.len() >= self.limits.load().minute_max_domain_keys as usize;
             if !full && self.reserve(DOMAIN_COST) {
                 self.new_domain(bucket, key.clone());
@@ -1182,20 +1234,11 @@ impl Collector {
                     }
                     let mut key = identity(&flow.meta, Some(target), true);
                     if let Some(classification) = &target_state.classification {
-                        if !classification.domain.is_empty() {
-                            (key.domain, key.root) = canonical_domain(&classification.domain);
-                            key.source = if key.domain == UNKNOWN {
-                                UNKNOWN
-                            } else {
-                                "sniff"
-                            }
-                            .into();
-                        }
-                        if !classification.app.is_empty() {
-                            key.app.clone_from(&classification.app);
-                        }
+                        key.domain.clone_from(&classification.domain);
+                        key.app.clone_from(&classification.app);
+                        key.ech_present = classification.ech_present;
                     }
-                    if key.domain != UNKNOWN {
+                    if key.has_domain() {
                         identified_up += up;
                         identified_down += down;
                     }
@@ -1204,12 +1247,15 @@ impl Collector {
                     }
                 }
                 let (up, down) = packets.unknown.drain();
+                let (known_up, known_down) = packets.unknown_identified.drain();
+                identified_up += known_up;
+                identified_down += known_down;
                 if retained {
                     self.add_domain(&mut bucket, DomainKey::unknown(user.clone()), up, down, 0);
                 }
             } else if nonzero {
                 let key = identity(&flow.meta, flow.meta.destination.as_ref(), false);
-                if key.domain != UNKNOWN {
+                if key.has_domain() {
                     identified_up += up;
                     identified_down += down;
                 }
@@ -1481,63 +1527,20 @@ fn web_protocol(protocol: &str) -> Option<&'static str> {
 }
 
 fn identity(meta: &Metadata, target: Option<&Target>, packet: bool) -> DomainKey {
-    let mut domain = "";
-    let mut app = UNKNOWN;
-    let mut source = UNKNOWN;
-    if !packet || (target.is_some() && target == meta.sniff_destination.as_ref()) {
-        domain = &meta.domain;
-        app = &meta.app_protocol;
-        if !domain.is_empty() {
-            source = "sniff";
+    let mut key = DomainKey::unknown(UserKey::from(meta));
+    // Sniffed and destination names are independent observations. Preserve
+    // spelling and ECH presence for the panel to interpret and normalize.
+    if !packet || (target.is_some_and(valid_target) && target == meta.sniff_destination.as_ref()) {
+        key.domain.clone_from(&meta.domain);
+        if !meta.app_protocol.is_empty() {
+            key.app.clone_from(&meta.app_protocol);
         }
+        key.ech_present = meta.ech_present;
     }
-    if domain.is_empty()
-        && let Some(target) = target
-    {
-        domain = &target.host;
-        source = "destination";
+    if let Some(target) = target.filter(|target| has_destination_domain(target)) {
+        key.destination.clone_from(&target.host);
     }
-    let (domain, root) = canonical_domain(domain);
-    if domain == UNKNOWN {
-        source = UNKNOWN;
-    }
-    DomainKey {
-        user: UserKey::from(meta),
-        domain,
-        root,
-        app: if app.is_empty() { UNKNOWN } else { app }.into(),
-        source: source.into(),
-    }
-}
-
-fn canonical_domain(raw: &str) -> (String, String) {
-    let raw = raw.trim().trim_end_matches('.');
-    let invalid = || (UNKNOWN.to_owned(), UNKNOWN.to_owned());
-    if raw.is_empty()
-        || raw.len() > 253
-        || raw.chars().any(|c| {
-            c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | ':' | '@' | '%')
-        })
-        || raw.parse::<IpAddr>().is_ok()
-    {
-        return invalid();
-    }
-    let Ok(url::Host::Domain(domain)) = url::Host::parse(raw) else {
-        return invalid();
-    };
-    if domain.len() > 253
-        || domain.ends_with(".arpa")
-        || domain.contains("sp.packet-addr")
-        || domain.contains("sp.v2.udp-over-tcp")
-        || domain.contains("sp.udp-over-tcp")
-        || domain
-            .split('.')
-            .any(|label| label.is_empty() || label.len() > 63)
-    {
-        return invalid();
-    }
-    let root = psl::domain_str(&domain).unwrap_or(&domain).to_owned();
-    (domain, root)
+    key
 }
 
 #[cfg(test)]
@@ -1566,6 +1569,7 @@ mod tests {
             network: network.into(),
             domain: "WWW.Example.COM.".into(),
             app_protocol: "tls".into(),
+            ech_present: false,
             destination: Some(target("example.com")),
             sniff_destination: None,
         }
@@ -1704,7 +1708,7 @@ mod tests {
             target("2.2.2.2"),
             target("sub.other.co.uk"),
         ];
-        flow.classify_target(epoch, &targets[2], None, "quic");
+        flow.classify_target(epoch, &targets[2], None, "quic", false);
         flow.begin()
             .done_packet_batch(targets.iter().zip([10, 20, 30]).map(|(t, n)| (t, n, 0)));
         flow.close();
@@ -1717,20 +1721,16 @@ mod tests {
             .unwrap()
             .domains
             .values()
-            .map(|r| (r.domain.as_str(), r.uplink_bytes))
+            .map(|r| {
+                (
+                    (r.domain.as_str(), r.destination_domain.as_str()),
+                    r.uplink_bytes,
+                )
+            })
             .collect();
-        assert_eq!(domains["www.example.com"], 10);
-        assert_eq!(domains[UNKNOWN], 0);
-        assert_eq!(domains["sub.other.co.uk"], 30);
-        assert!(
-            inner
-                .bucket
-                .as_ref()
-                .unwrap()
-                .domains
-                .values()
-                .any(|r| r.root_domain == "other.co.uk")
-        );
+        assert_eq!(domains[&("WWW.Example.COM.", "")], 10);
+        assert_eq!(domains[&("", "")], 0);
+        assert_eq!(domains[&("", "sub.other.co.uk")], 30);
         drop(inner);
         assert_eq!(collector.status().udp_targets, 0);
     }
@@ -1745,7 +1745,7 @@ mod tests {
         let first = target("1.1.1.1");
         let other = target("2.2.2.2");
         let observation = flow.begin();
-        flow.classify_target(epoch, &first, Some("video.youtube.com"), "quic");
+        flow.classify_target(epoch, &first, Some("video.youtube.com"), "quic", false);
         observation.done_packet(&first, 20, 0);
         flow.begin().done_packet(&other, 30, 0);
         collector.sample(60);
@@ -1753,7 +1753,7 @@ mod tests {
         collector.pause(epoch);
         let resumed = collector.begin_session();
         collector.configure(resumed, Some(&default_config(true)));
-        flow.classify_target(epoch, &first, Some("wrong.example.com"), "tls");
+        flow.classify_target(epoch, &first, Some("wrong.example.com"), "tls", false);
         flow.begin().done_packet(&first, 7, 0);
         flow.close();
         collector.sample(120);
@@ -1770,7 +1770,8 @@ mod tests {
         assert_eq!(row.domain, "video.youtube.com");
         assert_eq!(row.app_protocol, "quic");
         assert_eq!(row.target_sessions, 0);
-        assert_eq!(row.domain_source, "sniff");
+        assert!(row.destination_domain.is_empty());
+        assert!(!row.ech_present);
     }
 
     #[test]
@@ -1785,6 +1786,7 @@ mod tests {
                 &target(&format!("10.0.0.{i}")),
                 Some("example.com"),
                 "quic",
+                false,
             );
         }
         assert_eq!(collector.status().udp_targets, 2);
@@ -1823,7 +1825,10 @@ mod tests {
         let bucket = inner.bucket.as_ref().unwrap();
         assert_eq!(bucket.domains.len(), 1);
         let row = bucket.domains.values().next().unwrap();
-        assert_eq!(row.domain, UNKNOWN);
+        assert!(row.domain.is_empty());
+        assert!(row.destination_domain.is_empty());
+        assert_eq!(row.app_protocol, UNKNOWN);
+        assert!(!row.ech_present);
         assert_eq!(row.uplink_bytes, 51);
     }
 
@@ -1851,7 +1856,7 @@ mod tests {
         config.max_udp_targets_per_session = 1;
         let (collector, epoch) = collector(config);
         let flow = collector.register(metadata("udp")).unwrap();
-        flow.classify_target(epoch, &target("10.0.0.1"), None, "quic");
+        flow.classify_target(epoch, &target("10.0.0.1"), None, "quic", false);
         std::thread::scope(|scope| {
             for i in 0..8 {
                 let flow = &flow;
@@ -1981,7 +1986,13 @@ mod tests {
         let flow = collector.register(metadata("udp")).unwrap();
         let baseline = collector.status().memory_bytes;
         assert!(flow.try_reserve_sniff(20 << 10));
-        flow.classify_target(epoch, &target("1.1.1.1"), Some("example.com"), "quic");
+        flow.classify_target(
+            epoch,
+            &target("1.1.1.1"),
+            Some("example.com"),
+            "quic",
+            false,
+        );
         assert_eq!(
             collector.status().memory_bytes,
             baseline + (20 << 10) + TARGET_COST
@@ -2068,32 +2079,149 @@ mod tests {
     }
 
     #[test]
-    fn malformed_metadata_and_internal_destinations_never_become_domains() {
+    fn observation_wire_safety_remains_bounded() {
+        for value in ["x".repeat(254), "bad\0name".into(), "é".repeat(127)] {
+            for field in ["domain", "destination", "sniff_destination"] {
+                let (collector, _) = collector(default_config(true));
+                let mut meta = metadata("tcp");
+                match field {
+                    "domain" => meta.domain = value.clone(),
+                    "destination" => meta.destination = Some(target(&value)),
+                    "sniff_destination" => meta.sniff_destination = Some(target(&value)),
+                    _ => unreachable!(),
+                }
+                assert!(collector.register(meta).is_none(), "{field}: {value:?}");
+                assert_eq!(collector.status().memory_bytes, 0);
+                assert_eq!(collector.status().dropped_by_reason["invalid_metadata"], 1);
+            }
+        }
         let (collector, _) = collector(default_config(true));
         let mut meta = metadata("tcp");
-        meta.domain = "x".repeat(254);
-        assert!(collector.register(meta).is_none());
-        for raw in [
-            "",
-            "127.0.0.1",
-            "[::1]",
-            "a b.com",
-            "user@example.com",
-            "foo.arpa",
-            "sp.packet-addr",
-            "sp.v2.udp-over-tcp",
-            "a%20b.com",
-            "https://example.com",
-        ] {
-            assert_eq!(canonical_domain(raw).0, UNKNOWN, "{raw}");
+        meta.domain = format!("{}x", "é".repeat(126));
+        assert_eq!(meta.domain.len(), 253);
+        assert!(collector.register(meta).is_some());
+    }
+
+    #[test]
+    fn observations_preserve_raw_domains_destinations_and_ech_in_protobuf() {
+        let cases = [
+            ("WWW.Example.COM.", "first.example", false),
+            ("WWW.Example.COM.", "first.example", true),
+            ("WWW.Example.COM.", "second.example", true),
+            ("www.例子.中国", "first.example", false),
+            ("127.0.0.1", "first.example", false),
+            ("invalid/name", "first.example", false),
+            ("", "first.example", true),
+            ("", "192.0.2.1", true),
+        ];
+        for network in ["tcp", "udp"] {
+            let (collector, _) = collector(default_config(true));
+            for (domain, destination, ech_present) in cases {
+                let mut meta = metadata(network);
+                meta.domain = domain.into();
+                meta.ech_present = ech_present;
+                meta.destination = Some(target(destination));
+                meta.sniff_destination = meta.destination.clone();
+                if network == "udp" {
+                    meta.app_protocol = "quic".into();
+                }
+                let flow = collector.register(meta).unwrap();
+                if network == "udp" {
+                    flow.begin().done_packet(&target(destination), 11, 7);
+                    flow.begin().done_packet(&target("192.0.2.2"), 999, 999);
+                } else {
+                    flow.begin().done(11, 7);
+                }
+                flow.close();
+            }
+            collector.sample(60);
+            assert_eq!(totals(&collector), (88, 56, 8, 77), "{network}");
+            collector.sample(120);
+            let inner = lock(&collector.inner);
+            let mut seen = std::collections::HashSet::new();
+            for batch in &inner.queue {
+                let decoded =
+                    TrafficAnalysisBatch::decode(batch.message.encode_to_vec().as_slice()).unwrap();
+                for row in decoded.domain_minutes {
+                    assert_eq!(
+                        (row.uplink_bytes, row.downlink_bytes, row.target_sessions),
+                        (11, 7, 1)
+                    );
+                    assert!(seen.insert((row.domain, row.destination_domain, row.ech_present)));
+                }
+            }
+            for (domain, destination, ech_present) in cases {
+                let destination = if has_destination_domain(&target(destination)) {
+                    destination
+                } else {
+                    ""
+                };
+                assert!(seen.contains(&(domain.to_owned(), destination.to_owned(), ech_present)));
+            }
+            assert_eq!(seen.len(), cases.len(), "{network}");
         }
-        assert_eq!(
-            canonical_domain(" WWW.Example.COM. "),
-            ("www.example.com".into(), "example.com".into())
-        );
-        assert_eq!(canonical_domain("a.b.co.uk").1, "b.co.uk");
-        assert_eq!(canonical_domain("a.github.io").1, "a.github.io");
-        assert_eq!(canonical_domain("bücher.de").0, "xn--bcher-kva.de");
+    }
+
+    #[test]
+    fn delayed_udp_classification_preserves_raw_domain_destination_and_ech() {
+        let (collector, epoch) = collector(default_config(true));
+        for ech_present in [false, true] {
+            let flow = collector.register(metadata("udp")).unwrap();
+            let destination = target("Original.Destination.");
+            flow.begin().done_packet(&destination, 13, 17);
+            assert!(flow.classify_target(
+                epoch,
+                &destination,
+                Some("Visible.例子.中国."),
+                "quic",
+                ech_present,
+            ));
+            flow.close();
+        }
+        collector.sample(60);
+        assert_eq!(totals(&collector), (26, 34, 2, 26));
+        let inner = lock(&collector.inner);
+        let rows: Vec<_> = inner
+            .bucket
+            .as_ref()
+            .unwrap()
+            .domains
+            .values()
+            .filter(|row| row.uplink_bytes > 0)
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.domain == "Visible.例子.中国."
+            && row.destination_domain == "Original.Destination."
+            && row.app_protocol == "quic"
+            && row.uplink_bytes == 13
+            && row.downlink_bytes == 17));
+        assert_ne!(rows[0].ech_present, rows[1].ech_present);
+    }
+
+    #[test]
+    fn delayed_udp_classification_rejects_unsafe_observation_strings() {
+        let (collector, epoch) = collector(default_config(true));
+        let flow = collector.register(metadata("udp")).unwrap();
+        for domain in ["bad\0domain".into(), "x".repeat(254)] {
+            assert!(!flow.classify_target(
+                epoch,
+                &target("192.0.2.1"),
+                Some(&domain),
+                "quic",
+                true
+            ));
+        }
+        assert!(!flow.classify_target(
+            epoch,
+            &target("bad\0target"),
+            Some("valid.example"),
+            "quic",
+            true
+        ));
+        assert_eq!(collector.status().udp_targets, 0);
+        assert_eq!(collector.status().dropped_by_reason["invalid_metadata"], 3);
+        collector.sample(60);
+        assert_eq!(totals(&collector), (0, 0, 0, 0));
     }
 
     #[test]
@@ -2143,7 +2271,13 @@ mod tests {
         for (i, protocol) in ["dns", "SSH", "ftp"].into_iter().enumerate() {
             let destination = target(&format!("192.0.2.{}", i + 1));
             flow.begin().done_packet(&destination, 10, 20);
-            flow.classify_target(epoch, &destination, Some("not-web.example.com"), protocol);
+            flow.classify_target(
+                epoch,
+                &destination,
+                Some("not-web.example.com"),
+                protocol,
+                false,
+            );
             // A terminal non-Web result detaches the wrapper. The collector
             // retains neither target state nor an unbounded rejected-key set.
             assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 0);
@@ -2164,7 +2298,7 @@ mod tests {
         assert_eq!(collector.status().dropped_entries, 0);
 
         let web = target("192.0.2.100");
-        flow.classify_target(epoch, &web, Some("video.youtube.com"), "QUIC");
+        flow.classify_target(epoch, &web, Some("video.youtube.com"), "QUIC", false);
         flow.begin().done_packet(&web, 7, 9);
         collector.sample(65);
         assert_eq!(totals(&collector), (7, 9, 1, 7));
@@ -2187,10 +2321,22 @@ mod tests {
         flow.begin().done_packet(&destination, 13, 5);
         collector.sample(60);
         assert_eq!(totals(&collector), (0, 0, 0, 0));
-        flow.classify_target(epoch, &destination, Some("video.youtube.com"), "QuIc");
+        flow.classify_target(
+            epoch,
+            &destination,
+            Some("video.youtube.com"),
+            "QuIc",
+            false,
+        );
         flow.begin().done_packet(&destination, 17, 7);
-        flow.classify_target(epoch, &destination, Some("wrong.example.com"), "dns");
-        flow.classify_target(epoch, &destination, Some("wrong.example.com"), "quic");
+        flow.classify_target(epoch, &destination, Some("wrong.example.com"), "dns", false);
+        flow.classify_target(
+            epoch,
+            &destination,
+            Some("wrong.example.com"),
+            "quic",
+            false,
+        );
         collector.sample(65);
         collector.sample(70);
         assert_eq!(totals(&collector), (41, 12, 1, 41));
@@ -2211,16 +2357,16 @@ mod tests {
         for _ in 0..9 {
             flow.begin().done_packet(&packets, 10, 0);
         }
-        flow.classify_target(epoch, &packets, None, "quic");
+        flow.classify_target(epoch, &packets, None, "quic", false);
         let bytes = target("192.0.2.2");
         flow.begin()
             .done_packet(&bytes, PENDING_BYTES, PENDING_BYTES);
-        flow.classify_target(epoch, &bytes, None, "quic");
+        flow.classify_target(epoch, &bytes, None, "quic", false);
         let expired = target("192.0.2.3");
         flow.begin().done_packet(&expired, 1000, 2000);
         tokio::time::advance(PENDING_AGE + Duration::from_millis(1)).await;
         collector.sample(60);
-        flow.classify_target(epoch, &expired, None, "quic");
+        flow.classify_target(epoch, &expired, None, "quic", false);
         flow.begin().done_packet(&expired, 7, 0);
         collector.sample(65);
         assert_eq!(totals(&collector), (80 + PENDING_BYTES + 7, 0, 1, 0));
@@ -2248,10 +2394,16 @@ mod tests {
         collector.pause(epoch);
         let resumed = collector.begin_session();
         collector.configure(resumed, Some(&default_config(true)));
-        flow.classify_target(epoch, &destination, Some("wrong.example.com"), "quic");
+        flow.classify_target(
+            epoch,
+            &destination,
+            Some("wrong.example.com"),
+            "quic",
+            false,
+        );
         collector.sample(60);
         assert_eq!(totals(&collector), (0, 0, 0, 0));
-        flow.classify_target(resumed, &destination, Some("youtube.com"), "quic");
+        flow.classify_target(resumed, &destination, Some("youtube.com"), "quic", false);
         flow.begin().done_packet(&destination, 7, 9);
         collector.sample(65);
         assert_eq!(totals(&collector), (7, 9, 1, 7));
@@ -2287,7 +2439,7 @@ mod tests {
             let dns = target(&format!("192.0.2.{i}"));
             flow.begin().done_packet(&dns, 100, 200);
             assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 1);
-            flow.classify_target(epoch, &dns, None, "dns");
+            flow.classify_target(epoch, &dns, None, "dns", false);
             assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 0);
             assert_eq!(collector.memory.load(Ordering::Relaxed), baseline);
         }
@@ -2298,7 +2450,7 @@ mod tests {
         assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 0);
         assert_eq!(collector.memory.load(Ordering::Relaxed), baseline);
         let web = target("192.0.2.201");
-        flow.classify_target(epoch, &web, Some("youtube.com"), "quic");
+        flow.classify_target(epoch, &web, Some("youtube.com"), "quic", false);
         flow.begin().done_packet(&web, 7, 9);
         collector.sample(65);
         assert_eq!(totals(&collector), (7, 9, 1, 7));
@@ -2326,7 +2478,7 @@ mod tests {
         let tcp = collector.register(metadata("tcp")).unwrap();
         tcp.begin().done(3, 4);
         // Already identified QUIC can use the independent confirmed-target pool.
-        flow.classify_target(epoch, &unknown, Some("youtube.com"), "quic");
+        flow.classify_target(epoch, &unknown, Some("youtube.com"), "quic", false);
         flow.begin().done_packet(&unknown, 7, 9);
         collector.sample(60);
         assert_eq!(totals(&collector), (10, 13, 2, 10));
@@ -2347,7 +2499,7 @@ mod tests {
         assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 1);
         assert_eq!(collector.status().udp_targets, 0);
         let web = target("192.0.2.3");
-        flow.classify_target(epoch, &web, Some("youtube.com"), "quic");
+        flow.classify_target(epoch, &web, Some("youtube.com"), "quic", false);
         flow.begin().done_packet(&web, 7, 9);
         collector.sample(60);
         assert_eq!(totals(&collector), (7, 9, 1, 7));
@@ -2375,18 +2527,19 @@ mod tests {
             &target("192.0.2.1"),
             Some("first.example.com"),
             "quic",
+            false,
         );
         let overflow = target("192.0.2.2");
         flow.begin().done_packet(&overflow, 11, 0);
         flow.begin().done_packet(&overflow, 13, 5);
-        assert!(flow.classify_target(epoch, &overflow, Some("second.example.com"), "quic"));
+        assert!(flow.classify_target(epoch, &overflow, Some("second.example.com"), "quic", false));
         assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 0);
         for _ in 0..10 {
             let token = flow.begin_token();
-            flow.finish_web_token(token, 7, 9, Some(&overflow));
+            flow.finish_web_token(token, 7, 9, Some(&overflow), true);
         }
         collector.sample(60);
-        assert_eq!(totals(&collector), (94, 95, 1, 0));
+        assert_eq!(totals(&collector), (94, 95, 1, 94));
         assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 0);
         assert_eq!(collector.status().udp_targets, 1);
         let inner = lock(&collector.inner);
@@ -2396,7 +2549,10 @@ mod tests {
                 .domains
                 .values()
                 .filter(|row| row.uplink_bytes > 0)
-                .all(|row| row.domain == UNKNOWN)
+                .all(|row| row.domain.is_empty()
+                    && row.destination_domain.is_empty()
+                    && row.app_protocol == UNKNOWN
+                    && !row.ech_present)
         );
         assert_eq!(
             bucket
@@ -2411,17 +2567,93 @@ mod tests {
         collector.pause(epoch);
         let resumed = collector.begin_session();
         collector.configure(resumed, Some(&default_config(true)));
-        assert!(!flow.classify_target(epoch, &overflow, Some("stale.example.com"), "quic"));
-        flow.finish_web_token(old, 1000, 2000, Some(&overflow));
+        assert!(!flow.classify_target(epoch, &overflow, Some("stale.example.com"), "quic", false));
+        flow.finish_web_token(old, 1000, 2000, Some(&overflow), true);
         let token = flow.begin_token();
-        flow.finish_web_token(token, 3, 4, Some(&overflow));
+        flow.finish_web_token(token, 3, 4, Some(&overflow), true);
         collector.sample(120);
-        assert_eq!(totals(&collector), (3, 4, 0, 0));
+        assert_eq!(totals(&collector), (3, 4, 0, 3));
         assert_eq!(collector.pending_targets.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn missing_sniff_domain_uses_destination_only_when_it_is_a_hostname() {
+    fn initial_udp_target_overflow_preserves_identified_totals_for_either_domain() {
+        for (domain, destination) in [
+            ("Visible.Example.", "192.0.2.2"),
+            ("", "Destination.Example."),
+            ("", "192.0.2.2"),
+        ] {
+            let mut config = default_config(true);
+            config.max_udp_targets = 1;
+            let (collector, epoch) = collector(config);
+            let occupied = collector.register(metadata("udp")).unwrap();
+            occupied.classify_target(epoch, &target("192.0.2.1"), None, "quic", false);
+            let mut meta = metadata("udp");
+            meta.domain = domain.into();
+            meta.destination = Some(target(destination));
+            meta.sniff_destination = meta.destination.clone();
+            meta.app_protocol = "quic".into();
+            meta.ech_present = true;
+            let flow = collector.register(meta).unwrap();
+            flow.begin().done_packet(&target(destination), 13, 17);
+            collector.sample(60);
+            let identified = if domain.is_empty() && destination == "192.0.2.2" {
+                0
+            } else {
+                13
+            };
+            assert_eq!(totals(&collector), (13, 17, 1, identified));
+            let inner = lock(&collector.inner);
+            let bucket = inner.bucket.as_ref().unwrap();
+            assert_eq!(bucket.domains.len(), 1);
+            let row = bucket.domains.values().next().unwrap();
+            assert!(row.domain.is_empty());
+            assert!(row.destination_domain.is_empty());
+            assert!(!row.ech_present);
+            assert_eq!(row.app_protocol, UNKNOWN);
+            assert_eq!((row.uplink_bytes, row.downlink_bytes), (13, 17));
+        }
+    }
+
+    #[test]
+    fn detail_limit_preserves_destination_only_identified_totals() {
+        for network in ["tcp", "udp"] {
+            let mut config = default_config(true);
+            config.minute_max_domain_keys = 1;
+            let (collector, _) = collector(config);
+            let mut meta = metadata(network);
+            meta.domain.clear();
+            meta.destination = Some(target("Original.Destination."));
+            meta.sniff_destination = meta.destination.clone();
+            meta.ech_present = true;
+            let flow = collector.register(meta).unwrap();
+            if network == "tcp" {
+                flow.begin().done(23, 29);
+            } else {
+                flow.begin()
+                    .done_packet(&target("Original.Destination."), 23, 29);
+            }
+            collector.sample(60);
+            assert_eq!(totals(&collector), (23, 29, 1, 23));
+            let inner = lock(&collector.inner);
+            let row = inner
+                .bucket
+                .as_ref()
+                .unwrap()
+                .domains
+                .values()
+                .next()
+                .unwrap();
+            assert!(row.domain.is_empty());
+            assert!(row.destination_domain.is_empty());
+            assert!(!row.ech_present);
+            assert_eq!(row.app_protocol, UNKNOWN);
+            assert_eq!((row.uplink_bytes, row.downlink_bytes), (23, 29));
+        }
+    }
+
+    #[test]
+    fn missing_sniff_domain_keeps_destination_as_an_independent_hostname() {
         let (collector, epoch) = collector(default_config(true));
         for network in ["tcp", "udp"] {
             for host in ["192.0.2.1", "destination.example.com"] {
@@ -2435,7 +2667,7 @@ mod tests {
                 if network == "tcp" {
                     flow.begin().done(7, 9);
                 } else {
-                    flow.classify_target(epoch, &destination, None, "quic");
+                    flow.classify_target(epoch, &destination, None, "quic", false);
                     flow.begin().done_packet(&destination, 7, 9);
                 }
             }
@@ -2452,14 +2684,11 @@ mod tests {
             .filter(|row| row.uplink_bytes > 0)
         {
             assert_eq!(row.uplink_bytes, 7);
-            assert_eq!(
-                row.domain_source,
-                if row.domain == UNKNOWN {
-                    UNKNOWN
-                } else {
-                    "destination"
-                }
-            );
+            assert!(row.domain.is_empty());
+            assert!(matches!(
+                row.destination_domain.as_str(),
+                "" | "destination.example.com"
+            ));
             assert!(matches!(row.app_protocol.as_str(), "tls" | "quic"));
         }
     }
@@ -2474,16 +2703,18 @@ mod tests {
         tcp.begin().done(10, 20);
         let udp = collector.register(metadata("udp")).unwrap();
         let destination = target("192.0.2.2");
-        udp.classify_target(epoch, &destination, None, "quic");
+        udp.classify_target(epoch, &destination, None, "quic", false);
         udp.begin().done_packet(&destination, 30, 40);
         collector.sample(60);
         assert_eq!(totals(&collector), (40, 60, 2, 0));
         let inner = lock(&collector.inner);
         let rows = &inner.bucket.as_ref().unwrap().domains;
-        assert!(rows.values().any(|row| row.domain == UNKNOWN
+        assert!(rows.values().any(|row| row.domain.is_empty()
+            && row.destination_domain.is_empty()
             && row.app_protocol == "tls"
             && row.uplink_bytes == 10));
-        assert!(rows.values().any(|row| row.domain == UNKNOWN
+        assert!(rows.values().any(|row| row.domain.is_empty()
+            && row.destination_domain.is_empty()
             && row.app_protocol == "quic"
             && row.uplink_bytes == 30));
     }

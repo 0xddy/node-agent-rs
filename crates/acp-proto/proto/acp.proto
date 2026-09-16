@@ -188,6 +188,7 @@ message TrafficAnalysisUserMinute {
   string network = 4;
   uint64 uplink_bytes = 5;
   uint64 downlink_bytes = 6;
+  // Bytes with a non-empty observed or requested domain, not verified site attribution.
   uint64 identified_uplink_bytes = 7;
   uint64 identified_downlink_bytes = 8;
   uint64 started_sessions = 9;
@@ -199,14 +200,21 @@ message TrafficAnalysisDomainMinute {
   int64 minute_at_unix = 2;
   string proxy_protocol = 3;
   string network = 4;
+  // Raw visible HTTP Host / TLS or QUIC SNI. Empty means no observation.
   string domain = 5;
-  string root_domain = 6;
+  reserved 6;
+  reserved "root_domain";
   string app_protocol = 7;
-  string domain_source = 8;
+  reserved 8;
+  reserved "domain_source";
   uint64 uplink_bytes = 9;
   uint64 downlink_bytes = 10;
   uint64 target_sessions = 11;
   string node_id = 12;
+  // Extension 0xfe0d was observed; includes GREASE and does not prove ECH acceptance.
+  bool ech_present = 13;
+  // Original request target domain, kept separately from the visible Host/SNI.
+  string destination_domain = 14;
 }
 
 message TrafficAnalysisStatus {
