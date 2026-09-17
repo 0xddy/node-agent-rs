@@ -63,9 +63,12 @@ machine_secret = "replace-with-machine-secret"
 ca_cert_path = ""
 tls_insecure_skip_verify = false
 debug = false
+disable_traffic_analysis = false
 log_file_path = "node-agent.log"
 traffic_report_min_delta_bytes = 26214400
 ```
+
+`disable_traffic_analysis = true` 会强制关闭本节点的流量分析采集、上报和所有嗅探，优先于面板设置，断线重连后仍生效。计费流量统计保持正常；省略或设为 `false` 时沿用面板设置。修改此项后需重启 agent。
 
 ```bash
 cargo build --release --locked -p node-agent --bin node-agent

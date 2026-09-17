@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use shoes_engine::{AnalysisFlow, AnalysisMetadata, AnalysisObserver, AnalysisTarget};
+use shoes_engine::{AnalysisFlow, AnalysisMetadata, AnalysisObserver, AnalysisTarget, InboundSpec};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -183,6 +183,150 @@ async fn routed_tcp_keeps_raw_observations_across_override_and_counts_payload_ex
     assert_eq!(flow.download.load(Ordering::Relaxed), RESPONSE.len() as u64);
     let billed = engine.get_user("vless", "alice").unwrap();
     assert!(billed.rx > flow.upload.load(Ordering::Relaxed));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_analysis_override_disables_tcp_sniff_and_observer_but_keeps_billing() {
+    const USER: &str = "11111111-1111-4111-8111-111111111111";
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: youtube.com\r\n\r\n";
+    const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    let engine = engine().await;
+    let observer = Arc::new(Observer::default());
+    observer.enabled.store(true, Ordering::Relaxed);
+    // Cover both installation orders; replacing the observer must not remove
+    // the process policy.
+    engine.set_analysis_observer(Some(observer.clone()));
+    engine.set_disable_traffic_analysis(true);
+    engine.set_analysis_observer(Some(observer.clone()));
+    let address = free_addr();
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let mut config = vless_inbound_with_rules(
+        address,
+        true,
+        serde_json::json!([
+            {"masks": "0.0.0.0/0", "match": {"protocol": ["http"]}, "action": "block"},
+            {"masks": "0.0.0.0/0", "action": "allow", "override_address": target_addr.to_string()}
+        ]),
+    );
+    config["sniff"] = serde_json::json!(true);
+    let mut validation = dynamic("vless", config.clone());
+    validation.config["sniff"] = serde_json::json!("overridden before validation");
+    engine.validate_inbound(&validation).await.unwrap();
+    engine
+        .add_inbound(dynamic("vless", config.clone()))
+        .await
+        .unwrap();
+    engine.add_user("vless", user("alice", USER)).unwrap();
+    let leg = free_addr();
+    engine.add_inbound(classic("leg", serde_json::json!({
+        "address": leg.to_string(),
+        "protocol": {"type": "socks", "udp_enabled": false},
+        "rules": [{"masks": "0.0.0.0/0", "action": "allow", "client_chain": vless_chain(address, USER)}],
+    }))).await.unwrap();
+    let upstream = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut bytes = vec![0; REQUEST.len()];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes, REQUEST);
+            stream.write_all(RESPONSE).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    for updated in [false, true] {
+        if updated {
+            engine
+                .update_inbound(InboundSpec {
+                    tag: "leg".into(),
+                    config: serde_json::json!({
+                        "address": leg.to_string(),
+                        "protocol": {"type": "socks", "udp_enabled": false},
+                        "sniff": true,
+                        "rules": [
+                            {"masks": "0.0.0.0/0", "match": {"protocol": ["http"]}, "action": "block"},
+                            {"masks": "0.0.0.0/0", "action": "allow", "client_chain": vless_chain(address, USER)}
+                        ],
+                    }),
+                    users: None,
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut client = Socks::connect(leg, target_addr).await.unwrap();
+            client.write_all(REQUEST).await.unwrap();
+            let mut response = vec![0; RESPONSE.len()];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, RESPONSE);
+        })
+        .await
+        .expect("HTTP must bypass the protocol predicate when sniff is locally disabled");
+    }
+    upstream.await.unwrap();
+    assert!(observer.flows.lock().unwrap().is_empty());
+    let billed = engine.get_user("vless", "alice").unwrap();
+    assert!(billed.rx >= (2 * REQUEST.len()) as u64);
+    assert!(billed.tx >= (2 * RESPONSE.len()) as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_analysis_override_controls_future_udp_associations_and_keeps_billing() {
+    let engine = engine().await;
+    assert!(!engine.traffic_analysis_disabled());
+    engine.set_disable_traffic_analysis(true);
+    let observer = Arc::new(Observer::default());
+    observer.enabled.store(true, Ordering::Relaxed);
+    engine.set_analysis_observer(Some(observer.clone()));
+    let address = free_addr();
+    engine
+        .add_inbound(dynamic("hy2", hysteria2_inbound(address, true)))
+        .await
+        .unwrap();
+    engine
+        .add_user("hy2", password_user("alice", "analysis-password"))
+        .unwrap();
+    let echo = UdpEcho::start().await;
+    let client = common::hysteria2::Hysteria2Client::connect(address, "analysis-password")
+        .await
+        .unwrap();
+    let packet = quic_initial("youtube.com");
+    client.send_udp(7, 1, echo.address, &packet).await.unwrap();
+    assert_eq!(
+        client.recv_udp(Duration::from_secs(3)).await.unwrap().1,
+        packet
+    );
+    assert!(observer.flows.lock().unwrap().is_empty());
+
+    // Re-enabling must use the latest observer installed while disabled.
+    let replacement = Arc::new(Observer::default());
+    replacement.enabled.store(true, Ordering::Relaxed);
+    engine.set_analysis_observer(Some(replacement.clone()));
+    engine.set_disable_traffic_analysis(false);
+    engine.set_disable_traffic_analysis(false);
+    engine.set_analysis_observer(Some(replacement.clone()));
+    client.send_udp(8, 1, echo.address, &packet).await.unwrap();
+    assert_eq!(
+        client.recv_udp(Duration::from_secs(3)).await.unwrap().1,
+        packet
+    );
+    assert!(observer.flows.lock().unwrap().is_empty());
+    assert_eq!(replacement.flows.lock().unwrap().len(), 1);
+
+    // Clearing during a disabled interval must survive re-enabling as well.
+    engine.set_disable_traffic_analysis(true);
+    engine.set_analysis_observer(None);
+    engine.set_disable_traffic_analysis(false);
+    client.send_udp(9, 1, echo.address, &packet).await.unwrap();
+    assert_eq!(
+        client.recv_udp(Duration::from_secs(3)).await.unwrap().1,
+        packet
+    );
+    assert_eq!(replacement.flows.lock().unwrap().len(), 1);
+
+    let billed = engine.get_user("hy2", "alice").unwrap();
+    assert!(billed.rx >= 3 * packet.len() as u64);
+    assert!(billed.tx >= 3 * packet.len() as u64);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -11,7 +11,15 @@ Rust agent 使用与 Go agent 相同的 ACP 流量分析协议，面板无需为
 enabled = true
 ```
 
-默认关闭。节点自己的 TOML 不增加分析开关；面板通过 `NodeConfig.traffic_analysis` 下发开关和资源限额。每次主会话完成 Hello、打开控制流后，无条件重新读取一次 `GetMachineConfig`。即使拓扑摘要相同，也会得到新开关；摘要未变时继续使用现有用户及代理运行配置，不重复拉用户或重新应用运行时。
+分析默认关闭，面板通过 `NodeConfig.traffic_analysis` 下发开关和资源限额。节点的引导 TOML 还支持本地强制关闭：
+
+```toml
+disable_traffic_analysis = true
+```
+
+此项默认为 `false`，修改后需重启 agent。设为 `true` 时优先于面板设置：不挂载分析采集器，不启动分析采样或上报任务，并关闭 TCP / UDP 嗅探，包括面板 provider 设置的嗅探。计费流量、业务转发和遥测继续运行；依赖嗅探所得协议或域名的路由条件将失去这类输入。面板重连、拓扑更新及远程 reload 均不能重新开启嗅探。
+
+每次主会话完成 Hello、打开控制流后，无条件重新读取一次 `GetMachineConfig`。即使拓扑摘要相同，也会得到新开关；摘要未变时继续使用现有用户及代理运行配置，不重复拉用户或重新应用运行时。本地强制关闭会在每次会话配置确认时重新覆盖面板分析开关。
 
 分析配置不参与拓扑摘要与代理配置编译，拓扑回滚不能覆盖主会话确认的分析状态。配置读取失败时，当前代理继续运行，分析保持暂停并随主会话退避重连。
 
@@ -34,7 +42,7 @@ TLS / QUIC ClientHello 包含 `0xfe0d` 扩展时，保留可见外层 SNI 并设
 
 UDP 按实际目标归属，首个被识别目标的域名不能继承到整个 association。用户汇总中的 `identified_*_bytes` 表示可见或请求域名任一非空的字节数，不代表验证过的站点归属；细分预算耗尽也保留这一计数。已确认 Web 协议但没有域名的记录仍保留协议，细分超限时汇入空域名、空请求域名、`ech_present=false`、`app_protocol=unknown` 的降级记录。会话数与域名目标会话数分别统计。
 
-TCP 沿用 300 ms 总超时和首包缓存回放，Hysteria2 默认开启 sniff；VLESS 继续遵循面板 provider 的 sniff 设置，分析开关不改变代理路由。UDP 的协议识别是有界、被动的分析采集：每个目标只检查最初的有限数据，最多 8 包、64 KiB，QUIC CRYPTO 重组最多 16 KiB、64 个碎片。它不会等待额外 UDP 数据，不会因识别超时关闭 association，也不提供新增 QUIC 协议路由能力。识别预算用尽后业务流量继续正常转发，未确认 Web 协议的目标不再参与分析。
+TCP 沿用 300 ms 总超时和首包缓存回放，Hysteria2 默认开启 sniff；VLESS 继续遵循面板 provider 的 sniff 设置。面板分析开关不改变代理路由，本地 `disable_traffic_analysis = true` 则会强制关闭所有 sniff。UDP 的协议识别是有界、被动的分析采集：每个目标只检查最初的有限数据，最多 8 包、64 KiB，QUIC CRYPTO 重组最多 16 KiB、64 个碎片。它不会等待额外 UDP 数据，不会因识别超时关闭 association，也不提供新增 QUIC 协议路由能力。识别预算用尽后业务流量继续正常转发，未确认 Web 协议的目标不再参与分析。
 
 ## 高频流量与上报隔离
 
@@ -61,7 +69,7 @@ UDP 待识别资源同时计入子预算与总预算，包含尚未出现 Web �
 
 ## 配套内核版本
 
-本次同步对应 Go agent `d74fc89b40293b8f08cf066e822b5952a7f43c53`。配套 `shoes-plus` 使用已发布基线 `32e58642cab6c5b2e1c8fda24fdc3907ae6af112`，并应用本仓库的 `patches/shoes-plus-raw-observations.patch`；`.github/workflows/ci.yml`、`.github/workflows/release.yml` 和 README 的源码构建示例均执行相同的补丁步骤。
+原始域名观测对应 Go agent `d74fc89b40293b8f08cf066e822b5952a7f43c53`；本地分析与嗅探覆盖同步至 `4b503c5`，ACP 契约同步至 `920c670`。配套 `shoes-plus` 使用已发布基线 `32e58642cab6c5b2e1c8fda24fdc3907ae6af112`，并应用本仓库的 `patches/shoes-plus-raw-observations.patch`；`.github/workflows/ci.yml`、`.github/workflows/release.yml` 和 README 的源码构建示例均执行相同的补丁步骤。
 
 本地构建时，在上述干净基线上应用补丁一次；已经包含这些改动的工作区无需重复应用。补丁随本仓库保存，使构建不依赖尚未发布的内核提交。以后内核发布包含此补丁的新提交时，可将固定 SHA 更新到该提交并删除补丁及应用步骤。
 
@@ -79,7 +87,7 @@ cargo test --manifest-path ../shoes-plus/Cargo.toml --lib routing::udp_sniff::te
 cargo test --manifest-path ../shoes-plus/Cargo.toml --lib routing::protocol::tests
 ```
 
-协议测试校验 Go 源文件校验和、分析配置限额和排除分析字段后的拓扑摘要。真实 tonic 会话测试验证开关切换、配置失败时暂停、重复连接不重新应用拓扑，以及分析连接单独重建时继续复用当前 session。采集器测试覆盖分钟封口、尾数、统计代次、目标归属和资源边界。
+协议测试校验 Go 源文件校验和、分析配置限额和排除分析字段后的拓扑摘要。真实 tonic 会话测试验证开关切换、配置失败时暂停、重复连接不重新应用拓扑，以及分析连接单独重建时继续复用当前 session；本地强制关闭测试覆盖面板反复开关、重连后不建分析流，并验证每个会话的计费报告正常送达。采集器测试覆盖分钟封口、尾数、统计代次、目标归属和资源边界。
 
 `shoes-engine` 分析测试通过真实 TCP 和 Hysteria2 UDP 转发验证域名、上下行字节及多目标 association 归属。内核测试覆盖包装对象预算释放、预算拒绝后继续转发、QUIC 分片隔离与原包不变，以及 TCP 嗅探的总超时和缓存回放。
 

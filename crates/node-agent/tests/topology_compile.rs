@@ -97,6 +97,135 @@ fn node(
     }
 }
 
+#[test]
+fn local_analysis_override_removes_sniff_actions_without_changing_panel_snapshot() {
+    let mut provider = vless_config("edge", 14431);
+    provider.sniff = true;
+    let mut top = topology(vec![node(
+        "node-a",
+        VLESS_REALITY_VISION_ID,
+        provider,
+        vec![],
+    )]);
+    top.route = Some(Route {
+        rules: vec![
+            RouteRule {
+                action: "sniff".into(),
+                sniff_options: Some(SniffActionOptions {
+                    sniffer: vec!["http".into(), "tls".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            RouteRule {
+                action: "reject".into(),
+                protocol: vec!["http".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    top.snapshot = Some(to_snapshot(&top));
+    let original_snapshot = top.snapshot.clone();
+    let original_digest = digest(&top);
+    assert!(original_digest.is_some());
+
+    let default_error = compile_with_warnings(&top).unwrap_err().to_string();
+    assert_eq!(
+        node_agent::compile::compile_with_local_overrides(&top, false)
+            .unwrap_err()
+            .to_string(),
+        default_error
+    );
+    let output = node_agent::compile::compile_with_local_overrides(&top, true)
+        .expect("local override must remove the unsupported sniff action before compilation");
+    let rules = output.runtime.inbounds[0].spec.config["rules"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rules.len(), 2); // Preserve the protocol reject and final direct rule.
+    assert_eq!(rules[0]["action"], "block");
+    assert_eq!(rules[0]["match"]["protocol"], json!(["http"]));
+    assert_eq!(rules[1]["action"], "allow");
+    assert_eq!(top.route.as_ref().unwrap().rules[0].action, "sniff");
+    assert_eq!(top.snapshot, original_snapshot);
+    assert_eq!(digest(&top), original_digest);
+
+    let mut expected_topology = top.clone();
+    expected_topology
+        .route
+        .as_mut()
+        .unwrap()
+        .rules
+        .retain(|rule| rule.action != "sniff");
+    let expected = compile_with_warnings(&expected_topology).unwrap();
+    assert_eq!(
+        output.runtime.diagnostic_yaml,
+        expected.runtime.diagnostic_yaml
+    );
+    assert_eq!(
+        output.runtime.dns_client_fingerprint, expected.runtime.dns_client_fingerprint,
+        "the DNS generation must fingerprint the effective route"
+    );
+    assert_eq!(output.warnings, expected.warnings);
+
+    top.route.as_mut().unwrap().rules[1].process_name = vec!["unsupported".into()];
+    assert!(
+        node_agent::compile::compile_with_local_overrides(&top, true)
+            .unwrap_err()
+            .to_string()
+            .contains("process_name"),
+        "the local override must preserve validation of all remaining routes"
+    );
+}
+
+#[test]
+fn local_analysis_override_preserves_routes_without_top_level_sniff_actions() {
+    let mut top = topology(vec![node(
+        "node-a",
+        VLESS_REALITY_VISION_ID,
+        vless_config("edge", 14431),
+        vec![active_user("user-a", UUID)],
+    )]);
+    for route in [
+        None,
+        Some(Route {
+            rules: vec![RouteRule {
+                action: "reject".into(),
+                domain: vec!["blocked.example".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    ] {
+        top.route = route;
+        let expected = compile_with_warnings(&top).unwrap();
+        let output = node_agent::compile::compile_with_local_overrides(&top, true).unwrap();
+        assert_eq!(
+            output.runtime.diagnostic_yaml,
+            expected.runtime.diagnostic_yaml
+        );
+        assert_eq!(
+            output.runtime.dns_client_fingerprint,
+            expected.runtime.dns_client_fingerprint
+        );
+        assert_eq!(
+            output.runtime.inbounds[0].spec.config,
+            expected.runtime.inbounds[0].spec.config
+        );
+        assert_eq!(output.warnings, expected.warnings);
+    }
+
+    top.route.as_mut().unwrap().rules[0].rules = vec![RouteRule {
+        action: "sniff".into(),
+        ..Default::default()
+    }];
+    assert_eq!(
+        node_agent::compile::compile_with_local_overrides(&top, true).unwrap_err(),
+        compile_with_warnings(&top).unwrap_err(),
+        "only top-level sniff actions may be removed"
+    );
+}
+
 fn topology(nodes: Vec<NodeInstance>) -> MachineTopology {
     MachineTopology {
         machine_id: "machine-a".into(),
@@ -199,6 +328,84 @@ fn append_shared_detour_candidates(
 }
 
 #[test]
+fn reality_validation_rejects_invalid_panel_credentials_before_runtime_apply() {
+    let cases: Vec<(&str, &str, Value)> = vec![
+        ("server_name", "tls.server_name", json!("  ")),
+        ("private_key", "private_key", json!("not-a-key")),
+        ("private_key", "private_key", json!("A".repeat(42))),
+        ("private_key", "private_key", json!("A".repeat(44))),
+        ("private_key", "private_key", json!("A".repeat(4096))),
+        (
+            "private_key",
+            "private_key",
+            json!(format!("{}!", "A".repeat(42))),
+        ),
+        (
+            "private_key",
+            "private_key",
+            json!(format!("{}B", "A".repeat(42))),
+        ),
+        (
+            "private_key",
+            "private_key",
+            json!(format!("{REALITY_KEY}=")),
+        ),
+        ("short_id", "short_id[0]", json!(["012"])),
+        ("short_id", "short_id[0]", json!(["gg"])),
+        ("short_id", "short_id[0]", json!(["0123456789abcdef00"])),
+    ];
+    for (field, expected, value) in cases {
+        let mut config = serde_json::to_value(vless_config("edge", 1443)).unwrap();
+        if field == "server_name" {
+            config["tls"][field] = value;
+        } else {
+            config["tls"]["reality"][field] = value;
+        }
+        let error = compile_with_warnings(&topology(vec![node(
+            "node",
+            VLESS_REALITY_VISION_ID,
+            config,
+            vec![],
+        )]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+
+    let mut config = vless_config("edge", 1443);
+    config.tls.reality.short_id = vec![String::new(), "ABCD".into()];
+    compile_with_warnings(&topology(vec![node(
+        "node",
+        VLESS_REALITY_VISION_ID,
+        config,
+        vec![],
+    )]))
+    .expect("Go accepts empty and uppercase even-length short IDs");
+}
+
+#[test]
+fn protobuf_invalid_ip_version_is_preserved_and_rejected_before_apply() {
+    let mut snapshot = to_snapshot(&topology(vec![node(
+        "node",
+        VLESS_REALITY_VISION_ID,
+        vless_config("edge", 1443),
+        vec![],
+    )]));
+    snapshot.route = Some(acp_proto::RouteConfig {
+        rules: vec![acp_proto::RouteRule {
+            ip_version: 300,
+            action: "reject".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let converted = from_snapshot("machine", Some(&snapshot));
+    assert_eq!(converted.route.as_ref().unwrap().rules[0].ip_version, 300);
+    let error = compile_with_warnings(&converted).unwrap_err().to_string();
+    assert!(error.contains("ip_version 300 must be 4 or 6"), "{error}");
+}
+
+#[test]
 fn serde_and_proto_round_trip_the_complete_topology_surface() {
     let nested = HeadlessRule {
         kind: "default".into(),
@@ -227,11 +434,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
         mode: "and".into(),
         rules: vec![],
     };
-    let strategy = NetworkStrategy {
-        kind: vec!["tcp".into()],
-        fallback_type: vec!["udp".into()],
-        fallback_delay: "250ms".into(),
-    };
+    let strategy = "fallback".to_string();
     let resolver = DomainResolveOptions {
         server: "dns".into(),
         strategy: "ipv4_only".into(),
@@ -239,8 +442,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
         rewrite_ttl: Some(60),
         client_subnet: "192.0.2.0/24".into(),
     };
-    let dialer = DialerOptions {
-        detour: "direct".into(),
+    let direct_options = DirectActionOptions {
         bind_interface: "eth0".into(),
         inet4_bind_address: "192.0.2.1".into(),
         inet6_bind_address: "2001:db8::1".into(),
@@ -249,8 +451,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
         connect_timeout: "5s".into(),
         tcp_fast_open: true,
         tcp_multi_path: true,
-        udp_fragment: true,
-        udp_timeout: "10s".into(),
+        udp_fragment: Some(false),
         domain_strategy: "prefer_ipv4".into(),
         bind_address_no_port: true,
         protect_path: "/protect".into(),
@@ -259,7 +460,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
         tcp_keep_alive: "30s".into(),
         tcp_keep_alive_interval: "10s".into(),
         domain_resolver: Some(resolver.clone()),
-        network_strategy: Some(strategy.clone()),
+        network_strategy: strategy.clone(),
         network_type: vec!["wifi".into()],
         fallback_network_type: vec!["cellular".into()],
         fallback_delay: "300ms".into(),
@@ -313,7 +514,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
         route_options: Some(RouteActionOptions {
             override_address: "example.org".into(),
             override_port: 8443,
-            network_strategy: Some(strategy.clone()),
+            network_strategy: strategy.clone(),
             fallback_delay: 42,
             udp_disable_domain_unmapping: true,
             udp_connect: true,
@@ -322,7 +523,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
             tls_fragment_fallback_delay: "10ms".into(),
             tls_record_fragment: true,
         }),
-        direct_options: Some(dialer),
+        direct_options: Some(direct_options),
         sniff_options: Some(SniffActionOptions {
             sniffer: vec!["tls".into()],
             timeout: "300ms".into(),
@@ -378,7 +579,7 @@ fn serde_and_proto_round_trip_the_complete_topology_surface() {
             }),
             override_android_vpn: true,
             default_domain_resolver: Some(resolver),
-            default_network_strategy: Some(strategy),
+            default_network_strategy: strategy,
             default_network_type: vec!["wifi".into()],
             default_fallback_network_type: vec!["cellular".into()],
             default_fallback_delay: "500ms".into(),
@@ -1153,7 +1354,7 @@ fn unimplemented_inbound_and_route_controls_are_rejected_before_apply() {
         geoip: Some(GeoIpOptions::default()),
         geosite: Some(GeositeOptions::default()),
         override_android_vpn: true,
-        default_network_strategy: Some(NetworkStrategy::default()),
+        default_network_strategy: "fallback".into(),
         default_network_type: vec!["wifi".into()],
         default_fallback_network_type: vec!["cellular".into()],
         default_fallback_delay: "500ms".into(),

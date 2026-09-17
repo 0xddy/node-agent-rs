@@ -1,9 +1,9 @@
 //! Bootstrap configuration loaded before an ACP session can be opened.
 //!
 //! The wire-facing topology is supplied by the panel; this deliberately small
-//! TOML file only says how to reach and authenticate that panel and where local
-//! diagnostics should go.  Its validation mirrors Go's `internal/config` so a
-//! file can be moved between the two agents without changing its meaning.
+//! TOML file says how to reach and authenticate that panel, where diagnostics
+//! should go, and whether to force analysis/sniffing off locally. Its validation
+//! mirrors Go's `internal/config` so a file can move between the two agents.
 
 use std::fmt;
 use std::path::Path;
@@ -27,6 +27,7 @@ pub struct Config {
     pub ca_cert_path: String,
     pub tls_insecure_skip_verify: bool,
     pub debug: bool,
+    pub disable_traffic_analysis: bool,
     pub log_file_path: String,
     pub traffic_report_min_delta_bytes: u64,
 }
@@ -74,6 +75,8 @@ struct RawConfig {
     tls_insecure_skip_verify: bool,
     #[serde(default)]
     debug: bool,
+    #[serde(default)]
+    disable_traffic_analysis: bool,
     #[serde(default)]
     log_file_path: String,
     traffic_report_min_delta_bytes: Option<u64>,
@@ -126,6 +129,7 @@ pub fn parse(source: &str) -> Result<Config, ConfigError> {
         ca_cert_path: raw.ca_cert_path,
         tls_insecure_skip_verify: raw.tls_insecure_skip_verify,
         debug: raw.debug,
+        disable_traffic_analysis: raw.disable_traffic_analysis,
         log_file_path: raw.log_file_path,
         traffic_report_min_delta_bytes,
     })
@@ -442,6 +446,7 @@ machine_secret = "secret"
         assert_eq!(config.panel_grpc_address, "127.0.0.1:9090");
         assert_eq!(config.panel_grpc_scheme, PANEL_GRPC_SCHEME_PLAINTEXT);
         assert_eq!(config.panel_grpc_server_name, "127.0.0.1");
+        assert!(!config.disable_traffic_analysis);
         assert_eq!(
             config.traffic_report_min_delta_bytes,
             DEFAULT_TRAFFIC_REPORT_MIN_DELTA_BYTES
@@ -458,6 +463,7 @@ machine_secret = "shared-secret"
 ca_cert_path = "C:/acp/private-ca.pem"
 tls_insecure_skip_verify = true
 debug = true
+disable_traffic_analysis = true
 log_file_path = "C:/acp/node-agent.log"
 traffic_report_min_delta_bytes = 4194304
 unknown_future_field = "ignored-by-both-agents"
@@ -475,8 +481,30 @@ unknown_future_field = "ignored-by-both-agents"
         assert_eq!(config.ca_cert_path, "C:/acp/private-ca.pem");
         assert!(config.tls_insecure_skip_verify);
         assert!(config.debug);
+        assert!(config.disable_traffic_analysis);
         assert_eq!(config.log_file_path, "C:/acp/node-agent.log");
         assert_eq!(config.traffic_report_min_delta_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn local_analysis_override_requires_a_boolean() {
+        for disabled in [false, true] {
+            let config = parse(
+                &(required("grpc://127.0.0.1:9090")
+                    + &format!("disable_traffic_analysis = {disabled}\n")),
+            )
+            .unwrap();
+            assert_eq!(config.disable_traffic_analysis, disabled);
+        }
+        for value in ["1", "\"true\""] {
+            assert!(
+                parse(
+                    &(required("grpc://127.0.0.1:9090")
+                        + &format!("disable_traffic_analysis = {value}\n")),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

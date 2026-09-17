@@ -138,9 +138,7 @@ pub struct Outbound {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct DialerOptions {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub detour: String,
+pub struct DirectActionOptions {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bind_interface: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -157,10 +155,8 @@ pub struct DialerOptions {
     pub tcp_fast_open: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub tcp_multi_path: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub udp_fragment: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub udp_timeout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_fragment: Option<bool>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub domain_strategy: String,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -177,8 +173,8 @@ pub struct DialerOptions {
     pub tcp_keep_alive_interval: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_resolver: Option<DomainResolveOptions>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_strategy: Option<NetworkStrategy>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub network_strategy: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network_type: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -200,17 +196,6 @@ pub struct DomainResolveOptions {
     pub rewrite_ttl: Option<u32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_subnet: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NetworkStrategy {
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "type")]
-    pub kind: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_type: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub fallback_delay: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -239,8 +224,8 @@ pub struct Route {
     pub override_android_vpn: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_domain_resolver: Option<DomainResolveOptions>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_network_strategy: Option<NetworkStrategy>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_network_strategy: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_network_type: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -346,8 +331,8 @@ pub struct RouteRule {
     pub inbound: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_zero_u8")]
-    pub ip_version: u8,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ip_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -433,7 +418,7 @@ pub struct RouteRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_options: Option<RouteActionOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub direct_options: Option<DialerOptions>,
+    pub direct_options: Option<DirectActionOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sniff_options: Option<SniffActionOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -467,8 +452,8 @@ pub struct RouteActionOptions {
     pub override_address: String,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub override_port: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_strategy: Option<NetworkStrategy>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub network_strategy: String,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub fallback_delay: u32,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -566,10 +551,6 @@ pub struct HeadlessRule {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-fn is_zero_u8(value: &u8) -> bool {
-    *value == 0
 }
 
 fn is_zero_u32(value: &u32) -> bool {

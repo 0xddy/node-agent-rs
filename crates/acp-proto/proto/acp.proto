@@ -433,8 +433,9 @@ message OutboundConfig {
   bytes options_json = 100;
 }
 
-message DialerOptions {
-  string detour = 1;
+message DirectActionOptions {
+  reserved 1, 11;
+  reserved "detour", "udp_timeout";
   string bind_interface = 2;
   string inet4_bind_address = 3;
   string inet6_bind_address = 4;
@@ -443,8 +444,7 @@ message DialerOptions {
   string connect_timeout = 7;
   bool tcp_fast_open = 8;
   bool tcp_multi_path = 9;
-  bool udp_fragment = 10;
-  string udp_timeout = 11;
+  optional bool udp_fragment = 10;
   string domain_strategy = 12;
   bool bind_address_no_port = 13;
   string protect_path = 14;
@@ -453,7 +453,7 @@ message DialerOptions {
   string tcp_keep_alive = 17;
   string tcp_keep_alive_interval = 18;
   DomainResolveOptions domain_resolver = 19;
-  NetworkStrategy network_strategy = 20;
+  string network_strategy = 20;
   repeated string network_type = 21;
   repeated string fallback_network_type = 22;
   string fallback_delay = 23;
@@ -465,12 +465,6 @@ message DomainResolveOptions {
   bool disable_cache = 3;
   optional uint32 rewrite_ttl = 4;
   string client_subnet = 5;
-}
-
-message NetworkStrategy {
-  repeated string type = 1;
-  repeated string fallback_type = 2;
-  string fallback_delay = 3;
 }
 
 message RouteConfig {
@@ -485,7 +479,7 @@ message RouteConfig {
   GeositeOptions geosite = 9;
   bool override_android_vpn = 10;
   DomainResolveOptions default_domain_resolver = 11;
-  NetworkStrategy default_network_strategy = 12;
+  string default_network_strategy = 12;
   repeated string default_network_type = 13;
   repeated string default_fallback_network_type = 14;
   string default_fallback_delay = 15;
@@ -584,7 +578,7 @@ message RouteRule {
   repeated string preferred_by = 44;
   bool rule_set_ip_cidr_match_source = 45;
   RouteActionOptions route_options = 46;
-  DialerOptions direct_options = 47;
+  DirectActionOptions direct_options = 47;
   SniffActionOptions sniff_options = 48;
   ResolveActionOptions resolve_options = 49;
 }
@@ -603,7 +597,7 @@ message RouteRuleSet {
 message RouteActionOptions {
   string override_address = 1;
   uint32 override_port = 2;
-  NetworkStrategy network_strategy = 3;
+  string network_strategy = 3;
   uint32 fallback_delay = 4;
   bool udp_disable_domain_unmapping = 5;
   bool udp_connect = 6;

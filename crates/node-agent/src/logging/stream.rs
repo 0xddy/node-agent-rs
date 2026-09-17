@@ -60,7 +60,9 @@ pub async fn run_log_stream(
             command = commands.message() => {
                 let Some(command) = command.map_err(SessionError::Rpc)? else {
                     close_subscription(&mut subscription, &mut subscription_id, &mut flush_at);
-                    return Ok(());
+                    return Err(SessionError::Rpc(tonic::Status::unavailable(
+                        "log stream closed by panel",
+                    )));
                 };
                 if command.subscription_id.is_empty() {
                     continue;
@@ -321,6 +323,7 @@ mod tests {
     #[derive(Clone)]
     struct MockLogPanel {
         batches: mpsc::UnboundedSender<NodeLogBatch>,
+        close_commands: CancellationToken,
     }
 
     #[tonic::async_trait]
@@ -347,6 +350,7 @@ mod tests {
 
             let mut batches = request.into_inner();
             let batch_events = self.batches.clone();
+            let close_commands = self.close_commands.clone();
             let (commands, receiver) = mpsc::channel(2);
             tokio::spawn(async move {
                 if commands
@@ -362,6 +366,10 @@ mod tests {
                 if let Ok(Some(batch)) = batches.message().await {
                     let _ = batch_events.send(batch);
                 }
+                tokio::select! {
+                    () = close_commands.cancelled() => {}
+                    () = commands.closed() => {}
+                }
             });
             Ok(Response::new(ReceiverStream::new(receiver)))
         }
@@ -369,16 +377,28 @@ mod tests {
 
     #[tokio::test]
     async fn tonic_stream_authenticates_starts_and_sends_a_bounded_batch() {
+        tonic_log_stream_lifecycle(false).await;
+    }
+
+    #[tokio::test]
+    async fn panel_eof_retires_log_stream_with_retryable_error() {
+        tonic_log_stream_lifecycle(true).await;
+    }
+
+    async fn tonic_log_stream_lifecycle(panel_eof: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let incoming = TcpListenerStream::new(listener);
         let (batch_events, mut batches) = mpsc::unbounded_channel();
         let server_cancel = CancellationToken::new();
         let server_token = server_cancel.clone();
+        let close_commands = CancellationToken::new();
+        let panel_close = close_commands.clone();
         let server = tokio::spawn(async move {
             Server::builder()
                 .add_service(LogServiceServer::new(MockLogPanel {
                     batches: batch_events,
+                    close_commands: panel_close,
                 }))
                 .serve_with_incoming_shutdown(incoming, server_token.cancelled_owned())
                 .await
@@ -430,12 +450,22 @@ machine_secret = "secret"
                 .any(|line| line.text.contains("wire-marker"))
         );
 
-        cancel.cancel();
-        tokio::time::timeout(Duration::from_secs(1), runner)
+        if panel_eof {
+            close_commands.cancel();
+        } else {
+            cancel.cancel();
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(1), runner)
             .await
             .expect("log runner did not stop")
-            .expect("log runner panicked")
-            .unwrap();
+            .expect("log runner panicked");
+        if panel_eof {
+            assert!(matches!(outcome, Err(SessionError::Rpc(status))
+                if status.code() == tonic::Code::Unavailable
+                    && status.message() == "log stream closed by panel"));
+        } else {
+            outcome.unwrap();
+        }
         server_cancel.cancel();
         tokio::time::timeout(Duration::from_secs(1), server)
             .await

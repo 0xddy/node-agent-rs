@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use acp_proto as pb;
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use crate::porthopping::{Manager as PortHoppingManager, Plan as PortHoppingPlan};
 use crate::runtime::{NodeRuntime, ReloadStatus, RuntimeConfig, RuntimeError};
@@ -184,7 +185,6 @@ impl PortRouter for PortHoppingManager {
     }
 }
 
-#[derive(Clone)]
 struct PreparedReload {
     candidate: MachineTopology,
     desired_plan: PortHoppingPlan,
@@ -314,9 +314,11 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
         let candidate = topology.clone();
         self.run_owned("topology apply", async move {
             let _operation = inner.operation.lock().await;
-            let output = crate::compile::compile_with_warnings(&candidate).map_err(|error| {
-                TopologyError::runtime(format!("compile topology: {error}"), false)
-            })?;
+            let output = crate::compile::compile_with_local_overrides(
+                &candidate,
+                inner.runtime.traffic_analysis_disabled(),
+            )
+            .map_err(|error| TopologyError::runtime(format!("compile topology: {error}"), false))?;
             let desired_plan = crate::porthopping::build_plan(&candidate).map_err(|error| {
                 TopologyError::runtime(
                     format!("build port hopping forwarding configuration: {error}"),
@@ -340,7 +342,12 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                 debug_assert_eq!(previous_plan, state.active_plan);
                 let previous_had_topology = !state.active_topology.machine_id.is_empty();
                 let previous_config = previous_had_topology
-                    .then(|| crate::compile::compile_with_warnings(&state.active_topology))
+                    .then(|| {
+                        crate::compile::compile_with_local_overrides(
+                            &state.active_topology,
+                            inner.runtime.traffic_analysis_disabled(),
+                        )
+                    })
                     .transpose()
                     .map_err(|error| {
                         TopologyError::runtime(
@@ -472,8 +479,11 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
     }
 
     fn prepare_reload(&self, topology: &MachineTopology) -> Result<RuntimeConfig, TopologyError> {
-        let output = crate::compile::compile_with_warnings(topology)
-            .map_err(|error| TopologyError::runtime(format!("compile topology: {error}"), false))?;
+        let output = crate::compile::compile_with_local_overrides(
+            topology,
+            self.inner.runtime.traffic_analysis_disabled(),
+        )
+        .map_err(|error| TopologyError::runtime(format!("compile topology: {error}"), false))?;
         let desired_plan = crate::porthopping::build_plan(topology).map_err(|error| {
             TopologyError::runtime(
                 format!("build port hopping forwarding configuration: {error}"),
@@ -502,7 +512,12 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
         debug_assert_eq!(previous_plan, state.active_plan);
         let previous_had_topology = !state.active_topology.machine_id.is_empty();
         let previous_config = previous_had_topology
-            .then(|| crate::compile::compile_with_warnings(&state.active_topology))
+            .then(|| {
+                crate::compile::compile_with_local_overrides(
+                    &state.active_topology,
+                    self.inner.runtime.traffic_analysis_disabled(),
+                )
+            })
             .transpose()
             .map_err(|error| {
                 TopologyError::runtime(
@@ -528,28 +543,30 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
         let candidate = topology.clone();
         self.run_owned("configure reload port hopping", async move {
             let _operation = inner.operation.lock().await;
-            let pending = {
-                let state = inner
+            let (desired_plan, previous_plan, previous_had_topology) = {
+                let mut state = inner
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.pending_reload.clone()
-            }
-            .ok_or_else(|| {
-                TopologyError::runtime("forced reload has no prepared transaction", false)
-            })?;
-            if pending.candidate != candidate {
-                inner
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .pending_reload = None;
-                return Err(TopologyError::runtime(
-                    "forced reload candidate changed after preparation",
-                    false,
-                ));
-            }
-            if let Err(error) = inner.reconcile_ports(&pending.desired_plan).await {
+                let pending = state.pending_reload.as_ref().ok_or_else(|| {
+                    TopologyError::runtime("forced reload has no prepared transaction", false)
+                })?;
+                if pending.candidate != candidate {
+                    state.pending_reload = None;
+                    return Err(TopologyError::runtime(
+                        "forced reload candidate changed after preparation",
+                        false,
+                    ));
+                }
+                // Port reconciliation needs only its plans. Keep the topology,
+                // credentials and rollback runtime configuration in place.
+                (
+                    pending.desired_plan.clone(),
+                    pending.previous_plan.clone(),
+                    pending.previous_had_topology,
+                )
+            };
+            if let Err(error) = inner.reconcile_ports(&desired_plan).await {
                 inner
                     .state
                     .lock()
@@ -558,8 +575,8 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                 return Err(port_configuration_failure(
                     &inner,
                     error,
-                    &pending.previous_plan,
-                    pending.previous_had_topology,
+                    &previous_plan,
+                    previous_had_topology,
                 )
                 .await);
             }
@@ -961,6 +978,8 @@ pub struct TopologyManager {
     runtime: Arc<dyn TopologyRuntime>,
     operation: Arc<tokio::sync::Mutex<()>>,
     published: Arc<RwLock<PublishedTopology>>,
+    operations_cancel: CancellationToken,
+    close_result: Arc<tokio::sync::OnceCell<Result<(), TopologyError>>>,
 }
 
 impl TopologyManager {
@@ -970,6 +989,8 @@ impl TopologyManager {
             runtime,
             operation: Arc::new(tokio::sync::Mutex::new(())),
             published: Arc::new(RwLock::new(PublishedTopology::default())),
+            operations_cancel: CancellationToken::new(),
+            close_result: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -1011,9 +1032,13 @@ impl TopologyManager {
     }
 
     fn publish(&self, topology: MachineTopology) {
-        let mut published = self.write_published();
-        published.topology = topology;
-        published.generation = published.generation.wrapping_add(1);
+        let previous = {
+            let mut published = self.write_published();
+            published.generation = published.generation.wrapping_add(1);
+            std::mem::replace(&mut published.topology, topology)
+        };
+        // Releasing a large user list and wire snapshot must not block readers.
+        drop(previous);
     }
 
     /// Returns a compare-and-swap token for an authoritative panel fetch.
@@ -1038,6 +1063,7 @@ impl TopologyManager {
     }
 
     pub fn current_config(&self) -> Result<Vec<u8>, TopologyError> {
+        self.ensure_operations_running()?;
         let config = self.runtime.current_config();
         if config.is_empty() {
             return Err(TopologyError::new(
@@ -1049,7 +1075,7 @@ impl TopologyManager {
     }
 
     pub async fn reconcile_current(&self) -> Result<(), TopologyError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.begin_operation().await?;
         let current = self.read_published().topology.clone();
         if current.machine_id.is_empty() {
             return Ok(());
@@ -1057,15 +1083,50 @@ impl TopologyManager {
         self.runtime.reconcile_current(&current).await
     }
 
+    /// Cancel panel fetches and runtime preparation while billing drains.
+    /// Already started mutation transactions retain ownership until completion.
+    pub fn stop_operations(&self) {
+        self.operations_cancel.cancel();
+        self.runtime.begin_close();
+    }
+
+    fn ensure_operations_running(&self) -> Result<(), TopologyError> {
+        if self.operations_cancel.is_cancelled() {
+            return Err(TopologyError::runtime(
+                "topology operations are stopped",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn begin_operation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, TopologyError> {
+        let operation = tokio::select! {
+            biased;
+            () = self.operations_cancel.cancelled() => {
+                return Err(TopologyError::runtime("topology operations are stopped", false));
+            }
+            operation = self.operation.lock() => operation,
+        };
+        self.ensure_operations_running()?;
+        Ok(operation)
+    }
+
     pub async fn close(&self) -> Result<(), TopologyError> {
+        self.stop_operations();
         let manager = self.clone();
         tokio::spawn(async move {
             // A slow download belongs to the operation currently holding this
             // lock. Signal it before waiting, while retaining ownership of the
             // eventual resource close even if this caller is cancelled.
-            manager.runtime.begin_close();
-            let _operation = manager.operation.lock().await;
-            manager.runtime.close().await
+            manager
+                .close_result
+                .get_or_init(|| async {
+                    let _operation = manager.operation.lock().await;
+                    manager.runtime.close().await
+                })
+                .await
+                .clone()
         })
         .await
         .map_err(|error| {
@@ -1143,7 +1204,7 @@ impl TopologyManager {
     pub async fn apply_initial(&self, topology: MachineTopology) -> Result<String, TopologyError> {
         let manager = self.clone();
         tokio::spawn(async move {
-            let _operation = manager.operation.lock().await;
+            let _operation = manager.begin_operation().await?;
             manager.guard_authoritative_revision(topology.revision)?;
             manager.apply(topology).await
         })
@@ -1169,7 +1230,7 @@ impl TopologyManager {
     ) -> Result<String, TopologyError> {
         let manager = self.clone();
         tokio::spawn(async move {
-            let _operation = manager.operation.lock().await;
+            let _operation = manager.begin_operation().await?;
             manager.guard_authoritative_revision(topology.revision)?;
             let current = manager.publication_token();
             if current.0 != expected.0 {
@@ -1193,10 +1254,9 @@ impl TopologyManager {
         })?
     }
 
-    /// Fetches, builds, configures and force-reloads one candidate under the
-    /// same operation lock. The candidate is published only after the single
-    /// `reload_prepared` call succeeds; this intentionally never follows reload
-    /// with a second ordinary apply.
+    /// Fetches outside the operation lock, then verifies the publication has
+    /// not changed before building and force-reloading the candidate. Once a
+    /// mutation starts, its owned task completes even if the caller disconnects.
     pub async fn reload_from<F, Fut, E>(
         self: &Arc<Self>,
         fetch: F,
@@ -1232,9 +1292,24 @@ impl TopologyManager {
         Fut: Future<Output = Result<MachineTopology, E>> + Send,
         E: fmt::Display,
     {
-        let _operation = self.operation.lock().await;
-        reporter.report(ReloadStage::PullConfiguration).await;
-        let mut candidate = match fetch(reporter.clone()).await {
+        if let Err(error) = self.ensure_operations_running() {
+            return reload_failure(ReloadStage::PullConfiguration, error);
+        }
+        let baseline = self.publication_token();
+        let fetched = tokio::select! {
+            biased;
+            () = self.operations_cancel.cancelled() => {
+                return reload_failure(
+                    reporter.current_stage(),
+                    TopologyError::runtime("topology operations are stopped", false),
+                );
+            }
+            result = async {
+                reporter.report(ReloadStage::PullConfiguration).await;
+                fetch(reporter.clone()).await
+            } => result,
+        };
+        let mut candidate = match fetched {
             Ok(candidate) => candidate,
             Err(error) => {
                 return TopologyReloadResult {
@@ -1251,6 +1326,22 @@ impl TopologyManager {
             candidate.machine_id.clone_from(&self.machine_id);
         }
 
+        let _operation = match self.begin_operation().await {
+            Ok(operation) => operation,
+            Err(error) => return reload_failure(ReloadStage::BuildConfiguration, error),
+        };
+        if baseline.0 != self.publication_token().0 {
+            return reload_failure(
+                ReloadStage::BuildConfiguration,
+                TopologyError::new(
+                    TopologyErrorKind::StaleRevision,
+                    "topology changed while fetching reload configuration; retry reload",
+                ),
+            );
+        }
+        if let Err(error) = self.guard_authoritative_revision(candidate.revision) {
+            return reload_failure(ReloadStage::BuildConfiguration, error);
+        }
         reporter.report(ReloadStage::BuildConfiguration).await;
         let prepared = match self.runtime.prepare_reload(&candidate) {
             Ok(prepared) => prepared,
@@ -1258,8 +1349,6 @@ impl TopologyManager {
                 return reload_failure(ReloadStage::BuildConfiguration, error);
             }
         };
-        let config_sha256 = sha256_hex(&prepared.diagnostic_yaml);
-
         reporter.report(ReloadStage::ConfigurePortHopping).await;
         if let Err(error) = self.runtime.configure_reload(&candidate).await {
             return reload_failure(ReloadStage::ConfigurePortHopping, error);
@@ -1281,12 +1370,15 @@ impl TopologyManager {
             };
         }
 
-        let previous = self.read_published().topology.clone();
-        self.publish(candidate.clone());
-        self.close_stale_users(&previous, &candidate).await;
+        let topology_revision = candidate.revision;
+        let loaded_user_count = topology_user_count(&candidate);
+        self.publish_and_close_stale_users(candidate).await;
         reporter.report(ReloadStage::Completed).await;
         let warnings = self.runtime.warnings();
         report_compile_warnings(&warnings);
+        // Runtime overrides can rewrite the prepared configuration. Match the
+        // exact effective bytes returned by the remote configuration endpoint.
+        let config_sha256 = sha256_hex(&self.runtime.current_config());
         TopologyReloadResult {
             outcome: ReloadOutcome::Succeeded,
             stage: ReloadStage::Completed,
@@ -1294,9 +1386,9 @@ impl TopologyManager {
                 "shoes reloaded with fresh panel configuration and users".into(),
                 &warnings,
             ),
-            topology_revision: candidate.revision,
+            topology_revision,
             config_sha256,
-            loaded_user_count: topology_user_count(&candidate),
+            loaded_user_count,
         }
     }
 
@@ -1304,7 +1396,7 @@ impl TopologyManager {
         &self,
         snapshot: Option<&pb::TopologySnapshot>,
     ) -> Result<String, TopologyError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.begin_operation().await?;
         let snapshot = snapshot.ok_or_else(|| {
             TopologyError::new(
                 TopologyErrorKind::InvalidMutation,
@@ -1320,7 +1412,7 @@ impl TopologyManager {
         &self,
         delta: Option<&pb::TopologyDelta>,
     ) -> Result<String, TopologyError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.begin_operation().await?;
         let delta = delta.ok_or_else(|| {
             TopologyError::new(
                 TopologyErrorKind::InvalidMutation,
@@ -1357,7 +1449,7 @@ impl TopologyManager {
         patch: Option<&pb::TopologyRoutePatch>,
         base_revision: u64,
     ) -> Result<String, TopologyError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.begin_operation().await?;
         let patch = patch.ok_or_else(|| {
             TopologyError::new(
                 TopologyErrorKind::InvalidMutation,
@@ -1386,7 +1478,7 @@ impl TopologyManager {
         mutation: Option<&pb::UserMutation>,
         base_revision: u64,
     ) -> Result<String, TopologyError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.begin_operation().await?;
         let mutation = mutation.ok_or_else(|| {
             TopologyError::new(
                 TopologyErrorKind::InvalidMutation,
@@ -1491,7 +1583,7 @@ impl TopologyManager {
             expected_current,
             revision,
         } = request;
-        let _operation = self.operation.lock().await;
+        let _operation = self.begin_operation().await?;
         if node_id.is_empty() {
             return Err(TopologyError::new(
                 TopologyErrorKind::InvalidMutation,
@@ -1578,9 +1670,8 @@ impl TopologyManager {
         offset: u64,
         limit: usize,
     ) -> Result<(usize, Vec<UserCredential>), TopologyError> {
-        // Match Go's `LoadedUsers`: serialize against mutations so a fetch/CAS
-        // loop observes a complete manager operation, never an intermediate one.
-        let _operation = self.operation.lock().await;
+        // Reads use the published snapshot and need not wait for preparation.
+        self.ensure_operations_running()?;
         self.read_published()
             .topology
             .nodes
@@ -1604,25 +1695,26 @@ impl TopologyManager {
         if topology.machine_id.is_empty() {
             topology.machine_id.clone_from(&self.machine_id);
         }
-        let previous = self.read_published().topology.clone();
         self.runtime.apply(&topology).await?;
-        self.publish(topology.clone());
-        self.close_stale_users(&previous, &topology).await;
+        let message = format!(
+            "shoes configuration applied: topology revision={}, nodes={}, users={}",
+            topology.revision,
+            topology.nodes.len(),
+            topology_user_count(&topology)
+        );
+        self.publish_and_close_stale_users(topology).await;
         let warnings = self.runtime.warnings();
         report_compile_warnings(&warnings);
-        Ok(append_warning_summary(
-            format!(
-                "shoes configuration applied: topology revision={}, nodes={}, users={}",
-                topology.revision,
-                topology.nodes.len(),
-                topology_user_count(&topology)
-            ),
-            &warnings,
-        ))
+        Ok(append_warning_summary(message, &warnings))
     }
 
-    async fn close_stale_users(&self, previous: &MachineTopology, next: &MachineTopology) {
-        for (node_id, user_ids) in stale_credential_topology_users(previous, next) {
+    /// The caller holds the operation lock through publication and cleanup.
+    /// Retain only identities to close, rather than cloning both full topologies.
+    async fn publish_and_close_stale_users(&self, topology: MachineTopology) {
+        let stale_users =
+            stale_credential_topology_users(&self.read_published().topology, &topology);
+        self.publish(topology);
+        for (node_id, user_ids) in stale_users {
             for user_id in user_ids {
                 self.runtime
                     .close_user_connections(&node_id, &user_id)
@@ -1906,12 +1998,7 @@ fn topology_user_count(topology: &MachineTopology) -> usize {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(encoded, "{byte:02x}").expect("writing into String cannot fail");
-    }
-    encoded
+    acp_proto::hex::encode(&Sha256::digest(data))
 }
 
 #[cfg(test)]
@@ -2672,17 +2759,25 @@ mod transaction_tests {
             "password",
             "adapter publication must wait for the gated runtime"
         );
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        gate.permit.add_permits(1);
-
-        let users = tokio::time::timeout(
+        let visible_users = tokio::time::timeout(
             Duration::from_secs(1),
             manager.loaded_users("node-hysteria"),
         )
         .await
-        .expect("owned user refresh did not finish")
+        .expect("reading the published users must not wait for preparation")
         .unwrap();
+        assert_eq!(visible_users[0].credential, "password");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        gate.permit.add_permits(1);
+
+        // LoadedUsers now reads the last published snapshot without joining
+        // the mutation. Wait explicitly for the owned transaction to complete.
+        let _completed_operation =
+            tokio::time::timeout(Duration::from_secs(1), manager.operation.lock())
+                .await
+                .expect("owned user refresh did not finish");
+        let users = manager.loaded_users("node-hysteria").await.unwrap();
         assert_eq!(users[0].credential, "replacement-password");
         assert_eq!(
             adapter.state().active_topology,

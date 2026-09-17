@@ -1,6 +1,6 @@
 # Rust node-agent 面板兼容边界
 
-更新日期：2026-09-16
+更新日期：2026-09-17
 
 ## 结论
 
@@ -30,6 +30,12 @@
 
 与 Go `d74fc89` 对齐，域名明细上报原始可见 `domain`、独立的 `destination_domain` 和 `ech_present`，不再发送 `root_domain`、`domain_source`。ECH（包括 GREASE）不会清除可见 SNI，站点归属与域名规范化由面板决定；`identified_*_bytes` 只表示有观测或请求域名的字节数。
 
+支持 Go `4b503c5` 的本地 `disable_traffic_analysis` 覆盖：强制关闭采集、上报与所有嗅探，面板配置及重连不能重新开启，计费不受影响。运行配置诊断和远程 reload 的 SHA-256 使用覆盖后的实际配置。
+
+ACP 路由契约同步至 Go `920c670`：`network_strategy` 和 `default_network_strategy` 使用字符串，`DirectActionOptions.udp_fragment` 保留未指定与显式 `false` 的区别，旧 `detour` / `udp_timeout` 字段号保持 reserved。这保证新版面板字段正确解码与往返；Shoes 尚不支持的路由选项仍在编译时明确拒绝。
+
+未知 protobuf 字段仍按 prost 的默认行为在解码时忽略；Go `920c670` 新增的 unknown-field 拒绝逻辑尚未等效实现。该差异不影响本次同步的已知字段，但不能将 Rust 的成功解码视为已验证未来版本的未知拓扑字段。
+
 ## 引导 TOML
 
 下列字段、缺省值和核心校验顺序与 Go 实现对齐：
@@ -40,6 +46,7 @@
 | `machine_id`、`node_id`、`machine_secret` | 直接兼容 |
 | `ca_cert_path`、`tls_insecure_skip_verify` | 直接兼容；显式 CA 要求至少一张可解析 X.509，混合坏 PEM block 时保留有效证书 |
 | `debug`、`log_file_path` | 直接兼容 |
+| `disable_traffic_analysis` | 直接兼容；缺省 `false`，设为 `true` 时本地强制关闭分析及嗅探，保留计费，修改后重启生效 |
 | `traffic_report_min_delta_bytes` | 直接兼容；缺省仍为 25 MiB，显式 0 仍拒绝 |
 
 规则集缓存、拓扑快照和刷新状态是 Rust 的内部运行数据，不会增加必填 TOML 字段。

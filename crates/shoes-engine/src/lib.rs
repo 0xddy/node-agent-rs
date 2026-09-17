@@ -90,7 +90,7 @@ mod users;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -322,6 +322,7 @@ impl<'a> CandidateResolvers<'a> {
 
 struct EngineInner {
     analysis: Arc<shoes::dynamic::analysis::AnalysisSlot>,
+    analysis_policy: Mutex<AnalysisPolicy>,
     /// Unique authority carried by replay leases. It is deliberately separate from
     /// the EngineInner Arc so retaining a lease cannot keep listeners alive.
     replay_identity: Arc<()>,
@@ -331,6 +332,22 @@ struct EngineInner {
     inbounds: DashMap<String, Arc<InboundSlot>>,
     /// bind address -> owning tag.
     bound: DashMap<BindKey, String>,
+}
+
+#[derive(Default)]
+struct AnalysisPolicy {
+    disabled: bool,
+    observer: Option<Arc<dyn AnalysisObserver>>,
+}
+
+impl AnalysisPolicy {
+    fn active_observer(&self) -> Option<&Arc<dyn AnalysisObserver>> {
+        if self.disabled {
+            None
+        } else {
+            self.observer.as_ref()
+        }
+    }
 }
 
 impl Drop for EngineInner {
@@ -491,6 +508,7 @@ impl Engine {
         Ok(Self {
             inner: Arc::new(EngineInner {
                 analysis: Arc::new(shoes::dynamic::analysis::AnalysisSlot::default()),
+                analysis_policy: Mutex::new(AnalysisPolicy::default()),
                 replay_identity: Arc::new(()),
                 control: tokio::sync::Mutex::new(ControlState {
                     client_chain_groups: ClientChainGroupRegistry::default(),
@@ -508,7 +526,54 @@ impl Engine {
     /// Observe routed payloads across all current and future inbounds without
     /// reloading listeners or modifying billing counters.
     pub fn set_analysis_observer(&self, observer: Option<Arc<dyn AnalysisObserver>>) {
-        self.inner.analysis.set(observer);
+        self.update_analysis_policy(|policy| policy.observer = observer);
+    }
+
+    /// Set the local process policy before installing any inbounds. A disabled
+    /// policy suppresses analysis observers and forces sniff off when validating,
+    /// adding or updating inbounds, regardless of their supplied configuration.
+    /// Billing counters remain enabled. Existing flows and listener settings are
+    /// not rebuilt by this startup-time setter.
+    pub fn set_disable_traffic_analysis(&self, disabled: bool) {
+        self.update_analysis_policy(|policy| policy.disabled = disabled);
+    }
+
+    fn update_analysis_policy(&self, update: impl FnOnce(&mut AnalysisPolicy)) {
+        let mut policy = self
+            .inner
+            .analysis_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = policy.active_observer().cloned();
+        update(&mut policy);
+        let current = policy.active_observer();
+        let unchanged = match (previous.as_ref(), current) {
+            (None, None) => true,
+            (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+            _ => false,
+        };
+        // Publish under the same lock so concurrent setters cannot restore an
+        // older observer. An unchanged effective policy needs no ArcSwap write.
+        if !unchanged {
+            self.inner.analysis.set(current.cloned());
+        }
+    }
+
+    /// Whether the local process policy disables sniffing and analysis.
+    pub fn traffic_analysis_disabled(&self) -> bool {
+        self.inner
+            .analysis_policy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .disabled
+    }
+
+    fn apply_analysis_policy(&self, config: &mut serde_json::Value) {
+        if self.traffic_analysis_disabled()
+            && let Some(config) = config.as_object_mut()
+        {
+            config.insert("sniff".into(), serde_json::Value::Bool(false));
+        }
     }
 
     pub fn status(&self) -> EngineStatus {
@@ -638,6 +703,7 @@ impl Engine {
         }
 
         let mut config = spec.config.clone();
+        self.apply_analysis_policy(&mut config);
         if spec.users.is_some() {
             protocol::install_placeholder_credentials(&mut config)?;
         }
@@ -750,6 +816,7 @@ impl Engine {
 
         // Parse and validate *before* taking the control lock: a malformed
         // payload should not delay other operations.
+        self.apply_analysis_policy(&mut config);
         let ValidatedInbound {
             configs: server_configs,
             dns_groups,
@@ -1025,6 +1092,7 @@ impl Engine {
             protocol::install_placeholder_credentials(&mut config)?;
         }
 
+        self.apply_analysis_policy(&mut config);
         let ValidatedInbound {
             configs: server_configs,
             dns_groups,

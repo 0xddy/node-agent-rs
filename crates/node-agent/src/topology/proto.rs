@@ -362,30 +362,9 @@ impl From<&DomainResolveOptions> for pb::DomainResolveOptions {
     }
 }
 
-impl From<&pb::NetworkStrategy> for NetworkStrategy {
-    fn from(value: &pb::NetworkStrategy) -> Self {
+impl From<&pb::DirectActionOptions> for DirectActionOptions {
+    fn from(value: &pb::DirectActionOptions) -> Self {
         Self {
-            kind: value.r#type.clone(),
-            fallback_type: value.fallback_type.clone(),
-            fallback_delay: value.fallback_delay.clone(),
-        }
-    }
-}
-
-impl From<&NetworkStrategy> for pb::NetworkStrategy {
-    fn from(value: &NetworkStrategy) -> Self {
-        Self {
-            r#type: value.kind.clone(),
-            fallback_type: value.fallback_type.clone(),
-            fallback_delay: value.fallback_delay.clone(),
-        }
-    }
-}
-
-impl From<&pb::DialerOptions> for DialerOptions {
-    fn from(value: &pb::DialerOptions) -> Self {
-        Self {
-            detour: value.detour.clone(),
             bind_interface: value.bind_interface.clone(),
             inet4_bind_address: value.inet4_bind_address.clone(),
             inet6_bind_address: value.inet6_bind_address.clone(),
@@ -395,7 +374,6 @@ impl From<&pb::DialerOptions> for DialerOptions {
             tcp_fast_open: value.tcp_fast_open,
             tcp_multi_path: value.tcp_multi_path,
             udp_fragment: value.udp_fragment,
-            udp_timeout: value.udp_timeout.clone(),
             domain_strategy: value.domain_strategy.clone(),
             bind_address_no_port: value.bind_address_no_port,
             protect_path: value.protect_path.clone(),
@@ -407,7 +385,7 @@ impl From<&pb::DialerOptions> for DialerOptions {
                 .domain_resolver
                 .as_ref()
                 .map(DomainResolveOptions::from),
-            network_strategy: value.network_strategy.as_ref().map(NetworkStrategy::from),
+            network_strategy: value.network_strategy.clone(),
             network_type: value.network_type.clone(),
             fallback_network_type: value.fallback_network_type.clone(),
             fallback_delay: value.fallback_delay.clone(),
@@ -415,10 +393,9 @@ impl From<&pb::DialerOptions> for DialerOptions {
     }
 }
 
-impl From<&DialerOptions> for pb::DialerOptions {
-    fn from(value: &DialerOptions) -> Self {
+impl From<&DirectActionOptions> for pb::DirectActionOptions {
+    fn from(value: &DirectActionOptions) -> Self {
         Self {
-            detour: value.detour.clone(),
             bind_interface: value.bind_interface.clone(),
             inet4_bind_address: value.inet4_bind_address.clone(),
             inet6_bind_address: value.inet6_bind_address.clone(),
@@ -428,7 +405,6 @@ impl From<&DialerOptions> for pb::DialerOptions {
             tcp_fast_open: value.tcp_fast_open,
             tcp_multi_path: value.tcp_multi_path,
             udp_fragment: value.udp_fragment,
-            udp_timeout: value.udp_timeout.clone(),
             domain_strategy: value.domain_strategy.clone(),
             bind_address_no_port: value.bind_address_no_port,
             protect_path: value.protect_path.clone(),
@@ -440,10 +416,7 @@ impl From<&DialerOptions> for pb::DialerOptions {
                 .domain_resolver
                 .as_ref()
                 .map(pb::DomainResolveOptions::from),
-            network_strategy: value
-                .network_strategy
-                .as_ref()
-                .map(pb::NetworkStrategy::from),
+            network_strategy: value.network_strategy.clone(),
             network_type: value.network_type.clone(),
             fallback_network_type: value.fallback_network_type.clone(),
             fallback_delay: value.fallback_delay.clone(),
@@ -468,10 +441,7 @@ impl From<&pb::RouteConfig> for Route {
                 .default_domain_resolver
                 .as_ref()
                 .map(DomainResolveOptions::from),
-            default_network_strategy: route
-                .default_network_strategy
-                .as_ref()
-                .map(NetworkStrategy::from),
+            default_network_strategy: route.default_network_strategy.clone(),
             default_network_type: route.default_network_type.clone(),
             default_fallback_network_type: route.default_fallback_network_type.clone(),
             default_fallback_delay: route.default_fallback_delay.clone(),
@@ -496,10 +466,7 @@ impl From<&Route> for pb::RouteConfig {
                 .default_domain_resolver
                 .as_ref()
                 .map(pb::DomainResolveOptions::from),
-            default_network_strategy: route
-                .default_network_strategy
-                .as_ref()
-                .map(pb::NetworkStrategy::from),
+            default_network_strategy: route.default_network_strategy.clone(),
             default_network_type: route.default_network_type.clone(),
             default_fallback_network_type: route.default_fallback_network_type.clone(),
             default_fallback_delay: route.default_fallback_delay.clone(),
@@ -645,7 +612,9 @@ impl From<&pb::RouteRule> for RouteRule {
             kind: value.r#type.clone(),
             inbound: value.inbound.clone(),
             network: value.network.clone(),
-            ip_version: u8::try_from(value.ip_version).unwrap_or_default(),
+            // Preserve invalid wire values until compile-time validation. A
+            // failed narrowing must never turn a scoped rule into a catch-all.
+            ip_version: value.ip_version,
             domain: value.domain.clone(),
             domain_suffix: value.domain_suffix.clone(),
             domain_keyword: value.domain_keyword.clone(),
@@ -688,7 +657,7 @@ impl From<&pb::RouteRule> for RouteRule {
             preferred_by: value.preferred_by.clone(),
             rule_set_ip_cidr_match_source: value.rule_set_ip_cidr_match_source,
             route_options: value.route_options.as_ref().map(RouteActionOptions::from),
-            direct_options: value.direct_options.as_ref().map(DialerOptions::from),
+            direct_options: value.direct_options.as_ref().map(DirectActionOptions::from),
             sniff_options: value.sniff_options.as_ref().map(SniffActionOptions::from),
             resolve_options: value
                 .resolve_options
@@ -704,7 +673,7 @@ impl From<&RouteRule> for pb::RouteRule {
             r#type: value.kind.clone(),
             inbound: value.inbound.clone(),
             network: value.network.clone(),
-            ip_version: u32::from(value.ip_version),
+            ip_version: value.ip_version,
             domain: value.domain.clone(),
             domain_suffix: value.domain_suffix.clone(),
             domain_keyword: value.domain_keyword.clone(),
@@ -750,7 +719,10 @@ impl From<&RouteRule> for pb::RouteRule {
                 .route_options
                 .as_ref()
                 .map(pb::RouteActionOptions::from),
-            direct_options: value.direct_options.as_ref().map(pb::DialerOptions::from),
+            direct_options: value
+                .direct_options
+                .as_ref()
+                .map(pb::DirectActionOptions::from),
             sniff_options: value
                 .sniff_options
                 .as_ref()
@@ -798,7 +770,7 @@ impl From<&pb::RouteActionOptions> for RouteActionOptions {
         Self {
             override_address: value.override_address.clone(),
             override_port: value.override_port,
-            network_strategy: value.network_strategy.as_ref().map(NetworkStrategy::from),
+            network_strategy: value.network_strategy.clone(),
             fallback_delay: value.fallback_delay,
             udp_disable_domain_unmapping: value.udp_disable_domain_unmapping,
             udp_connect: value.udp_connect,
@@ -815,10 +787,7 @@ impl From<&RouteActionOptions> for pb::RouteActionOptions {
         Self {
             override_address: value.override_address.clone(),
             override_port: value.override_port,
-            network_strategy: value
-                .network_strategy
-                .as_ref()
-                .map(pb::NetworkStrategy::from),
+            network_strategy: value.network_strategy.clone(),
             fallback_delay: value.fallback_delay,
             udp_disable_domain_unmapping: value.udp_disable_domain_unmapping,
             udp_connect: value.udp_connect,

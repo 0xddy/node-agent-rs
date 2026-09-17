@@ -24,6 +24,7 @@ path = "src/main.rs"
 acp-proto.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 if-addrs.workspace = true
 log.workspace = true

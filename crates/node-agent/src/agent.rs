@@ -103,6 +103,7 @@ impl Agent {
     /// Injectable constructor used by lifecycle and real-panel integration
     /// tests. Production uses [`Self::bootstrap`].
     pub fn with_runtime(config: Config, runtime: Arc<dyn NodeRuntime>) -> Arc<Self> {
+        runtime.set_disable_traffic_analysis(config.disable_traffic_analysis);
         let panel = PanelClient::new(
             config.clone(),
             AGENT_VERSION,
@@ -120,7 +121,11 @@ impl Agent {
         ));
         let analysis = Collector::new(acp_proto::auth::new_nonce(16));
         telemetry.set_analysis(analysis.clone());
-        runtime.set_analysis_collector(analysis.clone());
+        if config.disable_traffic_analysis {
+            log::info!("本地配置已强制关闭流量分析采集和 sniff：disable_traffic_analysis=true");
+        } else {
+            runtime.set_analysis_collector(analysis.clone());
+        }
         Arc::new(Self {
             traffic: Arc::new(Aggregator::new(config.traffic_report_min_delta_bytes)),
             config: Arc::new(config),
@@ -208,6 +213,7 @@ impl Agent {
 
         log::info!("node-agent 收到停止请求，准备关闭");
 
+        self.topologies.stop_operations();
         sampling_shutdown.cancel();
         if sampling_running {
             wait_for_task(&mut sampling, "遥测采样任务").await;
@@ -306,7 +312,7 @@ impl Agent {
                 session_task_error("session configuration", error.to_string())
             })?,
         };
-        let analysis_config = machine_config
+        let mut analysis_config = machine_config
             .nodes
             .iter()
             .find(|node| node.node_id == self.config.node_id)
@@ -368,6 +374,11 @@ impl Agent {
         control
             .confirm_ready(&current_digest, current_revision)
             .await?;
+        // The process-local opt-out wins even when the panel enables analysis
+        // again on a reconnect with an unchanged topology digest.
+        if self.config.disable_traffic_analysis {
+            analysis_config = None;
+        }
         if attempt_cancel.is_cancelled()
             || !self.analysis.configure(epoch, analysis_config.as_ref())
         {
@@ -405,12 +416,14 @@ impl Agent {
             run_control_stream(cancel, control, worker, acknowledgements).await
         });
 
-        let analysis = self.analysis.clone();
-        group.start_session_critical("analysis sampler", move |cancel| async move {
-            let _guard = SessionAnalysisGuard::new(analysis.clone(), epoch);
-            analysis.run_sampling(&cancel).await;
-            Ok(())
-        });
+        if !self.config.disable_traffic_analysis {
+            let analysis = self.analysis.clone();
+            group.start_session_critical("analysis sampler", move |cancel| async move {
+                let _guard = SessionAnalysisGuard::new(analysis.clone(), epoch);
+                analysis.run_sampling(&cancel).await;
+                Ok(())
+            });
+        }
         if self.analysis.config().enabled {
             let limiter = Arc::new(tokio::sync::Mutex::new(SendLimiter::new(
                 &self.analysis.config(),

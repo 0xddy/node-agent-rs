@@ -14,6 +14,7 @@ use acp_proto::control_service_server::{ControlService, ControlServiceServer};
 use acp_proto::traffic_analysis_service_server::{
     TrafficAnalysisService, TrafficAnalysisServiceServer,
 };
+use acp_proto::traffic_service_server::{TrafficService, TrafficServiceServer};
 use acp_proto::*;
 use async_trait::async_trait;
 use node_agent::agent::Agent;
@@ -50,6 +51,7 @@ struct PanelState {
     control_peer: Mutex<Option<std::net::SocketAddr>>,
     analysis_peers: Mutex<Vec<std::net::SocketAddr>>,
     analysis_sessions: Mutex<Vec<String>>,
+    traffic_reports: Mutex<Vec<(String, TrafficReport)>>,
 }
 
 impl Panel {
@@ -250,10 +252,19 @@ struct Runtime {
     applies: AtomicUsize,
     closes: AtomicUsize,
     config: Mutex<Vec<u8>>,
+    disable_analysis: AtomicBool,
+    collector_installs: AtomicUsize,
+    traffic: Mutex<Vec<TrafficDrain>>,
 }
 
 #[async_trait]
 impl NodeRuntime for Runtime {
+    fn set_disable_traffic_analysis(&self, disabled: bool) {
+        self.disable_analysis.store(disabled, Ordering::SeqCst);
+    }
+    fn set_analysis_collector(&self, _: Arc<node_agent::analysis::Collector>) {
+        self.collector_installs.fetch_add(1, Ordering::SeqCst);
+    }
     async fn apply_config(&self, config: RuntimeConfig) -> Result<(), RuntimeError> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         *self.config.lock().unwrap() = config.diagnostic_yaml;
@@ -280,7 +291,26 @@ impl NodeRuntime for Runtime {
         0
     }
     async fn drain_traffic(&self) -> Result<Vec<TrafficDrain>, RuntimeError> {
-        Ok(Vec::new())
+        Ok(std::mem::take(&mut *self.traffic.lock().unwrap()))
+    }
+}
+
+#[tonic::async_trait]
+impl TrafficService for Panel {
+    async fn traffic_stream(
+        &self,
+        request: Request<tonic::Streaming<TrafficReport>>,
+    ) -> Result<Response<StreamClosed>, Status> {
+        let session = self.authenticate(&request)?;
+        let mut reports = request.into_inner();
+        while let Some(report) = reports.message().await? {
+            self.0
+                .traffic_reports
+                .lock()
+                .unwrap()
+                .push((session.clone(), report));
+        }
+        Ok(Response::new(StreamClosed::default()))
     }
 }
 
@@ -326,6 +356,8 @@ machine_secret = "{SECRET}"
     .unwrap();
     let runtime = Arc::new(Runtime::default());
     let agent = Agent::with_runtime(config, runtime.clone());
+    assert!(!runtime.disable_analysis.load(Ordering::SeqCst));
+    assert_eq!(runtime.collector_installs.load(Ordering::SeqCst), 1);
     let agent_cancel = CancellationToken::new();
     let run = tokio::spawn(agent.clone().run(agent_cancel.clone()));
 
@@ -391,6 +423,116 @@ machine_secret = "{SECRET}"
     assert_eq!(runtime.applies.load(Ordering::SeqCst), 1);
     assert_eq!(panel.0.analysis_streams.load(Ordering::SeqCst), 2);
     assert!(panel.0.configs.load(Ordering::SeqCst) >= 4);
+
+    agent_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.closes.load(Ordering::SeqCst), 1);
+    server_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_analysis_override_survives_reconnects_and_preserves_billing() {
+    let panel = Panel::default();
+    panel.0.enabled.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_cancel = CancellationToken::new();
+    let cancel = server_cancel.clone();
+    let server_panel = panel.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(AuthServiceServer::new(server_panel.clone()))
+            .add_service(ConfigServiceServer::new(server_panel.clone()))
+            .add_service(ControlServiceServer::new(server_panel.clone()))
+            .add_service(TrafficServiceServer::new(server_panel.clone()))
+            .add_service(TrafficAnalysisServiceServer::new(server_panel))
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                cancel.cancelled_owned(),
+            )
+            .await
+            .unwrap();
+    });
+    let config = node_agent::config::parse(&format!(
+        r#"
+panel_grpc_endpoint = "grpc://{address}"
+machine_id = "{MACHINE}"
+node_id = "{NODE}"
+machine_secret = "{SECRET}"
+disable_traffic_analysis = true
+traffic_report_min_delta_bytes = 1
+"#
+    ))
+    .unwrap();
+    let runtime = Arc::new(Runtime::default());
+    let agent = Agent::with_runtime(config, runtime.clone());
+    assert!(runtime.disable_analysis.load(Ordering::SeqCst));
+    assert_eq!(runtime.collector_installs.load(Ordering::SeqCst), 0);
+    let agent_cancel = CancellationToken::new();
+    let run = tokio::spawn(agent.clone().run(agent_cancel.clone()));
+
+    for (index, panel_enabled) in [true, false, true].into_iter().enumerate() {
+        if index != 0 {
+            panel.0.enabled.store(panel_enabled, Ordering::SeqCst);
+            panel.disconnect_control();
+        }
+        wait_until("control readiness after panel configuration", || {
+            panel.0.ready.load(Ordering::SeqCst) == index + 1
+        })
+        .await;
+        let protocol = ["hysteria2", "vless", "hysteria2"][index];
+        runtime.traffic.lock().unwrap().push(TrafficDrain {
+            inbound_tag: "billing-inbound".into(),
+            node_id: NODE.into(),
+            protocol: protocol.into(),
+            user_id: "billing-user".into(),
+            uplink_bytes: 43,
+            downlink_bytes: 256,
+            observed_at: Some(std::time::SystemTime::now()),
+        });
+        // A real billable report proves the session finished Configure; checking
+        // the initially disabled collector alone could hide a readiness race.
+        wait_until("billing report while local analysis is disabled", || {
+            panel.0.traffic_reports.lock().unwrap().len() == index + 1
+        })
+        .await;
+        let (session, report) = panel.0.traffic_reports.lock().unwrap()[index].clone();
+        assert_eq!(session, format!("analysis-session-{}", index + 1));
+        assert_eq!(report.machine_id, MACHINE);
+        assert_eq!(report.node_id, NODE);
+        assert_eq!(report.user_id, "billing-user");
+        assert_eq!(report.protocol, protocol);
+        assert_eq!((report.uplink_bytes, report.downlink_bytes), (43, 256));
+        assert!(!agent.analysis().config().enabled);
+        assert!(!agent.analysis().status().enabled);
+        assert!(
+            agent
+                .analysis()
+                .register(node_agent::analysis::Metadata {
+                    node_id: NODE.into(),
+                    user_id: "billing-user".into(),
+                    proxy_protocol: protocol.into(),
+                    network: "tcp".into(),
+                    app_protocol: "tls".into(),
+                    domain: "example.com".into(),
+                    ..Default::default()
+                })
+                .is_none()
+        );
+        assert_eq!(panel.0.analysis_streams.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(panel.0.configs.load(Ordering::SeqCst), 3);
+    assert_eq!(panel.0.hellos.load(Ordering::SeqCst), 3);
+    assert_eq!(panel.0.users.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.applies.load(Ordering::SeqCst), 1);
 
     agent_cancel.cancel();
     tokio::time::timeout(Duration::from_secs(10), run)

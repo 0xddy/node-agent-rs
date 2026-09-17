@@ -30,7 +30,7 @@ pub mod hex;
 /// the same commit that re-copies the file -- that is the point. The test below
 /// fails loudly rather than letting the two drift into a wire incompatibility
 /// that only shows up against a live panel.
-pub const PROTO_SHA256: &str = "41a41cafb593652df3a77300b6e6958526ccc29a13297933aea55900c72a5fcf";
+pub const PROTO_SHA256: &str = "59bc1ea85b0c28a9e13131ea97637e1d65b86709b1925e29c5fc454bdd1a7c1a";
 
 /// Marks the one-time telemetry clock handshake; individual samples have no ACK.
 pub const TELEMETRY_READY_METADATA_KEY: &str = "x-acp-telemetry-ready";
@@ -51,7 +51,29 @@ pub use v1::*;
 
 #[cfg(test)]
 mod tests {
+    use prost::Message;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn route_contract_decodes_string_strategies_and_explicit_false_fragmentation() {
+        // ACP's current contract uses scalar strings here, not nested messages.
+        let route_wire = b"\x62\x08fallback";
+        let route = crate::RouteConfig::decode(route_wire.as_slice()).unwrap();
+        assert_eq!(route.default_network_strategy, "fallback");
+        assert_eq!(route.encode_to_vec(), route_wire);
+
+        let action_wire = b"\x1a\x06hybrid";
+        let action = crate::RouteActionOptions::decode(action_wire.as_slice()).unwrap();
+        assert_eq!(action.network_strategy, "hybrid");
+        assert_eq!(action.encode_to_vec(), action_wire);
+
+        let direct_wire = b"\x50\x00\xa2\x01\x07default";
+        let direct = crate::DirectActionOptions::decode(direct_wire.as_slice()).unwrap();
+        assert_eq!(direct.network_strategy, "default");
+        assert_eq!(direct.udp_fragment, Some(false));
+        assert_eq!(direct.encode_to_vec(), direct_wire);
+        assert_eq!(crate::DirectActionOptions::default().udp_fragment, None);
+    }
 
     #[test]
     fn the_vendored_proto_matches_its_recorded_checksum() {

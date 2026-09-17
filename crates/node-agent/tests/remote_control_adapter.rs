@@ -19,6 +19,7 @@ use node_agent::runtime::{
 };
 use node_agent::topology::manager::{TopologyError, TopologyManager, TopologyRuntime};
 use node_agent::topology::{MachineTopology, NodeInstance, UserCredential};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -192,7 +193,13 @@ async fn remote_reload_force_fetches_once_emits_go_stages_and_publishes_atomical
     assert_eq!(result.loaded_user_count, 1);
     assert_eq!(
         result.config_sha256,
-        "ea8e486ba259cd252ee99d956f79978f6efc3989aa9ddd35cd22faf8c663c2b3"
+        acp_proto::hex::encode(&Sha256::digest(runtime.current_config())),
+        "reload SHA must describe the effective configuration exposed by remote control"
+    );
+    assert_ne!(
+        result.config_sha256,
+        acp_proto::hex::encode(&Sha256::digest(b"revision: 2\n")),
+        "the prepared configuration can differ after local runtime overrides"
     );
     assert_eq!(panel.topology_calls.load(Ordering::SeqCst), 1);
     assert_eq!(lock(&runtime.applied).len(), 2, "initial + one reload");

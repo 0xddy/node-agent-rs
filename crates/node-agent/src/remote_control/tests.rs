@@ -714,6 +714,47 @@ async fn periodic_disconnect_waits_for_local_transaction_before_releasing_attemp
 }
 
 #[tokio::test]
+async fn periodic_setting_change_during_pull_preserves_immediate_retry() {
+    let services = Arc::new(FakeServices::default());
+    services.sync_block.store(true, Ordering::SeqCst);
+    services
+        .sync_finish_after_cancel
+        .store(true, Ordering::SeqCst);
+    let controller = RemoteController::new();
+    controller.set_periodic(true, Duration::from_secs(60));
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(run_periodic_user_pull(
+        cancel.clone(),
+        target(),
+        services.dependencies(),
+        controller.clone(),
+    ));
+    services.sync_called.notified().await;
+
+    controller.set_periodic(true, Duration::from_secs(7 * 60));
+    services.sync_after_cancel.notified().await;
+    assert_eq!(services.sync_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        controller.begin_periodic_attempt(&cancel).is_none(),
+        "changing the interval must not release a running local transaction"
+    );
+
+    services.sync_block.store(false, Ordering::SeqCst);
+    services.sync_release.add_permits(1);
+    let retry = tokio::time::timeout(Duration::from_secs(1), services.sync_called.notified()).await;
+    cancel.cancel();
+    runner.await.unwrap();
+    retry.expect("setting change must retry immediately after the previous pull finishes");
+    assert_eq!(services.sync_calls.load(Ordering::SeqCst), 2);
+    assert!(
+        controller
+            .snapshot()
+            .periodic_user_pull_last_error
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn replacement_periodic_scheduler_waits_for_attempt_completion_without_self_waking() {
     use std::future::Future;
     use std::task::{Context, Poll, Wake, Waker};

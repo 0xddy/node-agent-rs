@@ -36,6 +36,12 @@ struct RecordingRuntime {
     close_calls: AtomicUsize,
     fail: AtomicBool,
     rolled_back: AtomicBool,
+    close_gate: Option<Arc<ConnectionCloseGate>>,
+}
+
+struct ConnectionCloseGate {
+    entered: Semaphore,
+    release: Semaphore,
 }
 
 #[async_trait]
@@ -53,6 +59,10 @@ impl TopologyRuntime for RecordingRuntime {
 
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64 {
         lock(&self.closed).push((node_id.into(), user_id.into()));
+        if let Some(gate) = &self.close_gate {
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+        }
         1
     }
 
@@ -224,6 +234,61 @@ async fn successful_user_mutations_close_removed_and_explicitly_kicked_sessions(
     // Removal is closed by the old/new topology diff exactly once; the
     // explicit-kick path sees that the user is no longer authorized and skips.
     assert_eq!(lock(&runtime.closed).len(), 2);
+}
+
+#[tokio::test]
+async fn publication_is_readable_while_stale_connections_finish_closing() {
+    for force_reload in [false, true] {
+        let gate = Arc::new(ConnectionCloseGate {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        let runtime = Arc::new(RecordingRuntime {
+            close_gate: Some(gate.clone()),
+            ..Default::default()
+        });
+        let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+        manager
+            .apply_initial(topology(1, vec![user("old", "old-credential")]))
+            .await
+            .unwrap();
+        let next = topology(2, vec![user("new", "new-credential")]);
+        let applying_manager = manager.clone();
+        let applying = tokio::spawn(async move {
+            if force_reload {
+                let result = applying_manager
+                    .reload_from(move |_| async move { Ok::<_, TopologyError>(next) }, None)
+                    .await;
+                assert_eq!(result.outcome, ReloadOutcome::Succeeded);
+                assert_eq!(result.topology_revision, 2);
+                assert_eq!(result.loaded_user_count, 1);
+            } else {
+                applying_manager.apply_initial(next).await.unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.acquire())
+            .await
+            .expect("stale connection cleanup did not start")
+            .unwrap()
+            .forget();
+        assert!(!applying.is_finished());
+        assert_eq!(manager.current_revision(), Some(2));
+        let visible_users =
+            tokio::time::timeout(Duration::from_secs(1), manager.loaded_users("node-1"))
+                .await
+                .expect("published topology must remain readable during cleanup")
+                .unwrap();
+        assert_eq!(visible_users, vec![user("new", "new-credential")]);
+        assert_eq!(
+            lock(&runtime.closed).as_slice(),
+            &[("node-1".into(), "old".into())]
+        );
+        gate.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), applying)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -424,6 +489,13 @@ async fn forced_reload_reports_exact_stages_and_never_follows_with_apply() {
     assert_eq!(result.topology_revision, 2);
     assert_eq!(result.loaded_user_count, 2);
     assert_eq!(result.config_sha256.len(), 64);
+    assert_eq!(
+        result.config_sha256,
+        acp_proto::hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(
+            runtime.current_config()
+        )),
+        "reload must hash the effective runtime bytes, including local overrides"
+    );
     assert_eq!(manager.current_revision(), Some(2));
     // One initial apply plus one forced reload. A reload-then-apply bug records three.
     assert_eq!(lock(&runtime.applied).len(), 2);
@@ -438,6 +510,103 @@ async fn forced_reload_reports_exact_stages_and_never_follows_with_apply() {
             ReloadStage::Completed,
         ]
     );
+}
+
+#[tokio::test]
+async fn reload_fetch_allows_updates_and_rejects_a_same_revision_race() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+    let candidate = topology(1, vec![user("user-1", "old")]);
+    manager.apply_initial(candidate.clone()).await.unwrap();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let reload_manager = manager.clone();
+    let reloading = tokio::spawn(async move {
+        reload_manager
+            .reload_from(
+                move |_| async move {
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok::<_, String>(candidate)
+                },
+                None,
+            )
+            .await
+    });
+    started.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.refresh_node_users("node-1", vec![user("user-1", "new")]),
+    )
+    .await
+    .expect("reload fetch blocked a control update")
+    .unwrap();
+    release.send(()).unwrap();
+    let result = reloading.await.unwrap();
+    assert_eq!(result.outcome, ReloadOutcome::FailedUnchanged);
+    assert_eq!(result.stage, ReloadStage::BuildConfiguration);
+    assert!(result.message.contains("topology changed while fetching"));
+    assert_eq!(
+        manager.current_topology().nodes[0].users[0].credential,
+        "new"
+    );
+    assert_eq!(lock(&runtime.applied).len(), 2);
+}
+
+#[tokio::test]
+async fn reload_rejects_an_older_panel_revision() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+    manager.apply_initial(topology(2, vec![])).await.unwrap();
+    let result = manager
+        .reload_from(|_| async { Ok::<_, String>(topology(1, vec![])) }, None)
+        .await;
+    assert_eq!(result.outcome, ReloadOutcome::FailedUnchanged);
+    assert_eq!(result.stage, ReloadStage::BuildConfiguration);
+    assert_eq!(manager.current_revision(), Some(2));
+    assert_eq!(lock(&runtime.applied).len(), 1);
+}
+
+#[tokio::test]
+async fn closing_cancels_a_reload_fetch_and_rejects_new_operations() {
+    let runtime = Arc::new(RecordingRuntime::default());
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+    manager.apply_initial(topology(1, vec![])).await.unwrap();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let fetch_dropped = CancellationToken::new();
+    let drop_token = fetch_dropped.clone();
+    let reload_manager = manager.clone();
+    let reloading = tokio::spawn(async move {
+        reload_manager
+            .reload_from(
+                move |_| async move {
+                    let _on_drop = drop_token.drop_guard();
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<MachineTopology, String>>().await
+                },
+                None,
+            )
+            .await
+    });
+    started.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), manager.close())
+        .await
+        .expect("close waited on a panel fetch")
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(1), reloading)
+        .await
+        .expect("panel fetch was not cancelled")
+        .unwrap();
+    assert_eq!(result.outcome, ReloadOutcome::FailedUnchanged);
+    assert_eq!(result.stage, ReloadStage::PullConfiguration);
+    assert!(fetch_dropped.is_cancelled());
+    assert!(manager.apply_initial(topology(2, vec![])).await.is_err());
+    assert!(manager.reconcile_current().await.is_err());
+    assert!(manager.loaded_users("node-1").await.is_err());
+    assert!(manager.current_config().is_err());
+    assert_eq!(lock(&runtime.applied).len(), 1);
+    manager.close().await.unwrap();
+    assert_eq!(runtime.close_calls.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -614,6 +783,46 @@ impl TopologyRuntime for CancellationSafeReloadRuntime {
             rolled_back: false,
         })
     }
+}
+
+#[tokio::test]
+async fn stopping_operations_releases_waiters_and_finishes_started_reload() {
+    let runtime = Arc::new(CancellationSafeReloadRuntime {
+        runtime_revision: AtomicUsize::new(0),
+        forwarding_revision: AtomicUsize::new(0),
+        start_entered: Notify::new(),
+        allow_start: Semaphore::new(0),
+    });
+    let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+    manager.apply_initial(topology(1, vec![])).await.unwrap();
+    let start_entered = runtime.start_entered.notified();
+    let reload_manager = manager.clone();
+    let reloading = tokio::spawn(async move {
+        reload_manager
+            .reload_from(|_| async { Ok::<_, String>(topology(2, vec![])) }, None)
+            .await
+    });
+    start_entered.await;
+    let waiting_manager = manager.clone();
+    let waiting =
+        tokio::spawn(async move { waiting_manager.apply_initial(topology(3, vec![])).await });
+    manager.stop_operations();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("stopped operation still waits on the mutation lock")
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(manager.current_revision(), Some(1));
+    assert_eq!(runtime.forwarding_revision.load(Ordering::SeqCst), 2);
+
+    runtime.allow_start.add_permits(1);
+    let result = reloading.await.unwrap();
+    assert_eq!(result.outcome, ReloadOutcome::Succeeded);
+    assert_eq!(manager.current_revision(), Some(2));
+    assert_eq!(runtime.runtime_revision.load(Ordering::SeqCst), 2);
+    manager.close().await.unwrap();
 }
 
 #[tokio::test]

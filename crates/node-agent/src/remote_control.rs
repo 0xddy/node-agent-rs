@@ -390,7 +390,7 @@ impl RemoteController {
         } else if let Some(error) = error {
             state.periodic_last_error = error.to_string();
         }
-        if state.periodic_enabled {
+        if state.periodic_enabled && state.periodic_next_attempt.is_none() {
             state.periodic_next_attempt = Some(SystemTime::now() + state.periodic_interval);
         }
         drop(state);

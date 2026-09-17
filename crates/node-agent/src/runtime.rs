@@ -183,6 +183,12 @@ impl std::error::Error for RuntimeError {}
 /// running each mutation in an owned task behind one apply mutex.
 #[async_trait]
 pub trait NodeRuntime: Send + Sync {
+    /// Configure the local process policy before applying the first topology.
+    /// Like analysis collection, this must not participate in topology rollback.
+    fn set_disable_traffic_analysis(&self, _disabled: bool) {}
+    fn traffic_analysis_disabled(&self) -> bool {
+        false
+    }
     /// Analysis is process state and must never participate in topology rollback.
     fn set_analysis_collector(&self, _collector: Arc<crate::analysis::Collector>) {}
     async fn apply_config(&self, config: RuntimeConfig) -> Result<(), RuntimeError>;
@@ -737,11 +743,23 @@ impl ShoesRuntime {
                 !self.inner.engine.list_inbounds().is_empty(),
             ));
         }
-        for inbound in &mut config.inbounds {
-            prepared.rewrite_config(&mut inbound.spec.config);
+        if self.inner.engine.traffic_analysis_disabled() {
+            disable_runtime_sniff(&mut config).map_err(|error| {
+                RuntimeError::unchanged(
+                    format!("disable runtime sniff: {error}"),
+                    !self.inner.engine.list_inbounds().is_empty(),
+                )
+            })?;
         }
-        if let Some(probe_dns) = &mut config.urltest_probe_dns {
-            prepared.rewrite_config(probe_dns);
+        // Without rule-set resources there are no paths to replace. Avoid
+        // walking every nested inbound/client-chain and probe DNS value.
+        if !config.rule_sets.is_empty() {
+            for inbound in &mut config.inbounds {
+                prepared.rewrite_config(&mut inbound.spec.config);
+            }
+            if let Some(probe_dns) = &mut config.urltest_probe_dns {
+                prepared.rewrite_config(probe_dns);
+            }
         }
         let mut desired = normalize(config).map_err(|error| {
             RuntimeError::unchanged(
@@ -2407,6 +2425,14 @@ async fn run_rule_set_watcher(
 
 #[async_trait]
 impl NodeRuntime for ShoesRuntime {
+    fn set_disable_traffic_analysis(&self, disabled: bool) {
+        self.inner.engine.set_disable_traffic_analysis(disabled);
+    }
+
+    fn traffic_analysis_disabled(&self) -> bool {
+        self.inner.engine.traffic_analysis_disabled()
+    }
+
     fn set_analysis_collector(&self, collector: Arc<crate::analysis::Collector>) {
         self.inner
             .engine
@@ -2508,6 +2534,53 @@ impl ShoesRuntime {
             !self.inner.engine.list_inbounds().is_empty(),
         )
     }
+}
+
+/// Apply the local override before diffing configurations, so a panel changing
+/// only its sniff preference cannot rebuild listeners while sniff is disabled.
+fn disable_runtime_sniff(config: &mut RuntimeConfig) -> Result<(), String> {
+    for inbound in &mut config.inbounds {
+        if let Some(config) = inbound.spec.config.as_object_mut() {
+            if let Some(sniff) = config.get_mut("sniff") {
+                *sniff = serde_json::Value::Bool(false);
+            } else {
+                config.insert("sniff".into(), serde_json::Value::Bool(false));
+            }
+        }
+    }
+    if config.diagnostic_yaml.is_empty() {
+        return Ok(());
+    }
+    let mut diagnostic: serde_yaml::Value = serde_yaml::from_slice(&config.diagnostic_yaml)
+        .map_err(|error| format!("decode diagnostic YAML: {error}"))?;
+    let mut changed = false;
+    if let Some(inbounds) = diagnostic
+        .get_mut("inbounds")
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    {
+        for inbound in inbounds {
+            if let Some(config) = inbound
+                .get_mut("config")
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                if let Some(sniff) = config.get_mut("sniff") {
+                    if *sniff != serde_yaml::Value::Bool(false) {
+                        *sniff = serde_yaml::Value::Bool(false);
+                        changed = true;
+                    }
+                } else {
+                    config.insert("sniff".into(), serde_yaml::Value::Bool(false));
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        config.diagnostic_yaml = serde_yaml::to_string(&diagnostic)
+            .map_err(|error| format!("encode diagnostic YAML: {error}"))?
+            .into_bytes();
+    }
+    Ok(())
 }
 
 fn normalize(config: RuntimeConfig) -> Result<NormalizedConfig, String> {
@@ -2921,6 +2994,89 @@ mod tests {
 
     async fn runtime() -> ShoesRuntime {
         ShoesRuntime::from_engine(Engine::bootstrap().await.expect("bootstrap engine"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_analysis_override_applies_to_reload_diagnostics_and_effective_diff() {
+        let runtime = runtime().await;
+        runtime.set_disable_traffic_analysis(true);
+        let address = free_addrs(1)[0];
+        let candidate = |sniff: bool| {
+            let inbound = compiled("edge", "node-a", socks(address, sniff), None);
+            let diagnostic = serde_yaml::to_string(&json!({
+                "format": "shoes-equivalent-v1",
+                "inbounds": [{"tag": "edge", "config": inbound.spec.config.clone()}],
+                "requested_route": {"rules": [{"action": "reject", "protocol": ["http"]}]},
+                "revision": 9_007_199_254_740_993_u64,
+            }))
+            .unwrap();
+            config(diagnostic.as_bytes(), vec![inbound])
+        };
+        runtime.apply_config(candidate(true)).await.unwrap();
+        let before = runtime.engine().get_inbound("edge").unwrap();
+        let diagnostic: serde_yaml::Value =
+            serde_yaml::from_slice(&runtime.current_config()).unwrap();
+        assert_eq!(diagnostic["inbounds"][0]["config"]["sniff"], false);
+        assert_eq!(diagnostic["revision"].as_u64(), Some(9_007_199_254_740_993));
+        assert_eq!(
+            diagnostic["requested_route"]["rules"][0]["action"],
+            "reject"
+        );
+        assert_eq!(
+            diagnostic["requested_route"]["rules"][0]["protocol"][0],
+            "http"
+        );
+        {
+            let state = runtime.read_state();
+            assert_eq!(
+                state.current.as_ref().unwrap().inbounds["edge"]
+                    .compiled
+                    .spec
+                    .config["sniff"],
+                false
+            );
+        }
+        runtime.apply_config(candidate(false)).await.unwrap();
+        let after = runtime.engine().get_inbound("edge").unwrap();
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            after.revision(),
+            0,
+            "only changing an overridden sniff preference must not reload"
+        );
+        runtime.reload_config(candidate(true)).await.unwrap();
+        let reloaded = runtime.engine().get_inbound("edge").unwrap();
+        assert!(!Arc::ptr_eq(&after, &reloaded));
+        let diagnostic: serde_yaml::Value =
+            serde_yaml::from_slice(&runtime.current_config()).unwrap();
+        assert_eq!(diagnostic["inbounds"][0]["config"]["sniff"], false);
+        runtime.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_analysis_policy_preserves_config_and_diagnostic_bytes() {
+        let runtime = runtime().await;
+        let address = free_addrs(1)[0];
+        let diagnostic = b"# original diagnostic\ninbounds: [{config: {sniff: true}}]\n";
+        runtime
+            .apply_config(config(
+                diagnostic,
+                vec![compiled("edge", "node-a", socks(address, true), None)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(runtime.current_config(), diagnostic);
+        {
+            let state = runtime.read_state();
+            assert_eq!(
+                state.current.as_ref().unwrap().inbounds["edge"]
+                    .compiled
+                    .spec
+                    .config["sniff"],
+                true
+            );
+        }
+        runtime.close().await.unwrap();
     }
 
     #[test]

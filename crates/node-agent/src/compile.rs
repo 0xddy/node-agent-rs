@@ -10,6 +10,7 @@ use std::fmt::{self, Write as _};
 use std::io;
 use std::net::IpAddr;
 
+use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
@@ -89,7 +90,41 @@ pub fn compile(topology: &MachineTopology) -> Result<RuntimeConfig, CompileError
     Ok(compile_with_warnings(topology)?.runtime)
 }
 
+/// Apply local compilation overrides without rewriting the panel snapshot.
+/// The runtime separately enforces inbound sniffing and observer policy.
+pub fn compile_with_local_overrides(
+    topology: &MachineTopology,
+    disable_traffic_analysis: bool,
+) -> Result<CompileOutput, CompileError> {
+    if !disable_traffic_analysis {
+        return compile_with_warnings(topology);
+    }
+    // Borrow unchanged routes and copy only the routing surface when needed;
+    // the topology also owns potentially large user lists and a panel snapshot.
+    let effective_route = topology
+        .route
+        .as_ref()
+        .filter(|route| route.rules.iter().any(|rule| rule.action == "sniff"))
+        .map(|route| {
+            let mut route = route.clone();
+            // Match the Go override: only top-level sniff actions are removed.
+            route.rules.retain(|rule| rule.action != "sniff");
+            route
+        });
+    compile_with_route(
+        topology,
+        effective_route.as_ref().or(topology.route.as_ref()),
+    )
+}
+
 pub fn compile_with_warnings(topology: &MachineTopology) -> Result<CompileOutput, CompileError> {
+    compile_with_route(topology, topology.route.as_ref())
+}
+
+fn compile_with_route(
+    topology: &MachineTopology,
+    route: Option<&Route>,
+) -> Result<CompileOutput, CompileError> {
     if topology.machine_id.is_empty() {
         return Err(CompileError::new("machine_id is required"));
     }
@@ -134,15 +169,12 @@ pub fn compile_with_warnings(topology: &MachineTopology) -> Result<CompileOutput
     // error to the panel.
     let mut outbounds = validate_outbounds(&topology.outbounds)?;
     validate_outbound_catalog(&outbounds)?;
-    let (rule_sets, rule_set_resources) = compile_rule_set_catalog(topology.route.as_ref())?;
-    validate_route(topology.route.as_ref(), &outbounds, &rule_sets)?;
-    let dns_ip_strategies = validate_dns_resolution_projection(
-        topology.route.as_ref(),
-        topology.dns.as_ref(),
-        &outbounds,
-    )?;
+    let (rule_sets, rule_set_resources) = compile_rule_set_catalog(route)?;
+    validate_route(route, &outbounds, &rule_sets)?;
+    let dns_ip_strategies =
+        validate_dns_resolution_projection(route, topology.dns.as_ref(), &outbounds)?;
     let outbound_dns_projection = project_outbound_dns_resolvers(
-        topology.route.as_ref(),
+        route,
         topology.dns.as_ref(),
         &mut outbounds,
         &dns_ip_strategies,
@@ -164,7 +196,7 @@ pub fn compile_with_warnings(topology: &MachineTopology) -> Result<CompileOutput
 
     for inbound in &mut inbounds {
         let rules = compile_rules_for_inbound(
-            topology.route.as_ref(),
+            route,
             &outbounds,
             &rule_sets,
             &inbound.spec.tag,
@@ -188,10 +220,9 @@ pub fn compile_with_warnings(topology: &MachineTopology) -> Result<CompileOutput
         }
     }
     let warnings: Vec<String> = warnings.into_iter().collect();
-    let diagnostic_yaml = diagnostic_yaml(topology, &inbounds, &outbounds, &warnings)?;
-    let dns_client_fingerprint =
-        json_fingerprint(&(&topology.dns, &topology.route, &topology.outbounds))
-            .expect("typed global topology always serializes to JSON");
+    let diagnostic_yaml = diagnostic_yaml(topology, route, &inbounds, &outbounds, &warnings)?;
+    let dns_client_fingerprint = json_fingerprint(&(&topology.dns, route, &topology.outbounds))
+        .expect("typed global topology always serializes to JSON");
     Ok(CompileOutput {
         runtime: RuntimeConfig {
             inbounds,
@@ -1540,7 +1571,7 @@ fn validate_outbound_options(
     fields: &Map<String, Value>,
 ) -> Result<(), CompileError> {
     // sing-box applies strict unknown-field decoding.  Direct is the important
-    // zero-config case and has the full DialerOptions surface from topology.go.
+    // zero-config case and accepts the sing-box outbound dialer options.
     if kind == "direct" {
         const DIRECT_FIELDS: &[&str] = &[
             "detour",
@@ -2213,6 +2244,41 @@ fn compile_vless(node: &NodeInstance) -> Result<CompiledInbound, CompileError> {
             node.node_id
         )));
     }
+    if cfg.tls.server_name.trim().is_empty() {
+        return Err(CompileError::new(format!(
+            "node {} vless provider requires tls.server_name",
+            node.node_id
+        )));
+    }
+    let mut private_key = [0_u8; 32];
+    if cfg.tls.reality.private_key.len() != 43
+        || !matches!(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode_slice(&cfg.tls.reality.private_key, &mut private_key),
+            Ok(32)
+        )
+    {
+        return Err(CompileError::new(format!(
+            "node {} vless reality private_key must be a base64url-encoded 32-byte key",
+            node.node_id
+        )));
+    }
+    for (index, short_id) in cfg.tls.reality.short_id.iter().enumerate() {
+        if short_id.len() > 16 {
+            return Err(CompileError::new(format!(
+                "node {} vless reality short_id[{index}] must contain at most 16 hex characters",
+                node.node_id
+            )));
+        }
+        if !short_id.len().is_multiple_of(2)
+            || !short_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CompileError::new(format!(
+                "node {} vless reality short_id[{index}] must contain an even number of hex characters",
+                node.node_id
+            )));
+        }
+    }
     if !cfg.flow.is_empty() && cfg.flow != VLESS_FLOW_REALITY_VISION {
         return Err(CompileError::new(format!(
             "node {} vless provider has unsupported flow {:?}",
@@ -2222,7 +2288,7 @@ fn compile_vless(node: &NodeInstance) -> Result<CompiledInbound, CompileError> {
 
     let tag = defaulted(&cfg.tag, &node.node_id);
     let listen = defaulted(&cfg.listen, DEFAULT_INBOUND_LISTEN);
-    let sni = defaulted(&cfg.tls.server_name, &cfg.tls.reality.handshake.server);
+    let sni = &cfg.tls.server_name;
     let users = compile_users(node, "vless")?;
     if cfg.tcp_fast_open {
         return Err(CompileError::new(format!(
@@ -2490,7 +2556,7 @@ fn unsupported_route_top_level_fields(route: &Route) -> Vec<&'static str> {
     if route.override_android_vpn {
         unsupported.push("override_android_vpn");
     }
-    if route.default_network_strategy.is_some() {
+    if !route.default_network_strategy.is_empty() {
         unsupported.push("default_network_strategy");
     }
     if !route.default_network_type.is_empty() {
@@ -3509,6 +3575,7 @@ struct DiagnosticUser {
 
 fn diagnostic_yaml(
     topology: &MachineTopology,
+    route: Option<&Route>,
     inbounds: &[CompiledInbound],
     outbounds: &BTreeMap<String, ValidatedOutbound>,
     warnings: &[String],
@@ -3554,9 +3621,7 @@ fn diagnostic_yaml(
             })
             .collect(),
     );
-    let requested_route = topology
-        .route
-        .as_ref()
+    let requested_route = route
         .map(serde_json::to_value)
         .transpose()
         .map_err(|error| CompileError::new(format!("encode diagnostic route: {error}")))?

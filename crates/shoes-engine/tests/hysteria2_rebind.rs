@@ -148,10 +148,10 @@ async fn survives_a_rebinding(num_endpoints: Option<usize>) -> Result<(), String
     // it will send at full rate, and that is fine -- only survival is asserted.
     match tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Ok(name) = reaches(&client, &sink).await {
-                if name == "rebind-sink" {
-                    return;
-                }
+            if let Ok(name) = reaches(&client, &sink).await
+                && name == "rebind-sink"
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

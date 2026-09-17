@@ -123,6 +123,7 @@ machine_secret = "replace-with-machine-secret"
 ca_cert_path = ""
 tls_insecure_skip_verify = false
 debug = false
+disable_traffic_analysis = false
 log_file_path = "runtime/node-agent.log"
 traffic_report_min_delta_bytes = 26214400
 ```
@@ -136,6 +137,7 @@ traffic_report_min_delta_bytes = 26214400
 | `ca_cert_path` | `""` | 使用 `grpcs://` 时可设置自定义 CA 证书路径；默认使用系统信任根 |
 | `tls_insecure_skip_verify` | `false` | TLS 证书校验开关；`false` 表示执行证书校验 |
 | `debug` | `false` | 启用调试日志 |
+| `disable_traffic_analysis` | `false` | 本地强制关闭流量分析采集、上报及所有嗅探，优先于面板设置；计费流量仍正常统计，修改后需重启 agent |
 | `log_file_path` | `""` | 本地日志路径；留空时使用 `runtime/node-agent.log` |
 | `traffic_report_min_delta_bytes` | `26214400` | 流量增量上报阈值，单位为字节，默认 25 MiB，取值为正整数 |
 

@@ -1,0 +1,22 @@
+# Panel connection and node identity, compatible with the Go agent.
+panel_grpc_endpoint = "grpcs://panel.example.com:443"
+machine_id = "replace-with-machine-id"
+node_id = "replace-with-node-id"
+machine_secret = "replace-with-machine-secret"
+
+# Optional CA file for grpcs://. An empty value uses system trust roots.
+ca_cert_path = ""
+tls_insecure_skip_verify = false
+
+# Enable verbose recurring runtime logs.
+debug = false
+log_file_path = "runtime/node-agent.log"
+
+# Force traffic analysis collection/reporting and all sniffing off on this node,
+# even when the panel enables them. Billing traffic accounting remains active.
+# Defaults to false when omitted. Restart node-agent after changing this setting.
+disable_traffic_analysis = false
+
+# Minimum accumulated billing traffic per user within each UTC hour, in bytes.
+# Defaults to 25 MiB and must be greater than zero.
+traffic_report_min_delta_bytes = 26214400
