@@ -19,8 +19,8 @@ release daemon、配置 fixture 构建和上传回归测试，再运行 FTP 矩�
 `--core PATH`。每次使用新的运行目录，证据默认写入 `run/hy2-ftp-时间戳/`。
 
 若相邻核心是 CI 固定的原始 `32e5864` checkout，需先按 CI 顺序应用
-`patches/shoes-plus-raw-observations.patch`、`patches/shoes-plus-hy2-late-stop.patch`
-和 `patches/shoes-plus-empty-udp.patch`。
+`patches/shoes-plus-raw-observations.patch`、`patches/shoes-plus-hy2-late-stop.patch`、
+`patches/shoes-plus-empty-udp.patch` 和 `patches/shoes-plus-debug-logs.patch`。
 已有对应修改的工作树不要重复应用。runner 只读挂载源代码，不会自动更改核心；
 未包含修复时，新增截断回归应失败。
 

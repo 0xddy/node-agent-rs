@@ -1,0 +1,1287 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 729eba1..6af93e8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -60,7 +60,7 @@ hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
+ hyper-util = { version = "*", features = ["tokio", "server"] }
+ indexmap = "*"
+ libc = "*"
+-log = { version = "*", features = ["std", "release_max_level_info"] }
++log = { version = "*", features = ["std", "release_max_level_debug"] }
+ lru = "*"
+ md-5 = "*"
+ memchr = "*"
+diff --git a/src/client_proxy_selector.rs b/src/client_proxy_selector.rs
+index a3474f6..e451447 100644
+--- a/src/client_proxy_selector.rs
++++ b/src/client_proxy_selector.rs
+@@ -1,4 +1,4 @@
+-use log::{debug, error};
++use log::debug;
+ use lru::LruCache;
+ use parking_lot::RwLock;
+ use std::hash::Hash;
+@@ -9,6 +9,7 @@ use std::sync::Arc;
+ use crate::address::{Address, NetLocation, ResolvedLocation};
+ use crate::address::{AddressMask, NetLocationMask};
+ use crate::client_proxy_chain::ClientChainGroup;
++use crate::logging::connection_events::log_outbound_failure;
+ use crate::resolver::{Resolver, resolve_location};
+ use crate::routing::predicate::{
+     RouteContext, RouteMatchConfig, RoutePredicate, RoutePredicateError, RouteProtocol,
+@@ -645,15 +646,21 @@ async fn match_rule(
+                     }
+                 }
+                 Err(MatchMaskError::Fatal(e)) => {
+-                    return Err(std::io::Error::other(format!(
+-                        "fatal error while matching mask for {}: {e}",
+-                        location.location()
+-                    )));
++                    return Err(std::io::Error::new(
++                        e.kind(),
++                        MaskMatchContextError {
++                            location: location.location().clone(),
++                            source: e,
++                        },
++                    ));
+                 }
+                 Err(MatchMaskError::NonFatal(e)) => {
+-                    error!(
+-                        "Non-fatal error while trying to match mask for {}: {e}",
+-                        location.location()
++                    log_outbound_failure(
++                        format_args!(
++                            "Non-fatal error while trying to match mask for {}",
++                            location.location()
++                        ),
++                        &e,
+                     );
+                 }
+             }
+@@ -703,6 +710,28 @@ enum MatchMaskError {
+     Fatal(std::io::Error),
+ }
+ 
++#[derive(Debug)]
++struct MaskMatchContextError {
++    location: NetLocation,
++    source: std::io::Error,
++}
++
++impl std::fmt::Display for MaskMatchContextError {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            formatter,
++            "fatal error while matching mask for {}: {}",
++            self.location, self.source
++        )
++    }
++}
++
++impl std::error::Error for MaskMatchContextError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.source)
++    }
++}
++
+ // Helper function for testing - exposed for unit tests
+ #[cfg(test)]
+ pub fn matches_domain_for_test(base_domain: &str, hostname: &str) -> bool {
+@@ -887,6 +916,34 @@ mod tests {
+         Arc::new(MockResolver::new())
+     }
+ 
++    #[tokio::test]
++    async fn mask_routing_preserves_dns_failure_kind_and_no_addresses_source() {
++        let selector = ClientProxySelector::new(vec![block_rule(vec!["10.0.0.0/8"])]);
++        let destination = NetLocation::new(Address::Hostname("missing.test".into()), 443);
++
++        let missing = selector
++            .judge_tcp(destination.clone().into(), &mock_resolver())
++            .await
++            .unwrap_err();
++        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
++        assert_eq!(
++            missing.to_string(),
++            "fatal error while matching mask for missing.test:443: No mock mapping for missing.test:443"
++        );
++
++        let empty_resolver: Arc<dyn Resolver> =
++            Arc::new(MockResolver::new().with_mapping("missing.test", 443, vec![]));
++        let empty = selector
++            .judge_tcp(destination.into(), &empty_resolver)
++            .await
++            .unwrap_err();
++        assert!(crate::dns::no_addresses::is_no_addresses_error(&empty));
++        assert_eq!(
++            empty.to_string(),
++            "fatal error while matching mask for missing.test:443: could not resolve location: missing.test:443"
++        );
++    }
++
+     /// Create a mock ClientChainGroup for testing (single chain with direct connector)
+     fn mock_chain_group() -> ClientChainGroup {
+         use crate::resolver::NativeResolver;
+diff --git a/src/dns/composite_resolver.rs b/src/dns/composite_resolver.rs
+index 87d8502..f2b90bc 100644
+--- a/src/dns/composite_resolver.rs
++++ b/src/dns/composite_resolver.rs
+@@ -8,6 +8,7 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use crate::address::NetLocation;
++use crate::dns::no_addresses::no_addresses_error;
+ use crate::resolver::Resolver;
+ 
+ /// Resolver that tries multiple DNS servers in order until one succeeds.
+@@ -44,7 +45,7 @@ impl Resolver for CompositeResolver {
+                 match resolver.resolve_location(&location).await {
+                     Ok(addrs) if !addrs.is_empty() => {
+                         if i > 0 {
+-                            log::info!(
++                            log::debug!(
+                                 "CompositeResolver: resolved {} via resolver #{} ({:?}) after {} failures",
+                                 location,
+                                 i,
+@@ -61,7 +62,7 @@ impl Resolver for CompositeResolver {
+                             resolver,
+                             location
+                         );
+-                        last_error = Some(std::io::Error::other("empty response"));
++                        last_error = Some(no_addresses_error("empty response".to_owned()));
+                     }
+                     Err(e) => {
+                         log::debug!(
+diff --git a/src/dns/hickory_resolver.rs b/src/dns/hickory_resolver.rs
+index 5d2659e..3f69f2d 100644
+--- a/src/dns/hickory_resolver.rs
++++ b/src/dns/hickory_resolver.rs
+@@ -24,12 +24,14 @@ use hickory_resolver::{ConnectionProvider, PoolContext, Resolver};
+ 
+ use crate::address::NetLocation;
+ use crate::client_proxy_chain::ClientChainGroup;
++use crate::dns::no_addresses::no_addresses_error;
+ use crate::dns::parsed::IpStrategy;
+ use crate::dns::proxy_runtime::ProxyRuntimeProvider;
+ use crate::dns::{
+     DnsCachePolicy, DnsClientSubnet, DnsExchangeResponse, DnsQueryCache, DnsQuestion,
+     DnsQuestionType,
+ };
++use crate::logging::connection_events::log_outbound_failure;
+ use crate::resolver::Resolver as ShoesResolver;
+ 
+ /// Tuning options for hickory-backed resolvers.
+@@ -844,13 +846,15 @@ impl ShoesResolver for HickoryResolver {
+                 }
+             }
+             .map_err(|error| {
+-                log::warn!(
+-                    "DNS lookup failed via {}: {}:{} in {:?}: {}",
+-                    description,
+-                    name,
+-                    port,
+-                    started.elapsed(),
+-                    error
++                log_outbound_failure(
++                    format_args!(
++                        "DNS lookup failed via {}: {}:{} in {:?}",
++                        description,
++                        name,
++                        port,
++                        started.elapsed()
++                    ),
++                    &error,
+                 );
+                 error
+             })?;
+@@ -861,14 +865,14 @@ impl ShoesResolver for HickoryResolver {
+                 .map(|ip| SocketAddr::new(ip, port))
+                 .collect();
+             if addrs.is_empty() {
+-                return Err(std::io::Error::other(format!(
++                return Err(no_addresses_error(format!(
+                     "DNS lookup returned no addresses for {name}"
+                 )));
+             }
+ 
+             let elapsed = started.elapsed();
+             if elapsed > Duration::from_millis(500) {
+-                log::info!(
++                log::debug!(
+                     "slow DNS lookup via {}: {}:{} -> {:?} in {:?}",
+                     description,
+                     name,
+diff --git a/src/dns/mod.rs b/src/dns/mod.rs
+index f17892f..0ccb9d5 100644
+--- a/src/dns/mod.rs
++++ b/src/dns/mod.rs
+@@ -14,6 +14,7 @@ mod builder;
+ mod client_subnet;
+ mod composite_resolver;
+ mod hickory_resolver;
++pub(crate) mod no_addresses;
+ mod parsed;
+ mod policy;
+ mod predefined;
+diff --git a/src/dns/no_addresses.rs b/src/dns/no_addresses.rs
+new file mode 100644
+index 0000000..aa2a69e
+--- /dev/null
++++ b/src/dns/no_addresses.rs
+@@ -0,0 +1,97 @@
++use std::error::Error;
++use std::fmt;
++use std::io;
++
++/// Marks a successful DNS lookup that yielded no usable addresses.
++#[derive(Debug)]
++struct NoAddressesError(String);
++
++impl fmt::Display for NoAddressesError {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(&self.0)
++    }
++}
++
++impl Error for NoAddressesError {}
++
++pub(crate) fn no_addresses_error(message: String) -> io::Error {
++    io::Error::other(NoAddressesError(message))
++}
++
++/// Recognizes the marker through both I/O wrappers and ordinary error sources.
++pub(crate) fn is_no_addresses_error(error: &io::Error) -> bool {
++    let mut current: Option<&(dyn Error + 'static)> = Some(error);
++    while let Some(error) = current {
++        if error.is::<NoAddressesError>() {
++            return true;
++        }
++
++        // io::Error::source can skip its contained error, so inspect get_ref
++        // before following the usual source chain.
++        current = error
++            .downcast_ref::<io::Error>()
++            .and_then(io::Error::get_ref)
++            .map(|inner| inner as &(dyn Error + 'static))
++            .or_else(|| error.source());
++    }
++    false
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn marker_preserves_error_kind_and_message() {
++        for message in [
++            "DNS lookup returned no addresses for example.test",
++            "native DNS lookup returned no addresses for example.test",
++        ] {
++            let error = no_addresses_error(message.to_owned());
++            assert_eq!(error.kind(), io::ErrorKind::Other);
++            assert_eq!(error.to_string(), message);
++            assert!(is_no_addresses_error(&error));
++        }
++    }
++
++    #[test]
++    fn recognizes_marker_inside_nested_io_errors() {
++        let error = io::Error::other(io::Error::other(no_addresses_error(
++            "DNS lookup returned no addresses for example.test".to_owned(),
++        )));
++        assert!(is_no_addresses_error(&error));
++    }
++
++    #[derive(Debug)]
++    struct WrappedError(io::Error);
++
++    impl fmt::Display for WrappedError {
++        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++            formatter.write_str("wrapped resolver error")
++        }
++    }
++
++    impl Error for WrappedError {
++        fn source(&self) -> Option<&(dyn Error + 'static)> {
++            Some(&self.0)
++        }
++    }
++
++    #[test]
++    fn recognizes_marker_through_custom_error_source() {
++        let error = io::Error::other(WrappedError(io::Error::other(no_addresses_error(
++            "DNS lookup returned no addresses for example.test".to_owned(),
++        ))));
++        assert!(is_no_addresses_error(&error));
++    }
++
++    #[test]
++    fn does_not_recognize_unrelated_errors_with_identical_text() {
++        let message = "DNS lookup returned no addresses for example.test";
++        let error = io::Error::other(message);
++        assert!(!is_no_addresses_error(&error));
++        assert!(!is_no_addresses_error(&io::Error::other(WrappedError(
++            error
++        ))));
++    }
++}
+diff --git a/src/dns/proxy_runtime.rs b/src/dns/proxy_runtime.rs
+index c4e8b8b..ff1d38a 100644
+--- a/src/dns/proxy_runtime.rs
++++ b/src/dns/proxy_runtime.rs
+@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
+ use crate::address::{Address, NetLocation, ResolvedLocation};
+ use crate::async_stream::{AsyncMessageStream, AsyncStream};
+ use crate::client_proxy_chain::ClientChainGroup;
++use crate::logging::connection_events::log_outbound_failure;
+ use crate::resolver::Resolver;
+ use crate::socket_util::new_udp_socket;
+ 
+@@ -123,16 +124,18 @@ impl RuntimeProvider for ProxyRuntimeProvider {
+                     Ok(AsyncIoTokioAsStd(result.client_stream))
+                 }
+                 Ok(Err(e)) => {
+-                    log::warn!(
+-                        "DNS upstream connect to {} failed in {:?}: {}",
+-                        server_addr,
+-                        started.elapsed(),
+-                        e
++                    log_outbound_failure(
++                        format_args!(
++                            "DNS upstream connect to {} failed in {:?}",
++                            server_addr,
++                            started.elapsed()
++                        ),
++                        &e,
+                     );
+                     Err(e)
+                 }
+                 Err(_) => {
+-                    log::warn!(
++                    log::debug!(
+                         "DNS upstream connect to {} timed out in {:?}",
+                         server_addr,
+                         started.elapsed()
+diff --git a/src/dns/query_cache.rs b/src/dns/query_cache.rs
+index df6c5e0..9f14fe1 100644
+--- a/src/dns/query_cache.rs
++++ b/src/dns/query_cache.rs
+@@ -21,6 +21,7 @@ use parking_lot::Mutex;
+ use tokio::sync::watch;
+ 
+ use crate::address::NetLocation;
++use crate::dns::no_addresses::no_addresses_error;
+ use crate::dns::parsed::IpStrategy;
+ use crate::resolver::Resolver;
+ 
+@@ -543,7 +544,7 @@ impl Resolver for SharedNativeResolver {
+             };
+             addresses.retain(|address| !address.is_unspecified());
+             if addresses.is_empty() {
+-                return Err(io::Error::other(format!(
++                return Err(no_addresses_error(format!(
+                     "native DNS lookup returned no addresses for {name_string}"
+                 )));
+             }
+diff --git a/src/dns/system_resolver.rs b/src/dns/system_resolver.rs
+index fffae06..1c102ed 100644
+--- a/src/dns/system_resolver.rs
++++ b/src/dns/system_resolver.rs
+@@ -24,6 +24,7 @@ use hickory_resolver::proto::rr::{Name, RData, RecordType};
+ use crate::address::NetLocation;
+ use crate::client_proxy_chain::ClientChainGroup;
+ use crate::dns::hickory_resolver::{HickoryResolver, HickoryResolverOptions};
++use crate::dns::no_addresses::no_addresses_error;
+ use crate::dns::parsed::IpStrategy;
+ use crate::dns::system_config::{
+     ResolvedDnsOverTlsMode, ResolvedNameServer, SystemConfiguration, SystemdResolvedConfiguration,
+@@ -573,7 +574,7 @@ impl Resolver for OrderedSystemResolver {
+                 .map(|address| SocketAddr::new(address, port))
+                 .collect::<Vec<_>>();
+             if addresses.is_empty() {
+-                return Err(std::io::Error::other(format!(
++                return Err(no_addresses_error(format!(
+                     "system DNS lookup returned no addresses for {name}"
+                 )));
+             }
+diff --git a/src/h2mux/h2mux_server_session.rs b/src/h2mux/h2mux_server_session.rs
+index 7d314de..dfbb0a6 100644
+--- a/src/h2mux/h2mux_server_session.rs
++++ b/src/h2mux/h2mux_server_session.rs
+@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ use bytes::Bytes;
+ use http::Response;
+-use log::{debug, warn};
++use log::debug;
+ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+ use tokio::sync::mpsc;
+ use tokio::task::JoinHandle;
+@@ -18,6 +18,7 @@ use tokio::time::interval;
+ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
+ use crate::copy_bidirectional::copy_bidirectional;
+ use crate::dynamic::{ConnContext, current_connection};
++use crate::logging::connection_events::log_outbound_failure;
+ use crate::resolver::Resolver;
+ use crate::routing::protocol::{SniffedTcpMetadata, sniff_tcp};
+ use crate::routing::{ServerStream, run_udp_routing};
+@@ -530,14 +531,20 @@ async fn handle_h2mux_tcp(
+             )
+             .await
+             .map_err(|error| {
+-                warn!("H2MUX TCP route selection for {destination} failed: {error}");
++                log_outbound_failure(
++                    format_args!("H2MUX TCP route selection for {destination} failed"),
++                    &error,
++                );
+                 error
+             })?,
+         None => proxy_selector
+             .judge_tcp(destination.clone().into(), &resolver)
+             .await
+             .map_err(|error| {
+-                warn!("H2MUX TCP route selection for {destination} failed: {error}");
++                log_outbound_failure(
++                    format_args!("H2MUX TCP route selection for {destination} failed"),
++                    &error,
++                );
+                 error
+             })?,
+     };
+@@ -556,7 +563,10 @@ async fn handle_h2mux_tcp(
+                 .connect_tcp(remote_location.clone(), &resolver)
+                 .await
+                 .map_err(|error| {
+-                    warn!("H2MUX outbound TCP connect to {remote_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("H2MUX outbound TCP connect to {remote_location} failed"),
++                        &error,
++                    );
+                     error
+                 })?;
+ 
+@@ -649,7 +659,10 @@ async fn handle_h2mux_udp(
+         .judge_udp(destination.clone().into(), &resolver)
+         .await
+         .map_err(|error| {
+-            warn!("H2MUX UDP route selection for {destination} failed: {error}");
++            log_outbound_failure(
++                format_args!("H2MUX UDP route selection for {destination} failed"),
++                &error,
++            );
+             error
+         })?;
+ 
+@@ -663,7 +676,10 @@ async fn handle_h2mux_udp(
+                 .connect_udp_bidirectional(&resolver, remote_location.clone())
+                 .await
+                 .map_err(|error| {
+-                    warn!("H2MUX outbound UDP connect to {remote_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("H2MUX outbound UDP connect to {remote_location} failed"),
++                        &error,
++                    );
+                     error
+                 })?;
+ 
+diff --git a/src/hysteria2_server.rs b/src/hysteria2_server.rs
+index ecced72..a54b6aa 100644
+--- a/src/hysteria2_server.rs
++++ b/src/hysteria2_server.rs
+@@ -134,6 +134,7 @@ use crate::dynamic::{
+     ConnContext, SelectorSlot, TrafficMeterStream, UserContext, UserRegistry,
+     scope_connection_until_cancelled,
+ };
++use crate::logging::connection_events::{RoutineEvent, log_outbound_failure};
+ use crate::quic_server::{
+     QUIC_PRE_AUTH_TIMEOUT, QUIC_TRANSPORT_HANDSHAKE_TIMEOUT, QuicConnectionLifecycle,
+     require_validated_quic_address,
+@@ -541,24 +542,27 @@ async fn process_connection(
+         result = async { tokio::try_join!(udp_loop, uni_loop, tcp_loop) } => result,
+     };
+ 
+-    // A transport failure ends every proxied stream on this connection. Keep one
+-    // diagnostic at warning level: release builds compile out the per-loop debug
+-    // messages, otherwise an INTERNAL_ERROR looks like a healthy but frozen node.
++    // Keep unexpected transport failures visible in release builds. Timeouts are
++    // common when clients leave or change networks, so summarize those at debug.
+     let close_reason = connection.close_reason();
+-    let abnormal_close = match &close_reason {
+-        None | Some(quinn::ConnectionError::LocallyClosed) => false,
+-        Some(quinn::ConnectionError::ApplicationClosed(close)) => {
+-            close.error_code != 0u32.into() && close.error_code != CLOSE_ERR_CODE_OK.into()
+-        }
+-        Some(quinn::ConnectionError::ConnectionClosed(close)) => {
+-            close.error_code != quinn::TransportErrorCode::NO_ERROR
+-        }
+-        Some(_) => true,
+-    };
+-    if abnormal_close {
++    if let Some(level) = authenticated_close_log_level(close_reason.as_ref())
++        && log::log_enabled!(level)
++    {
+         let stats = connection.stats();
+-        warn!(
+-            "Hysteria2 authenticated connection ended abnormally: peer={}, reason={close_reason:?}, rx_bytes={}, tx_bytes={}, rtt={:?}, cwnd={}, sent_packets={}, lost_packets={}, peer_data_blocked={}, peer_stream_data_blocked={}",
++        let event = if level == log::Level::Debug {
++            "Hysteria2 authenticated connection timed out"
++        } else {
++            "Hysteria2 authenticated connection ended abnormally"
++        };
++        let log_close = |message: std::fmt::Arguments<'_>| {
++            if level == log::Level::Debug {
++                RoutineEvent::Hysteria2Timeout.log(message);
++            } else {
++                warn!("{message}");
++            }
++        };
++        log_close(format_args!(
++            "{event}: peer={}, reason={close_reason:?}, rx_bytes={}, tx_bytes={}, rtt={:?}, cwnd={}, sent_packets={}, lost_packets={}, peer_data_blocked={}, peer_stream_data_blocked={}",
+             connection.remote_address(),
+             stats.udp_rx.bytes,
+             stats.udp_tx.bytes,
+@@ -568,7 +572,7 @@ async fn process_connection(
+             stats.path.lost_packets,
+             stats.frame_rx.data_blocked,
+             stats.frame_rx.stream_data_blocked,
+-        );
++        ));
+     }
+ 
+     cancel_token.cancel();
+@@ -584,6 +588,24 @@ async fn process_connection(
+     }
+ }
+ 
++fn authenticated_close_log_level(reason: Option<&quinn::ConnectionError>) -> Option<log::Level> {
++    match reason {
++        None | Some(quinn::ConnectionError::LocallyClosed) => None,
++        Some(quinn::ConnectionError::ApplicationClosed(close))
++            if close.error_code == 0u32.into() || close.error_code == CLOSE_ERR_CODE_OK.into() =>
++        {
++            None
++        }
++        Some(quinn::ConnectionError::ConnectionClosed(close))
++            if close.error_code == quinn::TransportErrorCode::NO_ERROR =>
++        {
++            None
++        }
++        Some(quinn::ConnectionError::TimedOut) => Some(log::Level::Debug),
++        Some(_) => Some(log::Level::Warn),
++    }
++}
++
+ fn connection_lifecycle_cancelled_error() -> std::io::Error {
+     std::io::Error::new(
+         std::io::ErrorKind::ConnectionAborted,
+@@ -1136,7 +1158,10 @@ async fn connect_udp_target(
+     {
+         Ok(decision) => decision,
+         Err(error) => {
+-            warn!("Hysteria2 UDP routing for {requested_location} failed: {error}");
++            log_outbound_failure(
++                format_args!("Hysteria2 UDP routing for {requested_location} failed"),
++                &error,
++            );
+             return Err(error);
+         }
+     };
+@@ -1151,7 +1176,10 @@ async fn connect_udp_target(
+                 .connect_udp_bidirectional(resolver, remote_location)
+                 .await
+                 .map_err(|error| {
+-                    warn!("Hysteria2 UDP outbound setup to {outbound_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("Hysteria2 UDP outbound setup to {outbound_location} failed"),
++                        &error,
++                    );
+                     error
+                 })
+                 .map(|stream| crate::dynamic::analysis::wrap_udp(stream, &requested_location))
+@@ -2428,9 +2456,9 @@ mod tests {
+         MAX_UDP_PACKET_SIZE, MAX_UDP_TARGETS_PER_SESSION, TCP_REQUEST_HEADER_TIMEOUT,
+         TcpResponseWrite, UdpForwardCommand, UdpFragmentCache, UdpResponseSendOutcome, UdpSession,
+         UdpTargetEvent, UdpTargetPermit, UdpTargetWorker, acquire_udp_target_permits,
+-        checked_response_fragment_count, checked_udp_packet_len, cleanup_udp_sessions,
+-        connect_udp_target, decode_udp_address_length, dispatch_udp_target_command,
+-        encode_tcp_response, read_tcp_request_header_before_deadline,
++        authenticated_close_log_level, checked_response_fragment_count, checked_udp_packet_len,
++        cleanup_udp_sessions, connect_udp_target, decode_udp_address_length,
++        dispatch_udp_target_command, encode_tcp_response, read_tcp_request_header_before_deadline,
+         run_connected_udp_target_worker, send_udp_response_with, try_admit_tcp_logical_flow,
+         try_reserve_payload_bytes, try_reserve_udp_target_worker, udp_response_send_allowed,
+         valid_udp_fragment, write_tcp_fast_open_replay, write_tcp_response,
+@@ -2466,6 +2494,70 @@ mod tests {
+     use tokio::time::{Instant, advance};
+     use tokio_util::sync::CancellationToken;
+ 
++    #[test]
++    fn authenticated_close_normal_reasons_stay_silent() {
++        assert_eq!(authenticated_close_log_level(None), None);
++        let normal_reasons = [
++            quinn::ConnectionError::LocallyClosed,
++            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
++                error_code: 0u32.into(),
++                reason: Bytes::new(),
++            }),
++            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
++                error_code: super::CLOSE_ERR_CODE_OK.into(),
++                reason: Bytes::new(),
++            }),
++            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
++                error_code: quinn::TransportErrorCode::NO_ERROR,
++                frame_type: None,
++                reason: Bytes::new(),
++            }),
++        ];
++        for reason in normal_reasons {
++            assert_eq!(
++                authenticated_close_log_level(Some(&reason)),
++                None,
++                "{reason:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn authenticated_close_timeout_is_debug() {
++        assert_eq!(
++            authenticated_close_log_level(Some(&quinn::ConnectionError::TimedOut)),
++            Some(log::Level::Debug),
++        );
++    }
++
++    #[test]
++    fn authenticated_close_unexpected_failures_stay_warning() {
++        let failures = [
++            quinn::ConnectionError::Reset,
++            quinn::ConnectionError::VersionMismatch,
++            quinn::ConnectionError::CidsExhausted,
++            quinn::ConnectionError::TransportError(
++                quinn::TransportErrorCode::PROTOCOL_VIOLATION.into(),
++            ),
++            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
++                error_code: quinn::TransportErrorCode::INTERNAL_ERROR,
++                frame_type: None,
++                reason: Bytes::from_static(b"stream failure"),
++            }),
++            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
++                error_code: 1u32.into(),
++                reason: Bytes::from_static(b"application failure"),
++            }),
++        ];
++        for reason in failures {
++            assert_eq!(
++                authenticated_close_log_level(Some(&reason)),
++                Some(log::Level::Warn),
++                "{reason:?}",
++            );
++        }
++    }
++
+     struct CountingWriteMessageStream(Arc<AtomicUsize>);
+ 
+     impl AsyncReadMessage for CountingWriteMessageStream {
+diff --git a/src/logging.rs b/src/logging.rs
+index 3dba8d8..f5bcd90 100644
+--- a/src/logging.rs
++++ b/src/logging.rs
+@@ -10,6 +10,8 @@ use std::io::Write;
+ 
+ use log::{Level, LevelFilter, Log, Metadata, Record};
+ 
++pub(crate) mod connection_events;
++
+ /// Receives pre-formatted log lines. Implementations handle one output destination.
+ pub trait LogWriter: Send + Sync {
+     /// Writes a pre-formatted log line. `formatted` does NOT include a trailing newline.
+diff --git a/src/logging/connection_events.rs b/src/logging/connection_events.rs
+new file mode 100644
+index 0000000..b8e5443
+--- /dev/null
++++ b/src/logging/connection_events.rs
+@@ -0,0 +1,217 @@
++//! Debug diagnostics for routine connection events. Unexpected errors stay at WARN.
++
++use std::fmt;
++use std::io;
++use std::time::{Duration, Instant};
++
++use parking_lot::Mutex;
++
++use crate::dns::no_addresses::is_no_addresses_error;
++
++const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
++
++// Fixed categories keep both memory and log volume bounded even when every
++// request uses a different destination or every connection a different peer.
++static DNS_NO_ADDRESSES: Mutex<SampleWindow> = Mutex::new(SampleWindow::new());
++static HYSTERIA2_TIMEOUT: Mutex<SampleWindow> = Mutex::new(SampleWindow::new());
++
++#[derive(Clone, Copy)]
++pub(crate) enum RoutineEvent {
++    DnsNoAddresses,
++    Hysteria2Timeout,
++}
++
++impl RoutineEvent {
++    pub(crate) fn log(self, message: fmt::Arguments<'_>) {
++        if !log::log_enabled!(log::Level::Debug) {
++            return;
++        }
++        let (category, window) = match self {
++            Self::DnsNoAddresses => ("dns_no_addresses", &DNS_NO_ADDRESSES),
++            Self::Hysteria2Timeout => ("hysteria2_timeout", &HYSTERIA2_TIMEOUT),
++        };
++        let suppressed = {
++            let mut window = window.lock();
++            window.record(Instant::now())
++        };
++        if let Some(suppressed) = suppressed {
++            // Do not log while holding the limiter lock: output belongs to the
++            // application's logger. Normal operation never enters this path.
++            log::debug!(
++                "connection event: category={category}, suppressed_since_last_log={suppressed}, sample: {message}"
++            );
++        }
++    }
++}
++
++pub(crate) fn log_outbound_failure(context: fmt::Arguments<'_>, error: &io::Error) {
++    if is_no_addresses_error(error) {
++        RoutineEvent::DnsNoAddresses.log(format_args!("{context}: {error}"));
++    } else {
++        log::log!(outbound_failure_level(error), "{context}: {error}");
++    }
++}
++
++fn outbound_failure_level(error: &io::Error) -> log::Level {
++    use io::ErrorKind;
++    if matches!(
++        error.kind(),
++        ErrorKind::NotFound
++            | ErrorKind::TimedOut
++            | ErrorKind::ConnectionRefused
++            | ErrorKind::ConnectionReset
++            | ErrorKind::ConnectionAborted
++            | ErrorKind::NotConnected
++            | ErrorKind::BrokenPipe
++            | ErrorKind::HostUnreachable
++            | ErrorKind::NetworkUnreachable
++            | ErrorKind::WouldBlock
++    ) {
++        log::Level::Debug
++    } else {
++        log::Level::Warn
++    }
++}
++
++struct SampleWindow {
++    last_logged: Option<Instant>,
++    suppressed: u64,
++}
++
++impl SampleWindow {
++    const fn new() -> Self {
++        Self {
++            last_logged: None,
++            suppressed: 0,
++        }
++    }
++
++    // The first event is immediate. Later events within the interval are counted;
++    // the next event after the interval reports that count with its fresh sample.
++    // No timer or background task is started when traffic stops.
++    fn record(&mut self, now: Instant) -> Option<u64> {
++        if self
++            .last_logged
++            .is_some_and(|last| now.duration_since(last) < SAMPLE_INTERVAL)
++        {
++            self.suppressed = self.suppressed.saturating_add(1);
++            return None;
++        }
++        self.last_logged = Some(now);
++        Some(std::mem::take(&mut self.suppressed))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn routine_diagnostics_follow_runtime_level() {
++        const CHILD: &str = "SHOES_LOG_LEVEL_TEST_CHILD";
++        if std::env::var_os(CHILD).is_none() {
++            let output = std::process::Command::new(std::env::current_exe().unwrap())
++                .args([
++                    "--exact",
++                    "logging::connection_events::tests::routine_diagnostics_follow_runtime_level",
++                    "--nocapture",
++                ])
++                .env(CHILD, "1")
++                .output()
++                .unwrap();
++            assert!(output.status.success(), "child output: {output:?}");
++            return;
++        }
++
++        // This must also hold without debug_assertions: an INFO static ceiling
++        // would silently make the agent's production debug switch ineffective.
++        assert!(log::STATIC_MAX_LEVEL >= log::LevelFilter::Debug);
++        #[derive(Clone, Default)]
++        struct Capture(std::sync::Arc<Mutex<Vec<log::Level>>>);
++        impl log::Log for Capture {
++            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
++                true
++            }
++            fn log(&self, record: &log::Record<'_>) {
++                self.0.lock().push(record.level());
++            }
++            fn flush(&self) {}
++        }
++        let capture = Capture::default();
++        log::set_boxed_logger(Box::new(capture.clone())).unwrap();
++        let emit = || {
++            let dns = io::Error::other(crate::dns::no_addresses::no_addresses_error(
++                "DNS lookup returned no addresses".to_owned(),
++            ));
++            log_outbound_failure(format_args!("DNS"), &dns);
++            RoutineEvent::Hysteria2Timeout.log(format_args!("connection timed out"));
++            for kind in [
++                io::ErrorKind::NotFound,
++                io::ErrorKind::TimedOut,
++                io::ErrorKind::ConnectionRefused,
++                io::ErrorKind::InvalidData,
++            ] {
++                log_outbound_failure(format_args!("outbound"), &io::Error::from(kind));
++            }
++        };
++        log::set_max_level(log::LevelFilter::Info);
++        emit();
++        assert_eq!(*capture.0.lock(), [log::Level::Warn]);
++        capture.0.lock().clear();
++        log::set_max_level(log::LevelFilter::Debug);
++        emit();
++        assert_eq!(
++            *capture.0.lock(),
++            [
++                log::Level::Debug,
++                log::Level::Debug,
++                log::Level::Debug,
++                log::Level::Debug,
++                log::Level::Debug,
++                log::Level::Warn,
++            ]
++        );
++    }
++
++    #[test]
++    fn burst_is_sampled_and_next_event_reports_suppressed_count() {
++        let mut window = SampleWindow::new();
++        let start = Instant::now();
++        assert_eq!(window.record(start), Some(0));
++        for millis in [0, 100, 200, 5_000, 59_999] {
++            assert_eq!(window.record(start + Duration::from_millis(millis)), None);
++        }
++        assert_eq!(window.record(start + SAMPLE_INTERVAL), Some(5));
++        assert_eq!(window.record(start + SAMPLE_INTERVAL), None);
++        // A quiet period does not lose the pending count or require a timer.
++        assert_eq!(window.record(start + Duration::from_secs(600)), Some(1));
++        assert_eq!(window.record(start + Duration::from_secs(660)), Some(0));
++    }
++
++    #[test]
++    fn concurrent_events_admit_one_sample_and_count_every_other_event() {
++        let window = Mutex::new(SampleWindow::new());
++        let start = Instant::now();
++        let samples = std::thread::scope(|scope| {
++            let workers: Vec<_> = (0..16)
++                .map(|_| {
++                    scope.spawn(|| {
++                        let mut samples = 0;
++                        for _ in 0..100 {
++                            if window.lock().record(start).is_some() {
++                                samples += 1;
++                            }
++                        }
++                        samples
++                    })
++                })
++                .collect();
++            workers
++                .into_iter()
++                .map(|worker| worker.join().unwrap())
++                .sum::<usize>()
++        });
++        assert_eq!(samples, 1);
++        assert_eq!(window.lock().record(start + SAMPLE_INTERVAL), Some(1599));
++    }
++}
+diff --git a/src/quic_server.rs b/src/quic_server.rs
+index b11a66c..ed17c11 100644
+--- a/src/quic_server.rs
++++ b/src/quic_server.rs
+@@ -3,7 +3,8 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Duration;
+ 
+-use log::{debug, warn};
++use crate::logging::connection_events::log_outbound_failure;
++use log::debug;
+ use quinn::EndpointConfig;
+ use tokio::io::AsyncWriteExt;
+ use tokio::sync::Notify;
+@@ -717,7 +718,10 @@ async fn serve_stream(
+             {
+                 Ok(action) => action,
+                 Err(error) => {
+-                    warn!("UDP routing for {requested_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("UDP routing for {requested_location} failed"),
++                        &error,
++                    );
+                     return Err(error);
+                 }
+             };
+@@ -731,7 +735,10 @@ async fn serve_stream(
+                         .connect_udp_bidirectional(&resolver, remote_location)
+                         .await
+                         .map_err(|error| {
+-                            warn!("UDP outbound setup to {outbound_location} failed: {error}");
++                            log_outbound_failure(
++                                format_args!("UDP outbound setup to {outbound_location} failed"),
++                                &error,
++                            );
+                             error
+                         })?;
+ 
+diff --git a/src/resolver.rs b/src/resolver.rs
+index f68cfc2..f2924a4 100644
+--- a/src/resolver.rs
++++ b/src/resolver.rs
+@@ -17,6 +17,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
+ // Resolver is a public embedding API, so its public input types must be
+ // reachable by crates such as shoes-engine as well.
+ use crate::address::ResolvedLocation;
++use crate::dns::no_addresses::no_addresses_error;
+ // `Address` is part of the embedding API used by shoes-engine; the standalone
+ // binary's duplicate module graph does not reference it directly.
+ #[allow(unused_imports)]
+@@ -399,7 +400,7 @@ impl Resolver for RefreshingResolver {
+                             };
+                             if !unchanged {
+                                 *inner.write().await = fresh;
+-                                log::info!(
++                                log::debug!(
+                                     "RefreshingResolver ({}): rebuilt after {}",
+                                     description,
+                                     refresh_reason
+@@ -470,7 +471,7 @@ impl Resolver for RefreshingResolver {
+                             };
+                             if !unchanged {
+                                 *inner.write().await = fresh.clone();
+-                                log::info!(
++                                log::debug!(
+                                     "RefreshingResolver ({}): rebuilt on {} error for {}",
+                                     description,
+                                     err.kind(),
+@@ -554,7 +555,7 @@ pub async fn resolve_single_address(
+     }
+     let resolve_results = resolver.resolve_location(location).await?;
+     if resolve_results.is_empty() {
+-        return Err(std::io::Error::other(format!(
++        return Err(no_addresses_error(format!(
+             "could not resolve location: {location}"
+         )));
+     }
+@@ -585,7 +586,7 @@ pub async fn resolve_addresses_via(
+         None => resolver.resolve_location(location).await?,
+     };
+     if addrs.is_empty() {
+-        return Err(std::io::Error::other(format!(
++        return Err(no_addresses_error(format!(
+             "could not resolve location: {location}"
+         )));
+     }
+@@ -613,7 +614,7 @@ pub async fn resolve_location_via(
+     }
+     let addrs = resolve_addresses_via(resolver, upstream_tag, location.location()).await?;
+     let addr = addrs.first().copied().ok_or_else(|| {
+-        std::io::Error::other(format!(
++        no_addresses_error(format!(
+             "could not resolve location: {}",
+             location.location()
+         ))
+@@ -693,7 +694,7 @@ impl Resolver for CachingNativeResolver {
+                 result.filter(|addr| !addr.ip().is_unspecified()).collect();
+ 
+             if addrs.is_empty() {
+-                return Err(std::io::Error::other(format!(
++                return Err(no_addresses_error(format!(
+                     "DNS lookup returned no addresses for {address}"
+                 )));
+             }
+@@ -753,7 +754,7 @@ impl ResolverCache {
+             .into_iter()
+             .next()
+             .ok_or_else(|| {
+-                std::io::Error::other(format!("DNS lookup returned no addresses for {target}"))
++                no_addresses_error(format!("DNS lookup returned no addresses for {target}"))
+             })
+     }
+ 
+@@ -783,7 +784,7 @@ impl ResolverCache {
+         // Resolve
+         let addrs = self.resolver.resolve_location(target).await?;
+         if addrs.is_empty() {
+-            return Err(std::io::Error::other(format!(
++            return Err(no_addresses_error(format!(
+                 "DNS lookup returned no addresses for {target}"
+             )));
+         }
+@@ -803,7 +804,7 @@ impl ResolverCache {
+         match self.poll_resolve_addresses(cx, target) {
+             Poll::Pending => Poll::Pending,
+             Poll::Ready(Ok(addrs)) => Poll::Ready(addrs.into_iter().next().ok_or_else(|| {
+-                std::io::Error::other(format!("DNS lookup returned no addresses for {target}"))
++                no_addresses_error(format!("DNS lookup returned no addresses for {target}"))
+             })),
+             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+         }
+@@ -849,7 +850,7 @@ impl ResolverCache {
+             Poll::Ready(Ok(addrs)) => {
+                 self.pending = None;
+                 if addrs.is_empty() {
+-                    return Poll::Ready(Err(std::io::Error::other(format!(
++                    return Poll::Ready(Err(no_addresses_error(format!(
+                         "DNS lookup returned no addresses for {target}"
+                     ))));
+                 }
+@@ -871,6 +872,7 @@ impl ResolverCache {
+ mod tests {
+     use super::*;
+     use crate::address::Address;
++    use crate::dns::no_addresses::is_no_addresses_error;
+     use std::sync::atomic::{AtomicUsize, Ordering};
+     use tokio::sync::Barrier;
+ 
+@@ -1019,6 +1021,29 @@ mod tests {
+         NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
+     }
+ 
++    #[tokio::test]
++    async fn empty_results_from_resolution_helpers_keep_no_addresses_marker() {
++        let resolver: Arc<dyn Resolver> = Arc::new(MockResolver::with_addrs(vec![]));
++        let location = test_location();
++        let errors = [
++            resolve_single_address(&resolver, &location)
++                .await
++                .unwrap_err(),
++            resolve_addresses(&resolver, &location).await.unwrap_err(),
++            resolve_addresses_via(&resolver, Some(""), &location)
++                .await
++                .unwrap_err(),
++        ];
++        for error in errors {
++            assert!(is_no_addresses_error(&error));
++            assert_eq!(error.kind(), std::io::ErrorKind::Other);
++            assert_eq!(
++                error.to_string(),
++                format!("could not resolve location: {location}")
++            );
++        }
++    }
++
+     #[test]
+     fn connectivity_classifier_covers_immediate_route_and_bind_failures() {
+         for kind in [
+diff --git a/src/routing/udp_router.rs b/src/routing/udp_router.rs
+index ae9c86f..b211ba5 100644
+--- a/src/routing/udp_router.rs
++++ b/src/routing/udp_router.rs
+@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
+ use std::time::Duration;
+ 
+ use indexmap::IndexMap;
+-use log::{debug, warn};
++use log::debug;
+ use lru::LruCache;
+ use rustc_hash::{FxBuildHasher, FxHashMap};
+ use tokio::io::ReadBuf;
+@@ -35,6 +35,7 @@ use crate::async_stream::{
+     SessionMessageTarget,
+ };
+ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
++use crate::logging::connection_events::log_outbound_failure;
+ use crate::resolver::{Resolver, resolve_addresses};
+ use crate::util::allocate_vec;
+ 
+@@ -824,7 +825,7 @@ impl<'a> UdpRouter<'a> {
+                             buf = new_buf;
+                         }
+                         Poll::Ready(Err(e)) => {
+-                            warn!("remote write error: {}", e);
++                            log_outbound_failure(format_args!("remote write error"), &e);
+                             session.remote_write_eof = true;
+                             if session.should_remove() {
+                                 self.sessions_to_remove.insert(id);
+@@ -923,7 +924,7 @@ impl<'a> UdpRouter<'a> {
+                         .push_back(PendingWrite { id, buf, len });
+                 }
+                 Poll::Ready(Err(e)) => {
+-                    warn!("remote write error: {}", e);
++                    log_outbound_failure(format_args!("remote write error"), &e);
+                     session.in_remote_write_queue -= 1;
+                     self.remote_write_pool.release(buf);
+                     session.remote_write_eof = true;
+@@ -962,7 +963,7 @@ impl<'a> UdpRouter<'a> {
+                 }
+                 Poll::Ready(Err(error)) => {
+                     if !session.remote_write_eof {
+-                        warn!("remote flush error: {error}");
++                        log_outbound_failure(format_args!("remote flush error"), &error);
+                     }
+                     session.in_remote_flush_queue = false;
+                     session.remote_write_eof = true;
+@@ -1275,7 +1276,7 @@ impl<'a> UdpRouter<'a> {
+                         }
+                     }
+                     Poll::Ready(Err(e)) => {
+-                        warn!("remote write error: {}", e);
++                        log_outbound_failure(format_args!("remote write error"), &e);
+                         session.remote_write_eof = true;
+                         if session.should_remove() {
+                             self.sessions_to_remove.insert(id);
+@@ -1295,7 +1296,10 @@ impl<'a> UdpRouter<'a> {
+                     // Mark as blocked
+                     self.blocked.put(destination.clone(), ());
+                 } else {
+-                    warn!("Failed to create UDP session for {destination}: {e}");
++                    log_outbound_failure(
++                        format_args!("Failed to create UDP session for {destination}"),
++                        &e,
++                    );
+                 }
+                 // Remove from pending in lookup
+                 match (&mut self.session_lookup, &lookup_key) {
+diff --git a/src/tcp/tcp_server.rs b/src/tcp/tcp_server.rs
+index 65a35d8..61cca9d 100644
+--- a/src/tcp/tcp_server.rs
++++ b/src/tcp/tcp_server.rs
+@@ -6,7 +6,7 @@ use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+-use log::{debug, error, warn};
++use log::{debug, error};
+ use tokio::io::AsyncWriteExt;
+ use tokio::task::JoinHandle;
+ use tokio::time::timeout;
+@@ -30,6 +30,7 @@ use crate::dynamic::{
+     ConnContext, HandlerSlot, InboundReplayScope, InboundReplayState, ServerHandle,
+     TrafficMeterStream, UserRegistry, scope_connection_until_cancelled,
+ };
++use crate::logging::connection_events::log_outbound_failure;
+ use crate::quic_server::start_quic_servers_with_resolved_bind;
+ use crate::resolver::Resolver;
+ use crate::routing::protocol::{
+@@ -452,7 +453,10 @@ where
+             {
+                 Ok(action) => action,
+                 Err(error) => {
+-                    warn!("UDP routing for {requested_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("UDP routing for {requested_location} failed"),
++                        &error,
++                    );
+                     return Err(error);
+                 }
+             };
+@@ -466,7 +470,10 @@ where
+                         .connect_udp_bidirectional(&resolver, remote_location)
+                         .await
+                         .map_err(|error| {
+-                            warn!("UDP outbound setup to {outbound_location} failed: {error}");
++                            log_outbound_failure(
++                                format_args!("UDP outbound setup to {outbound_location} failed"),
++                                &error,
++                            );
+                             error
+                         })?;
+ 
+@@ -631,7 +638,7 @@ pub(crate) fn client_stream_setup_timeout(
+     remote_location: &NetLocation,
+     elapsed: tokio::time::error::Elapsed,
+ ) -> std::io::Error {
+-    warn!("TCP outbound setup to {remote_location} timed out: {elapsed}");
++    debug!("TCP outbound setup to {remote_location} timed out: {elapsed}");
+     std::io::Error::new(
+         std::io::ErrorKind::TimedOut,
+         format!("client setup to {remote_location} timed out: {elapsed}"),
+@@ -671,7 +678,10 @@ pub(crate) async fn prepare_client_tcp_stream_with_metadata(
+     let action = match action_result {
+         Ok(action) => action,
+         Err(error) => {
+-            warn!("TCP outbound routing for {requested_location} failed: {error}");
++            log_outbound_failure(
++                format_args!("TCP outbound routing for {requested_location} failed"),
++                &error,
++            );
+             return Err(error);
+         }
+     };
+@@ -686,7 +696,10 @@ pub(crate) async fn prepare_client_tcp_stream_with_metadata(
+                 .connect_tcp(remote_location, &resolver)
+                 .await
+                 .map_err(|error| {
+-                    warn!("TCP outbound setup to {outbound_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("TCP outbound setup to {outbound_location} failed"),
++                        &error,
++                    );
+                     error
+                 })?;
+             setup.client_stream = crate::dynamic::analysis::wrap_tcp(
+diff --git a/src/tuic_server.rs b/src/tuic_server.rs
+index f2e61cd..f48de22 100644
+--- a/src/tuic_server.rs
++++ b/src/tuic_server.rs
+@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
++use crate::logging::connection_events::log_outbound_failure;
+ use bytes::{Bytes, BytesMut};
+ use dashmap::DashMap;
+ use futures::future::poll_fn;
+-use log::{debug, warn};
++use log::debug;
+ use lru::LruCache;
+ use rustc_hash::FxHashMap;
+ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+@@ -1415,7 +1416,10 @@ async fn connect_udp_target(
+     {
+         Ok(decision) => decision,
+         Err(error) => {
+-            warn!("TUIC UDP routing for {requested_location} failed: {error}");
++            log_outbound_failure(
++                format_args!("TUIC UDP routing for {requested_location} failed"),
++                &error,
++            );
+             return Err(error);
+         }
+     };
+@@ -1430,7 +1434,10 @@ async fn connect_udp_target(
+                 .connect_udp_bidirectional(resolver, remote_location)
+                 .await
+                 .map_err(|error| {
+-                    warn!("TUIC UDP outbound setup to {outbound_location} failed: {error}");
++                    log_outbound_failure(
++                        format_args!("TUIC UDP outbound setup to {outbound_location} failed"),
++                        &error,
++                    );
+                     error
+                 })
+                 .map(|stream| crate::dynamic::analysis::wrap_udp(stream, &requested_location))

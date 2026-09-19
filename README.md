@@ -59,7 +59,7 @@ shoes-plus        代理协议、传输、路由、DNS、出站拨号
 
 ### 从源码构建
 
-将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交，再按顺序应用本仓库的域名观测、HY2 半关闭和空 UDP 报文补丁：
+将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交，再按顺序应用本仓库的域名观测、HY2 半关闭、空 UDP 报文和日志分级补丁：
 
 ```bash
 git clone https://github.com/0xddy/node-agent-rs.git
@@ -68,6 +68,7 @@ git -C shoes-plus checkout 32e58642cab6c5b2e1c8fda24fdc3907ae6af112
 git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-raw-observations.patch
 git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch
 git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-empty-udp.patch
+git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-debug-logs.patch
 cd node-agent-rs
 cargo build --release --locked -p node-agent --bin node-agent
 ```
@@ -138,7 +139,7 @@ traffic_report_min_delta_bytes = 26214400
 | `machine_secret` | 必填 | 节点与面板认证使用的共享密钥 |
 | `ca_cert_path` | `""` | 使用 `grpcs://` 时可设置自定义 CA 证书路径；默认使用系统信任根 |
 | `tls_insecure_skip_verify` | `false` | TLS 证书校验开关；`false` 表示执行证书校验 |
-| `debug` | `false` | 启用调试日志 |
+| `debug` | `false` | 启用调试日志（正式构建同样生效）；包含嗅探、DNS 查询和常见连接超时等细节，修改后需重启 agent |
 | `disable_traffic_analysis` | `false` | 本地强制关闭流量分析采集、上报及所有嗅探，优先于面板设置；计费流量仍正常统计，修改后需重启 agent |
 | `log_file_path` | `""` | 本地日志路径；留空时使用 `runtime/node-agent.log` |
 | `traffic_report_min_delta_bytes` | `26214400` | 流量增量上报阈值，单位为字节，默认 25 MiB，取值为正整数 |

@@ -44,6 +44,9 @@ jobs:
       - name: Preserve empty UDP datagrams
         run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-empty-udp.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-empty-udp.patch
 
+      - name: Keep routine connection diagnostics at debug
+        run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-debug-logs.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-debug-logs.patch
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

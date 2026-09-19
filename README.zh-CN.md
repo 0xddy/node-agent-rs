@@ -13,7 +13,7 @@
 shoes 内核只在同级 [`shoes-plus`](https://github.com/0xddy/shoes-plus) 仓库维护一份。本工作区通过 Cargo 路径依赖
 `../shoes-plus` 使用它，不再保留第二份源码；标准本地布局是把两个仓库克隆到同一个父目录下。
 
-本地构建直接使用该同级工作树；CI 与发布流程把固定的兼容 shoes-plus 提交检出到同级目录，再依次应用本仓库的域名观测、HY2 半关闭和空 UDP 报文补丁。首次构建的检出和补丁命令见 [README 源码构建](README.md#从源码构建)。
+本地构建直接使用该同级工作树；CI 与发布流程把固定的兼容 shoes-plus 提交检出到同级目录，再依次应用本仓库的域名观测、HY2 半关闭、空 UDP 报文和日志分级补丁。首次构建的检出和补丁命令见 [README 源码构建](README.md#从源码构建)。
 
 ## Engine
 
@@ -67,6 +67,8 @@ disable_traffic_analysis = false
 log_file_path = "node-agent.log"
 traffic_report_min_delta_bytes = 26214400
 ```
+
+默认 `debug = false`，嗅探、DNS 无结果与慢查询、DNS fallback 成功、HY2 超时及常见出站连接失败只在 debug 级别输出。需要排查时将 `debug = true` 并重启 agent，正式构建也支持该开关。DNS 无地址和 HY2 超时按类别每 60 秒采样一次，并报告期间省略的数量；配置、协议等异常仍保留警告。
 
 `disable_traffic_analysis = true` 会强制关闭本节点的流量分析采集、上报和所有嗅探，优先于面板设置，断线重连后仍生效。计费流量统计保持正常；省略或设为 `false` 时沿用面板设置。修改此项后需重启 agent。
 
