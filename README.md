@@ -59,13 +59,15 @@ shoes-plus        代理协议、传输、路由、DNS、出站拨号
 
 ### 从源码构建
 
-将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交，再应用本仓库的原始域名观测补丁：
+将两个仓库放在同一父目录下，并将 `shoes-plus` 切换到当前 CI 使用的兼容提交，再按顺序应用本仓库的域名观测、HY2 半关闭和空 UDP 报文补丁：
 
 ```bash
 git clone https://github.com/0xddy/node-agent-rs.git
 git clone https://github.com/0xddy/shoes-plus.git
 git -C shoes-plus checkout 32e58642cab6c5b2e1c8fda24fdc3907ae6af112
 git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-raw-observations.patch
+git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch
+git -C shoes-plus apply ../node-agent-rs/patches/shoes-plus-empty-udp.patch
 cd node-agent-rs
 cargo build --release --locked -p node-agent --bin node-agent
 ```

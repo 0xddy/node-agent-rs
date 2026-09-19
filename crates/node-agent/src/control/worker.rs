@@ -53,7 +53,7 @@ pub trait CommandExecutor: Send + Sync + 'static {
 
     /// Executes one dequeued command with the lifetime of its panel session.
     /// Generic executors retain the historical non-cancellable behavior; the
-    /// production topology executor overrides this to cancel only panel reads.
+    /// production topology executor cancels panel reads and operation admission.
     async fn execute_with_cancel(
         &self,
         command: ControlCommand,
@@ -177,9 +177,9 @@ impl TopologyCommandExecutor {
         command: &ControlCommand,
         cancellation: &CancellationToken,
     ) -> Result<String, ApplyFailure> {
-        // This check is the hand-off boundary: cancellation before it prevents
-        // any local mutation. Once a manager future is called below, it is
-        // deliberately awaited to a consistent terminal state.
+        // The manager also checks session cancellation while waiting for its
+        // operation lock. After admission, await the complete local transaction
+        // so session cancellation cannot interrupt apply/publication/rollback.
         ensure_active(cancellation)?;
         let command_type = ControlCommandType::try_from(command.r#type).map_err(|_| {
             ApplyFailure::plain(format!(
@@ -442,7 +442,15 @@ impl CommandExecutor for TopologyCommandExecutor {
         command: ControlCommand,
         cancellation: CancellationToken,
     ) -> TerminalResult {
-        self.execute_regular(&command, &cancellation).await
+        let scoped = Self {
+            manager: Arc::new(
+                self.manager
+                    .with_operation_cancellation(cancellation.clone()),
+            ),
+            fetcher: self.fetcher.clone(),
+            policy: self.policy.clone(),
+        };
+        scoped.execute_regular(&command, &cancellation).await
     }
 }
 
@@ -728,9 +736,26 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
                 break;
             }
             let generic = ack_command_from_proto(&command);
+            // A new panel session can resend this command while the old
+            // session's transaction is still finishing. Wait for that key's
+            // result before replaying, without blocking unrelated commands.
+            let execution = if generic.idempotency_key.is_empty() {
+                None
+            } else {
+                let gate = acknowledgements.execution_gate(&generic.idempotency_key);
+                Some(tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    execution = gate.lock() => execution,
+                })
+            };
+            if cancellation.is_cancelled() {
+                break;
+            }
             if !generic.idempotency_key.is_empty()
                 && let Ok(Some(replay)) = acknowledgements.replay(&generic)
             {
+                drop(execution);
                 if send_lane_ack(
                     &output,
                     &cancellation,
@@ -768,12 +793,6 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
                     "control command execution task failed: {error}"
                 )),
             };
-            // An already-started topology transaction must run to a consistent
-            // conclusion, but its disconnected session no longer receives an
-            // ACK and no queued successor may execute.
-            if cancellation.is_cancelled() {
-                break;
-            }
             if result.status == AckStatus::Accepted {
                 result =
                     TerminalResult::failed("control command completed without a terminal result");
@@ -801,6 +820,14 @@ fn spawn_lane(mut commands: mpsc::Receiver<ControlCommand>, lane: LaneContext) {
                         ..Ack::default()
                     })
             };
+            drop(execution);
+            // Cache the terminal result even when the session disconnected
+            // during a committed transaction. A reconnect must replay success
+            // instead of repeating its side effects. Only ACK transport and
+            // admission of queued successors end with the session.
+            if cancellation.is_cancelled() {
+                break;
+            }
             acknowledgement.status = proto_ack_status(terminal.status);
             acknowledgement.message = terminal.message;
             if send_lane_ack(&output, &cancellation, acknowledgement)

@@ -979,6 +979,7 @@ pub struct TopologyManager {
     operation: Arc<tokio::sync::Mutex<()>>,
     published: Arc<RwLock<PublishedTopology>>,
     operations_cancel: CancellationToken,
+    operation_cancellation: Option<CancellationToken>,
     close_result: Arc<tokio::sync::OnceCell<Result<(), TopologyError>>>,
 }
 
@@ -990,7 +991,18 @@ impl TopologyManager {
             operation: Arc::new(tokio::sync::Mutex::new(())),
             published: Arc::new(RwLock::new(PublishedTopology::default())),
             operations_cancel: CancellationToken::new(),
+            operation_cancellation: None,
             close_result: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// Shares this manager's state while binding operation admission to a panel
+    /// session. Cancellation rejects lock waiters; transactions that have
+    /// already acquired the lock still finish their apply/publication/rollback.
+    pub(crate) fn with_operation_cancellation(&self, cancellation: CancellationToken) -> Self {
+        Self {
+            operation_cancellation: Some(cancellation),
+            ..self.clone()
         }
     }
 
@@ -1101,14 +1113,34 @@ impl TopologyManager {
     }
 
     async fn begin_operation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, TopologyError> {
+        let session_cancelled = async {
+            if let Some(cancellation) = &self.operation_cancellation {
+                cancellation.cancelled().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let operation = tokio::select! {
             biased;
             () = self.operations_cancel.cancelled() => {
                 return Err(TopologyError::runtime("topology operations are stopped", false));
             }
+            () = session_cancelled => {
+                return Err(TopologyError::runtime("control command execution canceled", false));
+            }
             operation = self.operation.lock() => operation,
         };
         self.ensure_operations_running()?;
+        if self
+            .operation_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(TopologyError::runtime(
+                "control command execution canceled",
+                false,
+            ));
+        }
         Ok(operation)
     }
 

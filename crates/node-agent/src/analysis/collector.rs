@@ -119,8 +119,18 @@ struct TargetState {
     counters: Counters,
     started: bool,
     observed: bool,
-    classification: Option<Classification>,
+    classification: Option<Arc<Classification>>,
     _reservation: TargetReservation,
+}
+
+/// Immutable metadata is shared so sampling only copies counters and Arc handles
+/// while holding the packet-path lock. String allocation belongs to aggregation.
+struct TargetSample {
+    target: Arc<Target>,
+    classification: Option<Arc<Classification>>,
+    up: u64,
+    down: u64,
+    started: u64,
 }
 
 struct PendingCounters {
@@ -169,7 +179,7 @@ impl Drop for TargetReservation {
 #[derive(Default)]
 struct PacketState {
     retired: bool,
-    targets: HashMap<Target, TargetState>,
+    targets: HashMap<Arc<Target>, TargetState>,
     pending: HashMap<Target, PendingCounters>,
     unknown: Counters,
     unknown_identified: Counters,
@@ -440,11 +450,11 @@ impl Flow {
             counters: Counters::default(),
             started: false,
             observed: false,
-            classification: Some(Classification {
+            classification: Some(Arc::new(Classification {
                 domain: domain.unwrap_or_default().into(),
                 app: web.into(),
                 ech_present,
-            }),
+            })),
             _reservation: TargetReservation(self.collector.clone()),
         };
         if let Some(pending) = pending
@@ -452,7 +462,9 @@ impl Flow {
         {
             self.record_web_packet(state, &mut target_state, pending.up, pending.down);
         }
-        packets.targets.insert(target.clone(), target_state);
+        packets
+            .targets
+            .insert(Arc::new(target.clone()), target_state);
         true
     }
 
@@ -527,7 +539,7 @@ impl Flow {
                 collector.limited("target_limit");
             } else if collector.reserve_target(&cfg) {
                 packets.targets.insert(
-                    target.clone(),
+                    Arc::new(target.clone()),
                     TargetState {
                         counters: Counters::default(),
                         started: false,
@@ -751,6 +763,9 @@ pub struct Collector {
     self_weak: Weak<Self>,
     instance: String,
     inner: Mutex<Inner>,
+    // Lock order: inner -> registrations. Registration never takes inner, so
+    // aggregation and batch preparation cannot stall a forwarding task.
+    registrations: Mutex<Vec<Arc<Flow>>>,
     active: AtomicU64,
     limits: ArcSwap<TrafficAnalysisConfig>,
     wake: Notify,
@@ -774,6 +789,7 @@ impl Collector {
             self_weak: weak.clone(),
             instance: instance.chars().take(128).collect(),
             inner: Mutex::default(),
+            registrations: Mutex::default(),
             active: AtomicU64::new(0),
             limits: ArcSwap::from_pointee(default_config(false)),
             wake: Notify::new(),
@@ -881,7 +897,7 @@ impl Collector {
         false
     }
 
-    fn retire(&self, flow: &Flow) -> HashMap<Target, TargetState> {
+    fn retire(&self, flow: &Flow) -> HashMap<Arc<Target>, TargetState> {
         let Some(state) = flow.state.swap(None) else {
             return HashMap::new();
         };
@@ -889,6 +905,16 @@ impl Collector {
         packets.retired = true;
         packets.pending = HashMap::new();
         std::mem::take(&mut packets.targets)
+    }
+
+    /// Called with inner held. Hand off the queue under the registration lock,
+    /// then populate the worker-owned registry without blocking new arrivals.
+    fn adopt_registrations(&self, inner: &mut Inner) {
+        let registrations = std::mem::take(&mut *lock(&self.registrations));
+        for flow in registrations {
+            inner.next_flow = inner.next_flow.wrapping_add(1);
+            inner.flows.insert(inner.next_flow, flow);
+        }
     }
 
     fn discard_buffered(&self, inner: &mut Inner) {
@@ -926,6 +952,7 @@ impl Collector {
         }
         inner.session_open = false;
         self.active.store(0, Ordering::Release);
+        self.adopt_registrations(&mut inner);
         self.discard_buffered(&mut inner);
         for flow in inner.flows.values() {
             if flow.meta.network == "udp" {
@@ -946,6 +973,9 @@ impl Collector {
         }
         inner.configured = true;
         self.active.store(0, Ordering::Release);
+        // A registrar that observed the old epoch may still hold its short
+        // lock. This handoff waits for it before retiring/migrating any flows.
+        self.adopt_registrations(&mut inner);
         let config = normalize_config(config);
         self.limits.store(Arc::new(config));
         inner.flows.retain(|_, flow| {
@@ -1031,7 +1061,7 @@ impl Collector {
             self.limited("invalid_metadata");
             return None;
         }
-        let mut inner = lock(&self.inner);
+        let mut registrations = lock(&self.registrations);
         let epoch = self.active.load(Ordering::Acquire);
         if epoch == 0 || epoch != expected {
             return None;
@@ -1077,9 +1107,7 @@ impl Collector {
             web_seen: AtomicBool::new(tcp),
             cost,
         });
-        inner.next_flow = inner.next_flow.wrapping_add(1);
-        let id = inner.next_flow;
-        inner.flows.insert(id, Arc::clone(&flow));
+        registrations.push(Arc::clone(&flow));
         Some(flow)
     }
 
@@ -1165,6 +1193,7 @@ impl Collector {
     /// Drain into the observed UTC minute. Clock reversal never reopens a bucket.
     pub fn sample(&self, now_unix: i64) {
         let mut inner = lock(&self.inner);
+        self.adopt_registrations(&mut inner);
         self.last_sample.store(now_unix, Ordering::Relaxed);
         let epoch = self.active.load(Ordering::Acquire);
         if epoch == 0 {
@@ -1187,6 +1216,10 @@ impl Collector {
             .bucket
             .take()
             .unwrap_or_else(|| MinuteBucket::new(minute));
+        // Capacity covers the normalized per-flow limit. Reuse it across flows
+        // so draining UDP counters never allocates with the packet lock held.
+        let mut targets =
+            Vec::with_capacity(self.limits.load().max_udp_targets_per_session as usize);
         inner.flows.retain(|_, flow| {
             let state = flow.state.load();
             let Some(state) = state.as_ref().filter(|s| s.epoch == epoch) else {
@@ -1194,9 +1227,37 @@ impl Collector {
             };
             let finished =
                 flow.closed.load(Ordering::SeqCst) && flow.inflight.load(Ordering::SeqCst) == 0;
-            let mut packets = (flow.meta.network == "udp").then(|| lock(&state.packets));
-            let (up, down) = state.counters.drain();
-            let started = u64::from(state.started.swap(false, Ordering::Relaxed));
+            let packet = flow.meta.network == "udp";
+            let (up, down, started, unknown, unknown_identified) = if packet {
+                let mut packets = lock(&state.packets);
+                let (up, down) = state.counters.drain();
+                let started = u64::from(state.started.swap(false, Ordering::Relaxed));
+                packets.expire_pending();
+                for (target, target_state) in &mut packets.targets {
+                    let (up, down) = target_state.counters.drain();
+                    let started = u64::from(std::mem::take(&mut target_state.started));
+                    if up != 0 || down != 0 || started != 0 {
+                        targets.push(TargetSample {
+                            target: Arc::clone(target),
+                            classification: target_state.classification.clone(),
+                            up,
+                            down,
+                            started,
+                        });
+                    }
+                }
+                (
+                    up,
+                    down,
+                    started,
+                    packets.unknown.drain(),
+                    packets.unknown_identified.drain(),
+                )
+            } else {
+                let (up, down) = state.counters.drain();
+                let started = u64::from(state.started.swap(false, Ordering::Relaxed));
+                (up, down, started, (0, 0), (0, 0))
+            };
             let user = UserKey::from(&flow.meta);
             let nonzero = up != 0 || down != 0 || started != 0;
             if !bucket.users.contains_key(&user) && nonzero && self.reserve(USER_COST) {
@@ -1224,16 +1285,17 @@ impl Collector {
                 self.reason("budget");
             }
             let (mut identified_up, mut identified_down) = (0, 0);
-            if let Some(packets) = packets.as_mut() {
-                packets.expire_pending();
-                for (target, target_state) in &mut packets.targets {
-                    let (up, down) = target_state.counters.drain();
-                    let started = u64::from(std::mem::take(&mut target_state.started));
-                    if up == 0 && down == 0 && started == 0 {
-                        continue;
-                    }
-                    let mut key = identity(&flow.meta, Some(target), true);
-                    if let Some(classification) = &target_state.classification {
+            if packet {
+                for sample in targets.drain(..) {
+                    let TargetSample {
+                        target,
+                        classification,
+                        up,
+                        down,
+                        started,
+                    } = sample;
+                    let mut key = identity(&flow.meta, Some(&target), true);
+                    if let Some(classification) = classification {
                         key.domain.clone_from(&classification.domain);
                         key.app.clone_from(&classification.app);
                         key.ech_present = classification.ech_present;
@@ -1246,8 +1308,8 @@ impl Collector {
                         self.add_domain(&mut bucket, key, up, down, started);
                     }
                 }
-                let (up, down) = packets.unknown.drain();
-                let (known_up, known_down) = packets.unknown_identified.drain();
+                let (up, down) = unknown;
+                let (known_up, known_down) = unknown_identified;
                 identified_up += known_up;
                 identified_down += known_down;
                 if retained {
@@ -1267,7 +1329,6 @@ impl Collector {
                 row.identified_uplink_bytes += identified_up;
                 row.identified_downlink_bytes += identified_down;
             }
-            drop(packets);
             if finished {
                 self.retire(flow);
                 false
@@ -1475,7 +1536,8 @@ impl Collector {
 
     pub fn status(&self) -> TrafficAnalysisStatus {
         let inner = lock(&self.inner);
-        self.status_locked(&inner)
+        let registrations = lock(&self.registrations).len();
+        self.status_locked(&inner, registrations)
     }
 
     /// Telemetry must not wait behind classification or protobuf batching.
@@ -1486,14 +1548,19 @@ impl Collector {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
-        Some(self.status_locked(&inner))
+        let registrations = match self.registrations.try_lock() {
+            Ok(registrations) => registrations.len(),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().len(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(self.status_locked(&inner, registrations))
     }
 
-    fn status_locked(&self, inner: &Inner) -> TrafficAnalysisStatus {
+    fn status_locked(&self, inner: &Inner, registrations: usize) -> TrafficAnalysisStatus {
         TrafficAnalysisStatus {
             enabled: self.active.load(Ordering::Acquire) != 0,
             epoch: inner.epoch,
-            tracked_connections: inner.flows.len() as u64,
+            tracked_connections: (inner.flows.len() + registrations) as u64,
             udp_targets: self.targets.load(Ordering::Relaxed),
             buffered_domain_keys: inner.bucket.as_ref().map_or(0, |b| b.domains.len() as u64),
             queue_bytes: inner.queue_bytes,
@@ -1587,6 +1654,256 @@ mod tests {
                 )
             })
         })
+    }
+
+    #[test]
+    fn registration_does_not_wait_for_aggregation_and_status_includes_pending() {
+        let (collector, epoch) = collector(default_config(true));
+        let inner = lock(&collector.inner);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_collector = collector.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(worker_collector.register(metadata("tcp")))
+                .unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        // Release before asserting so a regression can finish its worker.
+        drop(inner);
+        worker.join().unwrap();
+        let flow = result
+            .expect("registration waited for aggregation")
+            .unwrap();
+        assert!(lock(&collector.inner).flows.is_empty());
+        assert_eq!(lock(&collector.registrations).len(), 1);
+        assert_eq!(collector.status().tracked_connections, 1);
+        assert_eq!(collector.status().memory_bytes, flow.cost);
+        flow.close();
+        drop(flow);
+        collector.sample(180);
+        collector.pause(epoch);
+        assert_eq!(collector.status().tracked_connections, 0);
+        assert_eq!(collector.status().memory_bytes, 0);
+    }
+
+    #[test]
+    fn pending_registrations_follow_pause_reconnect_disable_and_close() {
+        for network in ["tcp", "udp"] {
+            for enabled in [true, false] {
+                let (collector, first) = collector(default_config(true));
+                let flow = collector.register(metadata(network)).unwrap();
+                let old_io = flow.begin();
+                if network == "udp" {
+                    assert!(flow.classify_target(
+                        first,
+                        &target("1.1.1.1"),
+                        Some("web.example"),
+                        "quic",
+                        false
+                    ));
+                    flow.begin().done_packet(&target("1.1.1.1"), 11, 7);
+                } else {
+                    flow.begin().done(11, 7);
+                }
+                assert!(lock(&collector.inner).flows.is_empty());
+                collector.pause(first);
+                assert!(lock(&collector.registrations).is_empty());
+                let next = collector.begin_session();
+                assert!(collector.configure(next, Some(&default_config(enabled))));
+                if network == "udp" {
+                    old_io.done_packet(&target("1.1.1.1"), 1000, 1000);
+                } else {
+                    old_io.done(1000, 1000);
+                }
+                assert_eq!(flow.inflight.load(Ordering::SeqCst), 0);
+                if enabled {
+                    assert_eq!(flow.state.load().as_ref().unwrap().epoch, next);
+                    if network == "udp" {
+                        flow.begin().done_packet(&target("1.1.1.1"), 3, 4);
+                    } else {
+                        flow.begin().done(3, 4);
+                    }
+                    collector.sample(180);
+                    assert_eq!(totals(&collector), (3, 4, 0, 3));
+                } else {
+                    assert!(flow.state.load().is_none());
+                    assert_eq!(collector.status().tracked_connections, 0);
+                    assert_eq!(collector.status().udp_targets, 0);
+                    assert_eq!(collector.status().memory_bytes, flow.cost);
+                }
+                flow.close();
+                drop(flow);
+                collector.sample(180);
+                collector.pause(next);
+                assert_eq!(collector.status().memory_bytes, 0);
+            }
+        }
+
+        let (collector, _) = collector(default_config(true));
+        let flow = collector.register(metadata("udp")).unwrap();
+        // BeginSession leaves the queue pending while its epoch is fenced.
+        collector.begin_session();
+        flow.close();
+        drop(flow);
+        collector.sample(180);
+        assert_eq!(collector.status().tracked_connections, 0);
+        assert_eq!(collector.status().memory_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_registration_and_configuration_keep_every_reservation() {
+        let (collector, _) = collector(default_config(true));
+        let mut flows = vec![collector.register(metadata("tcp")).unwrap()];
+        let start = std::sync::Barrier::new(7);
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..6 {
+                let collector = &collector;
+                let start = &start;
+                workers.push(scope.spawn(move || {
+                    start.wait();
+                    let network = if worker % 2 == 0 { "tcp" } else { "udp" };
+                    (0..128)
+                        .filter_map(|_| {
+                            let flow = collector.register(metadata(network))?;
+                            if network == "udp" {
+                                let token = flow.begin_token();
+                                flow.classify_target(
+                                    token,
+                                    &target("1.1.1.1"),
+                                    Some("web.example"),
+                                    "quic",
+                                    false,
+                                );
+                                flow.finish_token(token, 1, 1, Some(&target("1.1.1.1")));
+                            } else {
+                                flow.begin().done(1, 1);
+                            }
+                            Some(flow)
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            start.wait();
+            for iteration in 0..32 {
+                let epoch = collector.begin_session();
+                assert!(collector.configure(epoch, Some(&default_config(iteration % 3 != 0))));
+                std::thread::yield_now();
+            }
+            for worker in workers {
+                flows.extend(worker.join().unwrap());
+            }
+        });
+        let epoch = collector.begin_session();
+        assert!(collector.configure(epoch, Some(&default_config(true))));
+        let mut live = 0;
+        let mut targets = 0;
+        let mut memory = 0;
+        for flow in &flows {
+            memory += flow.cost;
+            assert_eq!(flow.inflight.load(Ordering::SeqCst), 0);
+            if let Some(state) = flow.state.load().as_ref() {
+                assert_eq!(state.epoch, epoch);
+                live += 1;
+                targets += lock(&state.packets).targets.len() as u64;
+            }
+        }
+        let status = collector.status();
+        assert_eq!(status.tracked_connections, live);
+        assert_eq!(status.udp_targets, targets);
+        assert_eq!(status.memory_bytes, memory + targets * TARGET_COST);
+        assert!(lock(&collector.registrations).is_empty());
+        let epoch = collector.begin_session();
+        assert!(collector.configure(epoch, None));
+        assert!(flows.iter().all(|flow| flow.state.load().is_none()));
+        assert_eq!(collector.status().tracked_connections, 0);
+        assert_eq!(collector.status().udp_targets, 0);
+        assert_eq!(collector.status().memory_bytes, memory);
+        drop(flows);
+        assert_eq!(collector.status().memory_bytes, 0);
+        assert_eq!(collector.pending_memory.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_udp_sampling_keeps_user_target_and_overflow_totals_together() {
+        let mut config = default_config(true);
+        config.max_udp_targets_per_session = 1;
+        let (collector, epoch) = collector(config);
+        let flows: Vec<_> = (0..4)
+            .map(|_| {
+                let flow = collector.register(metadata("udp")).unwrap();
+                assert!(flow.classify_target(
+                    epoch,
+                    &target("1.1.1.1"),
+                    Some("web.example"),
+                    "quic",
+                    false
+                ));
+                flow
+            })
+            .collect();
+        let start = std::sync::Barrier::new(flows.len() + 1);
+        let running = std::sync::atomic::AtomicUsize::new(flows.len());
+        std::thread::scope(|scope| {
+            for flow in &flows {
+                let start = &start;
+                let running = &running;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..2000 {
+                        flow.begin().done_packet(&target("1.1.1.1"), 7, 4096);
+                        let token = flow.begin_token();
+                        flow.finish_web_token(token, 3, 2, Some(&target("overflow.example")), true);
+                        std::thread::yield_now();
+                    }
+                    flow.close();
+                    running.fetch_sub(1, Ordering::Release);
+                });
+            }
+            start.wait();
+            loop {
+                collector.sample(180);
+                let inner = lock(&collector.inner);
+                let bucket = inner.bucket.as_ref().unwrap();
+                let sum_users = bucket.users.values().fold((0, 0), |(up, down), row| {
+                    (up + row.uplink_bytes, down + row.downlink_bytes)
+                });
+                let sum_domains = bucket.domains.values().fold((0, 0), |(up, down), row| {
+                    (up + row.uplink_bytes, down + row.downlink_bytes)
+                });
+                assert_eq!(sum_users, sum_domains);
+                assert!(
+                    bucket
+                        .users
+                        .values()
+                        .all(|row| row.identified_uplink_bytes == row.uplink_bytes
+                            && row.identified_downlink_bytes == row.downlink_bytes)
+                );
+                drop(inner);
+                if running.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        collector.sample(180);
+        assert_eq!(totals(&collector), (80_000, 32_784_000, 4, 80_000));
+        collector.sample(180);
+        assert_eq!(totals(&collector), (80_000, 32_784_000, 4, 80_000));
+        assert_eq!(collector.status().tracked_connections, 0);
+        assert_eq!(collector.status().udp_targets, 0);
+        drop(flows);
+        collector.pause(epoch);
+        assert_eq!(collector.status().memory_bytes, 0);
+    }
+
+    #[test]
+    fn telemetry_snapshot_never_waits_for_registration() {
+        let (collector, _) = collector(default_config(true));
+        let registrations = lock(&collector.registrations);
+        assert!(collector.try_status().is_none());
+        drop(registrations);
+        assert!(collector.try_status().unwrap().enabled);
     }
 
     #[test]

@@ -1,0 +1,1689 @@
+diff --git a/src/async_stream.rs b/src/async_stream.rs
+index 0add07c..d9e9293 100644
+--- a/src/async_stream.rs
++++ b/src/async_stream.rs
+@@ -20,12 +20,20 @@ pub trait AsyncPing {
+     fn poll_write_ping(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<bool>>;
+ }
+ 
++/// A datagram can contain no bytes. Only `Eof` ends a message stream;
++/// `Message` always denotes one complete datagram, including an empty one.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum MessageReadStatus {
++    Message,
++    Eof,
++}
++
+ pub trait AsyncReadMessage {
+     fn poll_read_message(
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>>;
++    ) -> Poll<std::io::Result<MessageReadStatus>>;
+ }
+ 
+ pub trait AsyncWriteMessage {
+@@ -229,8 +237,9 @@ impl AsyncReadMessage for UdpSocket {
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         self.poll_recv(cx, buf)
++            .map(|result| result.map(|()| MessageReadStatus::Message))
+     }
+ }
+ 
+@@ -397,7 +406,7 @@ impl<T: ?Sized + AsyncReadMessage + Unpin> AsyncReadMessage for Box<T> {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         Pin::new(&mut **self).poll_read_message(cx, buf)
+     }
+ }
+@@ -407,7 +416,7 @@ impl<T: ?Sized + AsyncReadMessage + Unpin> AsyncReadMessage for &mut T {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         Pin::new(&mut **self).poll_read_message(cx, buf)
+     }
+ }
+diff --git a/src/copy_bidirectional_message.rs b/src/copy_bidirectional_message.rs
+index 783977a..a2db748 100644
+--- a/src/copy_bidirectional_message.rs
++++ b/src/copy_bidirectional_message.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use futures::ready;
+ use tokio::io::ReadBuf;
+ 
+@@ -18,6 +19,7 @@ struct CopyBuffer {
+     need_flush: bool,
+     need_write_ping: bool,
+     cache_length: usize,
++    has_message: bool,
+     buf: Box<[u8]>,
+     read_count: usize,
+ }
+@@ -29,6 +31,7 @@ impl CopyBuffer {
+             need_flush,
+             need_write_ping: false,
+             cache_length: 0,
++            has_message: false,
+             buf: allocate_vec(65535).into_boxed_slice(),
+             read_count: 0,
+         }
+@@ -44,28 +47,30 @@ impl CopyBuffer {
+         R: AsyncMessageStream + ?Sized,
+         W: AsyncMessageStream + ?Sized,
+     {
+-        // Check tokio's cooperative budget to prevent task starvation
+-        let coop = ready!(tokio::task::coop::poll_proceed(cx));
+-
+         loop {
++            // Each datagram consumes a budget unit, including empty datagrams.
++            let coop = ready!(tokio::task::coop::poll_proceed(cx));
+             let mut did_read = false;
+             let mut did_write = false;
+             let mut read_pending = false;
+             let mut write_pending = false;
+ 
+-            if !self.read_done && self.cache_length == 0 {
++            if !self.read_done && !self.has_message {
+                 let me = &mut *self;
+                 let mut buf = ReadBuf::new(&mut me.buf);
+                 match reader.as_mut().poll_read_message(cx, &mut buf) {
+                     Poll::Ready(val) => {
+-                        val?;
++                        let status = val?;
+                         let n = buf.filled().len();
+-                        if n == 0 {
++                        if status == MessageReadStatus::Eof {
+                             self.read_done = true;
+                         } else {
+                             self.cache_length = n;
++                            self.has_message = true;
+                             did_read = true;
+-                            self.read_count = self.read_count.wrapping_add(n);
++                            // Activity tracks datagrams rather than byte count:
++                            // an empty datagram must refresh association expiry.
++                            self.read_count = self.read_count.wrapping_add(1);
+                             coop.made_progress();
+                         }
+                     }
+@@ -75,7 +80,7 @@ impl CopyBuffer {
+                 }
+             }
+ 
+-            if self.cache_length > 0 {
++            if self.has_message {
+                 let me = &mut *self;
+                 match writer
+                     .as_mut()
+@@ -84,6 +89,7 @@ impl CopyBuffer {
+                     Poll::Ready(val) => {
+                         val?;
+                         self.cache_length = 0;
++                        self.has_message = false;
+                         self.need_flush = true;
+                         // Don't bother writing ping, since we just wrote.
+                         self.need_write_ping = false;
+@@ -124,7 +130,7 @@ impl CopyBuffer {
+             }
+ 
+             // If we've written all the data and we've seen EOF, finish the transfer.
+-            if self.read_done && self.cache_length == 0 {
++            if self.read_done && !self.has_message {
+                 return Poll::Ready(Ok(()));
+             }
+ 
+@@ -240,17 +246,9 @@ where
+ /// writing any data read to the opposing stream.
+ /// This happens in both directions concurrently.
+ ///
+-/// If an EOF is observed on one stream, [`shutdown()`] will be invoked on
+-/// the other, and reading from that stream will stop. Copying of data in
+-/// the other direction will continue.
+-///
+-/// The future will complete successfully once both directions of communication has been shut down.
+-/// A direction is shut down when the reader reports EOF,
+-/// at which point [`shutdown()`] is called on the corresponding writer. When finished,
+-/// it will return a tuple of the number of bytes copied from a to b
+-/// and the number of bytes copied from b to a, in that order.
+-///
+-/// [`shutdown()`]: crate::io::AsyncWriteExt::shutdown
++/// Empty datagrams are forwarded normally. Explicit EOF on either stream
++/// flushes and shuts down the opposing message writer, then completes the
++/// association. An idle association also completes after its timeout.
+ ///
+ /// # Errors
+ ///
+@@ -258,9 +256,6 @@ where
+ /// or `b` returns an error. Some data read from either stream may be lost (not
+ /// written to the other stream) in this case.
+ ///
+-/// # Return value
+-///
+-/// Returns a tuple of bytes copied `a` to `b` and bytes copied `b` to `a`.
+ pub async fn copy_bidirectional_message<A, B>(
+     a: &mut A,
+     b: &mut B,
+@@ -290,3 +285,149 @@ where
+     }
+     .await
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::async_stream::{
++        AsyncFlushMessage, AsyncPing, AsyncReadMessage, AsyncShutdownMessage, AsyncWriteMessage,
++    };
++    use std::sync::{
++        Arc,
++        atomic::{AtomicBool, Ordering},
++    };
++    use tokio::sync::mpsc;
++
++    struct ChannelStream {
++        incoming: mpsc::UnboundedReceiver<Vec<u8>>,
++        outgoing: mpsc::UnboundedSender<Vec<u8>>,
++        shutdown: Arc<AtomicBool>,
++        delay_write_once: bool,
++    }
++
++    impl AsyncReadMessage for ChannelStream {
++        fn poll_read_message(
++            mut self: Pin<&mut Self>,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<MessageReadStatus>> {
++            match self.incoming.poll_recv(cx) {
++                Poll::Ready(Some(message)) => {
++                    buf.put_slice(&message);
++                    Poll::Ready(Ok(MessageReadStatus::Message))
++                }
++                Poll::Ready(None) => Poll::Ready(Ok(MessageReadStatus::Eof)),
++                Poll::Pending => Poll::Pending,
++            }
++        }
++    }
++    impl AsyncWriteMessage for ChannelStream {
++        fn poll_write_message(
++            mut self: Pin<&mut Self>,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<()>> {
++            if std::mem::take(&mut self.delay_write_once) {
++                cx.waker().wake_by_ref();
++                return Poll::Pending;
++            }
++            self.outgoing.send(buf.to_vec()).unwrap();
++            Poll::Ready(Ok(()))
++        }
++    }
++    impl AsyncFlushMessage for ChannelStream {
++        fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Poll::Ready(Ok(()))
++        }
++    }
++    impl AsyncShutdownMessage for ChannelStream {
++        fn poll_shutdown_message(
++            self: Pin<&mut Self>,
++            _: &mut Context<'_>,
++        ) -> Poll<io::Result<()>> {
++            self.shutdown.store(true, Ordering::SeqCst);
++            Poll::Ready(Ok(()))
++        }
++    }
++    impl AsyncPing for ChannelStream {
++        fn supports_ping(&self) -> bool {
++            false
++        }
++        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
++            Poll::Ready(Ok(false))
++        }
++    }
++    impl AsyncMessageStream for ChannelStream {}
++
++    fn channel_stream(
++        delay_write_once: bool,
++    ) -> (
++        ChannelStream,
++        mpsc::UnboundedSender<Vec<u8>>,
++        mpsc::UnboundedReceiver<Vec<u8>>,
++    ) {
++        let (input, incoming) = mpsc::unbounded_channel();
++        let (outgoing, output) = mpsc::unbounded_channel();
++        (
++            ChannelStream {
++                incoming,
++                outgoing,
++                shutdown: Arc::new(AtomicBool::new(false)),
++                delay_write_once,
++            },
++            input,
++            output,
++        )
++    }
++
++    #[tokio::test]
++    async fn empty_datagrams_survive_backpressure_in_both_directions_and_eof_closes() {
++        let (mut a, a_input, mut a_output) = channel_stream(true);
++        let (mut b, b_input, mut b_output) = channel_stream(true);
++        let b_shutdown = b.shutdown.clone();
++        let task =
++            tokio::spawn(
++                async move { copy_bidirectional_message(&mut a, &mut b, false, false).await },
++            );
++        tokio::time::timeout(std::time::Duration::from_secs(2), async {
++            for payload in [b"".as_slice(), b"after-empty", b""] {
++                a_input.send(payload.to_vec()).unwrap();
++                assert_eq!(b_output.recv().await.unwrap(), payload);
++                b_input.send(payload.to_vec()).unwrap();
++                assert_eq!(a_output.recv().await.unwrap(), payload);
++            }
++            assert!(!task.is_finished());
++            drop(a_input);
++            task.await.unwrap().unwrap();
++            assert!(b_shutdown.load(Ordering::SeqCst));
++        })
++        .await
++        .expect("empty message or EOF did not make progress");
++    }
++
++    #[tokio::test]
++    async fn empty_datagram_refreshes_an_expired_association() {
++        let (mut a, a_input, _a_output) = channel_stream(false);
++        let (mut b, _b_input, mut b_output) = channel_stream(false);
++        a_input.send(Vec::new()).unwrap();
++        let mut copy = Box::pin(CopyBidirectional {
++            a: &mut a,
++            b: &mut b,
++            a_buf: CopyBuffer::new(false),
++            b_buf: CopyBuffer::new(false),
++            a_to_b: TransferState::Running,
++            b_to_a: TransferState::Running,
++            sleep_future: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60))),
++            last_active: Instant::now()
++                - std::time::Duration::from_secs(u64::from(DEFAULT_ASSOCIATION_TIMEOUT_SECS) + 1),
++        });
++        std::future::poll_fn(|cx| {
++            assert!(copy.as_mut().poll(cx).is_pending());
++            Poll::Ready(())
++        })
++        .await;
++        assert_eq!(copy.a_buf.read_count, 1);
++        assert!(copy.last_active.elapsed().as_secs() < 1);
++        assert!(b_output.try_recv().unwrap().is_empty());
++    }
++}
+diff --git a/src/dns/proxy_runtime.rs b/src/dns/proxy_runtime.rs
+index 69d8e02..c4e8b8b 100644
+--- a/src/dns/proxy_runtime.rs
++++ b/src/dns/proxy_runtime.rs
+@@ -1,5 +1,6 @@
+ //! Custom RuntimeProvider that routes TCP connections through proxy chains.
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::future::Future;
+ use std::io::{self, IoSliceMut};
+ use std::net::{IpAddr, SocketAddr};
+@@ -602,7 +603,10 @@ impl quinn::AsyncUdpSocket for ProxyQuicSocket {
+             ProxyQuicTransport::Connected(stream) => {
+                 let mut read_buf = ReadBuf::new(&mut bufs[0]);
+                 match Pin::new(&mut **stream).poll_read_message(cx, &mut read_buf) {
+-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
++                    Poll::Ready(Ok(MessageReadStatus::Message)) => {
++                        Poll::Ready(Ok(Some(read_buf.filled().len())))
++                    }
++                    Poll::Ready(Ok(MessageReadStatus::Eof)) => Poll::Ready(Ok(None)),
+                     Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                     Poll::Pending => Poll::Pending,
+                 }
+@@ -610,8 +614,8 @@ impl quinn::AsyncUdpSocket for ProxyQuicSocket {
+         };
+ 
+         match result {
+-            Poll::Ready(Ok(len)) => {
+-                if len == 0 {
++            Poll::Ready(Ok(message)) => {
++                let Some(len) = message else {
+                     let error = io::Error::new(
+                         io::ErrorKind::UnexpectedEof,
+                         "QUIC proxy datagram stream closed",
+@@ -620,7 +624,7 @@ impl quinn::AsyncUdpSocket for ProxyQuicSocket {
+                         io::Error::new(error.kind(), error.to_string()),
+                     ));
+                     return Poll::Ready(Err(error));
+-                }
++                };
+                 meta[0] = quinn::udp::RecvMeta {
+                     addr: self.server_addr,
+                     len,
+@@ -833,11 +837,11 @@ mod tests {
+             self: Pin<&mut Self>,
+             cx: &mut Context<'_>,
+             buf: &mut ReadBuf<'_>,
+-        ) -> Poll<io::Result<()>> {
++        ) -> Poll<io::Result<MessageReadStatus>> {
+             match self.get_mut().inbound.poll_recv(cx) {
+                 Poll::Ready(Some(message)) if message.len() <= buf.remaining() => {
+                     buf.put_slice(&message);
+-                    Poll::Ready(Ok(()))
++                    Poll::Ready(Ok(MessageReadStatus::Message))
+                 }
+                 Poll::Ready(Some(message)) => Poll::Ready(Err(io::Error::new(
+                     io::ErrorKind::InvalidData,
+@@ -847,7 +851,7 @@ mod tests {
+                         buf.remaining()
+                     ),
+                 ))),
+-                Poll::Ready(None) => Poll::Ready(Ok(())),
++                Poll::Ready(None) => Poll::Ready(Ok(MessageReadStatus::Eof)),
+                 Poll::Pending => Poll::Pending,
+             }
+         }
+diff --git a/src/dynamic/analysis.rs b/src/dynamic/analysis.rs
+index 02318d1..5d640d9 100644
+--- a/src/dynamic/analysis.rs
++++ b/src/dynamic/analysis.rs
+@@ -1,6 +1,7 @@
+ //! Optional, payload-level analytics hooks. No transport, aggregation or storage
+ //! policy belongs in the proxy core. The observer is sampled once per routed flow.
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::io;
+ use std::pin::Pin;
+ use std::sync::{Arc, OnceLock};
+@@ -615,7 +616,7 @@ impl<T: AsyncReadMessage + Unpin> AsyncReadMessage for AnalysisStream<T> {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<io::Result<()>> {
++    ) -> Poll<io::Result<MessageReadStatus>> {
+         self.sniff_expiry(cx);
+         self.read_begin();
+         let before = buf.filled().len();
+@@ -772,6 +773,42 @@ mod tests {
+         assert_eq!(budget.releases.load(Ordering::Relaxed), 0);
+     }
+ 
++    #[tokio::test]
++    async fn udp_analysis_wrapper_preserves_empty_datagrams_and_eof_status() {
++        let budget = Arc::new(BudgetFlow::default());
++        budget.allowed.store(true, Ordering::Relaxed);
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let ((server, _), mut peer) = tokio::try_join!(
++            listener.accept(),
++            tokio::net::TcpStream::connect(listener.local_addr().unwrap())
++        )
++        .unwrap();
++        let inner = crate::vless::VlessMessageStream::new(server);
++        let mut stream = AnalysisStream::try_new(inner, Arc::new(FlowHandle(budget.clone())), None)
++            .ok()
++            .unwrap();
++        peer.write_all(b"\0\0\0\x03abc").await.unwrap();
++        peer.shutdown().await.unwrap();
++        for (expected_status, expected_payload) in [
++            (MessageReadStatus::Message, b"".as_slice()),
++            (MessageReadStatus::Message, b"abc"),
++            (MessageReadStatus::Eof, b""),
++        ] {
++            let mut storage = [0; 16];
++            let mut buf = ReadBuf::new(&mut storage);
++            let status = futures::future::poll_fn(|cx| {
++                Pin::new(&mut stream).poll_read_message(cx, &mut buf)
++            })
++            .await
++            .unwrap();
++            assert_eq!(status, expected_status);
++            assert_eq!(buf.filled(), expected_payload);
++        }
++        drop(stream);
++        assert_eq!(budget.reserved.load(Ordering::Relaxed), 0);
++        assert_eq!(budget.closed.load(Ordering::Relaxed), 1);
++    }
++
+     #[tokio::test]
+     async fn refusing_udp_target_storage_preserves_datagram_forwarding() {
+         let budget = Arc::new(BudgetFlow::default());
+diff --git a/src/h2mux/h2mux_client_handler.rs b/src/h2mux/h2mux_client_handler.rs
+index 6ad52e6..6c8aff4 100644
+--- a/src/h2mux/h2mux_client_handler.rs
++++ b/src/h2mux/h2mux_client_handler.rs
+@@ -8,6 +8,7 @@
+ //! multiplexing, setup_client_tcp_stream and the proxy chain group need significant changes
+ //! to allow the handler to manage its own transport connections.
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::io;
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -288,7 +289,7 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<io::Result<()>> {
++    ) -> Poll<io::Result<MessageReadStatus>> {
+         let this = &mut *self;
+ 
+         loop {
+@@ -303,8 +304,7 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
+                                 let n = temp_buf.filled().len();
+                                 if n == 0 {
+                                     if this.read_header_pos == 0 {
+-                                        // EOF at message boundary - return empty
+-                                        return Poll::Ready(Ok(()));
++                                        return Poll::Ready(Ok(MessageReadStatus::Eof));
+                                     }
+                                     return Poll::Ready(Err(io::Error::new(
+                                         io::ErrorKind::UnexpectedEof,
+@@ -327,7 +327,7 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
+                     if len == 0 {
+                         // Empty message
+                         this.read_state = ReadState::Header;
+-                        return Poll::Ready(Ok(()));
++                        return Poll::Ready(Ok(MessageReadStatus::Message));
+                     }
+ 
+                     if len > buf.remaining() {
+@@ -356,7 +356,7 @@ impl AsyncReadMessage for H2MuxUdpMessageStream {
+                             if this.read_data_remaining == 0 {
+                                 // Message complete
+                                 this.read_state = ReadState::Header;
+-                                return Poll::Ready(Ok(()));
++                                return Poll::Ready(Ok(MessageReadStatus::Message));
+                             }
+                             // Continue reading
+                         }
+diff --git a/src/hysteria2_client.rs b/src/hysteria2_client.rs
+index 7c6a2a6..30adca0 100644
+--- a/src/hysteria2_client.rs
++++ b/src/hysteria2_client.rs
+@@ -9,6 +9,7 @@
+ //! owns QUIC, HTTP/3 authentication, congestion-control negotiation and datagram
+ //! session demultiplexing.
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::collections::HashMap;
+ use std::future::Future;
+ use std::io;
+@@ -743,7 +744,7 @@ impl AsyncReadMessage for Hysteria2RawUdpStream {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<io::Result<()>> {
++    ) -> Poll<io::Result<MessageReadStatus>> {
+         match self.receiver.poll_recv(cx) {
+             Poll::Ready(Some(datagram)) => {
+                 if datagram.len() > buf.remaining() {
+@@ -757,7 +758,7 @@ impl AsyncReadMessage for Hysteria2RawUdpStream {
+                     )));
+                 }
+                 buf.put_slice(&datagram);
+-                Poll::Ready(Ok(()))
++                Poll::Ready(Ok(MessageReadStatus::Message))
+             }
+             Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                 io::ErrorKind::ConnectionAborted,
+@@ -1313,14 +1314,17 @@ impl AsyncReadMessage for Hysteria2UdpMessageStream {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         output: &mut ReadBuf<'_>,
+-    ) -> Poll<io::Result<()>> {
++    ) -> Poll<io::Result<MessageReadStatus>> {
+         loop {
+             let this = &mut *self;
+             let mut datagram = ReadBuf::new(&mut *this.read_buffer);
+             match Pin::new(&mut this.inner).poll_read_message(cx, &mut datagram) {
+                 Poll::Pending => return Poll::Pending,
+                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+-                Poll::Ready(Ok(())) => {
++                Poll::Ready(Ok(MessageReadStatus::Eof)) => {
++                    return Poll::Ready(Ok(MessageReadStatus::Eof));
++                }
++                Poll::Ready(Ok(MessageReadStatus::Message)) => {
+                     let length = datagram.filled().len();
+                     let owned = Bytes::copy_from_slice(&datagram.filled()[..length]);
+                     match this.process_fragment(&owned)? {
+@@ -1336,7 +1340,7 @@ impl AsyncReadMessage for Hysteria2UdpMessageStream {
+                                 )));
+                             }
+                             output.put_slice(&payload);
+-                            return Poll::Ready(Ok(()));
++                            return Poll::Ready(Ok(MessageReadStatus::Message));
+                         }
+                         None => continue,
+                     }
+diff --git a/src/hysteria2_server.rs b/src/hysteria2_server.rs
+index 4bf8fd4..ecced72 100644
+--- a/src/hysteria2_server.rs
++++ b/src/hysteria2_server.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use lru::LruCache;
+ use std::collections::hash_map::Entry;
+ use std::future::Future;
+@@ -1315,7 +1316,7 @@ async fn run_connected_udp_target_worker(
+ 
+     enum TargetAction {
+         Command(Option<UdpForwardCommand>),
+-        Read(std::io::Result<usize>),
++        Read(std::io::Result<Option<usize>>),
+     }
+ 
+     loop {
+@@ -1332,7 +1333,7 @@ async fn run_connected_udp_target_worker(
+                     biased;
+                     _ = cancel_token.cancelled() => return Ok(()),
+                     result = poll_fn(|cx| Pin::new(&mut **remote).poll_read_message(cx, &mut read_buf)) => {
+-                        TargetAction::Read(result.map(|()| read_buf.filled().len()))
++                        TargetAction::Read(result.map(|status| (status == MessageReadStatus::Message).then(|| read_buf.filled().len())))
+                     }
+                     command = outbound_rx.recv() => TargetAction::Command(command),
+                 }
+@@ -1342,7 +1343,7 @@ async fn run_connected_udp_target_worker(
+                     _ = cancel_token.cancelled() => return Ok(()),
+                     command = outbound_rx.recv() => TargetAction::Command(command),
+                     result = poll_fn(|cx| Pin::new(&mut **remote).poll_read_message(cx, &mut read_buf)) => {
+-                        TargetAction::Read(result.map(|()| read_buf.filled().len()))
++                        TargetAction::Read(result.map(|status| (status == MessageReadStatus::Message).then(|| read_buf.filled().len())))
+                     }
+                 }
+             }
+@@ -1368,7 +1369,9 @@ async fn run_connected_udp_target_worker(
+             TargetAction::Command(None) => return Ok(()),
+             TargetAction::Read(result) => {
+                 prefer_read = false;
+-                let payload_len = result?;
++                let Some(payload_len) = result? else {
++                    return Ok(());
++                };
+                 let event = UdpTargetEvent::Message {
+                     remote_location: remote_location.clone(),
+                     generation,
+@@ -2435,7 +2438,7 @@ mod tests {
+     use crate::address::{Address, NetLocation, NetLocationMask};
+     use crate::async_stream::{
+         AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
+-        AsyncWriteMessage,
++        AsyncWriteMessage, MessageReadStatus,
+     };
+     use crate::client_proxy_selector::{ClientProxySelector, ConnectAction, ConnectRule};
+     use crate::config::{
+@@ -2470,7 +2473,7 @@ mod tests {
+             self: Pin<&mut Self>,
+             _cx: &mut Context<'_>,
+             _buf: &mut ReadBuf<'_>,
+-        ) -> Poll<std::io::Result<()>> {
++        ) -> Poll<std::io::Result<MessageReadStatus>> {
+             Poll::Pending
+         }
+     }
+@@ -2529,11 +2532,11 @@ mod tests {
+             mut self: Pin<&mut Self>,
+             _cx: &mut Context<'_>,
+             buf: &mut ReadBuf<'_>,
+-        ) -> Poll<std::io::Result<()>> {
++        ) -> Poll<std::io::Result<MessageReadStatus>> {
+             match self.reply.take() {
+                 Some(reply) => {
+                     buf.put_slice(&reply);
+-                    Poll::Ready(Ok(()))
++                    Poll::Ready(Ok(MessageReadStatus::Message))
+                 }
+                 None => Poll::Pending,
+             }
+diff --git a/src/routing/udp_router.rs b/src/routing/udp_router.rs
+index cdfae01..ae9c86f 100644
+--- a/src/routing/udp_router.rs
++++ b/src/routing/udp_router.rs
+@@ -7,6 +7,7 @@
+ //! - DelayQueue for O(1) session expiry (no iteration)
+ //! - Work queues for pending writes/flushes/responses (no iteration over all sessions)
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::collections::{HashSet, VecDeque};
+ use std::future::Future;
+ use std::io;
+@@ -292,6 +293,11 @@ impl ServerStream {
+         match self {
+             ServerStream::Targeted(stream) => {
+                 match Pin::new(stream).poll_read_targeted_message(cx, buf) {
++                    Poll::Ready(Ok(dest))
++                        if dest == NetLocation::UNSPECIFIED && buf.filled().is_empty() =>
++                    {
++                        Poll::Ready(Ok(InboundMessage::Eof))
++                    }
+                     Poll::Ready(Ok(dest)) => {
+                         Poll::Ready(Ok(InboundMessage::Packet(InboundPacket {
+                             destination: dest.into(),
+@@ -413,6 +419,7 @@ struct InboundPacket {
+ }
+ 
+ enum InboundMessage {
++    Eof,
+     Packet(InboundPacket),
+     SessionEnd(u16),
+     UnknownKeep(u16),
+@@ -649,6 +656,10 @@ impl<'a> UdpRouter<'a> {
+ 
+     fn handle_inbound_message(&mut self, message: InboundMessage) -> InboundAction {
+         match message {
++            InboundMessage::Eof => {
++                self.set_server_read_eof();
++                InboundAction::Stop
++            }
+             InboundMessage::Packet(packet) => InboundAction::Packet(packet),
+             InboundMessage::SessionEnd(session_id) => {
+                 debug!("[UdpRouter] peer ended protocol session {session_id}");
+@@ -681,9 +692,9 @@ impl<'a> UdpRouter<'a> {
+     fn poll_read_server_with_control_buffer(&mut self, cx: &mut Context<'_>) -> (bool, bool) {
+         let mut made_progress = false;
+         for _ in 0..CONTROL_READ_BUDGET {
+-            let (message, len) = {
++            let message = {
+                 let mut read_buf = ReadBuf::new(&mut self.control_read_buffer);
+-                let message = match self.server.poll_read_message(cx, &mut read_buf) {
++                match self.server.poll_read_message(cx, &mut read_buf) {
+                     Poll::Ready(Ok(message)) => {
+                         made_progress = true;
+                         message
+@@ -694,18 +705,13 @@ impl<'a> UdpRouter<'a> {
+                         return (made_progress, false);
+                     }
+                     Poll::Pending => return (made_progress, false),
+-                };
+-                (message, read_buf.filled().len())
++                }
+             };
+ 
+             match self.handle_inbound_message(message) {
+                 InboundAction::Continue => continue,
+                 InboundAction::Stop => return (true, false),
+                 InboundAction::Packet(packet) => {
+-                    if len == 0 {
+-                        self.set_server_read_eof();
+-                        return (true, false);
+-                    }
+                     if self.reject_fresh_protocol_new(&packet) {
+                         return (true, false);
+                     }
+@@ -766,11 +772,6 @@ impl<'a> UdpRouter<'a> {
+                 len, packet.destination, packet.status
+             );
+ 
+-            if len == 0 {
+-                self.set_server_read_eof();
+-                break;
+-            }
+-
+             // Look up session
+             let key_state = match &self.session_lookup {
+                 SessionLookup::ByDestination(map) => {
+@@ -1007,13 +1008,13 @@ impl<'a> UdpRouter<'a> {
+                 let mut read_buf = ReadBuf::new(&mut buf);
+ 
+                 match Pin::new(&mut session.remote).poll_read_message(cx, &mut read_buf) {
+-                    Poll::Ready(Ok(())) => {
++                    Poll::Ready(Ok(status)) => {
+                         let len = read_buf.filled().len();
+                         debug!(
+                             "[UdpRouter] Read {} bytes from session remote (session {})",
+                             len, session.destination
+                         );
+-                        if len == 0 {
++                        if status == MessageReadStatus::Eof {
+                             session.remote_read_eof = true;
+                             if session.should_remove() {
+                                 self.sessions_to_remove.insert(id);
+@@ -1247,38 +1248,37 @@ impl<'a> UdpRouter<'a> {
+                 session.expiry_key = Some(expiry_key);
+ 
+                 // Try to write immediately
+-                if !initial_data.is_empty() {
+-                    debug!(
+-                        "Writing initial_data ({} bytes) to session for {}",
+-                        initial_data.len(),
+-                        session.destination
+-                    );
+-                    match Pin::new(&mut session.remote).poll_write_message(cx, &initial_data) {
+-                        Poll::Ready(Ok(())) => {
+-                            debug!("Initial data write succeeded, queueing flush");
+-                            session.last_write = Instant::now();
+-                            // Note: expiry was just set above when inserting into expiry_queue
+-                            if !session.in_remote_flush_queue {
+-                                session.in_remote_flush_queue = true;
+-                                self.remote_flush_queue.push_back(id);
+-                            }
++                // A pending create always owns one first datagram, even if it is empty.
++                debug!(
++                    "Writing initial_data ({} bytes) to session for {}",
++                    initial_data.len(),
++                    session.destination
++                );
++                match Pin::new(&mut session.remote).poll_write_message(cx, &initial_data) {
++                    Poll::Ready(Ok(())) => {
++                        debug!("Initial data write succeeded, queueing flush");
++                        session.last_write = Instant::now();
++                        // Note: expiry was just set above when inserting into expiry_queue
++                        if !session.in_remote_flush_queue {
++                            session.in_remote_flush_queue = true;
++                            self.remote_flush_queue.push_back(id);
+                         }
+-                        Poll::Pending => {
+-                            debug!("Initial data write pending, queueing for later");
+-                            if let Some(mut buf) = self.remote_write_pool.acquire() {
+-                                let len = initial_data.len();
+-                                buf[..len].copy_from_slice(&initial_data);
+-                                session.in_remote_write_queue += 1;
+-                                self.remote_write_queue
+-                                    .push_back(PendingWrite { id, buf, len });
+-                            }
++                    }
++                    Poll::Pending => {
++                        debug!("Initial data write pending, queueing for later");
++                        if let Some(mut buf) = self.remote_write_pool.acquire() {
++                            let len = initial_data.len();
++                            buf[..len].copy_from_slice(&initial_data);
++                            session.in_remote_write_queue += 1;
++                            self.remote_write_queue
++                                .push_back(PendingWrite { id, buf, len });
+                         }
+-                        Poll::Ready(Err(e)) => {
+-                            warn!("remote write error: {}", e);
+-                            session.remote_write_eof = true;
+-                            if session.should_remove() {
+-                                self.sessions_to_remove.insert(id);
+-                            }
++                    }
++                    Poll::Ready(Err(e)) => {
++                        warn!("remote write error: {}", e);
++                        session.remote_write_eof = true;
++                        if session.should_remove() {
++                            self.sessions_to_remove.insert(id);
+                         }
+                     }
+                 }
+@@ -1986,7 +1986,7 @@ mod tests {
+             self: Pin<&mut Self>,
+             _cx: &mut Context<'_>,
+             _buf: &mut ReadBuf<'_>,
+-        ) -> Poll<io::Result<()>> {
++        ) -> Poll<io::Result<MessageReadStatus>> {
+             Poll::Pending
+         }
+     }
+@@ -2036,7 +2036,7 @@ mod tests {
+             self: Pin<&mut Self>,
+             _cx: &mut Context<'_>,
+             _buf: &mut ReadBuf<'_>,
+-        ) -> Poll<io::Result<()>> {
++        ) -> Poll<io::Result<MessageReadStatus>> {
+             Poll::Pending
+         }
+     }
+@@ -2276,6 +2276,148 @@ mod tests {
+         assert!(lookup.is_empty());
+     }
+ 
++    #[tokio::test]
++    async fn empty_first_session_datagram_and_remote_replies_are_forwarded() {
++        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let address = peer.local_addr().unwrap();
++        let writes = Arc::new(Mutex::new(Vec::new()));
++        let mut server = ServerStream::Session(Box::new(PacketServer {
++            events: VecDeque::from([(
++                SessionMessage::Data {
++                    session_id: 71,
++                    status: SessionMessageStatus::New,
++                    target: SessionMessageTarget::unresolved(literal_destination(address)),
++                },
++                Vec::new(),
++            )]),
++            writes: writes.clone(),
++            ends: Arc::new(Mutex::new(Vec::new())),
++        }));
++        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
++        let selector = direct_udp_selector(resolver.clone());
++        let mut router = UdpRouter::new(&mut server, selector, resolver, false);
++        let (payload, source) = receive_remote_datagram(&mut router, &peer).await;
++        assert!(payload.is_empty());
++        assert!(!router.server_read_eof);
++        for (index, payload) in [b"".as_slice(), b"after-empty", b""]
++            .into_iter()
++            .enumerate()
++        {
++            peer.send_to(payload, source).await.unwrap();
++            tokio::time::timeout(Duration::from_secs(1), async {
++                while writes.lock().unwrap().len() <= index {
++                    futures::future::poll_fn(|cx| {
++                        router.poll_inbound(cx, false);
++                        Poll::Ready(())
++                    })
++                    .await;
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await
++            .expect("remote datagram was lost");
++            assert_eq!(writes.lock().unwrap()[index].1, payload);
++        }
++        assert_eq!(router.sessions.len(), 1);
++    }
++
++    async fn receive_remote_datagram(
++        router: &mut UdpRouter<'_>,
++        peer: &tokio::net::UdpSocket,
++    ) -> (Vec<u8>, SocketAddr) {
++        tokio::time::timeout(Duration::from_secs(1), async {
++            let mut storage = [0; 64];
++            loop {
++                futures::future::poll_fn(|cx| {
++                    router.poll_outbound(cx, false);
++                    router.poll_inbound(cx, false);
++                    Poll::Ready(())
++                })
++                .await;
++                match peer.try_recv_from(&mut storage) {
++                    Ok((len, source)) => return (storage[..len].to_vec(), source),
++                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
++                        tokio::task::yield_now().await
++                    }
++                    Err(error) => panic!("UDP receive failed: {error}"),
++                }
++            }
++        })
++        .await
++        .expect("router did not forward datagram")
++    }
++
++    #[tokio::test]
++    async fn targeted_empty_datagrams_do_not_hide_transport_eof() {
++        use tokio::io::AsyncWriteExt;
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let ((stream, _), mut client) = tokio::try_join!(
++            listener.accept(),
++            tokio::net::TcpStream::connect(listener.local_addr().unwrap())
++        )
++        .unwrap();
++        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let mut server =
++            ServerStream::Targeted(Box::new(crate::uot::UotV1ServerStream::new_uot(stream)));
++        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
++        let selector = direct_udp_selector(resolver.clone());
++        let mut router = UdpRouter::new(&mut server, selector, resolver, false);
++        for payload in [b"".as_slice(), b"after-empty", b""] {
++            let mut frame = vec![0, 127, 0, 0, 1];
++            frame.extend_from_slice(&peer.local_addr().unwrap().port().to_be_bytes());
++            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
++            frame.extend_from_slice(payload);
++            client.write_all(&frame).await.unwrap();
++            assert_eq!(receive_remote_datagram(&mut router, &peer).await.0, payload);
++            assert!(!router.server_read_eof);
++        }
++        client.shutdown().await.unwrap();
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while !router.server_read_eof {
++                futures::future::poll_fn(|cx| {
++                    router.poll_outbound(cx, false);
++                    Poll::Ready(())
++                })
++                .await;
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .expect("targeted transport EOF was lost");
++    }
++
++    #[tokio::test]
++    async fn empty_data_before_end_under_backpressure_is_not_stream_eof() {
++        let session_id = 72;
++        let address: SocketAddr = "127.0.0.1:20000".parse().unwrap();
++        let mut server = ServerStream::Session(Box::new(PacketServer {
++            events: VecDeque::from([
++                (
++                    SessionMessage::Data {
++                        session_id,
++                        status: SessionMessageStatus::Keep,
++                        target: SessionMessageTarget::new(
++                            ResolvedLocation::with_resolved(literal_destination(address), address),
++                            address,
++                        ),
++                    },
++                    Vec::new(),
++                ),
++                (SessionMessage::End { session_id }, Vec::new()),
++            ]),
++            writes: Arc::new(Mutex::new(Vec::new())),
++            ends: Arc::new(Mutex::new(Vec::new())),
++        }));
++        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
++        let selector = Arc::new(ClientProxySelector::new(Vec::new()));
++        let mut router = UdpRouter::new(&mut server, selector, resolver, false);
++        exhaust_remote_write_pool(&mut router, session_id);
++        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
++        router.poll_read_server(&mut cx);
++        assert!(!router.server_read_eof);
++        assert!(router.sessions.is_empty());
++    }
++
+     #[tokio::test]
+     async fn slow_hostname_subflow_does_not_block_following_literal_session() {
+         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+diff --git a/src/shadowsocks/shadowsocks_stream.rs b/src/shadowsocks/shadowsocks_stream.rs
+index 2791c25..aad6dee 100644
+--- a/src/shadowsocks/shadowsocks_stream.rs
++++ b/src/shadowsocks/shadowsocks_stream.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use std::pin::Pin;
+ use std::sync::Arc;
+ use std::task::{Context, Poll};
+@@ -887,11 +888,17 @@ impl AsyncWrite for ShadowsocksStream {
+ 
+ impl AsyncReadMessage for ShadowsocksStream {
+     fn poll_read_message(
+-        self: Pin<&mut Self>,
++        mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> std::task::Poll<std::io::Result<()>> {
+-        self.poll_read_inner(cx, buf, false)
++    ) -> std::task::Poll<std::io::Result<MessageReadStatus>> {
++        let before = buf.filled().len();
++        ready!(self.as_mut().poll_read_inner(cx, buf, false))?;
++        Poll::Ready(Ok(if self.is_eof && buf.filled().len() == before {
++            MessageReadStatus::Eof
++        } else {
++            MessageReadStatus::Message
++        }))
+     }
+ }
+ 
+diff --git a/src/shadowsocks/shadowsocks_udp.rs b/src/shadowsocks/shadowsocks_udp.rs
+index ecc499b..0e20471 100644
+--- a/src/shadowsocks/shadowsocks_udp.rs
++++ b/src/shadowsocks/shadowsocks_udp.rs
+@@ -4,6 +4,7 @@
+ //! separate from UoT: the underlying stream here is a UDP socket connected to the
+ //! Shadowsocks server, not a TCP byte stream with length-prefixed messages.
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::fmt;
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -180,7 +181,7 @@ impl AsyncReadMessage for ShadowsocksUdpMessageStream {
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         output: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         let this = self.get_mut();
+ 
+         // Invalid authenticated packets are association-local noise, not EOF and
+@@ -191,7 +192,10 @@ impl AsyncReadMessage for ShadowsocksUdpMessageStream {
+             match Pin::new(&mut this.inner).poll_read_message(cx, &mut encrypted) {
+                 Poll::Pending => return Poll::Pending,
+                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+-                Poll::Ready(Ok(())) => {}
++                Poll::Ready(Ok(MessageReadStatus::Eof)) => {
++                    return Poll::Ready(Ok(MessageReadStatus::Eof));
++                }
++                Poll::Ready(Ok(MessageReadStatus::Message)) => {}
+             }
+ 
+             let packet = encrypted.filled().to_vec();
+@@ -208,7 +212,7 @@ impl AsyncReadMessage for ShadowsocksUdpMessageStream {
+                         )));
+                     }
+                     output.put_slice(&plaintext);
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Message));
+                 }
+                 Err(error) => {
+                     log::debug!("dropping invalid Shadowsocks UDP packet: {error}");
+diff --git a/src/snell/snell_fixed_target_stream.rs b/src/snell/snell_fixed_target_stream.rs
+index 14c0ec6..2933c8d 100644
+--- a/src/snell/snell_fixed_target_stream.rs
++++ b/src/snell/snell_fixed_target_stream.rs
+@@ -3,6 +3,7 @@
+ //! - On write: adding the fixed target to each message
+ //! - On read: stripping the source address from responses
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ use tokio::io::ReadBuf;
+@@ -29,11 +30,17 @@ impl<S: AsyncSourcedMessageStream> AsyncReadMessage for SnellFixedTargetStream<S
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         let this = self.get_mut();
+         // Reads the message and discards the source address.
+         match Pin::new(&mut this.stream).poll_read_sourced_message(cx, buf) {
+-            Poll::Ready(Ok(_source)) => Poll::Ready(Ok(())),
++            Poll::Ready(Ok(source)) => {
++                Poll::Ready(Ok(if source.ip().is_unspecified() && source.port() == 0 {
++                    MessageReadStatus::Eof
++                } else {
++                    MessageReadStatus::Message
++                }))
++            }
+             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+             Poll::Pending => Poll::Pending,
+         }
+diff --git a/src/snell/snell_udp_stream.rs b/src/snell/snell_udp_stream.rs
+index 7b020be..8122262 100644
+--- a/src/snell/snell_udp_stream.rs
++++ b/src/snell/snell_udp_stream.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use futures::ready;
+ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+ use std::pin::Pin;
+@@ -53,10 +54,10 @@ impl AsyncReadTargetedMessage for SnellUdpStream {
+         }
+ 
+         let mut read_buf = ReadBuf::new(&mut this.read_buf);
+-        ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf))?;
++        let status = ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf))?;
+ 
+         let len = read_buf.filled().len();
+-        if len == 0 {
++        if status == MessageReadStatus::Eof {
+             this.is_eof = true;
+             return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
+         }
+@@ -261,10 +262,10 @@ impl AsyncReadSourcedMessage for SnellUdpClientStream {
+         }
+ 
+         let mut read_buf = ReadBuf::new(&mut this.read_buf);
+-        ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf))?;
++        let status = ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut read_buf))?;
+ 
+         let len = read_buf.filled().len();
+-        if len == 0 {
++        if status == MessageReadStatus::Eof {
+             this.is_eof = true;
+             return Poll::Ready(Ok(SocketAddr::new(
+                 std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+diff --git a/src/socks5_udp_relay.rs b/src/socks5_udp_relay.rs
+index 5261545..5b357aa 100644
+--- a/src/socks5_udp_relay.rs
++++ b/src/socks5_udp_relay.rs
+@@ -275,12 +275,6 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
+                             target,
+                             payload.len()
+                         );
+-                        // Skip empty payloads - the copy loop interprets 0-byte reads as EOF
+-                        if payload.is_empty() {
+-                            log::debug!("SOCKS5 UDP relay: skipping empty payload");
+-                            cx.waker().wake_by_ref();
+-                            return Poll::Pending;
+-                        }
+                         if payload.len() > buf.remaining() {
+                             return Poll::Ready(Err(std::io::Error::new(
+                                 std::io::ErrorKind::InvalidData,
+@@ -401,6 +395,37 @@ impl AsyncTargetedMessageStream for Socks5UdpRelayStream {}
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn relay_delivers_empty_and_following_datagrams() {
++        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let relay_address = socket.local_addr().unwrap();
++        let mut relay = Socks5UdpRelayStream::new(socket);
++        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let target = NetLocation::new(Address::Ipv4(Ipv4Addr::LOCALHOST), 53);
++        tokio::time::timeout(std::time::Duration::from_secs(1), async {
++            for payload in [b"".as_slice(), b"after-empty", b""] {
++                client
++                    .send_to(&encode_socks5_udp_packet(&target, payload), relay_address)
++                    .await
++                    .unwrap();
++                let mut storage = [0; 64];
++                let mut buf = ReadBuf::new(&mut storage);
++                let destination = futures::future::poll_fn(|cx| {
++                    Pin::new(&mut relay).poll_read_targeted_message(cx, &mut buf)
++                })
++                .await
++                .unwrap();
++                assert_eq!(destination, target);
++                assert_eq!(buf.filled(), payload);
++            }
++        })
++        .await
++        .expect("SOCKS relay discarded a datagram");
++        futures::future::poll_fn(|cx| Pin::new(&mut relay).poll_shutdown_message(cx))
++            .await
++            .unwrap();
++    }
++
+     #[test]
+     fn test_parse_ipv4_packet() {
+         // RSV(2) + FRAG(1) + ATYP(1) + IPv4(4) + PORT(2) + DATA
+diff --git a/src/trojan_handler.rs b/src/trojan_handler.rs
+index c9165c5..1fc9ad7 100644
+--- a/src/trojan_handler.rs
++++ b/src/trojan_handler.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use std::io::{Error, ErrorKind};
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -361,10 +362,10 @@ impl<S: AsyncStream> AsyncReadMessage for TrojanUdpMessageStream<S> {
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         out_buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         let this = self.get_mut();
+         if this.is_eof {
+-            return Poll::Ready(Ok(()));
++            return Poll::Ready(Ok(MessageReadStatus::Eof));
+         }
+ 
+         loop {
+@@ -386,7 +387,7 @@ impl<S: AsyncStream> AsyncReadMessage for TrojanUdpMessageStream<S> {
+                     } else {
+                         this.read_end_index = 0;
+                     }
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Message));
+                 }
+             }
+ 
+@@ -404,7 +405,7 @@ impl<S: AsyncStream> AsyncReadMessage for TrojanUdpMessageStream<S> {
+                     if read_len == 0 {
+                         this.is_eof = true;
+                         if this.read_end_index == 0 {
+-                            return Poll::Ready(Ok(()));
++                            return Poll::Ready(Ok(MessageReadStatus::Eof));
+                         }
+                         return Poll::Ready(Err(Error::new(
+                             ErrorKind::UnexpectedEof,
+@@ -764,6 +765,38 @@ mod tests {
+         assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+     }
+ 
++    #[tokio::test]
++    async fn empty_udp_frames_are_distinct_from_transport_eof() {
++        let (client, mut peer) = duplex(1024);
++        let target = ipv4_target();
++        let mut stream = TrojanUdpMessageStream::new(TestStream(client), &target).unwrap();
++        for payload in [b"".as_slice(), b"after-empty", b""] {
++            peer.write_all(&encode_frame(&target, payload))
++                .await
++                .unwrap();
++        }
++        peer.shutdown().await.unwrap();
++        for expected in [b"".as_slice(), b"after-empty", b""] {
++            let mut storage = [0; 64];
++            let mut buf = ReadBuf::new(&mut storage);
++            assert_eq!(
++                poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buf))
++                    .await
++                    .unwrap(),
++                MessageReadStatus::Message
++            );
++            assert_eq!(buf.filled(), expected);
++        }
++        let mut storage = [0; 64];
++        let mut buf = ReadBuf::new(&mut storage);
++        assert_eq!(
++            poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buf))
++                .await
++                .unwrap(),
++            MessageReadStatus::Eof
++        );
++    }
++
+     #[tokio::test]
+     async fn reads_fragmented_reverse_response_and_coalesced_followup() {
+         let (client, mut peer) = duplex(128 * 1024);
+diff --git a/src/tuic_server.rs b/src/tuic_server.rs
+index 8c2f1fb..f2e61cd 100644
+--- a/src/tuic_server.rs
++++ b/src/tuic_server.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use std::future::Future;
+ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+ use std::num::NonZeroUsize;
+@@ -1590,7 +1591,13 @@ async fn run_udp_target_worker(
+                         let mut read_buf = ReadBuf::new(&mut remote_buf);
+                         poll_fn(|cx| Pin::new(&mut *remote).poll_read_message(cx, &mut read_buf))
+                             .await
+-                            .map(|()| read_buf.filled().len())
++                            .and_then(|status| match status {
++                                MessageReadStatus::Message => Ok(read_buf.filled().len()),
++                                MessageReadStatus::Eof => Err(std::io::Error::new(
++                                    std::io::ErrorKind::UnexpectedEof,
++                                    "TUIC UDP target stream closed",
++                                )),
++                            })
+                     } => UdpTargetWork::Read(result),
+                 }
+             } => work,
+@@ -3284,7 +3291,7 @@ mod tests {
+     use crate::address::{Address, NetLocation};
+     use crate::async_stream::{
+         AsyncFlushMessage, AsyncMessageStream, AsyncPing, AsyncReadMessage, AsyncShutdownMessage,
+-        AsyncWriteMessage,
++        AsyncWriteMessage, MessageReadStatus,
+     };
+     use crate::dynamic::{ConnContext, UserContext};
+     use bytes::Bytes;
+@@ -3310,7 +3317,7 @@ mod tests {
+             self: Pin<&mut Self>,
+             _cx: &mut Context<'_>,
+             _buf: &mut ReadBuf<'_>,
+-        ) -> Poll<std::io::Result<()>> {
++        ) -> Poll<std::io::Result<MessageReadStatus>> {
+             Poll::Pending
+         }
+     }
+@@ -3366,7 +3373,7 @@ mod tests {
+             self: Pin<&mut Self>,
+             _cx: &mut Context<'_>,
+             _buf: &mut ReadBuf<'_>,
+-        ) -> Poll<std::io::Result<()>> {
++        ) -> Poll<std::io::Result<MessageReadStatus>> {
+             Poll::Pending
+         }
+     }
+@@ -3426,11 +3433,11 @@ mod tests {
+             mut self: Pin<&mut Self>,
+             cx: &mut Context<'_>,
+             buf: &mut ReadBuf<'_>,
+-        ) -> Poll<std::io::Result<()>> {
++        ) -> Poll<std::io::Result<MessageReadStatus>> {
+             if self.written && !self.reply_sent {
+                 self.reply_sent = true;
+                 buf.put_slice(b"reply-a");
+-                Poll::Ready(Ok(()))
++                Poll::Ready(Ok(MessageReadStatus::Message))
+             } else {
+                 self.read_waker = Some(cx.waker().clone());
+                 Poll::Pending
+diff --git a/src/tun/udp_manager.rs b/src/tun/udp_manager.rs
+index b337431..665ccf2 100644
+--- a/src/tun/udp_manager.rs
++++ b/src/tun/udp_manager.rs
+@@ -5,6 +5,7 @@
+ //! via channel. This eliminates the busy-polling loop that previously caused
+ //! CPU runaway under high-churn UDP workloads.
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::collections::HashMap;
+ use std::io;
+ use std::net::SocketAddr;
+@@ -425,7 +426,7 @@ async fn destination_task(
+         // All branches return an Action value, deferring stream/buf access
+         // to after the select block where all future borrows are released.
+         enum Action {
+-            Read(io::Result<()>),
++            Read(io::Result<MessageReadStatus>),
+             Write(Option<Vec<u8>>),
+             Timeout,
+         }
+@@ -439,11 +440,9 @@ async fn destination_task(
+         };
+ 
+         match action {
+-            Action::Read(Ok(())) => {
++            Action::Read(Ok(MessageReadStatus::Eof)) => break,
++            Action::Read(Ok(MessageReadStatus::Message)) => {
+                 let len = buf.filled().len();
+-                if len == 0 {
+-                    break;
+-                }
+                 sleep.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
+ 
+                 debug!(
+diff --git a/src/uot/uot_v1_server_stream.rs b/src/uot/uot_v1_server_stream.rs
+index ccd9c9d..8cf8a15 100644
+--- a/src/uot/uot_v1_server_stream.rs
++++ b/src/uot/uot_v1_server_stream.rs
+@@ -10,6 +10,7 @@
+ //! - UoT V1 and V2 non-connect use sing `AddrParser`
+ //! - h2mux `packet_addr` uses SOCKS-style `SocksaddrSerializer`
+ 
++use crate::async_stream::MessageReadStatus;
+ use std::net::SocketAddr;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+@@ -398,9 +399,13 @@ impl AsyncReadMessage for VlessPacketAddrClientStream {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         ready!(Pin::new(&mut self.inner).poll_read_targeted_message(cx, buf))?;
+-        Poll::Ready(Ok(()))
++        Poll::Ready(Ok(if self.inner.is_eof {
++            MessageReadStatus::Eof
++        } else {
++            MessageReadStatus::Message
++        }))
+     }
+ }
+ 
+@@ -519,6 +524,44 @@ mod tests {
+         assert_eq!(ipv6_len, 19);
+     }
+ 
++    #[tokio::test]
++    async fn packetaddr_client_preserves_empty_frames_and_distinguishes_eof() {
++        let (client, mut peer) = tcp_pair().await.unwrap();
++        let target: SocketAddr = "127.0.0.1:53".parse().unwrap();
++        let mut stream = VlessPacketAddrClientStream::new(Box::new(client), target);
++        for payload in [b"".as_slice(), b"after-empty", b""] {
++            poll_fn(|cx| Pin::new(&mut stream).poll_write_message(cx, payload))
++                .await
++                .unwrap();
++            poll_fn(|cx| Pin::new(&mut stream).poll_flush_message(cx))
++                .await
++                .unwrap();
++            let expected = encode_packet(write_vless_packet_address, &target, payload);
++            let mut wire = vec![0; expected.len()];
++            peer.read_exact(&mut wire).await.unwrap();
++            assert_eq!(wire, expected);
++            peer.write_all(&wire).await.unwrap();
++            let mut storage = [0; 64];
++            let mut buf = ReadBuf::new(&mut storage);
++            assert_eq!(
++                poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buf))
++                    .await
++                    .unwrap(),
++                MessageReadStatus::Message
++            );
++            assert_eq!(buf.filled(), payload);
++        }
++        peer.shutdown().await.unwrap();
++        let mut storage = [0; 64];
++        let mut buf = ReadBuf::new(&mut storage);
++        assert_eq!(
++            poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buf))
++                .await
++                .unwrap(),
++            MessageReadStatus::Eof
++        );
++    }
++
+     #[tokio::test]
+     async fn test_new_uot_reads_uot_packets() {
+         let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 4444));
+diff --git a/src/vless/vless_message_stream.rs b/src/vless/vless_message_stream.rs
+index e47322f..174e22b 100644
+--- a/src/vless/vless_message_stream.rs
++++ b/src/vless/vless_message_stream.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use std::io::{Error, ErrorKind, Result};
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+@@ -47,11 +48,11 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         out_buf: &mut ReadBuf<'_>,
+-    ) -> Poll<Result<()>> {
++    ) -> Poll<Result<MessageReadStatus>> {
+         let this = self.get_mut();
+ 
+         if this.is_eof {
+-            return Poll::Ready(Ok(()));
++            return Poll::Ready(Ok(MessageReadStatus::Eof));
+         }
+ 
+         loop {
+@@ -72,7 +73,7 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
+                         // this.read_end_index == total_len
+                         this.read_end_index = 0;
+                     }
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Message));
+                 }
+             }
+ 
+@@ -87,7 +88,7 @@ impl<S: AsyncStream> AsyncReadMessage for VlessMessageStream<S> {
+                     if n == 0 {
+                         this.is_eof = true;
+                         if this.read_end_index == 0 {
+-                            return Poll::Ready(Ok(()));
++                            return Poll::Ready(Ok(MessageReadStatus::Eof));
+                         } else {
+                             return Poll::Ready(Err(Error::new(
+                                 ErrorKind::UnexpectedEof,
+@@ -195,3 +196,47 @@ impl<S: AsyncStream> AsyncPing for VlessMessageStream<S> {
+ }
+ 
+ impl<S: AsyncStream> AsyncMessageStream for VlessMessageStream<S> {}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::future::poll_fn;
++    use tokio::io::AsyncWriteExt;
++    use tokio::net::{TcpListener, TcpStream};
++
++    #[tokio::test]
++    async fn empty_frames_remain_messages_and_transport_eof_stays_terminal() {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let ((server, _), mut peer) = tokio::try_join!(
++            listener.accept(),
++            TcpStream::connect(listener.local_addr().unwrap())
++        )
++        .unwrap();
++        // Include an empty final frame immediately before transport EOF.
++        peer.write_all(b"\0\0\0\x03abc\0\0").await.unwrap();
++        peer.shutdown().await.unwrap();
++        let mut stream = VlessMessageStream::new(server);
++        for expected in [b"".as_slice(), b"abc", b""] {
++            let mut storage = [0; 16];
++            let mut buf = ReadBuf::new(&mut storage);
++            assert_eq!(
++                poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buf))
++                    .await
++                    .unwrap(),
++                MessageReadStatus::Message
++            );
++            assert_eq!(buf.filled(), expected);
++        }
++        for _ in 0..2 {
++            let mut storage = [0; 16];
++            let mut buf = ReadBuf::new(&mut storage);
++            assert_eq!(
++                poll_fn(|cx| Pin::new(&mut stream).poll_read_message(cx, &mut buf))
++                    .await
++                    .unwrap(),
++                MessageReadStatus::Eof
++            );
++            assert!(buf.filled().is_empty());
++        }
++    }
++}
+diff --git a/src/vmess/vmess_stream.rs b/src/vmess/vmess_stream.rs
+index 25ef5ec..ba7417a 100644
+--- a/src/vmess/vmess_stream.rs
++++ b/src/vmess/vmess_stream.rs
+@@ -1,3 +1,4 @@
++use crate::async_stream::MessageReadStatus;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
+@@ -924,7 +925,7 @@ impl AsyncReadMessage for VmessStream {
+         self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> std::task::Poll<std::io::Result<()>> {
++    ) -> std::task::Poll<std::io::Result<MessageReadStatus>> {
+         let this = self.get_mut();
+ 
+         if this.read_header_state != ReadHeaderState::Done && !this.is_eof {
+@@ -935,7 +936,7 @@ impl AsyncReadMessage for VmessStream {
+                 let len = read_buf.filled().len();
+                 if len == 0 {
+                     this.is_eof = true;
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Eof));
+                 }
+                 this.unprocessed_end_offset += len;
+                 this.process_read_header()?;
+@@ -958,7 +959,7 @@ impl AsyncReadMessage for VmessStream {
+                     DecryptState::BufferFull => {
+                         assert!(this.processed_end_offset > 0);
+                         this.read_processed(buf);
+-                        return Poll::Ready(Ok(()));
++                        return Poll::Ready(Ok(MessageReadStatus::Message));
+                     }
+                     DecryptState::Success => {
+                         continue;
+@@ -969,7 +970,7 @@ impl AsyncReadMessage for VmessStream {
+ 
+         if this.processed_end_offset > 0 {
+             this.read_processed(buf);
+-            return Poll::Ready(Ok(()));
++            return Poll::Ready(Ok(MessageReadStatus::Message));
+         }
+ 
+         match this.try_decrypt()? {
+@@ -980,16 +981,16 @@ impl AsyncReadMessage for VmessStream {
+             DecryptState::BufferFull => {
+                 assert!(this.processed_end_offset > 0);
+                 this.read_processed(buf);
+-                return Poll::Ready(Ok(()));
++                return Poll::Ready(Ok(MessageReadStatus::Message));
+             }
+             DecryptState::Success => {
+                 this.read_processed(buf);
+-                return Poll::Ready(Ok(()));
++                return Poll::Ready(Ok(MessageReadStatus::Message));
+             }
+         }
+ 
+         if this.is_eof {
+-            return Poll::Ready(Ok(()));
++            return Poll::Ready(Ok(MessageReadStatus::Eof));
+         }
+ 
+         loop {
+@@ -1016,8 +1017,9 @@ impl AsyncReadMessage for VmessStream {
+                     // TODO: I don't think we ever hit this clause.
+                     // The only time we read is when processed_end_offset is 0.
+                     this.read_processed(buf);
++                    return Poll::Ready(Ok(MessageReadStatus::Message));
+                 }
+-                return Poll::Ready(Ok(()));
++                return Poll::Ready(Ok(MessageReadStatus::Eof));
+             }
+ 
+             this.unprocessed_end_offset += len;
+@@ -1027,16 +1029,16 @@ impl AsyncReadMessage for VmessStream {
+                 DecryptState::NeedData => {}
+                 DecryptState::ReceivedEof => {
+                     this.is_eof = true;
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Eof));
+                 }
+                 DecryptState::BufferFull => {
+                     assert!(this.processed_end_offset > 0);
+                     this.read_processed(buf);
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Message));
+                 }
+                 DecryptState::Success => {
+                     this.read_processed(buf);
+-                    return Poll::Ready(Ok(()));
++                    return Poll::Ready(Ok(MessageReadStatus::Message));
+                 }
+             }
+ 
+diff --git a/src/xudp/message_stream.rs b/src/xudp/message_stream.rs
+index d65f538..a377c5a 100644
+--- a/src/xudp/message_stream.rs
++++ b/src/xudp/message_stream.rs
+@@ -2,6 +2,7 @@
+ // Wraps any AsyncStream and provides XUDP frame encoding/decoding with session management
+ // Used by both VLESS and VMess protocols
+ 
++use crate::async_stream::MessageReadStatus;
+ use bytes::{Buf, BufMut, BytesMut};
+ use futures::ready;
+ use std::collections::{HashMap, HashSet};
+@@ -342,10 +343,6 @@ impl XudpMessageStream {
+             // A New/Keep frame without DATA can still update the session target.
+             return Ok(Some(DecodedSessionMessage::Ignored));
+         };
+-        if data.is_empty() {
+-            return Ok(Some(DecodedSessionMessage::Ignored));
+-        }
+-
+         // Determine destination
+         let destination = if let Some(ref target) = metadata.target {
+             target.clone()
+@@ -733,7 +730,7 @@ impl AsyncReadMessage for XudpClientMessageStream {
+         mut self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+-    ) -> Poll<std::io::Result<()>> {
++    ) -> Poll<std::io::Result<MessageReadStatus>> {
+         let (session_id, response_target) =
+             match ready!(Pin::new(&mut self.inner).poll_read_session_message(cx, buf))? {
+                 SessionMessage::Data {
+@@ -792,7 +789,7 @@ impl AsyncReadMessage for XudpClientMessageStream {
+                 self.target
+             );
+         }
+-        Poll::Ready(Ok(()))
++        Poll::Ready(Ok(MessageReadStatus::Message))
+     }
+ }
+ 
+@@ -1065,6 +1062,36 @@ mod tests {
+         xudp_data_frame_with_status(session_id, SessionStatus::New, target, payload)
+     }
+ 
++    #[test]
++    fn empty_data_frames_are_delivered_without_hiding_following_frames() {
++        let target = NetLocation::from_str("127.0.0.1:53", None).unwrap();
++        let mut encoded = xudp_data_frame(7, target.clone(), b"");
++        encoded.extend_from_slice(&xudp_data_frame_with_status(
++            7,
++            SessionStatus::Keep,
++            target.clone(),
++            b"next",
++        ));
++        encoded.extend_from_slice(&xudp_data_frame_with_status(
++            7,
++            SessionStatus::Keep,
++            target,
++            b"",
++        ));
++        let mut stream = XudpMessageStream::new(Box::new(UnusedStream));
++        stream.feed_initial_read_data(&encoded).unwrap();
++        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
++        for payload in [b"".as_slice(), b"next", b""] {
++            let mut storage = [0; 16];
++            let mut buf = ReadBuf::new(&mut storage);
++            assert!(matches!(
++                Pin::new(&mut stream).poll_read_session_message(&mut cx, &mut buf),
++                Poll::Ready(Ok(SessionMessage::Data { session_id: 7, .. }))
++            ));
++            assert_eq!(buf.filled(), payload);
++        }
++    }
++
+     fn xudp_end_frame(session_id: u16) -> BytesMut {
+         let mut frame = BytesMut::new();
+         FrameMetadata {

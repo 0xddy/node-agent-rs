@@ -1,7 +1,7 @@
 //! Short-lived idempotency cache for control command acknowledgements.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 const DEFAULT_ACK_STORE_CAPACITY: usize = 512;
 
@@ -66,17 +66,59 @@ impl std::error::Error for ExecuteError {}
 struct State {
     seen: HashMap<String, Ack>,
     order: VecDeque<String>,
+    executions: HashMap<String, Weak<ExecutionGate>>,
+}
+
+pub(super) struct ExecutionGate {
+    key: String,
+    registry: Weak<Mutex<State>>,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ExecutionGate {
+    pub(super) async fn lock(self: Arc<Self>) -> ExecutionPermit {
+        let lock = self.mutex.clone().lock_owned().await;
+        ExecutionPermit {
+            _lock: lock,
+            _gate: self,
+        }
+    }
+}
+
+impl Drop for ExecutionGate {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut state = registry.lock().unwrap_or_else(|error| error.into_inner());
+        // Another caller may already have replaced this dead weak reference
+        // while its destructor waited for the registry lock.
+        if state
+            .executions
+            .get(&self.key)
+            .is_some_and(|gate| std::ptr::eq(gate.as_ptr(), self))
+        {
+            state.executions.remove(&self.key);
+        }
+    }
+}
+
+pub(super) struct ExecutionPermit {
+    // Fields drop in declaration order: unlock before releasing the registry
+    // handle, so no second gate can appear while the old execution holds a lock.
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    _gate: Arc<ExecutionGate>,
 }
 
 /// FIFO-bounded replay cache matching Go's `internal/control.AckStore`.
 ///
 /// Failed and rolled-back results are deliberately not cached, so the panel can
 /// retry the same logical operation with the same idempotency key. Execution is
-/// outside the mutex just as in Go; the ACP control worker is serial, and keeping
-/// the store from holding a lock across arbitrary work avoids turning it into a
-/// hidden transaction lock.
+/// outside the state mutex just as in Go. Async control workers use a separate
+/// gate per key to cover overlapping sessions without serializing unrelated
+/// commands or holding a synchronous lock across arbitrary work.
 pub struct AckStore {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     capacity: usize,
 }
 
@@ -93,10 +135,11 @@ impl AckStore {
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 seen: HashMap::new(),
                 order: VecDeque::new(),
-            }),
+                executions: HashMap::new(),
+            })),
             capacity,
         }
     }
@@ -105,6 +148,25 @@ impl AckStore {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Serializes lookup/execution/completion for one key across worker lanes
+    /// and panel sessions. Only active/waiting callers retain a strong reference;
+    /// the last caller removes the entry, keeping storage bounded by active work.
+    pub(super) fn execution_gate(&self, key: &str) -> Arc<ExecutionGate> {
+        let mut state = self.state();
+        if let Some(gate) = state.executions.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(ExecutionGate {
+            key: key.to_owned(),
+            registry: Arc::downgrade(&self.state),
+            mutex: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        state
+            .executions
+            .insert(key.to_owned(), Arc::downgrade(&gate));
+        gate
     }
 
     /// Looks up a previously completed successful command.
@@ -180,6 +242,28 @@ impl AckStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_registry_releases_completed_and_canceled_keys() {
+        let store = AckStore::new();
+        let first = store.execution_gate("same-key").lock().await;
+        let mut waiting = Box::pin(store.execution_gate("same-key").lock());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(waiting);
+        assert_eq!(store.state().executions.len(), 1);
+        drop(first);
+        assert!(store.state().executions.is_empty());
+
+        for index in 0..1024 {
+            let permit = store.execution_gate(&format!("key-{index}")).lock().await;
+            drop(permit);
+        }
+        assert!(store.state().executions.is_empty());
+    }
 
     fn command(key: &str) -> Command {
         Command {

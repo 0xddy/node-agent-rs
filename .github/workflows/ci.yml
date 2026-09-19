@@ -41,6 +41,9 @@ jobs:
       - name: Apply HY2 upload half-close correction
         run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-hy2-late-stop.patch
 
+      - name: Preserve empty UDP datagrams
+        run: git -C ../shoes-plus apply --check ../node-agent-rs/patches/shoes-plus-empty-udp.patch && git -C ../shoes-plus apply ../node-agent-rs/patches/shoes-plus-empty-udp.patch
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

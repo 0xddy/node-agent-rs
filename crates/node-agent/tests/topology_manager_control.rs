@@ -37,6 +37,7 @@ struct RecordingRuntime {
     fail: AtomicBool,
     rolled_back: AtomicBool,
     close_gate: Option<Arc<ConnectionCloseGate>>,
+    reconcile_gate: Option<Arc<ConnectionCloseGate>>,
 }
 
 struct ConnectionCloseGate {
@@ -72,6 +73,10 @@ impl TopologyRuntime for RecordingRuntime {
 
     async fn reconcile_current(&self, topology: &MachineTopology) -> Result<(), TopologyError> {
         lock(&self.reconciled).push(topology.clone());
+        if let Some(gate) = &self.reconcile_gate {
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+        }
         Ok(())
     }
 
@@ -1054,7 +1059,117 @@ async fn generation_cancel_drops_dequeued_panel_fetch_without_late_apply() {
 }
 
 #[tokio::test]
-async fn generation_cancel_after_local_transaction_start_still_commits_consistently() {
+async fn generation_cancel_rejects_all_topology_commands_waiting_for_operation_lock() {
+    let cases = [
+        (
+            "snapshot",
+            ControlCommand {
+                r#type: ControlCommandType::TopologySnapshot as i32,
+                revision: 2,
+                payload: Some(Payload::TopologySnapshot(to_snapshot(&topology(
+                    2,
+                    vec![user("new", "new")],
+                )))),
+                ..Default::default()
+            },
+        ),
+        (
+            "delta",
+            ControlCommand {
+                r#type: ControlCommandType::TopologyDelta as i32,
+                base_revision: 1,
+                revision: 2,
+                payload: Some(Payload::TopologyDelta(TopologyDelta {
+                    base_revision: 1,
+                    target_revision: 2,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ),
+        (
+            "route patch",
+            ControlCommand {
+                r#type: ControlCommandType::RoutePatch as i32,
+                base_revision: 1,
+                revision: 2,
+                payload: Some(Payload::TopologyRoutePatch(acp_proto::TopologyRoutePatch {
+                    revision: 2,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ),
+        ("user mutation", user_upsert_command(1, 2, "new")),
+        ("user refresh", user_refresh_command()),
+        ("authoritative resync", user_upsert_command(99, 100, "new")),
+    ];
+    for (name, command) in cases {
+        let gate = Arc::new(ConnectionCloseGate {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        let runtime = Arc::new(RecordingRuntime {
+            reconcile_gate: Some(gate.clone()),
+            ..Default::default()
+        });
+        let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
+        manager
+            .apply_initial(topology(1, vec![user("old", "old")]))
+            .await
+            .unwrap();
+        let reconcile = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.reconcile_current().await.unwrap() })
+        };
+        gate.entered.acquire().await.unwrap().forget();
+        let fetcher = Arc::new(QueueFetcher::new(vec![topology(
+            100,
+            vec![user("new", "new")],
+        )]));
+        *lock(&fetcher.users) = vec![user("new", "new")];
+        let executor = TopologyCommandExecutor::new(manager.clone(), fetcher);
+        let cancellation = CancellationToken::new();
+        let command = executor.execute_with_cancel(command, cancellation.clone());
+        tokio::pin!(command);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(command.as_mut(), cx).is_pending(),
+                "{name} should wait for the operation lock"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        cancellation.cancel();
+        // The reconcile operation still holds the lock. Cancellation must
+        // resolve now, rather than only after admission becomes possible.
+        let terminal = tokio::time::timeout(Duration::from_secs(1), command)
+            .await
+            .unwrap_or_else(|_| panic!("{name} ignored cancellation while waiting for the lock"));
+        assert_eq!(terminal.status, AckStatus::Failed, "{name}");
+        assert!(
+            terminal.message.contains("canceled"),
+            "{name}: {terminal:?}"
+        );
+        gate.release.add_permits(1);
+        reconcile.await.unwrap();
+        assert_eq!(manager.current_revision(), Some(1), "{name}");
+        assert_eq!(lock(&runtime.applied).len(), 1, "{name} mutated runtime");
+        assert!(
+            lock(&runtime.closed).is_empty(),
+            "{name} closed connections"
+        );
+        let next_session = executor
+            .execute_with_cancel(user_upsert_command(1, 2, "fresh"), CancellationToken::new())
+            .await;
+        assert_eq!(next_session.status, AckStatus::Applied, "{name}");
+        assert_eq!(manager.current_revision(), Some(2), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn generation_cancel_after_local_transaction_start_commits_and_caches_success() {
     let runtime = Arc::new(BlockingTransactionRuntime::default());
     let manager = Arc::new(TopologyManager::new("machine-1", runtime.clone()));
     manager
@@ -1065,13 +1180,17 @@ async fn generation_cancel_after_local_transaction_start_still_commits_consisten
     *lock(&fetcher.users) = vec![user("new", "new")];
     let started = runtime.started.notified();
     let cancellation = CancellationToken::new();
+    let store = Arc::new(AckStore::new());
+    let executor = Arc::new(TopologyCommandExecutor::new(manager.clone(), fetcher));
     let (worker, mut acks) = ControlCommandWorker::spawn_with_cancel(
-        Arc::new(TopologyCommandExecutor::new(manager.clone(), fetcher)),
-        Arc::new(AckStore::new()),
+        executor.clone(),
+        store.clone(),
         cancellation.clone(),
     );
 
-    worker.submit(user_refresh_command()).await.unwrap();
+    let mut command = user_refresh_command();
+    command.idempotency_key = "refresh-once".into();
+    worker.submit(command.clone()).await.unwrap();
     assert_eq!(
         ack(&mut acks).await.status,
         ControlAckStatus::Accepted as i32
@@ -1094,6 +1213,25 @@ async fn generation_cancel_after_local_transaction_start_still_commits_consisten
         "cancelled session gets no terminal ACK"
     );
     drop(worker);
+    // Closing the channel joins both lanes, including terminal caching after
+    // the runtime's commit. Do not race the new session against that finish.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), acks.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (worker, mut acks) = ControlCommandWorker::spawn(executor, store);
+    command.command_id = "refresh-reconnected".into();
+    worker.submit(command).await.unwrap();
+    assert_eq!(
+        ack(&mut acks).await.status,
+        ControlAckStatus::Accepted as i32
+    );
+    let terminal = ack(&mut acks).await;
+    assert_eq!(terminal.command_id, "refresh-reconnected");
+    assert_eq!(terminal.status, ControlAckStatus::Applied as i32);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
 }
 
 fn user_upsert_command(base: u64, target: u64, user_id: &str) -> ControlCommand {
@@ -1476,6 +1614,115 @@ impl CommandExecutor for ImmediateExecutor {
 }
 
 struct PanicExecutor;
+
+struct ReconnectingExecutor {
+    first_status: AckStatus,
+    calls: AtomicUsize,
+    started: Notify,
+    permits: Semaphore,
+}
+
+#[async_trait]
+impl CommandExecutor for ReconnectingExecutor {
+    async fn execute(&self, command: ControlCommand) -> TerminalResult {
+        if command.idempotency_key != "shared-key" {
+            return TerminalResult::applied("independent command");
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.notify_waiters();
+            self.permits.acquire().await.unwrap().forget();
+            return TerminalResult {
+                status: self.first_status,
+                message: "first transaction finished".into(),
+            };
+        }
+        TerminalResult::applied("retried failed transaction")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_waits_for_inflight_key_and_retries_only_failed_transactions() {
+    for first_status in [AckStatus::Applied, AckStatus::Failed, AckStatus::RolledBack] {
+        let executor = Arc::new(ReconnectingExecutor {
+            first_status,
+            calls: AtomicUsize::new(0),
+            started: Notify::new(),
+            permits: Semaphore::new(0),
+        });
+        let store = Arc::new(AckStore::new());
+        let cancellation = CancellationToken::new();
+        let (old_worker, mut old_acks) = ControlCommandWorker::spawn_with_cancel(
+            executor.clone(),
+            store.clone(),
+            cancellation.clone(),
+        );
+        let mut original = queued_command("original", ControlCommandType::UserMutation);
+        original.idempotency_key = "shared-key".into();
+        let started = executor.started.notified();
+        old_worker.submit(original.clone()).await.unwrap();
+        assert_eq!(
+            ack(&mut old_acks).await.status,
+            ControlAckStatus::Accepted as i32
+        );
+        started.await;
+        cancellation.cancel();
+
+        // Reconnect while the old transaction is still blocked, before it can
+        // populate the replay cache. The other lane must remain independent.
+        let (worker, mut acks) = ControlCommandWorker::spawn(executor.clone(), store.clone());
+        original.command_id = "reconnected".into();
+        worker.submit(original).await.unwrap();
+        assert_eq!(
+            ack(&mut acks).await.status,
+            ControlAckStatus::Accepted as i32
+        );
+        let mut independent = queued_command("independent", ControlCommandType::UserRefresh);
+        independent.idempotency_key = "different-key".into();
+        worker.submit(independent).await.unwrap();
+        assert_eq!(
+            ack(&mut acks).await.status,
+            ControlAckStatus::Accepted as i32
+        );
+        let independent = ack(&mut acks).await;
+        assert_eq!(independent.command_id, "independent");
+        assert_eq!(independent.status, ControlAckStatus::Applied as i32);
+        // With paused time this drains runnable tasks until both copies are
+        // blocked, without relying on a wall-clock scheduling delay.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+        let (abandoned, mut abandoned_acks) = ControlCommandWorker::spawn(executor.clone(), store);
+        let mut waiting = queued_command("canceled-waiter", ControlCommandType::UserMutation);
+        waiting.idempotency_key = "shared-key".into();
+        abandoned.submit(waiting).await.unwrap();
+        assert_eq!(
+            ack(&mut abandoned_acks).await.status,
+            ControlAckStatus::Accepted as i32
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        abandoned.cancel();
+        drop(abandoned);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), abandoned_acks.recv())
+                .await
+                .expect("canceled key waiter stayed blocked on the old transaction")
+                .is_none()
+        );
+
+        executor.permits.add_permits(1);
+        let terminal = ack(&mut acks).await;
+        assert_eq!(terminal.command_id, "reconnected");
+        assert_eq!(terminal.status, ControlAckStatus::Applied as i32);
+        let expected_calls = if first_status == AckStatus::Applied {
+            1
+        } else {
+            2
+        };
+        assert_eq!(executor.calls.load(Ordering::SeqCst), expected_calls);
+        drop(old_worker);
+        assert!(old_acks.recv().await.is_none());
+    }
+}
 
 #[async_trait]
 impl CommandExecutor for PanicExecutor {
