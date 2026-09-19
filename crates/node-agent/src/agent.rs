@@ -295,7 +295,7 @@ impl Agent {
         let channel = self.panel.dial().await?;
         let session = self.panel.authenticate(channel, local_revision).await?;
         log::info!(
-            "面板认证成功：会话已建立，拓扑版本={}",
+            "面板认证成功：准备注册控制流并同步配置，拓扑版本={}",
             session.descriptor().topology_revision
         );
 

@@ -236,11 +236,16 @@ enum PanelEvent {
 struct MockPanel {
     events: mpsc::UnboundedSender<PanelEvent>,
     digest: Arc<str>,
+    hello_error: Option<Status>,
+    control_error: Option<Status>,
 }
 
 #[tonic::async_trait]
 impl AuthService for MockPanel {
     async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<Session>, Status> {
+        if let Some(status) = &self.hello_error {
+            return Err(status.clone());
+        }
         let hello = request.into_inner();
         let fields = HelloFields {
             machine_id: hello.machine_id.clone(),
@@ -269,6 +274,9 @@ impl ControlService for MockPanel {
         &self,
         request: Request<tonic::Streaming<ControlAck>>,
     ) -> Result<Response<Self::ControlStreamStream>, Status> {
+        if let Some(status) = &self.control_error {
+            return Err(status.clone());
+        }
         let fields = verify_incoming_session_metadata(request.metadata())?;
         self.events
             .send(PanelEvent::ControlMetadata(fields))
@@ -398,6 +406,8 @@ fn mock_panel() -> (MockPanel, mpsc::UnboundedReceiver<PanelEvent>) {
         MockPanel {
             events,
             digest: Arc::from(DIGEST),
+            hello_error: None,
+            control_error: None,
         },
         receiver,
     )
@@ -408,6 +418,44 @@ async fn next_event(events: &mut mpsc::UnboundedReceiver<PanelEvent>) -> PanelEv
         .await
         .expect("panel event timed out")
         .expect("panel event channel closed")
+}
+
+#[tokio::test]
+async fn rejected_session_rpcs_identify_the_stage_and_preserve_authentication_status() {
+    for reject_hello in [true, false] {
+        let (mut panel, _events) = mock_panel();
+        let rejection = Status::unauthenticated("session expired");
+        let operation = if reject_hello {
+            panel.hello_error = Some(rejection);
+            "auth hello"
+        } else {
+            panel.control_error = Some(rejection);
+            "control stream registration"
+        };
+        let running = spawn_panel(panel, None).await;
+        let client = PanelClient::new(
+            test_config(&format!("grpc://{}", running.address)),
+            "agent",
+            "shoes",
+        );
+        let channel = client.dial().await.unwrap();
+        let error = if reject_hello {
+            client.authenticate(channel, 41).await.err().unwrap()
+        } else {
+            client
+                .authenticate(channel, 41)
+                .await
+                .unwrap()
+                .open_control_stream()
+                .await
+                .err()
+                .unwrap()
+        };
+        assert!(error.to_string().starts_with(operation), "{error}");
+        assert!(error.to_string().contains("session expired"), "{error}");
+        assert!(error.is_unauthenticated(), "{error}");
+        running.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -625,6 +673,84 @@ async fn complete_session_attempts_reconnect_with_the_same_cancellation_domain()
     .await
     .unwrap();
     assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn reconnect_failures_are_logged_without_debug_but_shutdown_is_quiet() {
+    const CHILD_LOG_PATH: &str = "ACP_SESSION_RECONNECT_TEST_LOG_PATH";
+    if let Some(path) = std::env::var_os(CHILD_LOG_PATH) {
+        // Keep the process-wide logger isolated from parallel unit tests.
+        crate::logging::configure(false, std::path::Path::new(&path)).unwrap();
+        assert!(!crate::logging::debug_enabled());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let shutdown = CancellationToken::new();
+            let mut attempts = 0;
+            run_panel_sessions_with_policy(
+                shutdown.clone(),
+                |_attempt_cancel| {
+                    attempts += 1;
+                    let attempt = attempts;
+                    let shutdown = shutdown.clone();
+                    async move {
+                        match attempt {
+                            1 => Err(SessionError::ControlRegistration(
+                                "missing x-acp-control-ready".into(),
+                            )),
+                            2 => Err(SessionError::stream(
+                                "control stream registration",
+                                SessionError::Rpc(Status::permission_denied(
+                                    "registration rejected",
+                                )),
+                            )),
+                            3 => {
+                                shutdown.cancel();
+                                Err(SessionError::Rpc(Status::cancelled("intentional shutdown")))
+                            }
+                            _ => panic!("session retried after shutdown"),
+                        }
+                    }
+                },
+                fast_policy(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(attempts, 3);
+        });
+        crate::logging::close();
+        return;
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.log");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "session::tests::reconnect_failures_are_logged_without_debug_but_shutdown_is_quiet",
+            "--nocapture",
+        ])
+        .env(CHILD_LOG_PATH, &path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "child output: {output:?}");
+    let log = std::fs::read_to_string(path).unwrap();
+    let failures = log
+        .lines()
+        .filter(|line| line.contains("面板会话失败："))
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 2, "{log}");
+    assert!(failures[0].contains("missing x-acp-control-ready"), "{log}");
+    assert!(failures[1].contains("control stream registration"), "{log}");
+    assert!(failures[1].contains("registration rejected"), "{log}");
+    assert!(
+        failures.iter().all(|line| line.contains(" 后重连")),
+        "{log}"
+    );
+    assert!(!log.contains("[debug]"), "{log}");
+    assert!(!log.contains("intentional shutdown"), "{log}");
 }
 
 #[test]

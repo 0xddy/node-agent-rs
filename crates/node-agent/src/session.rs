@@ -275,7 +275,12 @@ impl PanelClient {
         let response =
             match tokio::time::timeout(PANEL_REQUEST_TIMEOUT, client.hello(request)).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(status)) => return Err(SessionError::Rpc(status)),
+                Ok(Err(status)) => {
+                    return Err(SessionError::stream(
+                        "auth hello",
+                        SessionError::Rpc(status),
+                    ));
+                }
                 Err(_) => {
                     return Err(SessionError::Timeout {
                         operation: "auth hello",
@@ -579,7 +584,12 @@ impl AuthenticatedSession {
         .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(status)) => return Err(SessionError::Rpc(status)),
+            Ok(Err(status)) => {
+                return Err(SessionError::stream(
+                    "control stream registration",
+                    SessionError::Rpc(status),
+                ));
+            }
             Err(_) => {
                 return Err(SessionError::Timeout {
                     operation: "control stream registration",
@@ -759,14 +769,15 @@ where
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        if result.is_ok() {
+        let Err(error) = result else {
             backoff.reset();
             continue;
-        }
+        };
         if started_at.elapsed() > policy.stable_after {
             backoff.reset();
         }
         let delay = backoff.next_delay();
+        log::warn!("面板会话失败：{error}；{delay:?} 后重连");
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
             () = shutdown.cancelled() => return Ok(()),
