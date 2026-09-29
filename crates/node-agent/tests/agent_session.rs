@@ -27,7 +27,8 @@ use acp_proto::{
 use async_trait::async_trait;
 use node_agent::agent::Agent;
 use node_agent::runtime::{
-    ConnectionStats, NodeRuntime, ReloadStatus, RuntimeConfig, RuntimeError, TrafficDrain,
+    ConnectionStats, NodeRuntime, ReloadStatus, RuntimeConfig, RuntimeError, RuntimeHealthSnapshot,
+    TrafficDrain,
 };
 use node_agent::session::{
     CONTROL_CLIENT_READY_KEY, CONTROL_READY_METADATA_KEY, CONTROL_TOPOLOGY_DIGEST_METADATA_KEY,
@@ -344,6 +345,17 @@ impl NodeRuntime for FakeRuntime {
             .last()
             .map(|config| config.diagnostic_yaml.clone())
             .unwrap_or_default()
+    }
+
+    fn runtime_health_snapshot(&self) -> Option<RuntimeHealthSnapshot> {
+        let applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(RuntimeHealthSnapshot {
+            running: !applied.is_empty(),
+            failure: None,
+        })
     }
 
     async fn close(&self) -> Result<(), RuntimeError> {

@@ -2173,9 +2173,13 @@ async fn node_delta_upsert_and_delete_match_go_mutation_defaults() {
     );
 }
 
+type ScriptedUserPages = Arc<Mutex<VecDeque<Result<acp_proto::ListUsersResponse, tonic::Status>>>>;
+
 #[derive(Clone)]
 struct ConfigPanel {
     nonces: Arc<Mutex<Vec<String>>>,
+    scripted_pages: Option<ScriptedUserPages>,
+    page_tokens: Arc<Mutex<Vec<String>>>,
 }
 
 #[tonic::async_trait]
@@ -2222,6 +2226,13 @@ impl acp_proto::config_service_server::ConfigService for ConfigPanel {
         self.verify(request.metadata())?;
         let request = request.into_inner();
         assert_eq!(request.page_size, 500);
+        lock(&self.page_tokens).push(request.page_token.clone());
+        if let Some(pages) = &self.scripted_pages {
+            return lock(pages)
+                .pop_front()
+                .expect("unexpected ListUsers request")
+                .map(tonic::Response::new);
+        }
         let response = if request.page_token.is_empty() {
             acp_proto::ListUsersResponse {
                 users: vec![proto_user("user-1", "credential-1")],
@@ -2295,6 +2306,8 @@ async fn panel_fetcher_authenticates_every_unary_and_fetches_all_user_pages() {
     let address = listener.local_addr().unwrap();
     let panel = ConfigPanel {
         nonces: Arc::new(Mutex::new(Vec::new())),
+        scripted_pages: None,
+        page_tokens: Arc::new(Mutex::new(Vec::new())),
     };
     let server_panel = panel.clone();
     let server = tokio::spawn(async move {
@@ -2326,4 +2339,122 @@ async fn panel_fetcher_authenticates_every_unary_and_fetches_all_user_pages() {
     }
     server.abort();
     let _ = server.await;
+}
+
+async fn fetch_scripted_user_pages(
+    pages: Vec<Result<acp_proto::ListUsersResponse, tonic::Status>>,
+) -> (Result<Vec<UserCredential>, FetchError>, Vec<String>) {
+    use acp_proto::auth_service_server::AuthServiceServer;
+    use acp_proto::config_service_server::ConfigServiceServer;
+    use node_agent::config;
+    use node_agent::control::PanelTopologyFetcher;
+    use node_agent::session::PanelClient;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let panel = ConfigPanel {
+        nonces: Arc::new(Mutex::new(Vec::new())),
+        scripted_pages: Some(Arc::new(Mutex::new(pages.into()))),
+        page_tokens: Arc::new(Mutex::new(Vec::new())),
+    };
+    let server_panel = panel.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(AuthServiceServer::new(server_panel.clone()))
+            .add_service(ConfigServiceServer::new(server_panel))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let config = config::parse(&format!(
+        "panel_grpc_endpoint = \"grpc://{address}\"\nmachine_id = \"machine-1\"\nnode_id = \"node-1\"\nmachine_secret = \"secret\"\n"
+    ))
+    .unwrap();
+    let client = PanelClient::new(config, "test-agent", "test-shoes");
+    let channel = client.dial().await.unwrap();
+    let session = client.authenticate(channel, 0).await.unwrap();
+    let fetcher = PanelTopologyFetcher::new("machine-1", session);
+    let result = fetcher.fetch_node_users("node-1").await;
+    let tokens = lock(&panel.page_tokens).clone();
+    assert!(lock(panel.scripted_pages.as_ref().unwrap()).is_empty());
+    server.abort();
+    let _ = server.await;
+    (result, tokens)
+}
+
+fn user_page(ids: &[&str], total_size: u32, next_page_token: &str) -> acp_proto::ListUsersResponse {
+    acp_proto::ListUsersResponse {
+        users: ids.iter().map(|id| proto_user(id, "credential")).collect(),
+        next_page_token: next_page_token.into(),
+        total_size,
+        has_next: !next_page_token.is_empty(),
+    }
+}
+
+#[tokio::test]
+async fn panel_fetcher_restarts_an_aborted_snapshot_without_partial_users() {
+    let (result, tokens) = fetch_scripted_user_pages(vec![
+        Ok(user_page(&["stale"], 2, "snapshot.1.500")),
+        Err(tonic::Status::aborted("authorization changed")),
+        Ok(user_page(&["fresh"], 1, "")),
+    ])
+    .await;
+    assert_eq!(tokens, vec!["", "snapshot.1.500", ""]);
+    assert_eq!(result.unwrap()[0].user_id, "fresh");
+}
+
+#[tokio::test]
+async fn panel_fetcher_stops_after_three_aborted_snapshots() {
+    let (result, tokens) = fetch_scripted_user_pages(vec![
+        Err(tonic::Status::aborted("first")),
+        Err(tonic::Status::aborted("second")),
+        Err(tonic::Status::aborted("third")),
+    ])
+    .await;
+    assert_eq!(tokens, vec!["", "", ""]);
+    assert!(result.unwrap_err().to_string().contains("third"));
+}
+
+#[tokio::test]
+async fn panel_fetcher_does_not_retry_unrelated_panel_errors() {
+    let (result, tokens) =
+        fetch_scripted_user_pages(vec![Err(tonic::Status::internal("database unavailable"))]).await;
+    assert_eq!(tokens, vec![""]);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("database unavailable")
+    );
+}
+
+#[tokio::test]
+async fn panel_fetcher_rejects_incomplete_or_inconsistent_snapshots() {
+    let cases = [
+        (vec![Ok(user_page(&[""], 1, ""))], "empty user identity"),
+        (
+            vec![
+                Ok(user_page(&["same"], 2, "snapshot.1.500")),
+                Ok(user_page(&["same"], 2, "")),
+            ],
+            "duplicate identity",
+        ),
+        (
+            vec![
+                Ok(user_page(&["one"], 2, "snapshot.1.500")),
+                Ok(user_page(&["two"], 3, "")),
+            ],
+            "snapshot total changed",
+        ),
+        (vec![Ok(user_page(&["one"], 2, ""))], "snapshot incomplete"),
+    ];
+    for (pages, expected) in cases {
+        let (result, _) = fetch_scripted_user_pages(pages).await;
+        assert!(
+            result.unwrap_err().to_string().contains(expected),
+            "expected {expected}"
+        );
+    }
 }

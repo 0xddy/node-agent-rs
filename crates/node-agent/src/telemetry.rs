@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::policy::PolicyState;
-use crate::runtime::{ConnectionStats, NodeRuntime};
+use crate::runtime::{ConnectionStats, NodeRuntime, RuntimeHealthSnapshot};
 
 pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(3);
 pub const TELEMETRY_SEND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -96,7 +96,8 @@ impl TelemetryReporter {
                 // Non-blocking runtime lookup keeps reloads out of the
                 // host clock measurement and never stops the sampler.
                 let stats = runtime.connection_stats_snapshot(&self.node_id);
-                self.publish(host, timestamp_unix, elapsed_ms, stats);
+                let health = runtime.runtime_health_snapshot();
+                self.publish(host, timestamp_unix, elapsed_ms, stats, health);
             }
             workers_cancel.cancel();
         })
@@ -116,6 +117,7 @@ impl TelemetryReporter {
         timestamp_unix: i64,
         elapsed_ms: u64,
         stats: Option<ConnectionStats>,
+        health: Option<RuntimeHealthSnapshot>,
     ) {
         let stats_valid = stats.is_some();
         let mut snapshot = build_snapshot(
@@ -124,6 +126,7 @@ impl TelemetryReporter {
             host,
             stats.unwrap_or_default(),
             self.policy.maintenance(),
+            health.as_ref(),
         );
         snapshot.agent_instance_id.clone_from(&self.instance_id);
         snapshot.sample_seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -182,6 +185,7 @@ pub fn build_snapshot(
     host: HostSnapshot,
     stats: ConnectionStats,
     maintenance: bool,
+    health: Option<&RuntimeHealthSnapshot>,
 ) -> TelemetrySnapshot {
     TelemetrySnapshot {
         machine_id: machine_id.to_string(),
@@ -196,12 +200,7 @@ pub fn build_snapshot(
         memory_valid: host.memory_valid,
         active_connections: stats.active_connections,
         online_users: stats.online_users,
-        sing_box_state: if maintenance {
-            "maintenance"
-        } else {
-            "running"
-        }
-        .to_string(),
+        sing_box_state: runtime_state(maintenance, health).to_string(),
         network_interfaces_valid: host.network_interfaces_valid,
         network_interfaces: host
             .network_interfaces
@@ -236,6 +235,18 @@ pub fn build_snapshot(
             })
             .collect(),
         ..Default::default()
+    }
+}
+
+fn runtime_state(maintenance: bool, health: Option<&RuntimeHealthSnapshot>) -> &'static str {
+    if maintenance {
+        return "maintenance";
+    }
+    match health {
+        Some(snapshot) if snapshot.failure.is_some() => "error",
+        Some(snapshot) if snapshot.running => "running",
+        Some(_) => "stopped",
+        None => "unknown",
     }
 }
 

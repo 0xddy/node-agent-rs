@@ -412,7 +412,7 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
     async fn reconcile_current(&self, topology: &MachineTopology) -> Result<(), TopologyError> {
         let inner = Arc::clone(&self.inner);
         let current = topology.clone();
-        self.run_owned("port hopping reconciliation", async move {
+        self.run_owned("runtime reconciliation", async move {
             let _operation = inner.operation.lock().await;
             let plan = crate::porthopping::build_plan(&current).map_err(|error| {
                 TopologyError::runtime(
@@ -420,12 +420,58 @@ impl TopologyRuntime for NodeRuntimeTopologyAdapter {
                     false,
                 )
             })?;
-            inner.reconcile_ports(&plan).await.map_err(|error| {
-                TopologyError::runtime(
-                    format!("reconcile current port hopping forwarding state: {error}"),
-                    false,
+            let mut failures = Vec::new();
+            if let Err(error) = inner.reconcile_ports(&plan).await {
+                failures.push(format!(
+                    "reconcile current port hopping forwarding state: {error}"
+                ));
+            }
+            if let Some(health) = inner.runtime.runtime_health_snapshot()
+                && let Some(failure) = health.failure
+            {
+                // This is deliberately a forced reload. Applying the same
+                // topology normally updates no inbounds and would leave a dead
+                // accept loop registered forever.
+                let recovery = crate::compile::compile_with_local_overrides(
+                    &current,
+                    inner.runtime.traffic_analysis_disabled(),
                 )
-            })?;
+                .map_err(|error| {
+                    TopologyError::runtime(
+                        format!("compile current topology to recover {failure}: {error}"),
+                        false,
+                    )
+                })?;
+                log::warn!("shoes 监听器异常，准备从已发布拓扑恢复：{failure}");
+                match inner.runtime.reload_config(recovery.runtime).await {
+                    Ok(_) => match inner.runtime.runtime_health_snapshot() {
+                        Some(after) if after.failure.is_some() || !after.running => {
+                            failures.push(format!(
+                                "runtime still unhealthy after recovery of {failure}: {:?}",
+                                after.failure
+                            ));
+                        }
+                        Some(_) => log::info!("shoes 监听器已从已发布拓扑恢复"),
+                        None => failures.push(format!(
+                            "runtime health unavailable after recovery of {failure}"
+                        )),
+                    },
+                    Err(error) => failures.push(format!(
+                        "recover stopped shoes listener ({failure}): {error}"
+                    )),
+                }
+            }
+            if !failures.is_empty() {
+                let running = inner
+                    .runtime
+                    .runtime_health_snapshot()
+                    .is_some_and(|health| health.running);
+                return Err(TopologyError::runtime_state(
+                    failures.join("; "),
+                    false,
+                    running,
+                ));
+            }
             let mut state = inner
                 .state
                 .lock()
@@ -1087,12 +1133,25 @@ impl TopologyManager {
     }
 
     pub async fn reconcile_current(&self) -> Result<(), TopologyError> {
-        let _operation = self.begin_operation().await?;
-        let current = self.read_published().topology.clone();
-        if current.machine_id.is_empty() {
-            return Ok(());
-        }
-        self.runtime.reconcile_current(&current).await
+        let manager = self.clone();
+        tokio::spawn(async move {
+            // Retain the manager gate if the timer or shutdown drops its
+            // caller. The adapter owns the inner transaction independently.
+            let _operation = manager.begin_operation().await?;
+            let current = manager.read_published().topology.clone();
+            if current.machine_id.is_empty() {
+                return Ok(());
+            }
+            manager.runtime.reconcile_current(&current).await
+        })
+        .await
+        .map_err(|error| {
+            TopologyError::runtime_state(
+                format!("runtime reconciliation task failed: {error}"),
+                false,
+                false,
+            )
+        })?
     }
 
     /// Cancel panel fetches and runtime preparation while billing drains.
@@ -2045,7 +2104,7 @@ mod transaction_tests {
 
     use super::*;
     use crate::porthopping::{PortRange, Redirect, StateUncertainError};
-    use crate::runtime::{ConnectionStats, TrafficDrain};
+    use crate::runtime::{ConnectionStats, RuntimeHealthSnapshot, TrafficDrain};
     use crate::topology::RawJson;
     use crate::topology::provider::{CURRENT_CONFIG_VERSION, HYSTERIA2_SALAMANDER_ID};
 
@@ -2121,6 +2180,7 @@ mod transaction_tests {
         apply_errors: VecDeque<RuntimeError>,
         reload_errors: VecDeque<RuntimeError>,
         current: Vec<u8>,
+        failure: Option<String>,
     }
 
     #[tokio::test]
@@ -2320,6 +2380,9 @@ mod transaction_tests {
     }
 
     impl FakeRuntime {
+        fn fail_listener(&self) {
+            self.state.lock().unwrap().failure = Some("listener stopped for test".into());
+        }
         fn queue_apply_error(&self, error: RuntimeError) {
             self.state.lock().unwrap().apply_errors.push_back(error);
         }
@@ -2353,6 +2416,7 @@ mod transaction_tests {
             }
             let mut state = self.state.lock().unwrap();
             state.current = config.diagnostic_yaml.clone();
+            state.failure = None;
             state.successful_applies.push(config.diagnostic_yaml);
             Ok(())
         }
@@ -2364,6 +2428,7 @@ mod transaction_tests {
                 return Err(error);
             }
             state.current = config.diagnostic_yaml;
+            state.failure = None;
             Ok(ReloadStatus {
                 running: true,
                 rolled_back: false,
@@ -2372,6 +2437,14 @@ mod transaction_tests {
 
         fn current_config(&self) -> Vec<u8> {
             self.state.lock().unwrap().current.clone()
+        }
+
+        fn runtime_health_snapshot(&self) -> Option<RuntimeHealthSnapshot> {
+            let state = self.state.lock().unwrap();
+            Some(RuntimeHealthSnapshot {
+                running: state.apply_calls > 0,
+                failure: state.failure.clone(),
+            })
         }
 
         async fn close(&self) -> Result<(), RuntimeError> {
@@ -2613,6 +2686,36 @@ mod transaction_tests {
         let plans = router.plans();
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0], plans[1]);
+    }
+
+    #[tokio::test]
+    async fn terminal_listener_failure_forces_reload_and_retries_after_failure() {
+        let (manager, _adapter, runtime, _router) = fixture();
+        manager.apply_initial(topology(1, "20000")).await.unwrap();
+        manager.reconcile_current().await.unwrap();
+        assert_eq!(runtime.reload_calls(), 0, "healthy listener must stay up");
+
+        runtime.fail_listener();
+        runtime.queue_reload_error(RuntimeError::external(
+            "temporary bind failure",
+            true,
+            false,
+            true,
+        ));
+        let error = manager.reconcile_current().await.unwrap_err();
+        assert!(error.to_string().contains("temporary bind failure"));
+        assert_eq!(runtime.reload_calls(), 1);
+        assert_eq!(manager.current_revision(), Some(1));
+
+        manager.reconcile_current().await.unwrap();
+        assert_eq!(
+            runtime.reload_calls(),
+            2,
+            "next check retries the same topology"
+        );
+        assert_eq!(runtime.apply_calls(), 1, "recovery must use forced reload");
+        assert_eq!(manager.current_revision(), Some(1));
+        assert!(runtime.runtime_health_snapshot().unwrap().failure.is_none());
     }
 
     #[tokio::test]

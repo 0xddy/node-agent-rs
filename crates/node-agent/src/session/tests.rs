@@ -238,6 +238,7 @@ struct MockPanel {
     digest: Arc<str>,
     hello_error: Option<Status>,
     control_error: Option<Status>,
+    control_stream_terminal: Option<Status>,
 }
 
 #[tonic::async_trait]
@@ -281,6 +282,16 @@ impl ControlService for MockPanel {
         self.events
             .send(PanelEvent::ControlMetadata(fields))
             .unwrap();
+
+        if let Some(status) = &self.control_stream_terminal {
+            let (sender, receiver) = mpsc::channel(1);
+            sender.send(Err(status.clone())).await.unwrap();
+            let mut response = Response::new(ReceiverStream::new(receiver));
+            response
+                .metadata_mut()
+                .insert("x-test-control-open", MetadataValue::from_static("1"));
+            return Ok(response);
+        }
 
         let events = self.events.clone();
         let mut acknowledgements = request.into_inner();
@@ -408,6 +419,7 @@ fn mock_panel() -> (MockPanel, mpsc::UnboundedReceiver<PanelEvent>) {
             digest: Arc::from(DIGEST),
             hello_error: None,
             control_error: None,
+            control_stream_terminal: None,
         },
         receiver,
     )
@@ -456,6 +468,43 @@ async fn rejected_session_rpcs_identify_the_stage_and_preserve_authentication_st
         assert!(error.is_unauthenticated(), "{error}");
         running.stop().await;
     }
+}
+
+#[tokio::test]
+async fn control_stream_without_ready_header_reports_terminal_panel_status() {
+    let (mut panel, _events) = mock_panel();
+    panel.control_stream_terminal = Some(Status::aborted("user snapshot invalidated"));
+    let running = spawn_panel(panel, None).await;
+    let client = PanelClient::new(
+        test_config(&format!("grpc://{}", running.address)),
+        "agent",
+        "shoes",
+    );
+    let channel = client.dial().await.unwrap();
+    let session = client.authenticate(channel, 41).await.unwrap();
+    let (_ack_sender, ack_receiver) = mpsc::channel(1);
+    let mut raw_client = acp_proto::control_service_client::ControlServiceClient::new(
+        session.authenticated_channel(),
+    );
+    let raw_response = raw_client
+        .control_stream(Request::new(ReceiverStream::new(ack_receiver)))
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_response.metadata().get("x-test-control-open").unwrap(),
+        "1"
+    );
+    let error = session.open_control_stream().await.err().unwrap();
+    assert!(
+        error.to_string().contains("user snapshot invalidated"),
+        "{error}"
+    );
+    assert!(
+        matches!(&error, SessionError::Stream { source, .. }
+            if matches!(source.as_ref(), SessionError::Rpc(status) if status.code() == Code::Aborted)),
+        "{error}"
+    );
+    running.stop().await;
 }
 
 #[tokio::test]

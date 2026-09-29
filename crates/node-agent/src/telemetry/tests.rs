@@ -60,6 +60,7 @@ fn snapshot_mapping_preserves_validity_counters_and_inventory() {
             online_users: 6,
         },
         true,
+        None,
     );
     assert_eq!(snapshot.machine_id, "machine");
     assert_eq!(snapshot.timestamp_unix, 123);
@@ -86,10 +87,31 @@ fn snapshot_mapping_preserves_validity_counters_and_inventory() {
 }
 
 #[test]
+fn runtime_state_reports_terminal_failure_and_busy_or_stopped_runtime() {
+    let healthy = RuntimeHealthSnapshot {
+        running: true,
+        failure: None,
+    };
+    let failed = RuntimeHealthSnapshot {
+        running: true,
+        failure: Some("listener stopped".into()),
+    };
+    let stopped = RuntimeHealthSnapshot {
+        running: false,
+        failure: None,
+    };
+    assert_eq!(runtime_state(false, Some(&healthy)), "running");
+    assert_eq!(runtime_state(false, Some(&failed)), "error");
+    assert_eq!(runtime_state(false, Some(&stopped)), "stopped");
+    assert_eq!(runtime_state(false, None), "unknown");
+    assert_eq!(runtime_state(true, Some(&failed)), "maintenance");
+}
+
+#[test]
 fn latest_only_publication_keeps_identity_sequence_and_invalid_stats() {
     let reporter = reporter();
     for elapsed in 1..=100 {
-        reporter.publish(HostSnapshot::default(), 1, elapsed, None);
+        reporter.publish(HostSnapshot::default(), 1, elapsed, None, None);
     }
     let current = reporter.latest.borrow().clone().unwrap();
     assert_eq!(current.sample_seq, 100);
@@ -102,6 +124,10 @@ fn latest_only_publication_keeps_identity_sequence_and_invalid_stats() {
         2,
         101,
         Some(ConnectionStats::default()),
+        Some(RuntimeHealthSnapshot {
+            running: true,
+            failure: None,
+        }),
     );
     let current = reporter.latest.borrow().clone().unwrap();
     assert_eq!(current.sample_seq, 101);
@@ -156,6 +182,7 @@ fn frozen_host_cache_keeps_heartbeats_without_claiming_fresh_counters() {
             1,
             reporter.elapsed_ms(),
             Some(ConnectionStats::default()),
+            None,
         );
     }
     let snapshot = reporter.latest.borrow().clone().unwrap();
@@ -185,7 +212,13 @@ fn reporter() -> Arc<TelemetryReporter> {
 }
 
 fn publish_now(reporter: &TelemetryReporter) {
-    reporter.publish(HostSnapshot::default(), 1, reporter.elapsed_ms(), None);
+    reporter.publish(
+        HostSnapshot::default(),
+        1,
+        reporter.elapsed_ms(),
+        None,
+        None,
+    );
 }
 
 #[derive(Clone)]
@@ -518,6 +551,7 @@ async fn flow_control_stall_times_out_without_blocking_latest_publication() {
                 },
                 1,
                 reporter.elapsed_ms(),
+                None,
                 None,
             );
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -43,6 +43,8 @@ use crate::traffic::{
 };
 
 pub const BACKGROUND_SHUTDOWN_LIMIT: Duration = Duration::from_secs(5);
+const TOPOLOGY_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const TOPOLOGY_RECONCILE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum AgentError {
@@ -175,11 +177,13 @@ impl Agent {
         let session_shutdown = CancellationToken::new();
         let flusher_shutdown = CancellationToken::new();
         let sampling_shutdown = shutdown.child_token();
+        let reconciliation_shutdown = shutdown.child_token();
         // These guards also signal the children if the supervisor unwinds.
         // Normal shutdown below still controls their order explicitly.
         let _cancel_sessions = session_shutdown.clone().drop_guard();
         let _cancel_flusher = flusher_shutdown.clone().drop_guard();
         let _cancel_sampling = sampling_shutdown.clone().drop_guard();
+        let _cancel_reconciliation = reconciliation_shutdown.clone().drop_guard();
 
         let mut sampling = self
             .telemetry
@@ -187,9 +191,11 @@ impl Agent {
             .start_sampling(sampling_shutdown.clone(), self.runtime.clone());
         let mut flusher = self.spawn_traffic_flusher(flusher_shutdown.clone());
         let mut sessions = self.spawn_panel_sessions(session_shutdown.clone());
+        let mut reconciliation = self.spawn_reconciliation(reconciliation_shutdown.clone());
         let mut sessions_running = true;
         let mut flusher_running = true;
         let mut sampling_running = true;
+        let mut reconciliation_running = true;
 
         let trigger_error = tokio::select! {
             biased;
@@ -209,10 +215,21 @@ impl Agent {
                 sessions_running = false;
                 Some(session_result(joined))
             }
+            joined = &mut reconciliation => {
+                reconciliation_running = false;
+                Some(match joined {
+                    Ok(()) => AgentError::Background("runtime reconciliation stopped unexpectedly".into()),
+                    Err(error) => AgentError::Background(format!("runtime reconciliation failed: {error}")),
+                })
+            }
         };
 
         log::info!("node-agent 收到停止请求，准备关闭");
 
+        reconciliation_shutdown.cancel();
+        if reconciliation_running {
+            wait_for_task(&mut reconciliation, "运行时检查任务").await;
+        }
         self.topologies.stop_operations();
         sampling_shutdown.cancel();
         if sampling_running {
@@ -266,6 +283,19 @@ impl Agent {
         let machine_id = self.config.machine_id.clone();
         tokio::spawn(async move {
             run_traffic_flusher(cancel, runtime, traffic, queue, machine_id).await
+        })
+    }
+
+    fn spawn_reconciliation(self: &Arc<Self>, cancel: CancellationToken) -> JoinHandle<()> {
+        let topologies = self.topologies.clone();
+        tokio::spawn(async move {
+            run_reconciliation(
+                topologies,
+                cancel,
+                TOPOLOGY_RECONCILE_INTERVAL,
+                TOPOLOGY_RECONCILE_TIMEOUT,
+            )
+            .await;
         })
     }
 
@@ -609,6 +639,50 @@ fn topology_resync_required(local_digest: Option<&str>, panel_digest: &str) -> b
     local_digest != Some(panel_digest)
 }
 
+/// Runs outside the panel session so a live gRPC connection cannot mask a
+/// terminated accept loop. Healthy inbounds are only inspected, never reloaded.
+async fn run_reconciliation(
+    topologies: Arc<TopologyManager>,
+    cancel: CancellationToken,
+    interval: Duration,
+    timeout: Duration,
+) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_error = String::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {},
+        }
+        let operation = topologies.reconcile_current();
+        tokio::pin!(operation);
+        // A timeout is diagnostic only. Dropping a live replacement could
+        // release the outer operation gate while its owned inner task still
+        // mutates the runtime, allowing a newer topology to be overwritten.
+        let result = match tokio::time::timeout(timeout, &mut operation).await {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!("运行时检查超过 {timeout:?}，等待本次事务完成");
+                operation.await
+            }
+        };
+        let error = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        if error != last_error {
+            if error.is_empty() {
+                log::info!("运行时检查已恢复正常");
+            } else {
+                log::warn!("运行时检查失败，将自动重试：{error}");
+            }
+            last_error = error;
+        }
+    }
+}
+
 fn session_task_error(name: impl Into<String>, message: impl Into<String>) -> SessionError {
     SessionError::Task {
         name: name.into(),
@@ -658,6 +732,61 @@ mod tests {
     use crate::runtime::{ConnectionStats, ReloadStatus, RuntimeConfig, TrafficDrain};
     use crate::topology::MachineTopology;
     use crate::traffic::TrafficEvent;
+
+    struct ReconcileRecorder(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl crate::topology::manager::TopologyRuntime for ReconcileRecorder {
+        async fn apply(&self, _topology: &MachineTopology) -> Result<(), TopologyError> {
+            Ok(())
+        }
+
+        async fn close_user_connections(&self, _node_id: &str, _user_id: &str) -> u64 {
+            0
+        }
+
+        fn current_config(&self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        async fn reconcile_current(
+            &self,
+            _topology: &MachineTopology,
+        ) -> Result<(), TopologyError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_runs_periodically_without_a_panel_session() {
+        let runtime = Arc::new(ReconcileRecorder(AtomicUsize::new(0)));
+        let topologies = Arc::new(TopologyManager::new("machine", runtime.clone()));
+        topologies
+            .apply_initial(MachineTopology {
+                machine_id: "machine".into(),
+                revision: 1,
+                ..MachineTopology::default()
+            })
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_reconciliation(
+            topologies,
+            cancel.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(30),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.0.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("runtime is checked without session traffic");
+        cancel.cancel();
+        worker.await.unwrap();
+    }
 
     struct LifecycleRuntime {
         events: Mutex<Vec<&'static str>>,

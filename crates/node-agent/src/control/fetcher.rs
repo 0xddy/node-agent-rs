@@ -9,6 +9,7 @@ use acp_proto::config_service_client::ConfigServiceClient;
 use acp_proto::{GetMachineConfigRequest, ListUsersRequest, MachineConfig};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use tonic::Code;
 
 use crate::session::{AuthenticatedSession, PANEL_REQUEST_TIMEOUT};
 use crate::topology::manager::{ReloadReporter, ReloadStage};
@@ -16,19 +17,33 @@ use crate::topology::{MachineTopology, UserCredential, from_machine_config, repl
 
 const USER_PAGE_SIZE: u32 = 500;
 const MAX_USER_PAGES: usize = 10_000;
+const MAX_USER_SNAPSHOT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchError(String);
+pub struct FetchError {
+    message: String,
+    code: Option<Code>,
+}
 
 impl FetchError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn rpc(operation: &str, status: tonic::Status) -> Self {
+        Self {
+            message: format!("{operation}: {status}"),
+            code: Some(status.code()),
+        }
     }
 }
 
 impl fmt::Display for FetchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -98,12 +113,36 @@ impl PanelTopologyFetcher {
         if node_id.is_empty() {
             return Err(FetchError::new("list users requires node_id"));
         }
+        // A continuation token belongs to one immutable panel snapshot. If
+        // membership changes while paging, discard all partial users and pull
+        // again from the first page, as the Go agent does.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.list_node_users_snapshot(node_id).await {
+                Err(error)
+                    if error.code == Some(Code::Aborted)
+                        && attempts < MAX_USER_SNAPSHOT_ATTEMPTS =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn list_node_users_snapshot(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<UserCredential>, FetchError> {
         let mut client = ConfigServiceClient::new(self.session.authenticated_channel());
         let mut users = Vec::new();
         let mut page_token = String::new();
         let mut seen_page_tokens = BTreeSet::new();
+        let mut seen_user_ids = BTreeSet::new();
+        let mut expected_total = None;
 
-        for _ in 0..MAX_USER_PAGES {
+        for page in 0..MAX_USER_PAGES {
             if !page_token.is_empty() && !seen_page_tokens.insert(page_token.clone()) {
                 return Err(FetchError::new(format!(
                     "list users pagination repeated page_token={page_token:?} for node {node_id}"
@@ -125,7 +164,27 @@ impl PanelTopologyFetcher {
             .await?
             .into_inner();
 
-            users.extend(response.users.iter().map(UserCredential::from));
+            for user in &response.users {
+                if user.user_id.is_empty() {
+                    return Err(FetchError::new(format!(
+                        "list users returned empty user identity for node {node_id}"
+                    )));
+                }
+                if !seen_user_ids.insert(user.user_id.clone()) {
+                    return Err(FetchError::new(format!(
+                        "list users returned duplicate identity for node {node_id}"
+                    )));
+                }
+                users.push(UserCredential::from(user));
+            }
+            if page == 0 {
+                expected_total = Some(response.total_size);
+            }
+            if expected_total != Some(response.total_size) {
+                return Err(FetchError::new(format!(
+                    "list users snapshot total changed for node {node_id}"
+                )));
+            }
             let total_size = response.total_size as usize;
             if total_size > 0 && users.len() > total_size {
                 return Err(FetchError::new(format!(
@@ -138,6 +197,11 @@ impl PanelTopologyFetcher {
                     return Err(FetchError::new(format!(
                         "list users returned has_next=false with next_page_token={:?} for node {node_id}",
                         response.next_page_token
+                    )));
+                }
+                if total_size > 0 && users.len() != total_size {
+                    return Err(FetchError::new(format!(
+                        "list users snapshot incomplete for node {node_id}"
                     )));
                 }
                 return Ok(users);
@@ -262,7 +326,7 @@ where
     tokio::time::timeout(timeout, future)
         .await
         .map_err(|_| FetchError::new(format!("{operation} timed out after {timeout:?}")))?
-        .map_err(|status| FetchError::new(format!("{operation}: {status}")))
+        .map_err(|status| FetchError::rpc(&operation, status))
 }
 
 #[cfg(test)]

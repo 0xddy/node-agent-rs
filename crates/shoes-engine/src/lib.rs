@@ -672,6 +672,20 @@ impl Engine {
         self.inner.inbounds.get(tag).map(|e| e.value().clone())
     }
 
+    /// Tags whose listener tasks have exited while their inbounds remain
+    /// registered. A bound socket alone cannot establish QUIC accept health.
+    pub fn failed_listener_tags(&self) -> Vec<String> {
+        let mut failed: Vec<_> = self
+            .inner
+            .inbounds
+            .iter()
+            .filter(|entry| entry.value().listener_failed())
+            .map(|entry| entry.key().clone())
+            .collect();
+        failed.sort();
+        failed
+    }
+
     /// Retain the replay namespace while the same tagged inbound is explicitly
     /// stopped and rebuilt.
     pub fn preserve_inbound_replay(&self, tag: &str) -> EngineResult<InboundReplayLease> {
@@ -1997,6 +2011,48 @@ mod dns_sharing_tests {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("reserve test bind address");
         listener.local_addr().expect("read reserved bind address")
+    }
+
+    #[tokio::test]
+    async fn terminated_registered_listener_is_detected_until_replaced() {
+        let engine = Engine::bootstrap().await.unwrap();
+        let address = free_tcp_address();
+        let spec = InboundSpec {
+            tag: "listener-health".into(),
+            config: inbound_with_dns_at(address, "udp://127.0.0.1:5353"),
+            users: None,
+        };
+        engine.add_inbound(spec.clone()).await.unwrap();
+        assert!(engine.failed_listener_tags().is_empty());
+        tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the original listener accepts connections");
+
+        // Simulate an accept loop stopping after the startup health grace.
+        engine.get_inbound(&spec.tag).unwrap().stop_accepting();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if engine.failed_listener_tags().as_slice() == std::slice::from_ref(&spec.tag) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("terminated accept loop must be visible while still registered");
+        assert_eq!(
+            engine.failed_listener_tags().as_slice(),
+            std::slice::from_ref(&spec.tag)
+        );
+
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
+        assert!(engine.failed_listener_tags().is_empty());
+        engine.add_inbound(spec.clone()).await.unwrap();
+        assert!(engine.failed_listener_tags().is_empty());
+        tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the replacement listener accepts connections");
+        engine.remove_inbound_hard(&spec.tag).await.unwrap();
     }
 
     fn inbound_with_dns_at(address: SocketAddr, server: &str) -> serde_json::Value {

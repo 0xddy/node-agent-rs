@@ -597,7 +597,25 @@ impl AuthenticatedSession {
                 });
             }
         };
-        let panel_digest = validate_control_metadata(response.metadata())?;
+        let metadata_result = validate_control_metadata(response.metadata());
+        if single_ascii_metadata(response.metadata(), CONTROL_READY_METADATA_KEY).ok() != Some("1")
+        {
+            let metadata_error =
+                metadata_result.expect_err("invalid ready marker must be rejected");
+            // The panel can send empty headers followed by a terminal gRPC
+            // status when it fails while preparing the control stream.
+            let mut commands = response.into_inner();
+            if let Ok(Err(status)) =
+                tokio::time::timeout(PANEL_REQUEST_TIMEOUT, commands.message()).await
+            {
+                return Err(SessionError::stream(
+                    "control stream registration",
+                    SessionError::Rpc(status),
+                ));
+            }
+            return Err(metadata_error);
+        }
+        let panel_digest = metadata_result?;
         Ok(OpenedControlStream {
             ack_sender,
             commands: response.into_inner(),

@@ -57,6 +57,15 @@ pub struct ConnectionStats {
     pub online_users: u64,
 }
 
+/// A point-in-time view of the committed data plane. `failure` records a
+/// confirmed terminal listener error or a lost committed runtime, not a failed
+/// client handshake or a transient network reachability probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeHealthSnapshot {
+    pub running: bool,
+    pub failure: Option<String>,
+}
+
 /// Outcome of a successful forced reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReloadStatus {
@@ -205,6 +214,11 @@ pub trait NodeRuntime: Send + Sync {
     /// A telemetry snapshot, or `None` when runtime statistics are unavailable.
     /// Implementations opt in so a missing provider does not report a valid zero.
     fn connection_stats_snapshot(&self, _node_id: &str) -> Option<ConnectionStats> {
+        None
+    }
+    /// `None` means a configuration transaction is in progress or this runtime
+    /// implementation has no health reporter. Never interpret it as healthy.
+    fn runtime_health_snapshot(&self) -> Option<RuntimeHealthSnapshot> {
         None
     }
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64;
@@ -664,6 +678,51 @@ impl ShoesRuntime {
     /// Exposed for status/diagnostic wiring, not for topology mutations.
     pub fn engine(&self) -> &Engine {
         &self.inner.engine
+    }
+
+    fn health_snapshot(&self) -> Option<RuntimeHealthSnapshot> {
+        // A rule-set refresh can mutate the engine outside TopologyManager's
+        // operation gate. Take both transaction locks without waiting, so a
+        // partial replacement cannot look like a failed listener to telemetry.
+        let _configuration = self.inner.configuration.try_lock().ok()?;
+        let _apply = self.inner.apply.try_lock().ok()?;
+        let state = self.inner.state.try_read().ok()?;
+        if state.closed || self.inner.closing.is_cancelled() || !state.committed {
+            return Some(RuntimeHealthSnapshot {
+                running: false,
+                failure: None,
+            });
+        }
+        let Some(current) = state.current.as_ref() else {
+            return Some(RuntimeHealthSnapshot {
+                running: false,
+                failure: Some("committed shoes runtime lost after failed recovery".into()),
+            });
+        };
+        let missing: Vec<_> = current
+            .inbounds
+            .keys()
+            .filter(|tag| self.inner.engine.get_inbound(tag).is_none())
+            .cloned()
+            .collect();
+        let failed = self.inner.engine.failed_listener_tags();
+        let failure = if !missing.is_empty() {
+            Some(format!(
+                "committed inbound(s) missing: {}",
+                missing.join(", ")
+            ))
+        } else if !failed.is_empty() {
+            Some(format!(
+                "listener stopped for inbound(s): {}",
+                failed.join(", ")
+            ))
+        } else {
+            None
+        };
+        Some(RuntimeHealthSnapshot {
+            running: true,
+            failure,
+        })
     }
 
     /// Apply a control-plane candidate and, only after it commits, replace the
@@ -2485,6 +2544,10 @@ impl NodeRuntime for ShoesRuntime {
 
     fn connection_stats_snapshot(&self, node_id: &str) -> Option<ConnectionStats> {
         self.telemetry_connection_stats(node_id)
+    }
+
+    fn runtime_health_snapshot(&self) -> Option<RuntimeHealthSnapshot> {
+        self.health_snapshot()
     }
 
     async fn close_user_connections(&self, node_id: &str, user_id: &str) -> u64 {

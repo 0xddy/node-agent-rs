@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -194,6 +195,10 @@ pub struct InboundSlot {
     /// A reload re-expands the incoming config and pairs the result against this
     /// list positionally, which is why the order is preserved rather than keyed.
     handles: Vec<ServerHandle>,
+    /// A terminated accept loop remains a failure until this slot is replaced.
+    /// `take_dead_listener` removes the completed task from its handle, so a
+    /// subsequent health sample must retain the finding independently.
+    listener_failed: AtomicBool,
     /// Security state spans every expanded listener group and every replacement
     /// generation of this one logical inbound.
     replay_state: InboundReplayState,
@@ -230,6 +235,7 @@ impl InboundSlot {
             info,
             keys,
             handles,
+            listener_failed: AtomicBool::new(false),
             replay_state,
             replay_lineage,
             users,
@@ -242,6 +248,38 @@ impl InboundSlot {
 
     pub(crate) fn replay_state(&self) -> InboundReplayState {
         self.replay_state.clone()
+    }
+
+    /// Detect an accept loop that terminated after the startup grace period.
+    /// Engine removal unregisters the slot before deliberately stopping it.
+    pub(crate) fn listener_failed(&self) -> bool {
+        if self.listener_failed.load(Ordering::Acquire) {
+            return true;
+        }
+        for handle in &self.handles {
+            if let Some(dead) = handle.take_dead_listener() {
+                self.listener_failed.store(true, Ordering::Release);
+                let tag = self.info.tag.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        match dead.await {
+                            Ok(()) => log::error!(
+                                "inbound {tag} accept loop exited unexpectedly after startup"
+                            ),
+                            Err(error) => log::error!(
+                                "inbound {tag} accept loop failed after startup: {error}"
+                            ),
+                        }
+                    });
+                } else {
+                    log::error!(
+                        "inbound {tag} accept loop exited after startup (join detail unavailable)"
+                    );
+                }
+                return true;
+            }
+        }
+        false
     }
 
     pub(crate) fn replay_lineage(&self) -> Arc<()> {
